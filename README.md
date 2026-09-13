@@ -176,8 +176,8 @@ is only ever a cache, so losing one costs a scan.
 CI runs the suite on a Windows runner, but the author has not watched the
 atomic replacement or the lock behave on a real NTFS volume. The lock goes
 through `std.Io`, which uses `NtLockFile` there and `flock` on POSIX. Treat
-every promise as proved on Linux and macOS — `ci/linux.sh` runs the suite in a
-container on each release — and claimed on Windows.
+every promise as proved on Linux and macOS — `ci/linux.sh` runs the whole suite
+on Linux from whatever machine you are on — and claimed on Windows.
 
 ## More than one process
 
