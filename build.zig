@@ -30,14 +30,37 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // A second process is the only honest way to prove that a second writer
+    // is refused, so the suite spawns one. The binary is built and installed
+    // here and its path handed over in the environment; a test binary run
+    // without it skips that one test rather than failing.
+    const lock_helper = b.addExecutable(.{
+        .name = "zjournal-lock-helper",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/lock_helper.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "zjournal", .module = module }},
+        }),
+    });
+    const install_lock_helper = b.addInstallArtifact(lock_helper, .{});
+
+    const run_tests = b.addRunArtifact(tests);
+    run_tests.step.dependOn(&install_lock_helper.step);
+    run_tests.setEnvironmentVariable(
+        "ZJOURNAL_LOCK_HELPER",
+        b.getInstallPath(.bin, lock_helper.out_filename),
+    );
+
     const test_step = b.step("test", "Run zjournal tests");
-    test_step.dependOn(&b.addRunArtifact(tests).step);
+    test_step.dependOn(&run_tests.step);
 
     // Compiling without running: the step a cross-compilation check uses, and
     // the one an editor can keep warm. It covers the tests too, which the
     // default install step does not.
     const check_step = b.step("check", "Compile everything without running it");
     check_step.dependOn(&tests.step);
+    check_step.dependOn(&lock_helper.step);
 
     //=====================================================================
     // Examples

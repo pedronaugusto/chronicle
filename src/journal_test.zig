@@ -1,6 +1,7 @@
-//! The suite. Every test opens a real journal on a real file through
+//! The suite. Every test opens a real journal on a real directory through
 //! `std.testing.io`, because what this package promises is about files.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
@@ -25,6 +26,7 @@ const Registry = struct {
     events: u32 = 0,
     unknown: u32 = 0,
     names: u64 = 0,
+    last: u64 = 0,
 
     fn sink(self: *Registry) Journal.Sink {
         return .{ .ctx = self, .f = apply };
@@ -33,6 +35,7 @@ const Registry = struct {
     fn apply(ctx: *anyopaque, record: Journal.Record) void {
         const self: *Registry = @ptrCast(@alignCast(ctx));
         self.events += 1;
+        self.last = record.seq;
         switch (record.event) {
             .created => |e| {
                 self.live += 1;
@@ -49,10 +52,13 @@ fn created(id: u32, name: []const u8) Event {
     return .{ .created = .{ .id = id, .name = name } };
 }
 
-/// A temporary directory plus an absolute path inside it, torn down together.
+/// A temporary directory plus the absolute path of a journal inside it, torn
+/// down together. `sub` names a file relative to the temporary directory, so a
+/// test can write the file shapes a crash produces and open them.
 const Workspace = struct {
     tmp: testing.TmpDir,
     arena: std.heap.ArenaAllocator,
+    name: []const u8,
     path: []const u8,
 
     fn init(name: []const u8) !Workspace {
@@ -62,7 +68,7 @@ const Workspace = struct {
         errdefer arena.deinit();
         const root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena.allocator());
         const path = try std.fs.path.join(arena.allocator(), &.{ root, name });
-        return .{ .tmp = tmp, .arena = arena, .path = path };
+        return .{ .tmp = tmp, .arena = arena, .name = name, .path = path };
     }
 
     fn deinit(self: *Workspace) void {
@@ -70,18 +76,43 @@ const Workspace = struct {
         self.tmp.cleanup();
     }
 
+    /// `<journal>/<file>`, relative to the temporary directory.
+    fn sub(self: *Workspace, file: []const u8) ![]const u8 {
+        return std.fs.path.join(self.arena.allocator(), &.{ self.name, file });
+    }
+
+    fn segment(self: *Workspace, base_seq: u64) ![]const u8 {
+        return self.sub(&zjournal.segmentName(base_seq));
+    }
+
+    fn index(self: *Workspace, base_seq: u64) ![]const u8 {
+        var name = zjournal.segmentName(base_seq);
+        @memcpy(name[name.len - 4 ..], zjournal.index_extension);
+        return self.sub(&name);
+    }
+
     fn read(self: *Workspace, sub_path: []const u8) ![]u8 {
         return self.tmp.dir.readFileAlloc(testing.io, sub_path, self.arena.allocator(), .unlimited);
     }
 
     fn write(self: *Workspace, sub_path: []const u8, data: []const u8) !void {
+        self.tmp.dir.createDirPath(testing.io, self.name) catch {};
         return self.tmp.dir.writeFile(testing.io, .{ .sub_path = sub_path, .data = data });
+    }
+
+    fn exists(self: *Workspace, sub_path: []const u8) bool {
+        self.tmp.dir.access(testing.io, sub_path, .{}) catch return false;
+        return true;
     }
 };
 
-test "an append returns the sequence number and puts one line on the disk" {
+//========================================================================
+// The shape of the thing on the disk.
+//========================================================================
+
+test "an append returns the sequence number and puts one line in the first segment" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     var journal = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -90,7 +121,7 @@ test "an append returns the sequence number and puts one line on the disk" {
     try testing.expectEqual(@as(u64, 1), try journal.append(io, 1_000, created(1, "one")));
     try testing.expectEqual(@as(u64, 2), try journal.append(io, 2_000, created(2, "two")));
 
-    const on_disk = try ws.read("log.jsonl");
+    const on_disk = try ws.read(try ws.segment(1));
     try testing.expectEqualStrings(
         \\{"seq":1,"at":1000,"v":1,"ev":{"created":{"id":1,"name":"one"}}}
         \\{"seq":2,"at":2000,"v":1,"ev":{"created":{"id":2,"name":"two"}}}
@@ -99,21 +130,29 @@ test "an append returns the sequence number and puts one line on the disk" {
 
     // The record in memory is the line on the disk, parsed.
     const all = journal.records();
-    try testing.expectEqual(@as(usize, 2), all.len);
-    try testing.expectEqualStrings("two", all[1].event.created.name);
-    try testing.expectEqual(@as(i64, 2_000), all[1].at);
+    try testing.expect(all.complete);
+    try testing.expectEqual(@as(usize, 2), all.records.len);
+    try testing.expectEqualStrings("two", all.records[1].event.created.name);
+    try testing.expectEqual(@as(i64, 2_000), all.records[1].at);
 
     // A cursor is where a reader got to, so `since` is the rest of the log --
     // and a cursor past the end is a reader ahead of this process, not an
     // error.
-    try testing.expectEqual(@as(usize, 1), journal.since(1).len);
-    try testing.expectEqual(@as(usize, 0), journal.since(2).len);
-    try testing.expectEqual(@as(usize, 0), journal.since(99).len);
+    try testing.expectEqual(@as(usize, 1), journal.since(1).records.len);
+    try testing.expectEqual(@as(usize, 0), journal.since(2).records.len);
+    try testing.expectEqual(@as(usize, 0), journal.since(99).records.len);
+    try testing.expect(journal.since(99).complete);
+
+    // The directory is meant to be read by a person: one lock, one segment,
+    // one index.
+    try testing.expect(ws.exists(try ws.sub(zjournal.lock_name)));
+    try testing.expect(ws.exists(try ws.index(1)));
+    try testing.expectEqual(@as(usize, 1), journal.segmentCount());
 }
 
 test "a reopened journal continues the sequence and appends after the last line" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     {
@@ -126,21 +165,25 @@ test "a reopened journal continues the sequence and appends after the last line"
     var second = try Journal.open(testing.allocator, io, ws.path, .{});
     defer second.deinit(io);
     try testing.expectEqual(@as(u64, 2), try second.lastSeq(io));
-    try testing.expectEqual(@as(usize, 2), second.records().len);
-    try testing.expectEqualStrings("before", second.records()[0].event.created.name);
+    try testing.expectEqual(@as(usize, 2), second.records().records.len);
+    try testing.expectEqualStrings("before", second.records().records[0].event.created.name);
 
     // Two records sharing a number would make a cursor ambiguous, so the seq
     // continues rather than starting again -- and the line lands after the
     // history rather than over it.
     try testing.expectEqual(@as(u64, 3), try second.append(io, 3, created(3, "after")));
-    const on_disk = try ws.read("log.jsonl");
+    const on_disk = try ws.read(try ws.segment(1));
     try testing.expectEqual(@as(usize, 3), std.mem.count(u8, on_disk, "\n"));
     try testing.expect(std.mem.indexOf(u8, on_disk, "\"seq\":3") != null);
 }
 
-test "a final line the writer did not finish is dropped and the file repaired" {
+//========================================================================
+// The crash cases.
+//========================================================================
+
+test "a final line the writer did not finish is dropped and the segment repaired" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     const whole =
@@ -148,45 +191,63 @@ test "a final line the writer did not finish is dropped and the file repaired" {
         \\
     ;
     const partial = "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"crea";
-    try ws.write("log.jsonl", whole ++ partial);
+    try ws.write(try ws.segment(1), whole ++ partial);
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
-    defer journal.deinit(io);
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
 
-    try testing.expectEqual(@as(usize, partial.len), journal.dropped_bytes);
-    try testing.expectEqual(@as(usize, 1), journal.records().len);
-    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+        try testing.expectEqual(@as(usize, partial.len), journal.dropped_bytes);
+        try testing.expectEqual(@as(usize, 1), journal.records().records.len);
+        try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
 
-    // Repaired means the next append is well formed, not merely that this
-    // process ignored the tail.
-    _ = try journal.append(io, 3, created(2, "next"));
-    const on_disk = try ws.read("log.jsonl");
-    try testing.expect(std.mem.indexOf(u8, on_disk, "crea\"") == null);
-    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, on_disk, "\n"));
+        // Repaired means the next append is well formed, not merely that this
+        // process ignored the tail.
+        _ = try journal.append(io, 3, created(2, "next"));
+        const on_disk = try ws.read(try ws.segment(1));
+        try testing.expect(std.mem.indexOf(u8, on_disk, "crea\"") == null);
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, on_disk, "\n"));
+    }
 
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{});
     defer reopened.deinit(io);
-    try testing.expectEqual(@as(usize, 2), reopened.records().len);
+    try testing.expectEqual(@as(usize, 2), reopened.records().records.len);
     try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
 }
 
-test "on_truncated .fail refuses the journal and leaves the file as found" {
+test "on_truncated .fail refuses the journal and leaves the segment as found" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     const bytes = "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n{\"seq\":2";
-    try ws.write("log.jsonl", bytes);
+    try ws.write(try ws.segment(1), bytes);
     try testing.expectError(
         error.TruncatedRecord,
         Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail }),
     );
-    try testing.expectEqualStrings(bytes, try ws.read("log.jsonl"));
+    try testing.expectEqualStrings(bytes, try ws.read(try ws.segment(1)));
+}
+
+test "a torn line in a sealed segment is refused when something reads it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // Only the newest segment can end mid-record: an older one was made
+    // durable before the next was created. A hole in one is damage.
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n" ++
+        "{\"seq\":2,\"at\":1,\"v\":1,\"ev\":{\"remo");
+    try ws.write(try ws.segment(3), "{\"seq\":3,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try testing.expectError(
+        error.TruncatedRecord,
+        Journal.open(testing.allocator, io, ws.path, .{}),
+    );
 }
 
 test "a corrupt or discontinuous line is refused" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     const cases = [_]struct { bytes: []const u8, want: anyerror }{
@@ -194,18 +255,61 @@ test "a corrupt or discontinuous line is refused" {
         .{ .bytes = "{\"seq\":1,\"at\":1,\"v\":1}\n", .want = error.CorruptRecord },
         .{ .bytes = "{\"seq\":2,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n" ++
             "{\"seq\":4,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n", .want = error.DiscontinuousSeq },
+        // A segment whose records disagree with the name it is under: a
+        // cursor into it would point at a record that is not there.
+        .{ .bytes = "{\"seq\":9,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n", .want = error.DiscontinuousSeq },
     };
     for (cases) |case| {
-        try ws.write("log.jsonl", case.bytes);
+        try ws.write(try ws.segment(1), case.bytes);
         try testing.expectError(case.want, Journal.open(testing.allocator, io, ws.path, .{}));
     }
 }
 
+test "a gap between two segments is refused" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try ws.write(try ws.segment(7), "{\"seq\":7,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try testing.expectError(error.DiscontinuousSeq, Journal.open(testing.allocator, io, ws.path, .{}));
+}
+
+test "a write that does not reach the disk publishes nothing and latches" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    _ = try journal.append(io, 1, created(1, "durable"));
+
+    // Take the segment's write access away underneath the journal. A reader
+    // must never see a record the disk does not have, so the failed append
+    // adds nothing and every later one is refused.
+    const active = &journal.log.active.?;
+    const length = try active.file.length(io);
+    active.file.close(io);
+    active.file = try journal.log.dir.openFile(io, &zjournal.segmentName(1), .{});
+    active.writer = active.file.writer(io, journal.log.write_buf);
+    active.writer.pos = length;
+
+    try testing.expectError(error.WriteFailed, journal.append(io, 2, created(2, "lost")));
+    try testing.expect(journal.persistence_failed);
+    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, 1), journal.records().records.len);
+    try testing.expectError(error.PersistenceFailed, journal.append(io, 3, created(3, "also refused")));
+    try testing.expectError(error.PersistenceFailed, journal.compact(io, 0));
+}
+
+//========================================================================
+// Schema versions.
+//========================================================================
+
 test "a record from a newer schema is refused rather than guessed at" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write("log.jsonl", "{\"seq\":1,\"at\":1,\"v\":9,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":9,\"ev\":{\"removed\":{\"id\":1}}}\n");
     try testing.expectError(
         error.NewerSchema,
         Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2 }),
@@ -214,11 +318,11 @@ test "a record from a newer schema is refused rather than guessed at" {
 
 test "a record from an older schema goes through migrate" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     // Version 1 called the member `title`; version 2 calls it `name`.
-    try ws.write("log.jsonl", "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":7,\"title\":\"old\"}}}\n");
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":7,\"title\":\"old\"}}}\n");
 
     const migrate = struct {
         fn f(from_version: u32, value: std.json.Value) Journal.MigrateError!Event {
@@ -237,26 +341,26 @@ test "a record from an older schema goes through migrate" {
     });
     defer journal.deinit(io);
 
-    const record = journal.records()[0];
+    const record = journal.records().records[0];
     try testing.expectEqual(@as(u32, 1), record.version);
     try testing.expectEqualStrings("old", record.event.created.name);
 
-    // What the hook returned borrows from the journal's arena, so it is still
-    // there after the bytes it was read from would have gone.
+    // What the hook returned borrows from the record's own arena, so it is
+    // still there after the bytes it was read from would have gone.
     _ = try journal.append(io, 2, created(8, "new"));
-    try testing.expectEqualStrings("old", journal.records()[0].event.created.name);
+    try testing.expectEqualStrings("old", journal.records().records[0].event.created.name);
 }
 
 test "without a migrate hook an older record lands in the unknown arm" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write("log.jsonl", "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"retired\":{\"id\":7}}}\n");
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"retired\":{\"id\":7}}}\n");
 
     var journal = try Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2 });
     defer journal.deinit(io);
 
-    const record = journal.records()[0];
+    const record = journal.records().records[0];
     try testing.expectEqual(@as(u32, 1), record.version);
     try testing.expect(record.event == .unknown);
     try testing.expect(record.event.unknown.object.get("retired") != null);
@@ -264,9 +368,9 @@ test "without a migrate hook an older record lands in the unknown arm" {
 
 test "without a migrate hook and without an unknown arm an older record is refused" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write("log.jsonl", "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
 
     const Strict = union(enum) { removed: struct { id: u32 } };
     try testing.expectError(
@@ -275,9 +379,13 @@ test "without a migrate hook and without an unknown arm an older record is refus
     );
 }
 
+//========================================================================
+// Folds, live and from the disk.
+//========================================================================
+
 test "a fold built from the disk equals the fold built live" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     var live: Registry = .{};
@@ -307,7 +415,7 @@ test "a fold built from the disk equals the fold built live" {
 
 test "waitPast blocks until an append arrives" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     var journal = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -324,14 +432,14 @@ test "waitPast blocks until an append arrives" {
     try group.concurrent(io, appender, .{ &journal, io });
 
     const arrived = try journal.waitPast(io, 0);
-    try testing.expect(arrived.len >= 1);
-    try testing.expectEqualStrings("awaited", arrived[0].event.created.name);
+    try testing.expect(arrived.records.len >= 1);
+    try testing.expectEqualStrings("awaited", arrived.records[0].event.created.name);
     try group.await(io);
 }
 
 test "waitPast is woken by a nudge with no record behind it" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     var journal = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -356,47 +464,218 @@ test "waitPast is woken by a nudge with no record behind it" {
 
     const nothing = try journal.waitPast(io, 0);
     woken.store(true, .release);
-    try testing.expectEqual(@as(usize, 0), nothing.len);
+    try testing.expectEqual(@as(usize, 0), nothing.records.len);
     try group.await(io);
 }
 
-test "a write that does not reach the disk publishes nothing and latches" {
+//========================================================================
+// Segments, the tail, and reading from the disk.
+//========================================================================
+
+/// Options that rotate every few records, so a test can hold several segments
+/// without writing megabytes.
+fn small(records_per_segment: u64, tail_records: usize) Journal.Options {
+    return .{
+        .fsync = false,
+        .max_segment_records = records_per_segment,
+        .tail_records = tail_records,
+        .max_segment_bytes = 1 << 30,
+    };
+}
+
+test "the log rotates into segments named after their first record" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
-    defer journal.deinit(io);
-    _ = try journal.append(io, 1, created(1, "durable"));
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
-    // Take the file's write access away underneath the journal. A reader must
-    // never see a record the disk does not have, so the failed append adds
-    // nothing and every later one is refused.
-    const length = try journal.file.length(io);
-    journal.file.close(io);
-    journal.file = try Io.Dir.cwd().openFile(io, ws.path, .{});
-    journal.writer = journal.file.writer(io, journal.write_buf);
-    journal.writer.pos = length;
+        try testing.expectEqual(@as(usize, 3), journal.segmentCount());
+        try testing.expect(ws.exists(try ws.segment(1)));
+        try testing.expect(ws.exists(try ws.segment(5)));
+        try testing.expect(ws.exists(try ws.segment(9)));
+        try testing.expectEqual(@as(usize, 4), std.mem.count(u8, try ws.read(try ws.segment(1)), "\n"));
+        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, try ws.read(try ws.segment(9)), "\n"));
+    }
 
-    try testing.expectError(error.WriteFailed, journal.append(io, 2, created(2, "lost")));
-    try testing.expect(journal.persistence_failed);
-    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
-    try testing.expectEqual(@as(usize, 1), journal.records().len);
-    try testing.expectError(error.PersistenceFailed, journal.append(io, 3, created(3, "also refused")));
-    try testing.expectError(error.PersistenceFailed, journal.compact(io, 0));
+    // And a reopen walks them in order.
+    var reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 10), try reopened.lastSeq(io));
+    const all = reopened.records();
+    try testing.expect(all.complete);
+    try testing.expectEqual(@as(usize, 10), all.records.len);
+    try testing.expectEqual(@as(u64, 1), all.records[0].seq);
+    try testing.expectEqual(@as(u64, 10), all.records[9].seq);
 }
+
+test "the tail is bounded and a cursor older than it is an incomplete window" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
+    defer journal.deinit(io);
+    for (1..41) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+
+    // At most four records in memory for forty on the disk.
+    try testing.expect(journal.tail.items.len <= 4);
+    const stale = journal.since(1);
+    try testing.expect(!stale.complete);
+    const fresh = journal.since(39);
+    try testing.expect(fresh.complete);
+    try testing.expectEqual(@as(usize, 1), fresh.records.len);
+    try testing.expectEqual(@as(u64, 40), fresh.records[0].seq);
+
+    // What the window does not reach is on the disk, in order, entire.
+    var walk = try journal.replay(io, 0);
+    defer walk.deinit(io);
+    var seen: u64 = 0;
+    while (try walk.next(io)) |record| {
+        seen += 1;
+        try testing.expectEqual(seen, record.seq);
+    }
+    try testing.expectEqual(@as(u64, 40), seen);
+
+    // And a replay from a cursor starts at the record straight after it.
+    var from_thirty = try journal.replay(io, 30);
+    defer from_thirty.deinit(io);
+    const first = (try from_thirty.next(io)) orelse return error.TestExpectedRecord;
+    try testing.expectEqual(@as(u64, 31), first.seq);
+}
+
+test "a reopened journal fills its tail from the newest records only" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
+        defer journal.deinit(io);
+        for (1..41) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 40), try reopened.lastSeq(io));
+    try testing.expect(reopened.tail.items.len <= 4);
+    try testing.expect(reopened.tail.items.len >= 1);
+    const window = reopened.records();
+    try testing.expect(!window.complete);
+    try testing.expectEqual(@as(u64, 40), window.records[window.records.len - 1].seq);
+    try testing.expectEqual(@as(u64, 41), try reopened.append(io, 41, created(41, "n")));
+}
+
+test "subscribe folds a history longer than the tail, streaming from the disk" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var live: Registry = .{};
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(7, 3));
+        defer journal.deinit(io);
+        try journal.subscribe(io, live.sink());
+        for (1..51) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    var replayed: Registry = .{};
+    var reopened = try Journal.open(testing.allocator, io, ws.path, small(7, 3));
+    defer reopened.deinit(io);
+    try reopened.subscribe(io, replayed.sink());
+
+    try testing.expectEqual(@as(u32, 50), replayed.events);
+    try testing.expectEqual(@as(u64, 50), replayed.last);
+    try testing.expectEqual(live, replayed);
+
+    // No record twice at the seam between the disk and the tail.
+    var from_forty: Registry = .{};
+    try reopened.subscribeFrom(io, from_forty.sink(), 40);
+    try testing.expectEqual(@as(u32, 10), from_forty.events);
+}
+
+//========================================================================
+// The index.
+//========================================================================
+
+test "a missing index is rebuilt and a stale one is not trusted" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+        defer journal.deinit(io);
+        for (1..21) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // An index a crash never finished, and one from a different segment.
+    try ws.tmp.dir.deleteFile(io, try ws.index(1));
+    try ws.write(try ws.index(6), "zjidx\x00\x01\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 2));
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 20), try journal.lastSeq(io));
+
+    // A seek into either of those segments still lands on the right record.
+    for ([_]u64{ 0, 2, 5, 7, 12, 19 }) |cursor| {
+        var walk = try journal.replay(io, cursor);
+        defer walk.deinit(io);
+        const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
+        try testing.expectEqual(cursor + 1, record.seq);
+    }
+
+    // The missing one was rebuilt on the way, and it describes its segment.
+    try testing.expect(ws.exists(try ws.index(1)));
+    try testing.expectEqual(@as(usize, 16 + 5 * 8), (try ws.read(try ws.index(1))).len);
+}
+
+test "an index for the wrong segment length is refused and rebuilt" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+        defer journal.deinit(io);
+        for (1..16) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // Same shape, same count, a length that belongs to nothing: the header is
+    // what says which bytes an index was built from.
+    const good = try ws.read(try ws.index(1));
+    const bad = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(bad);
+    std.mem.writeInt(u64, bad[8..16], 999_999, .little);
+    try ws.write(try ws.index(1), bad);
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1));
+    defer journal.deinit(io);
+    var walk = try journal.replay(io, 2);
+    defer walk.deinit(io);
+    const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
+    try testing.expectEqual(@as(u64, 3), record.seq);
+    try testing.expectEqualStrings(good, try ws.read(try ws.index(1)));
+}
+
+//========================================================================
+// Snapshots, compaction and retention.
+//========================================================================
 
 test "a snapshot plus the records after it folds to the whole log" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     var whole: Registry = .{};
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         try journal.subscribe(io, whole.sink());
-        for (0..10) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
         // Halfway through, write the fold out and drop what it already covers.
         var half: Registry = .{};
@@ -404,14 +683,15 @@ test "a snapshot plus the records after it folds to the whole log" {
         try journal.snapshot(io, std.mem.asBytes(&half));
         try journal.compact(io, try journal.lastSeq(io));
 
-        for (10..15) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        for (11..16) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
 
-    const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, .{});
+    const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, small(4, 1024));
     var reopened = opened.journal;
     defer reopened.deinit(io);
 
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
+    defer testing.allocator.free(snapshot.state);
     try testing.expectEqual(@as(u64, 10), snapshot.seq);
     var restored: Registry = std.mem.bytesToValue(Registry, snapshot.state[0..@sizeOf(Registry)]);
     try reopened.subscribeFrom(io, restored.sink(), snapshot.seq);
@@ -420,73 +700,314 @@ test "a snapshot plus the records after it folds to the whole log" {
     try testing.expectEqual(@as(u64, 15), try reopened.lastSeq(io));
 }
 
-test "compact keeps the newest record so the sequence survives a reopen" {
+test "compact empties the log and the sequence still continues" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
         defer journal.deinit(io);
-        for (0..5) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
-        // Even asked to keep nothing, compaction leaves the last record: a
-        // journal compacted to empty would start counting from one again.
+        // A segment's name is the record that will go into it, so a log with
+        // nothing in it still knows where it got to.
         try journal.compact(io, 999);
-        try testing.expectEqual(@as(usize, 1), journal.records().len);
-        try testing.expectEqual(@as(u64, 5), journal.records()[0].seq);
+        try testing.expectEqual(@as(usize, 0), journal.records().records.len);
+        try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+        try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
         try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "n")));
-        try testing.expectEqual(@as(usize, 0), journal.since(6).len);
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{});
+    var reopened = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 6), try reopened.lastSeq(io));
     try testing.expectEqual(@as(u64, 7), try reopened.append(io, 7, created(7, "n")));
 }
 
-test "a compact interrupted before its rename leaves the journal whole" {
+test "compact keeps the records after the cut, byte for byte" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
-    defer journal.deinit(io);
-    for (0..5) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
-    const before = try ws.read("log.jsonl");
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        const kept = try ws.arena.allocator().dupe(u8, journal.records().records[6].bytes);
 
-    // The replacement is a whole file before it is a journal: until the
-    // rename, the journal on the disk is the old one, entire.
-    journal.fail_compact_before_rename = true;
-    try testing.expectError(error.InterruptedForTest, journal.compact(io, 3));
-    journal.fail_compact_before_rename = false;
+        try journal.compact(io, 6);
+        try testing.expectEqual(@as(u64, 7), journal.oldestSeq());
+        try testing.expectEqual(@as(u64, 10), try journal.lastSeq(io));
+        const window = journal.records();
+        try testing.expectEqual(@as(usize, 4), window.records.len);
+        try testing.expectEqualStrings(kept, window.records[0].bytes);
+        try testing.expect(!ws.exists(try ws.segment(1)));
+        try testing.expect(ws.exists(try ws.segment(7)));
 
-    try testing.expectEqualStrings(before, try ws.read("log.jsonl"));
-    try testing.expectEqual(@as(usize, 5), journal.records().len);
-    try testing.expectError(error.FileNotFound, ws.read("log.jsonl" ++ zjournal.compact_suffix));
+        // A cursor from before the cut gets what is left and says it is
+        // partial.
+        try testing.expect(!journal.since(1).complete);
+        try testing.expect(journal.since(7).complete);
+    }
 
-    // And the real thing still works afterwards.
-    try journal.compact(io, 3);
-    try testing.expectEqual(@as(usize, 2), journal.records().len);
-    try testing.expectEqual(@as(u64, 4), journal.records()[0].seq);
-    try testing.expectError(error.FileNotFound, ws.read("log.jsonl" ++ zjournal.compact_suffix));
-
-    // A cursor from before the compaction gets what is left, not a crash.
-    try testing.expectEqual(@as(usize, 2), journal.since(1).len);
-    try testing.expectEqual(@as(usize, 1), journal.since(4).len);
+    var reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(usize, 4), reopened.records().records.len);
+    try testing.expectEqual(@as(u64, 11), try reopened.append(io, 11, created(11, "n")));
 }
 
-test "twenty thousand records open within a bounded time and memory" {
+test "compact can cut inside the segment being written to" {
     const io = testing.io;
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    const count = 20_000;
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer journal.deinit(io);
+    for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    try testing.expectEqual(@as(usize, 2), journal.segmentCount());
+
+    // The cut falls inside segment 4, which is the one open for appending: it
+    // is let go of before the replacement is renamed over it, and picked up
+    // again afterwards.
+    try journal.compact(io, 4);
+    try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+    try testing.expectEqual(@as(u64, 5), journal.oldestSeq());
+    try testing.expectEqual(@as(usize, 1), journal.records().records.len);
+    try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "n")));
+    try testing.expect(ws.exists(try ws.segment(5)));
+    try testing.expect(!ws.exists(try ws.segment(1)));
+    try testing.expect(!ws.exists(try ws.sub("00000000000000000005.tmp")));
+}
+
+test "the tail gives way by bytes as well as by count" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .fsync = false,
+        .tail_records = 1_000,
+        .tail_bytes = 512,
+    });
+    defer journal.deinit(io);
+
+    const long = "a name long enough that a handful of these is already more than the tail may hold";
+    for (1..41) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), long));
+
+    try testing.expect(journal.tail_bytes <= 512);
+    try testing.expect(journal.tail.items.len < 40);
+    try testing.expect(!journal.since(0).complete);
+    try testing.expectEqual(@as(u64, 40), journal.records().records[journal.records().records.len - 1].seq);
+
+    // Everything the tail let go of is still on the disk, in order.
+    var walk = try journal.replay(io, 0);
+    defer walk.deinit(io);
+    var seen: u64 = 0;
+    while (try walk.next(io)) |record| {
+        seen += 1;
+        try testing.expectEqual(seen, record.seq);
+    }
+    try testing.expectEqual(@as(u64, 40), seen);
+}
+
+test "a compaction interrupted after its rename leaves a segment the next open removes" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..9) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // What the disk holds between the rename and the unlink: the replacement
+    // for records 3..4, and the segment it replaces, still there.
+    const whole = try ws.read(try ws.segment(1));
+    const cut = std.mem.indexOfPos(u8, whole, 0, "{\"seq\":3").?;
+    try ws.write(try ws.segment(3), whole[cut..]);
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer journal.deinit(io);
+    try testing.expect(!ws.exists(try ws.segment(1)));
+    try testing.expectEqual(@as(u64, 3), journal.oldestSeq());
+    try testing.expectEqual(@as(u64, 8), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, 6), journal.records().records.len);
+}
+
+test "a temporary file a crash left behind is ignored" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+
+        try ws.write(try ws.sub("00000000000000000003.tmp"), "half a segment, no newline");
+        try ws.write(try ws.sub(zjournal.snapshot_name ++ ".tmp"), "{ not a snapshot");
+        try journal.refresh(io);
+        try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
+    }
+
+    const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, small(4, 1024));
+    var reopened = opened.journal;
+    defer reopened.deinit(io);
+    try testing.expect(opened.snapshot == null);
+    try testing.expectEqual(@as(u64, 5), try reopened.lastSeq(io));
+}
+
+test "dropSegmentsBefore unlinks whole segments and never the newest one" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        try testing.expectEqual(@as(usize, 3), journal.segmentCount());
+
+        // Only segments whose every record is covered go, so a cut inside one
+        // leaves it alone.
+        try testing.expectEqual(@as(u64, 1), try journal.dropSegmentsBefore(io, 5));
+        try testing.expectEqual(@as(u64, 5), journal.oldestSeq());
+        try testing.expect(!ws.exists(try ws.segment(1)));
+        try testing.expect(!ws.exists(try ws.index(1)));
+
+        // Asked to drop everything, it keeps the segment being written to.
+        try testing.expectEqual(@as(u64, 1), try journal.dropSegmentsBefore(io, 1_000));
+        try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+        try testing.expectEqual(@as(u64, 10), try journal.lastSeq(io));
+        try testing.expectEqual(@as(u64, 11), try journal.append(io, 11, created(11, "n")));
+    }
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 9), reopened.oldestSeq());
+    try testing.expectEqual(@as(u64, 11), try reopened.lastSeq(io));
+}
+
+//========================================================================
+// More than one process.
+//========================================================================
+
+test "a second writer is refused while the first holds the lock" {
+    const io = testing.io;
+    const helper = testing.environ.getAlloc(testing.allocator, "ZJOURNAL_LOCK_HELPER") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer testing.allocator.free(helper);
+
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "mine"));
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ helper, ws.path },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+
+    // The helper says when the lock is its.
+    var buffer: [64]u8 = undefined;
+    var out = child.stdout.?.readerStreaming(io, &buffer);
+    const line = try out.interface.takeDelimiterExclusive('\n');
+    try testing.expectEqualStrings("locked", line);
+
+    // A second writer is told so, rather than interleaving half-records.
+    try testing.expectError(error.Locked, Journal.open(testing.allocator, io, ws.path, .{}));
+
+    // A reader is not: it takes no lock and writes nothing.
+    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    defer reader.deinit(io);
+    try testing.expectEqual(@as(u64, 1), try reader.lastSeq(io));
+    try testing.expectError(error.ReadOnly, reader.append(io, 2, created(2, "not mine")));
+    try testing.expectError(error.ReadOnly, reader.compact(io, 0));
+    try testing.expectError(error.ReadOnly, reader.snapshot(io, "state"));
+
+    // And the lock comes back when the process holding it goes.
+    child.stdin.?.close(io);
+    child.stdin = null;
+    _ = try child.wait(io);
+    var second = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer second.deinit(io);
+    try testing.expectEqual(@as(u64, 2), try second.append(io, 2, created(2, "mine again")));
+}
+
+test "a reader tails a writer by refreshing past its cursor" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var writer = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer writer.deinit(io);
+    for (1..4) |i| _ = try writer.append(io, @intCast(i), created(@intCast(i), "n"));
+
+    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_records = 1024 });
+    defer reader.deinit(io);
+    try testing.expectEqual(@as(u64, 3), try reader.lastSeq(io));
+
+    // The writer rotates past the reader; refreshing is what picks that up.
+    for (4..10) |i| _ = try writer.append(io, @intCast(i), created(@intCast(i), "n"));
+    try reader.refresh(io);
+    try testing.expectEqual(@as(u64, 9), try reader.lastSeq(io));
+
+    var walk = try reader.replay(io, 3);
+    defer walk.deinit(io);
+    var seen: u64 = 3;
+    while (try walk.next(io)) |record| {
+        seen += 1;
+        try testing.expectEqual(seen, record.seq);
+    }
+    try testing.expectEqual(@as(u64, 9), seen);
+}
+
+test "a reader beside a writer mid-record sees the records, not the fragment" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // What a reader finds if it looks between a writer's `write` and its
+    // newline: a complete log and a fragment. The fragment is not damage and
+    // the reader must not shorten the file to be rid of it.
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n" ++
+        "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"remo");
+    const before = try ws.read(try ws.segment(1));
+
+    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    defer reader.deinit(io);
+    try testing.expectEqual(@as(u64, 1), try reader.lastSeq(io));
+    try testing.expectEqual(@as(usize, 0), reader.dropped_bytes);
+    try testing.expectEqualStrings(before, try ws.read(try ws.segment(1)));
+    try testing.expect(!ws.exists(try ws.sub(zjournal.lock_name)));
+}
+
+//========================================================================
+// Size.
+//========================================================================
+
+test "two hundred thousand records open within a bounded time and memory" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const count = 200_000;
     {
         // No fsync here: this is building a fixture, not measuring durability.
         var journal = try Journal.open(testing.allocator, io, ws.path, .{ .fsync = false });
         defer journal.deinit(io);
         for (0..count) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name of some length"));
+        try testing.expect(journal.segmentCount() > 1);
     }
 
     const started = Io.Clock.awake.now(io);
@@ -494,15 +1015,21 @@ test "twenty thousand records open within a bounded time and memory" {
     defer journal.deinit(io);
     const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
 
-    try testing.expectEqual(@as(usize, count), journal.records().len);
     try testing.expectEqual(@as(u64, count), try journal.lastSeq(io));
 
-    // Loose on purpose: the point is that reading back the log is linear and
-    // proportionate, not that this machine hits a number.
-    const file_bytes = (try ws.read("log.jsonl")).len;
-    try testing.expect(elapsed_ms < 20_000);
-    try testing.expect(journal.arena.queryCapacity() < 32 * file_bytes);
-    try testing.expect(journal.scratch.queryCapacity() < 64 * 1024);
+    // Loose on purpose: the point is that opening a long log costs the newest
+    // segment and the tail, not the log, and that neither grows with it.
+    try testing.expect(elapsed_ms < 30_000);
+    try testing.expect(journal.tail.items.len <= journal.options.tail_records);
+    var held: usize = journal.scratch.queryCapacity();
+    for (journal.tail_arenas.items) |*arena| held += arena.queryCapacity();
+    try testing.expect(held < 4 * 1024 * 1024);
+
+    // And a fold over the whole of it still holds one record at a time.
+    var counted: Registry = .{};
+    try journal.subscribe(io, counted.sink());
+    try testing.expectEqual(@as(u64, count), counted.last);
+    try testing.expectEqual(@as(u32, count), counted.events);
 }
 
 //========================================================================
@@ -548,7 +1075,7 @@ const open_corpus = [_][]const u8{
     seeded("\x00\xff\xfe\n"),
 };
 
-test "fuzz: open of arbitrary file contents, and the repair it promises" {
+test "fuzz: open of arbitrary segment contents, and the repair it promises" {
     try testing.fuzz({}, fuzzOpen, .{ .corpus = &open_corpus });
 }
 
@@ -559,9 +1086,10 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
     var buffer: [1024]u8 = undefined;
     const bytes = buffer[0..smith.slice(&buffer)];
 
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write("log.jsonl", bytes);
+    const name = try ws.segment(1);
+    try ws.write(name, bytes);
 
     // `.fail` is the mode that promises to leave the file as it found it.
     if (Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail })) |untouched| {
@@ -569,11 +1097,11 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
         defer journal.deinit(io);
         try testing.expectEqual(@as(usize, 0), journal.dropped_bytes);
     } else |_| {}
-    try testing.expectEqualStrings(bytes, try ws.read("log.jsonl"));
+    try testing.expectEqualStrings(bytes, try ws.read(name));
 
-    // `.drop` promises a file the next append can extend. Whatever it made
-    // of these bytes, appending to it and opening again has to agree.
-    var held: usize = 0;
+    // `.drop` promises a log the next append can extend. Whatever it made of
+    // these bytes, appending to it and opening again has to agree.
+    var held: u64 = 0;
     {
         var journal = Journal.open(testing.allocator, io, ws.path, .{}) catch |err| {
             try testing.expect(err != error.TruncatedRecord);
@@ -586,14 +1114,58 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
             try testing.expectEqual(error.SequenceExhausted, err);
             return;
         };
-        held = journal.records().len;
+        held = try journal.lastSeq(io);
     }
 
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
     defer reopened.deinit(io);
-    try testing.expectEqual(held, reopened.records().len);
+    try testing.expectEqual(held, try reopened.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
-    try testing.expectEqual(reopened.records()[held - 1].seq, try reopened.lastSeq(io));
+}
+
+const index_corpus = [_][]const u8{
+    seeded(""),
+    seeded("zjidx\x00\x01\n"),
+    seeded("zjidx\x00\x01\n" ++ "\x00" ** 8),
+    seeded("zjidx\x00\x01\n" ++ "\x00" ** 16),
+    seeded("zjidx\x00\x01\n" ++ "\xff" ** 16),
+    seeded("not an index at all"),
+    seeded("zjidx\x00\x01\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 8),
+};
+
+test "fuzz: an arbitrary index file is a cache, never an answer" {
+    try testing.fuzz({}, fuzzIndex, .{ .corpus = &index_corpus });
+}
+
+fn fuzzIndex(_: void, smith: *testing.Smith) anyerror!void {
+    const io = testing.io;
+    var buffer: [512]u8 = undefined;
+    const bytes = buffer[0..smith.slice(&buffer)];
+
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        defer journal.deinit(io);
+        for (1..10) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+    try ws.write(try ws.index(1), bytes);
+    try ws.write(try ws.index(4), bytes);
+
+    // Whatever the sidecar says, the records are what the segments hold.
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1));
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 9), try journal.lastSeq(io));
+    for ([_]u64{ 0, 1, 4, 5, 8 }) |cursor| {
+        var walk = try journal.replay(io, cursor);
+        defer walk.deinit(io);
+        var seen = cursor;
+        while (try walk.next(io)) |record| {
+            seen += 1;
+            try testing.expectEqual(seen, record.seq);
+        }
+        try testing.expectEqual(@as(u64, 9), seen);
+    }
 }
 
 const snapshot_corpus = [_][]const u8{
@@ -616,23 +1188,24 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
     var buffer: [1024]u8 = undefined;
     const bytes = buffer[0..smith.slice(&buffer)];
 
-    var ws = try Workspace.init("log.jsonl");
+    var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write("log.jsonl", a_record);
-    try ws.write("log.jsonl" ++ zjournal.snapshot_suffix, bytes);
+    try ws.write(try ws.segment(1), a_record);
+    try ws.write(try ws.sub(zjournal.snapshot_name), bytes);
 
-    // A snapshot is an optimisation. A bad one must be an error the caller
-    // can name -- never a journal that opens with a wrong starting point.
+    // A snapshot is an optimisation. A bad one must be an error the caller can
+    // name -- never a journal that opens with a wrong starting point.
     const opened = Journal.openWithSnapshot(testing.allocator, io, ws.path, .{}) catch |err| {
         try testing.expectEqual(error.CorruptSnapshot, err);
         return;
     };
     var journal = opened.journal;
     defer journal.deinit(io);
-    try testing.expectEqual(@as(usize, 1), journal.records().len);
+    try testing.expectEqual(@as(usize, 1), journal.records().records.len);
     if (opened.snapshot) |snapshot| {
+        defer testing.allocator.free(snapshot.state);
         // Whatever sequence number the file claimed, a cursor is clamped to
         // what the journal holds rather than indexing past it.
-        try testing.expect(journal.since(snapshot.seq).len <= journal.records().len);
+        try testing.expect(journal.since(snapshot.seq).records.len <= journal.records().records.len);
     }
 }
