@@ -332,7 +332,15 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `dropSegmentsBefore`.
         pub const DropError = Log.CompactError;
 
-        /// The line, as written. Field order here is the field order on disk.
+        /// Errors from `truncateAfter`.
+        ///
+        /// * `SeqTooOld` — the log no longer holds a record at or before the
+        ///   cut, so truncating to it would claim a history that has already
+        ///   been dropped.
+        pub const TruncateError = CompactError || Log.TruncateError;
+
+        /// The line, as written, except for the checksum `append` appends to
+        /// it. Field order here is the field order on disk.
         const Line = struct {
             seq: u64,
             at: i64,
@@ -817,6 +825,40 @@ pub fn Journal(comptime Event: type) type {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             return self.log.dropSegmentsBefore(io, seq);
+        }
+
+        /// Drop every record after `seq`, so that `lastSeq` becomes `seq` and
+        /// the next `append` writes `seq + 1`.
+        ///
+        /// This is the one call that moves the sequence backwards, and the
+        /// numbers it frees are handed out again — so a reader holding a
+        /// cursor past `seq` is holding a cursor into a history that no longer
+        /// exists, and has to be told. It is for rolling back records a crash
+        /// left half-meant, not for retention: `compact` and
+        /// `dropSegmentsBefore` are that, and they never reuse a number.
+        ///
+        /// Whole segments past the cut are unlinked newest first, so what is
+        /// left is always a continuous prefix; the segment the cut falls
+        /// inside is then shortened to the record boundary, which is what
+        /// `open` already does to repair a torn tail. A crash at any point
+        /// leaves a log that opens — possibly one still holding records this
+        /// call was asked to drop, so call it again.
+        ///
+        /// `seq` may be one below the oldest record, which empties the log and
+        /// leaves the sequence at `seq`. Below that it is `error.SeqTooOld`.
+        ///
+        /// Every slice the journal handed out before this call is invalid
+        /// afterwards; subscribed sinks are not called again.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn truncateAfter(self: *Self, io: Io, seq: u64) TruncateError!void {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            if (self.options.access == .read) return error.ReadOnly;
+            if (self.persistence_failed) return error.PersistenceFailed;
+            try self.log.truncateAfter(io, seq);
+            self.clearTail();
+            try self.fillTail(io);
         }
 
         /// Rewrite the log keeping only the records after `keep_after_seq`, and

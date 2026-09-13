@@ -132,6 +132,8 @@ pub const ScanError = ReadError;
 
 pub const CompactError = OpenError || AppendError || Io.Dir.RenameError;
 
+pub const TruncateError = CompactError || error{SeqTooOld};
+
 pub const SnapshotError = Io.Cancelable || Io.File.OpenError || Io.Writer.Error ||
     Io.File.SyncError || Io.Dir.RenameError || Io.Dir.DeleteFileError || error{ReadOnly};
 
@@ -874,6 +876,70 @@ pub fn dropSegmentsBefore(log: *Log, io: Io, seq: u64) CompactError!u64 {
     }
     if (dropped != 0) try log.syncDir(io);
     return dropped;
+}
+
+/// Drop every record after `seq`.
+///
+/// Segments entirely past the cut are unlinked newest first, so what is left
+/// on the disk is always a continuous prefix; the segment holding `seq` is
+/// then shortened to the byte at which the next record began, which is the
+/// same in-place shortening `open` uses to repair a torn tail. A crash between
+/// the two leaves a log that opens and still holds records this was asked to
+/// drop, which is why calling it again is the answer.
+///
+/// `seq` may be one below the oldest record the log holds, which empties it
+/// and leaves the segment named for the record that comes next -- the shape a
+/// `compact` that keeps nothing leaves. Below that there is no record to
+/// truncate to and the answer is `error.SeqTooOld`.
+pub fn truncateAfter(log: *Log, io: Io, seq: u64) TruncateError!void {
+    if (log.options.access == .read) return error.ReadOnly;
+    if (log.segments.items.len == 0) return;
+    if (seq >= log.lastSeq()) return;
+    if (seq < log.baseSeq()) return error.SeqTooOld;
+
+    // The segment the cut falls inside: the one holding `seq`, or the oldest
+    // one when the cut is before every record it holds.
+    var holder = log.segments.items[0];
+    for (log.segments.items) |segment| {
+        if (segment.base_seq <= seq and seq <= segment.last_seq) holder = segment;
+    }
+    const offset = try log.offsetAfter(io, holder, seq);
+
+    log.closeActive(io);
+    var i = log.segments.items.len;
+    while (i > 0) {
+        i -= 1;
+        const segment = log.segments.items[i];
+        if (segment.base_seq <= holder.base_seq) break;
+        try log.deleteSegmentFiles(io, segment.base_seq);
+    }
+    try log.syncDir(io);
+
+    if (offset != holder.bytes) {
+        const file = try log.dir.createFile(io, &segmentName(holder.base_seq, segment_extension), .{ .truncate = false });
+        defer file.close(io);
+        try file.setLength(io, offset);
+        if (log.options.sync != .never) try file.sync(io);
+        // The index describes bytes that are no longer there. Removing it is
+        // cheaper than leaving one the next open has to reject and rebuild.
+        log.dir.deleteFile(io, &segmentName(holder.base_seq, index_extension)) catch {};
+        try log.syncDir(io);
+    }
+    try log.load(io);
+}
+
+/// The byte offset inside `segment` at which the record after `seq` begins,
+/// and `segment.bytes` when `seq` is the last record it holds.
+fn offsetAfter(log: *Log, io: Io, segment: Segment, seq: u64) OpenError!u64 {
+    var scan = try log.scanOver(&.{segment}, 0);
+    defer scan.deinit(io);
+    var offset: u64 = 0;
+    var at = segment.base_seq;
+    while (try scan.next(io)) |line| : (at += 1) {
+        if (at > seq) break;
+        offset += line.len + 1;
+    }
+    return offset;
 }
 
 /// Rewrite the log keeping only the records after `keep_after_seq`.

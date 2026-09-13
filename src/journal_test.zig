@@ -843,6 +843,49 @@ test "the tail gives way by bytes as well as by count" {
     try testing.expectEqual(@as(u64, 40), seen);
 }
 
+test "truncateAfter drops the records past the cut and hands the numbers back" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer journal.deinit(io);
+    for (1..10) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    try testing.expectEqual(@as(usize, 3), journal.segmentCount());
+
+    // A cut past the newest record is not a cut.
+    try journal.truncateAfter(io, 99);
+    try testing.expectEqual(@as(u64, 9), try journal.lastSeq(io));
+
+    // Inside a segment: the whole segments past it are unlinked, and the one
+    // holding the cut is shortened to the record boundary.
+    try journal.truncateAfter(io, 5);
+    try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, 2), journal.segmentCount());
+    try testing.expect(!ws.exists(try ws.segment(7)));
+    try testing.expectEqual(@as(u64, 5), try journal.verify(io));
+
+    // The number comes back, which is the one thing this call is for.
+    try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "again")));
+
+    // On a segment boundary nothing is rewritten, only unlinked.
+    try journal.truncateAfter(io, 3);
+    try testing.expectEqual(@as(u64, 3), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+
+    // To nothing, which leaves the sequence exactly where it was told to.
+    try journal.truncateAfter(io, 0);
+    try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, 0), journal.records().records.len);
+    try testing.expectEqual(@as(u64, 1), try journal.append(io, 1, created(1, "from the top")));
+
+    // And below the oldest record the log still holds there is nothing to
+    // truncate to, because the history it would claim has been dropped.
+    for (2..8) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    _ = try journal.dropSegmentsBefore(io, 3);
+    try testing.expectError(error.SeqTooOld, journal.truncateAfter(io, 1));
+}
+
 test "a compaction interrupted after its rename leaves a segment the next open removes" {
     const io = testing.io;
     var ws = try Workspace.init("log");
