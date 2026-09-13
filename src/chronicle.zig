@@ -37,6 +37,10 @@ pub const OnTruncated = Log.OnTruncated;
 /// Whether a journal may be written to, and so whether it takes the lock.
 pub const Access = Log.Access;
 
+/// How often `append` makes the bytes it wrote durable. README.md states the
+/// promise each level carries.
+pub const Sync = Log.Sync;
+
 /// The file inside a journal directory that a writer holds its advisory lock
 /// on. It is never read or written.
 pub const lock_name = Log.lock_name;
@@ -216,10 +220,10 @@ pub fn Journal(comptime Event: type) type {
             /// arm named `unknown` if there is one, and `error.OlderSchema` if
             /// there is not.
             migrate: ?Migrate = null,
-            /// Whether `append` calls `fsync` before it returns. With it off, a
-            /// returned sequence number means the bytes reached the operating
-            /// system, not the disk.
-            fsync: bool = true,
+            /// How often `append` makes the bytes it wrote durable. The
+            /// default is the durable one; README.md states what each level
+            /// promises and what it gives up.
+            sync: Sync = .always,
             /// How many of the newest records to keep in memory for `records`,
             /// `since` and `waitPast`. Older ones come from the disk. Zero is
             /// allowed: then `replay` and `subscribe` are the ways to read.
@@ -378,7 +382,7 @@ pub fn Journal(comptime Event: type) type {
             var log = try Log.open(gpa, io, path, .{
                 .access = options.access,
                 .on_truncated = options.on_truncated,
-                .fsync = options.fsync,
+                .sync = options.sync,
                 .write_buffer_size = options.write_buffer_size,
                 .read_buffer_size = options.read_buffer_size,
                 .max_segment_bytes = options.max_segment_bytes,

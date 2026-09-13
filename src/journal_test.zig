@@ -313,6 +313,30 @@ test "a write that does not reach the disk publishes nothing and latches" {
 // Schema versions.
 //========================================================================
 
+test "every fsync policy writes a log that opens with the same records" {
+    const io = testing.io;
+    // When the bytes reach the platter is not something a test on a running
+    // kernel can watch. What this checks is the other half of the promise:
+    // that the code path each policy takes -- the seal at a rotation, the one
+    // at a close, and neither -- still leaves a whole log behind it.
+    for ([_]chronicle.Sync{ .always, .on_segment, .never }) |policy| {
+        var ws = try Workspace.init("log");
+        defer ws.deinit();
+        {
+            var journal = try Journal.open(testing.allocator, io, ws.path, .{
+                .sync = policy,
+                .max_segment_records = 3,
+            });
+            defer journal.deinit(io);
+            for (1..8) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        }
+        var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
+        defer reopened.deinit(io);
+        try testing.expectEqual(@as(u64, 7), try reopened.lastSeq(io));
+        try testing.expectEqual(@as(usize, 3), reopened.segmentCount());
+    }
+}
+
 test "a record from a newer schema is refused rather than guessed at" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -484,7 +508,7 @@ test "waitPast is woken by a nudge with no record behind it" {
 /// without writing megabytes.
 fn small(records_per_segment: u64, tail_records: usize) Journal.Options {
     return .{
-        .fsync = false,
+        .sync = .never,
         .max_segment_records = records_per_segment,
         .tail_records = tail_records,
         .max_segment_bytes = 1 << 30,
@@ -794,7 +818,7 @@ test "the tail gives way by bytes as well as by count" {
     defer ws.deinit();
 
     var journal = try Journal.open(testing.allocator, io, ws.path, .{
-        .fsync = false,
+        .sync = .never,
         .tail_records = 1_000,
         .tail_bytes = 512,
     });
@@ -1113,7 +1137,7 @@ test "two hundred thousand records open within a bounded time and memory" {
     const count = 200_000;
     {
         // No fsync here: this is building a fixture, not measuring durability.
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .fsync = false });
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         for (0..count) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name of some length"));
         try testing.expect(journal.segmentCount() > 1);

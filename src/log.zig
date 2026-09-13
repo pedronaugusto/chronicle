@@ -61,6 +61,22 @@ pub const OnTruncated = enum {
     drop,
 };
 
+/// How often the bytes an append wrote are made durable.
+///
+/// It governs the record bytes only. The `fsync`s that make a rename atomic --
+/// a snapshot, a compaction, a new segment's name -- are not optional under
+/// any of these, because they are what the replacement promise is.
+pub const Sync = enum {
+    /// `fsync` before every `appendLine` returns.
+    always,
+    /// `fsync` when a segment is sealed and when the log is closed. Between
+    /// those, an appended record has reached the operating system only.
+    on_segment,
+    /// Never from an append, a seal or a close. The bytes reach the operating
+    /// system and it writes them back when it chooses.
+    never,
+};
+
 /// Whether this process may write to the log.
 pub const Access = enum {
     /// Take the exclusive advisory lock, repair a torn tail, maintain the
@@ -92,7 +108,7 @@ pub const Segment = struct {
 pub const Options = struct {
     access: Access = .write,
     on_truncated: OnTruncated = .drop,
-    fsync: bool = true,
+    sync: Sync = .always,
     write_buffer_size: usize = 64 * 1024,
     read_buffer_size: usize = 64 * 1024,
     max_segment_bytes: u64 = 8 * 1024 * 1024,
@@ -712,7 +728,7 @@ pub fn appendLine(log: *Log, io: Io, bytes: []const u8) AppendError!void {
     try active.writer.interface.writeAll(bytes);
     try active.writer.interface.writeByte('\n');
     try active.writer.interface.flush();
-    if (log.options.fsync) try active.file.sync(io);
+    if (log.options.sync == .always) try active.file.sync(io);
 
     try active.index_writer.interface.writeInt(u64, at, .little);
     segment.bytes += needed;
@@ -726,7 +742,7 @@ fn rotate(log: *Log, io: Io) AppendError!void {
     {
         const active = &log.active.?;
         try active.writer.interface.flush();
-        try active.file.sync(io);
+        if (log.options.sync != .never) try active.file.sync(io);
         try active.index_writer.interface.flush();
         sealIndex(io, active.index_file, segment.bytes) catch {};
     }
@@ -967,6 +983,7 @@ pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {
 pub fn deinit(log: *Log, io: Io) void {
     if (log.active) |*active| {
         active.writer.interface.flush() catch {};
+        if (log.options.sync != .never) active.file.sync(io) catch {};
         active.index_writer.interface.flush() catch {};
         // Leave the active index stamped with the length it describes, so that
         // the next open can take it rather than rebuild it.
