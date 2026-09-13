@@ -31,6 +31,9 @@ a moment ago. `tail -f` is a debugger.
   line a dying writer did not finish is detected and repaired, a write that
   does not reach the disk publishes nothing and latches, and schema drift in
   both directions is an error you can name rather than a wrong answer.
+- **A checksum on every record.** A CRC32C the read path verifies, so a
+  flipped bit in the middle of a year of history is `error.ChecksumMismatch`
+  and not a record that parses and lies.
 - **Everything through `std.Io`.** Every file operation and the wait
   primitive, so the package runs under `std.testing.io`, a threaded `Io`, or
   whatever comes next.
@@ -140,14 +143,24 @@ offset, and anything that disagrees is rebuilt from the segment. Deleting every
 
 ## The durability promises
 
-Exactly these four, and nothing more:
+Exactly these five, and nothing more:
 
-1. **A sequence number that `append` returned is on the disk.** The record is
-   serialised, written, flushed and — unless you set `Options.fsync = false` —
-   `fsync`ed before `append` returns, before any sink is called and before any
-   `waitPast` is woken. A reader therefore never sees a record the disk does
-   not have. With `fsync` off the promise weakens to "the bytes reached the
-   operating system", which survives a process crash but not a power cut.
+1. **A sequence number that `append` returned is on the disk**, as far as
+   `Options.sync` asks it to be. The record is serialised, written, flushed
+   and made durable before `append` returns, before any sink is called and
+   before any `waitPast` is woken — so a reader never sees a record the disk
+   does not have. The policy says how far "durable" goes:
+
+   | `Options.sync` | What a returned sequence number means | What that survives |
+   |---|---|---|
+   | `.always` (default) | The record's bytes have been `fsync`ed. | A process crash, and a power cut. |
+   | `.on_segment` | The bytes reached the operating system. They are `fsync`ed when the segment is sealed and when the journal is closed. | A process crash, including a kill. A power cut loses the records written since the last seal. |
+   | `.never` | The bytes reached the operating system, and nothing asks it when it will write them back. | A process crash, including a kill. A power cut loses whatever had not been written back. |
+
+   The policy governs the record bytes and nothing else. The `fsync`s that
+   make a *replacement* atomic — promises 3 and 4 — are not optional under any
+   of the three, because they are what those promises are.
+
 2. **A failure to reach the disk is permanent and loud.** If the write, the
    flush or the `fsync` fails, `append` returns that error, adds no record,
    calls no sink, and every later `append` returns
@@ -167,6 +180,17 @@ Exactly these four, and nothing more:
    whose contents reached the disk but whose name did not. Directories cannot
    be `fsync`ed on Windows; there this promise is the operating system's and
    not this package's.
+
+5. **A record that does not read back as it was written is named, not
+   returned.** Every record carries a CRC32C of its own bytes, and every path
+   that turns a line into a record checks it before the event is parsed:
+   `open`, `replay`, `subscribe`, `verify`. A line a dying writer left
+   unfinished is `error.TruncatedRecord`; a line whose bytes have changed
+   since is `error.ChecksumMismatch`. `Options.verify = .full` makes `open`
+   check every record of every segment rather than only the newest, and
+   `verify()` does the same on demand. A record written before 0.3.0 carries
+   no checksum: it is read exactly as it always was, and there is nothing to
+   check it against.
 
 What that leaves open, stated rather than implied: a snapshot is only ever an
 optimisation, so deleting one costs replay time and nothing else; and an index
@@ -205,14 +229,20 @@ is open. What follows from that:
 
 ## What it does not do
 
-- **No query, no time travel, no secondary indexes.** The index maps a
-  sequence number to a byte offset and nothing else. Everything past that is
-  your fold.
+- **No query and no secondary indexes.** Everything past a range of sequence
+  numbers is your fold.
 - **No automatic retention.** Segments rotate on their own; nothing is ever
   deleted on your behalf. `dropSegmentsBefore` unlinks whole segments and
   `compact` rewrites across one, and you decide when.
-- **No encryption, no compression, no checksums.** A record is corrupt when it
-  does not parse, which is not the same as a record being intact.
+- **No encryption and no compression.** A record is stored as it was written,
+  and its checksum is what says it still is.
+- **No group commit.** Each `append` is its own write and, under
+  `Options.sync = .always`, its own `fsync`. A batch under one `fsync` is not
+  here yet.
+- **No lookup by time, and no reader cursor kept for you.** The index maps a
+  sequence number to a byte offset. A cursor is a `u64` you hold.
+- **No hot backup.** Copying a running journal is copying a directory, and
+  nothing here does it for you.
 - **No hardening against a hostile file.** Records go through `std.json` with
   its defaults. A journal is written by the program that owns it; the file
   contents this package is built to survive are the ones a crash produces, not
@@ -226,13 +256,19 @@ is open. What follows from that:
 One record per line, newline-terminated, in the field order written:
 
 ```
-{"seq":<u64>,"at":<i64>,"v":<u32>,"ev":<your event as std.json>}
+{"seq":<u64>,"at":<i64>,"v":<u32>,"ev":<your event as std.json>,"c":<u32>}
 ```
 
 `seq` starts at 1 and rises by one, up to 2^63-1 — a sequence number is a JSON
 integer, and `append` refuses with `error.SequenceExhausted` rather than write
 one that cannot be read back. `at` is whatever you passed; milliseconds since
-the Unix epoch is the intended unit. `v` is `Options.schema_version`.
+the Unix epoch is the intended unit. `v` is `Options.schema_version`. `c` is the CRC32C of every byte of the line
+before the `,"c":` that carries it — the record with its closing brace removed
+— written as a decimal integer and always last, which is what makes it
+checkable without re-encoding anything. `chronicle.checksum` is that function,
+public so that a tool reading a segment with something other than this package
+can check one. A record written before 0.3.0 has no `c` and is read without
+one.
 
 A snapshot lives at `<path>/snapshot`:
 
@@ -325,9 +361,13 @@ with no re-encoding.
 | `snapshot(io, state_bytes)` | Write the fold out beside the log. |
 | `compact(io, keep_after_seq)` | Rewrite the log, keeping the records after the cut. |
 | `dropSegmentsBefore(io, seq)` | Unlink the whole segments a snapshot covers. |
+| `truncateAfter(io, seq)` | Drop every record after `seq`, handing the numbers back. |
+| `verify(io)` | Read every record of every segment through every check. |
+| `stats(io)` | Segments, records, and the bytes they take. |
 
 Plus the types `Record`, `Window`, `Replay`, `Sink`, `Options`, `Snapshot`,
-`Opened`, `Migrate`, and one named error set per operation. Every public
+`Opened`, `Migrate`, `Stats`, `Sync`, `Verify`, and one named error set per
+operation. Every public
 declaration carries a doc comment stating its contract; `src/chronicle.zig` is
 the reference, and `src/log.zig` is the segment store under it.
 
@@ -347,8 +387,10 @@ real directories in a temporary one, in Debug, ReleaseSafe, ReleaseFast and
 ReleaseSmall. What they cover beyond the happy path is the crash shapes, made
 on the disk rather than simulated: a torn final line, a torn line in a sealed
 segment, a missing index, an index for the wrong bytes, a `.tmp` file a crash
-left behind, and the two segments a compaction leaves when it dies between its
-rename and its unlink. One test spawns a second process to hold the lock,
+left behind, a byte flipped inside a record that still parses, a checksum that
+is not the last member of its line, a record from before checksums existed,
+and the two segments a compaction leaves when it dies between its rename and
+its unlink. One test spawns a second process to hold the lock,
 because `error.Locked` is not a claim a single process can prove. One builds a
 journal of two hundred thousand records and asserts that opening it is
 proportionate and that memory is not.

@@ -4,6 +4,54 @@ Each entry says what the old shape could not express, so a port has the reason
 and not only the diff. Versions follow [semantic versioning](https://semver.org);
 before 1.0 the minor is the breaking one.
 
+## 0.3.0
+
+A record that can say whether it is still the record that was written, and a
+durability setting that says what it is buying. 0.2.0 detected a torn tail and
+nothing else: a byte that changed after the fact produced a line that parsed,
+an event that type-checked and a fold that was quietly wrong.
+
+Breaking:
+
+- **`Options.fsync: bool` is now `Options.sync: Sync`**, one of `.always`,
+  `.on_segment` or `.never`. `fsync = true` is `.always`, which is the default,
+  and `fsync = false` is `.never`. The level in between is new: `fsync` when a
+  segment is sealed and when the journal is closed, which survives a kill but
+  not a power cut. README.md states the promise and the cost of each in a
+  table, because a durability knob without one is a knob.
+- **Records carry a checksum.** A line written by 0.3.0 ends `,"c":<u32>}`
+  where `c` is the CRC32C of everything before it. The format is still one
+  JSON object per line and `tail -f` is still a debugger. **Old journals open
+  unchanged**: a record with no `c` has nothing to check and is read exactly as
+  it was, so a 0.2.0 directory needs no conversion and gains checksums as it is
+  appended to. A 0.3.0 journal read by 0.2.0 is also fine, since the extra
+  member is ignored on the way in.
+- **`ReadError` has a new arm, `ChecksumMismatch`**, separate from
+  `CorruptRecord` because the two say different things: one line is not a
+  record, the other is a record that is not the one that was written.
+
+New:
+
+- **A verified read path.** Every path that turns a line into a record checks
+  the checksum before parsing the event — `open`, `replay`, `subscribe`.
+  `chronicle.checksum` is the same function, public, so a segment can be
+  checked by something that is not this package.
+- **`Options.verify`.** `.quick`, the default, reads the newest segment and one
+  line of each older one, as `open` always has. `.full` reads every record of
+  every segment through every check, which costs the log instead of one
+  segment. `verify(io)` runs the same pass on demand and reports how many
+  records it read.
+- **`truncateAfter(io, seq)`.** Drop every record after `seq`, so `lastSeq`
+  becomes `seq` and the next `append` is `seq + 1`. Whole segments past the cut
+  are unlinked newest first and the segment holding the cut is shortened to the
+  record boundary, so every state the directory passes through is a log that
+  opens — one that may still hold records the call was asked to drop, which is
+  why calling it again is the answer to a crash inside it. It is the one call
+  that moves the sequence backwards, and it says so.
+- **`stats(io)`.** Segments, records, bytes, and the oldest and newest sequence
+  numbers, read off what the journal already knows: no file is opened and
+  nothing is scanned.
+
 ## 0.2.0
 
 The log a daemon runs on for a year, rather than one that must fit in memory.
