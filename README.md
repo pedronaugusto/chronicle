@@ -4,14 +4,14 @@
 
 An append-only, replayable event log for Zig. One JSON line per event, with a
 sequence number, durable on disk, folded into state by any number of readers,
-with snapshots to bound replay.
+segmented so that a daemon can run on it for a year.
 
 ```
 {"seq":1,"at":1700000000000,"v":1,"ev":{"account_opened":{"id":1,"owner":"ada"}}}
 {"seq":2,"at":1700000000100,"v":1,"ev":{"deposited":{"id":1,"cents":5000}}}
 ```
 
-The file is the state: every screen, cache and projection is a fold of it, and
+The log is the state: every screen, cache and projection is a fold of it, and
 the same fold runs whether the records came off the disk at startup or arrived
 a moment ago. `tail -f` is a debugger.
 
@@ -20,6 +20,13 @@ a moment ago. `tail -f` is a debugger.
   `std.json` can write and read back — a tagged union is the expected shape,
   because it gives each record a name on disk and an exhaustive `switch` in
   the fold.
+- **Bounded memory, unbounded history.** `open` reads the newest segment and
+  one line of each older one. Folding streams from the disk, a record at a
+  time. What memory holds is a tail you size.
+- **Segments, an index and a lock.** The log rotates into files named after
+  the record they start with, a sidecar index turns a cursor into a seek, and
+  an advisory lock means a second writer is told `error.Locked` rather than
+  interleaving half-records into yours.
 - **Crash-shaped by design.** The sequence continues across restarts, a final
   line a dying writer did not finish is detected and repaired, a write that
   does not reach the disk publishes nothing and latches, and schema drift in
@@ -43,15 +50,17 @@ const zjournal = @import("zjournal");
 var balances: Balances = .{};
 var last: u64 = 0;
 {
-    // Open the log. It is created if it is not there, and every record
-    // already in it is read back; the sequence number continues from the
-    // last one, so a restart never reuses a number.
+    // Open the log. The directory is created if it is not there, the
+    // newest records are read back, and the sequence number continues
+    // from the last one, so a restart never reuses a number. A second
+    // writer would get error.Locked instead of this journal.
     var ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
     defer ledger.deinit(io);
 
-    // A sink is a fold. Subscribing hands it every record already on
-    // disk and then every record appended, so the state is built the
-    // same way whether it came from a file or from a live writer.
+    // A sink is a fold. Subscribing streams it every record already on
+    // disk -- one at a time, however long the history -- and then every
+    // record appended, so the state is built the same way whether it
+    // came from a file or from a live writer.
     try ledger.subscribe(io, balances.sink());
 
     // Append. The returned sequence number means the bytes are on the
@@ -64,6 +73,7 @@ var last: u64 = 0;
 
     // Write the fold out beside the log and drop the records it covers,
     // so the next start replays three records instead of three million.
+    // Nothing drops history on your behalf; this is the call that does.
     try ledger.snapshot(io, std.mem.asBytes(&balances));
     try ledger.compact(io, last);
 
@@ -79,6 +89,7 @@ defer reopened.deinit(io);
 var restored: Balances = .{};
 var from: u64 = 0;
 if (opened.snapshot) |snapshot| {
+    defer gpa.free(snapshot.state);
     restored = std.mem.bytesToValue(Balances, snapshot.state[0..@sizeOf(Balances)]);
     from = snapshot.seq;
 }
@@ -93,9 +104,43 @@ const zjournal_dep = b.dependency("zjournal", .{ .target = target, .optimize = o
 exe.root_module.addImport("zjournal", zjournal_dep.module("zjournal"));
 ```
 
+## What is on the disk
+
+A journal is a directory, and `path` names it:
+
+```
+ledger/
+  lock                          zero bytes; the writer's advisory lock
+  00000000000000000001.log      records 1..800
+  00000000000000000001.idx      one byte offset per record
+  00000000000000000801.log      records 801..    <- the active segment
+  00000000000000000801.idx
+  snapshot                      whatever you last handed to `snapshot`
+```
+
+A segment's name is the sequence number of its first record, zero-padded to
+twenty digits so that the directory sorts in sequence order. That one decision
+does most of the work here:
+
+- **A cursor is a lookup, not a scan.** The segment a sequence number is in is
+  found from the names, and the byte offset inside it from the index, so
+  reading from the middle of a year of records costs two reads.
+- **`open` costs one segment.** Only the newest one is read through; every
+  older one gives up its last record in a single read, which is enough to
+  prove the sequence runs without a gap from the first record to the last.
+- **The sequence survives an empty log.** `compact` asked to keep nothing
+  leaves one empty segment named for the record that comes next, so the
+  numbering continues with no record left to carry it.
+
+The index is a cache and is treated as one: a header naming the segment length
+it was built from, then one little-endian `u64` per record. It is checked
+against that length and against the sequence number of the record at its last
+offset, and anything that disagrees is rebuilt from the segment. Deleting every
+`.idx` file costs one scan per segment and nothing else.
+
 ## The durability promises
 
-Exactly these three, and nothing more:
+Exactly these four, and nothing more:
 
 1. **A sequence number that `append` returned is on the disk.** The record is
    serialised, written, flushed and — unless you set `Options.fsync = false` —
@@ -111,46 +156,70 @@ Exactly these three, and nothing more:
    repairs the partial line the failed write may have left.
 3. **`snapshot` and `compact` replace a file, never edit one.** Each writes a
    complete neighbouring file, flushes and `fsync`s it, and then renames it
-   over the destination. A crash at any moment leaves either the whole old
-   file or the whole new one. `compact` always keeps the newest record, so the
-   sequence survives a reopen even when you ask it to keep nothing, and it
-   closes the journal's own handle before the rename and reopens it after, so
-   a rename that fails leaves the old journal open and appendable.
+   into place. A crash at any moment leaves either the whole old file or the
+   whole new one. `compact` lets go of the segment it is replacing before the
+   rename, because Windows refuses to rename over a file this process has
+   open, and a crash between the rename and the unlink leaves a segment the
+   next `open` recognises and removes.
+4. **A name that has been created or renamed is `fsync`ed too.** After a new
+   segment, a renamed snapshot, a renamed segment or a dropped one, the
+   journal's directory is itself `fsync`ed, so a power cut cannot leave a file
+   whose contents reached the disk but whose name did not. Directories cannot
+   be `fsync`ed on Windows; there this promise is the operating system's and
+   not this package's.
 
-What that leaves open, stated rather than implied: zjournal does not `fsync`
-the containing directory after a rename, so a power cut immediately after
-`compact` may leave the filesystem presenting either file — both of which are
-complete journals. And a snapshot is only ever an optimisation: deleting one
-costs replay time and nothing else.
+What that leaves open, stated rather than implied: a snapshot is only ever an
+optimisation, so deleting one costs replay time and nothing else; and an index
+is only ever a cache, so losing one costs a scan.
 
 **Windows is compiled but unverified.** Every target below cross-compiles, and
 CI runs the suite on a Windows runner, but the author has not watched the
-atomic replacement behave on a real NTFS volume. `compact` is written for what
-Windows requires — the destination handle is closed before the rename — and
-`std.Io.Dir.rename` replaces an existing destination on every platform. Treat
-the third promise as proved on Linux and macOS and claimed on Windows.
+atomic replacement or the lock behave on a real NTFS volume. The lock goes
+through `std.Io`, which uses `NtLockFile` there and `flock` on POSIX. Treat
+every promise as proved on Linux and macOS — `ci/linux.sh` runs the suite in a
+container on each release — and claimed on Windows.
+
+## More than one process
+
+The writer holds an exclusive advisory lock on `<path>/lock` for as long as it
+is open. What follows from that:
+
+- **Safe.** One writer. A second `open` with the default
+  `Options.access = .write` returns `error.Locked` rather than corrupting
+  anything. The lock is released when the journal is closed, and by the
+  operating system when the process ends however it ends — including a kill.
+- **Safe.** Any number of readers, in any number of processes, opened with
+  `Options.access = .read`. Such a journal takes no lock, so it never keeps the
+  writer out, and writes nothing at all: no repair, no index, no compaction. A
+  record the writer is halfway through appending is the end of the log to a
+  reader, not damage.
+- **Safe.** Tailing. A reader calls `replay(cursor)` for the records after the
+  cursor, which costs a seek and then the records themselves; when the writer
+  may have started a new segment, `refresh` re-reads the directory first, which
+  costs a walk of the newest segment.
+- **Not safe.** Two writers without the lock — which this package gives you no
+  way to ask for. Nor is a journal on a filesystem whose locks do not work:
+  `open` returns `error.FileLocksUnsupported` rather than pretending.
+- **Not promised.** A reader is not woken by a writer in another process.
+  `waitPast` is for tasks inside one process; across processes, poll.
 
 ## What it does not do
 
-- **No locking between processes.** One writer per file. zjournal does not
-  take an advisory lock and does not detect a second writer; two processes
-  appending to one journal will interleave partial lines.
-- **No indexing, no query, no time travel.** `since(cursor)` is the whole
-  read API. Everything else is your fold.
-- **No log rotation, no retention policy, no size limit.** `compact` is
-  manual, and you choose when and how far.
-- **No streaming read.** `open` reads the whole file into memory and keeps
-  every record there. A journal is expected to be compacted to a size that
-  fits; if yours cannot be, this is the wrong package.
-- **No encryption, no compression, no checksums.** A record is corrupt when
-  it does not parse, which is not the same as a record being intact.
+- **No query, no time travel, no secondary indexes.** The index maps a
+  sequence number to a byte offset and nothing else. Everything past that is
+  your fold.
+- **No automatic retention.** Segments rotate on their own; nothing is ever
+  deleted on your behalf. `dropSegmentsBefore` unlinks whole segments and
+  `compact` rewrites across one, and you decide when.
+- **No encryption, no compression, no checksums.** A record is corrupt when it
+  does not parse, which is not the same as a record being intact.
 - **No hardening against a hostile file.** Records go through `std.json` with
   its defaults. A journal is written by the program that owns it; the file
-  contents this package is built to survive are the ones a crash produces,
-  not the ones an attacker chooses.
+  contents this package is built to survive are the ones a crash produces, not
+  the ones an attacker chooses.
 - **No clock.** `append` stores the `at` you pass. zjournal never reads the
   time, so a test is deterministic and a replay is honest.
-- **No network, no server, no replication.** It is a file.
+- **No network, no server, no replication.** It is a directory.
 
 ## The format
 
@@ -165,7 +234,7 @@ integer, and `append` refuses with `error.SequenceExhausted` rather than write
 one that cannot be read back. `at` is whatever you passed; milliseconds since
 the Unix epoch is the intended unit. `v` is `Options.schema_version`.
 
-A snapshot lives beside the journal at `<path>.snapshot`:
+A snapshot lives at `<path>/snapshot`:
 
 ```
 {"seq":<u64>,"state":"<your bytes, base64>"}
@@ -177,10 +246,29 @@ snapshot format having an opinion about it. `seq` is the journal's newest
 sequence number at the moment the snapshot was taken: restore the state, then
 replay only the records after it.
 
+An index is a sixteen-byte header — the magic `zjidx\0\x01\n`, then the
+segment length it describes as a little-endian `u64`, zero while that segment
+is still being appended to — followed by one little-endian `u64` per record.
+
+## Memory
+
+Three things, and each of them is bounded by something you set:
+
+- **The tail.** `Options.tail_records` records and `Options.tail_bytes` bytes
+  of them, whichever bites first, kept parsed in memory for `records`, `since`
+  and `waitPast`. The oldest half is released when either ceiling is reached,
+  which is why keeping a tail costs a constant amount per append.
+- **One record.** A `Replay`, and so a `subscribe`, holds the record it is on
+  and the one read buffer it streams through — `Options.read_buffer_size`.
+- **One segment, at open.** Only to walk its newlines; the records inside it
+  go into the tail and are subject to its ceilings.
+
+Nothing here grows with the length of the log.
+
 ## Schema versions
 
-Every record carries the version it was written at, and `open` compares each
-against `Options.schema_version`:
+Every record carries the version it was written at, and every record that is
+read back is compared against `Options.schema_version`:
 
 - **Equal** — parsed as `Event`.
 - **Newer** — `error.NewerSchema`. This process is the old one; guessing at a
@@ -197,17 +285,21 @@ written with.
 ## Threads and tasks
 
 One mutex inside. `append`, `waitPast`, `nudge`, `subscribe`,
-`subscribeFrom`, `lastSeq`, `snapshot` and `compact` take it and are safe to
-call from any task or thread, including several at once.
+`subscribeFrom`, `lastSeq`, `snapshot`, `compact`, `dropSegmentsBefore` and
+`refresh` take it and are safe to call from any task or thread, including
+several at once. `subscribeFrom` holds it for the whole of its replay, so the
+hand-over from the disk to the live records has no seam in it.
 
-`records()` and `since()` do not take it: call them from the task that
-appends, or under coordination of your own. `waitPast` is the equivalent that
-takes the lock, and a `Sink` is the way to consume from elsewhere.
+`records()`, `since()`, `segmentCount()`, `oldestSeq()` and a `Replay` do not
+take it: call them from the task that appends, or under coordination of your
+own. `waitPast` is the locked equivalent of `since`, and a `Sink` is the way
+to consume from elsewhere.
 
-Memory is an arena, and nothing in it is freed before `compact` or `deinit`.
-That is what makes every slice a reader holds — a record, its `bytes`, any
-string inside its event — stay valid until one of those two calls. Both
-invalidate everything at once.
+A `Record` from a `Window` lives in the tail, so it lasts until the tail
+releases it — which the next `append` may do. A `Record` from a `Replay` lasts
+until the next `next`. A `Record` handed to a `Sink` lasts for the call. Copy
+what you need to keep; `record.bytes` is the durable form, ready to forward
+with no re-encoding.
 
 ## The API
 
@@ -215,23 +307,29 @@ invalidate everything at once.
 
 | | |
 |---|---|
-| `open(gpa, io, path, options)` | Create or read back a journal. |
+| `open(gpa, io, path, options)` | Create or read back a journal directory. |
 | `openWithSnapshot(gpa, io, path, options)` | The same, plus the snapshot beside it. |
-| `deinit(io)` | Flush, close, release. |
+| `deinit(io)` | Flush, close, unlock, release. |
 | `append(io, at, event)` | Write one record durably; returns its sequence number. |
-| `records()` | Every record held, oldest first. |
-| `since(cursor)` | The records after `cursor`. |
+| `records()` | The tail, oldest first, as a `Window`. |
+| `since(cursor)` | The tail after `cursor`, as a `Window`. |
 | `waitPast(io, cursor)` | Block until there is one, then `since(cursor)`. |
+| `replay(io, cursor)` | A walk over every record after `cursor`, from the disk. |
 | `nudge(io)` | Wake the waiters with no record behind it. |
 | `lastSeq(io)` | The newest sequence number, or zero. |
+| `oldestSeq()` | The oldest one still held. |
+| `segmentCount()` | How many files the log is spread over. |
+| `refresh(io)` | Read the directory again — how a reader tails a writer. |
 | `subscribe(io, sink)` | Fold every record, from the disk and then live. |
 | `subscribeFrom(io, sink, cursor)` | The same, starting after a snapshot. |
 | `snapshot(io, state_bytes)` | Write the fold out beside the log. |
-| `compact(io, keep_after_seq)` | Rewrite the log, keeping the tail. |
+| `compact(io, keep_after_seq)` | Rewrite the log, keeping the records after the cut. |
+| `dropSegmentsBefore(io, seq)` | Unlink the whole segments a snapshot covers. |
 
-Plus the types `Record`, `Sink`, `Options`, `Snapshot`, `Opened`, `Migrate`,
-and one named error set per operation. Every public declaration carries a doc
-comment stating its contract; `src/zjournal.zig` is the reference.
+Plus the types `Record`, `Window`, `Replay`, `Sink`, `Options`, `Snapshot`,
+`Opened`, `Migrate`, and one named error set per operation. Every public
+declaration carries a doc comment stating its contract; `src/zjournal.zig` is
+the reference, and `src/log.zig` is the segment store under it.
 
 ## Testing
 
@@ -241,17 +339,26 @@ zig build examples      # the examples on their own
 zig build check         # compile everything, including the tests, run nothing
 zig build test --fuzz   # the fuzz tests, without a time limit
 zig fmt --check src examples build.zig
+ci/linux.sh             # the suite on Linux, in Docker, from any machine
 ```
 
 Every test runs under `std.testing.allocator` and `std.testing.io`, against
-real files in a temporary directory, in Debug, ReleaseSafe, ReleaseFast and
-ReleaseSmall.
+real directories in a temporary one, in Debug, ReleaseSafe, ReleaseFast and
+ReleaseSmall. What they cover beyond the happy path is the crash shapes, made
+on the disk rather than simulated: a torn final line, a torn line in a sealed
+segment, a missing index, an index for the wrong bytes, a `.tmp` file a crash
+left behind, and the two segments a compaction leaves when it dies between its
+rename and its unlink. One test spawns a second process to hold the lock,
+because `error.Locked` is not a claim a single process can prove. One builds a
+journal of two hundred thousand records and asserts that opening it is
+proportionate and that memory is not.
 
-Two of them are fuzz tests, over arbitrary journal and snapshot file
-contents: `open` must answer with a journal or a named error, the `.fail`
-mode must leave the file exactly as it found it, and a `.drop` open followed
-by an `append` must produce a file that opens again cleanly. Under `zig build
-test` they run their corpus and stop, which costs milliseconds.
+Three of them are fuzz tests, over arbitrary segment, index and snapshot file
+contents: `open` must answer with a journal or a named error, the `.fail` mode
+must leave the file exactly as it found it, a `.drop` open followed by an
+`append` must produce a log that opens again cleanly, and whatever an index
+says, the records must be the ones the segments hold. Under `zig build test`
+they run their corpus and stop, which costs milliseconds.
 
 ## License
 
