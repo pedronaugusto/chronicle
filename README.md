@@ -1,6 +1,6 @@
-# zjournal
+# chronicle
 
-[![CI](https://github.com/pedronaugusto/zjournal/actions/workflows/ci.yml/badge.svg)](https://github.com/pedronaugusto/zjournal/actions/workflows/ci.yml)
+[![CI](https://github.com/pedronaugusto/chronicle/actions/workflows/ci.yml/badge.svg)](https://github.com/pedronaugusto/chronicle/actions/workflows/ci.yml)
 
 An append-only, replayable event log for Zig. One JSON line per event, with a
 sequence number, durable on disk, folded into state by any number of readers,
@@ -45,7 +45,7 @@ something executes.
 
 <!-- BEGIN GENERATED ci/readme_usage.sh -->
 ```zig
-const zjournal = @import("zjournal");
+const chronicle = @import("chronicle");
 
 var balances: Balances = .{};
 var last: u64 = 0;
@@ -100,8 +100,8 @@ try reopened.subscribeFrom(io, restored.sink(), from);
 Add it as a dependency and link the module:
 
 ```zig
-const zjournal_dep = b.dependency("zjournal", .{ .target = target, .optimize = optimize });
-exe.root_module.addImport("zjournal", zjournal_dep.module("zjournal"));
+const chronicle_dep = b.dependency("chronicle", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("chronicle", chronicle_dep.module("chronicle"));
 ```
 
 ## What is on the disk
@@ -217,7 +217,7 @@ is open. What follows from that:
   its defaults. A journal is written by the program that owns it; the file
   contents this package is built to survive are the ones a crash produces, not
   the ones an attacker chooses.
-- **No clock.** `append` stores the `at` you pass. zjournal never reads the
+- **No clock.** `append` stores the `at` you pass. chronicle never reads the
   time, so a test is deterministic and a replay is honest.
 - **No network, no server, no replication.** It is a directory.
 
@@ -246,7 +246,7 @@ snapshot format having an opinion about it. `seq` is the journal's newest
 sequence number at the moment the snapshot was taken: restore the state, then
 replay only the records after it.
 
-An index is a sixteen-byte header — the magic `zjidx\0\x01\n`, then the
+An index is a sixteen-byte header — the magic `chridx\x01\n`, then the
 segment length it describes as a little-endian `u64`, zero while that segment
 is still being appended to — followed by one little-endian `u64` per record.
 
@@ -303,7 +303,7 @@ with no re-encoding.
 
 ## The API
 
-`zjournal.Journal(comptime Event: type)` returns a type with:
+`chronicle.Journal(comptime Event: type)` returns a type with:
 
 | | |
 |---|---|
@@ -328,7 +328,7 @@ with no re-encoding.
 
 Plus the types `Record`, `Window`, `Replay`, `Sink`, `Options`, `Snapshot`,
 `Opened`, `Migrate`, and one named error set per operation. Every public
-declaration carries a doc comment stating its contract; `src/zjournal.zig` is
+declaration carries a doc comment stating its contract; `src/chronicle.zig` is
 the reference, and `src/log.zig` is the segment store under it.
 
 ## Testing

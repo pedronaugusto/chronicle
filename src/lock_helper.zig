@@ -8,10 +8,10 @@
 //! also a way out.
 //!
 //! `zig build test` builds this and hands the test binary its path in
-//! `ZJOURNAL_LOCK_HELPER`; the test that needs it is skipped without that.
+//! `CHRONICLE_LOCK_HELPER`; the test that needs it is skipped without that.
 
 const std = @import("std");
-const zjournal = @import("zjournal");
+const chronicle = @import("chronicle");
 
 /// The helper never reads a record and never appends one, so one arm is enough
 /// to instantiate a journal.
@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
 
     // No tail: the lock is the whole point here, and this process has no
     // business parsing records written against somebody else's event type.
-    var journal = try zjournal.Journal(Event).open(init.gpa, io, args[1], .{ .tail_records = 0 });
+    var journal = try chronicle.Journal(Event).open(init.gpa, io, args[1], .{ .tail_records = 0 });
     defer journal.deinit(io);
 
     var out_buffer: [64]u8 = undefined;

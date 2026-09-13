@@ -11,8 +11,8 @@ pub fn build(b: *std.Build) void {
     // graph to disagree with this one.
     //=====================================================================
 
-    const module = b.addModule("zjournal", .{
-        .root_source_file = b.path("src/zjournal.zig"),
+    const module = b.addModule("chronicle", .{
+        .root_source_file = b.path("src/chronicle.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -22,9 +22,9 @@ pub fn build(b: *std.Build) void {
     //=====================================================================
 
     const tests = b.addTest(.{
-        .name = "zjournal-tests",
+        .name = "chronicle-tests",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/zjournal.zig"),
+            .root_source_file = b.path("src/chronicle.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -35,12 +35,12 @@ pub fn build(b: *std.Build) void {
     // here and its path handed over in the environment; a test binary run
     // without it skips that one test rather than failing.
     const lock_helper = b.addExecutable(.{
-        .name = "zjournal-lock-helper",
+        .name = "chronicle-lock-helper",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/lock_helper.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zjournal", .module = module }},
+            .imports = &.{.{ .name = "chronicle", .module = module }},
         }),
     });
     const install_lock_helper = b.addInstallArtifact(lock_helper, .{});
@@ -48,11 +48,11 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(tests);
     run_tests.step.dependOn(&install_lock_helper.step);
     run_tests.setEnvironmentVariable(
-        "ZJOURNAL_LOCK_HELPER",
+        "CHRONICLE_LOCK_HELPER",
         b.getInstallPath(.bin, lock_helper.out_filename),
     );
 
-    const test_step = b.step("test", "Run zjournal tests");
+    const test_step = b.step("test", "Run chronicle tests");
     test_step.dependOn(&run_tests.step);
 
     // Compiling without running: the step a cross-compilation check uses, and
@@ -80,7 +80,7 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path(source),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "zjournal", .module = module }},
+                .imports = &.{.{ .name = "chronicle", .module = module }},
             }),
         });
         b.installArtifact(example);

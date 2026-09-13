@@ -17,7 +17,7 @@
 //! of its first record — which is what makes a cursor a seek instead of a
 //! scan, and what lets the sequence survive a log `compact` empties.
 //!
-//! This file is internal. `zjournal.zig` is the package.
+//! This file is internal. `chronicle.zig` is the package.
 
 const builtin = @import("builtin");
 const std = @import("std");
@@ -347,7 +347,7 @@ fn sealedLastSeq(log: *Log, io: Io, segment: Segment) OpenError!u64 {
 // makes a crashed writer's index read as stale rather than as wrong.
 //========================================================================
 
-const index_magic = "zjidx\x00\x01\n";
+const index_magic = "chridx\x01\n";
 const index_header_len = 16;
 
 fn indexHeader(segment_bytes: u64) [index_header_len]u8 {

@@ -1,4 +1,4 @@
-# zjournal — a Linux with the pinned Zig in it, and nothing else.
+# chronicle — a Linux with the pinned Zig in it, and nothing else.
 #
 # ci/linux.sh builds this and runs the suite inside it, so that the file
 # behaviour this package promises is proved on the kernel a daemon runs on and

@@ -1,8 +1,8 @@
 .{
-    .name = .zjournal,
+    .name = .chronicle,
     .version = "0.2.0",
     .minimum_zig_version = "0.16.0",
-    .fingerprint = 0x4796a02519486c1,
+    .fingerprint = 0xdc91dbecd4617a72,
     .paths = .{
         "build.zig",
         "build.zig.zon",

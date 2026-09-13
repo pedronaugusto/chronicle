@@ -1,4 +1,4 @@
-//! zjournal — an append-only, replayable event log.
+//! chronicle — an append-only, replayable event log.
 //!
 //! One JSON object per line, each carrying a sequence number, a timestamp and
 //! a schema version:
@@ -119,7 +119,7 @@ pub fn Journal(comptime Event: type) type {
             /// written as a JSON integer, so `maxInt(i64)` is the last one a
             /// journal can hold; see `AppendError.SequenceExhausted`.
             seq: u64,
-            /// Whatever the appender passed as `at`. zjournal never reads a
+            /// Whatever the appender passed as `at`. chronicle never reads a
             /// clock; milliseconds since the Unix epoch is the intended unit.
             at: i64,
             /// The schema version this record was written at. Equal to the
@@ -427,7 +427,7 @@ pub fn Journal(comptime Event: type) type {
         /// Serialise `event`, write it, make it durable, publish it.
         ///
         /// Returns the new record's sequence number. `at` is stored as given;
-        /// zjournal never reads a clock.
+        /// chronicle never reads a clock.
         ///
         /// The record kept in memory is parsed back out of the bytes that were
         /// written, so it owns its own memory and is exactly what a reopen
@@ -710,7 +710,7 @@ pub fn Journal(comptime Event: type) type {
         /// Write `state_bytes` and the current sequence number to
         /// `<path>/snapshot`, replacing any snapshot there.
         ///
-        /// `state_bytes` is opaque to zjournal: whatever your fold serialises
+        /// `state_bytes` is opaque to chronicle: whatever your fold serialises
         /// to. It is stored base64-encoded in a JSON object, so the snapshot
         /// file is text however binary the state is.
         ///

@@ -7,7 +7,7 @@
 //! reader copies is code CI executes.
 
 const std = @import("std");
-const zjournal = @import("zjournal");
+const chronicle = @import("chronicle");
 
 /// One arm per thing that can happen. Anything `std.json` can write and read
 /// back works; a tagged union gives each record a name on disk.
@@ -17,7 +17,7 @@ const Event = union(enum) {
     withdrawn: struct { id: u32, cents: i64 },
 };
 
-const Ledger = zjournal.Journal(Event);
+const Ledger = chronicle.Journal(Event);
 
 /// The state the log adds up to. It is built the same way from the disk and
 /// from live appends, because the journal calls the sink for both.
@@ -49,8 +49,8 @@ pub fn main() !void {
     const io = threaded.io();
 
     var dir = std.Io.Dir.cwd();
-    defer dir.deleteTree(io, "zjournal-example") catch {};
-    const path = "zjournal-example/ledger";
+    defer dir.deleteTree(io, "chronicle-example") catch {};
+    const path = "chronicle-example/ledger";
 
     // --- README:usage ---
 

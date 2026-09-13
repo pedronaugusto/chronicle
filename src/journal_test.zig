@@ -5,7 +5,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
-const zjournal = @import("zjournal.zig");
+const chronicle = @import("chronicle.zig");
 
 /// The events of a tiny registry: enough shape to fold, and an `unknown` arm
 /// so a record from an older schema has somewhere to land.
@@ -16,7 +16,7 @@ const Event = union(enum) {
     unknown: std.json.Value,
 };
 
-const Journal = zjournal.Journal(Event);
+const Journal = chronicle.Journal(Event);
 
 /// A fold: the state the log adds up to. Two folds of the same records are
 /// equal whether the records came off the disk or arrived live, which is what
@@ -82,12 +82,12 @@ const Workspace = struct {
     }
 
     fn segment(self: *Workspace, base_seq: u64) ![]const u8 {
-        return self.sub(&zjournal.segmentName(base_seq));
+        return self.sub(&chronicle.segmentName(base_seq));
     }
 
     fn index(self: *Workspace, base_seq: u64) ![]const u8 {
-        var name = zjournal.segmentName(base_seq);
-        @memcpy(name[name.len - 4 ..], zjournal.index_extension);
+        var name = chronicle.segmentName(base_seq);
+        @memcpy(name[name.len - 4 ..], chronicle.index_extension);
         return self.sub(&name);
     }
 
@@ -145,7 +145,7 @@ test "an append returns the sequence number and puts one line in the first segme
 
     // The directory is meant to be read by a person: one lock, one segment,
     // one index.
-    try testing.expect(ws.exists(try ws.sub(zjournal.lock_name)));
+    try testing.expect(ws.exists(try ws.sub(chronicle.lock_name)));
     try testing.expect(ws.exists(try ws.index(1)));
     try testing.expectEqual(@as(usize, 1), journal.segmentCount());
 }
@@ -289,7 +289,7 @@ test "a write that does not reach the disk publishes nothing and latches" {
     const active = &journal.log.active.?;
     const length = try active.file.length(io);
     active.file.close(io);
-    active.file = try journal.log.dir.openFile(io, &zjournal.segmentName(1), .{});
+    active.file = try journal.log.dir.openFile(io, &chronicle.segmentName(1), .{});
     active.writer = active.file.writer(io, journal.log.write_buf);
     active.writer.pos = length;
 
@@ -375,7 +375,7 @@ test "without a migrate hook and without an unknown arm an older record is refus
     const Strict = union(enum) { removed: struct { id: u32 } };
     try testing.expectError(
         error.OlderSchema,
-        zjournal.Journal(Strict).open(testing.allocator, io, ws.path, .{ .schema_version = 2 }),
+        chronicle.Journal(Strict).open(testing.allocator, io, ws.path, .{ .schema_version = 2 }),
     );
 }
 
@@ -614,7 +614,7 @@ test "a missing index is rebuilt and a stale one is not trusted" {
 
     // An index a crash never finished, and one from a different segment.
     try ws.tmp.dir.deleteFile(io, try ws.index(1));
-    try ws.write(try ws.index(6), "zjidx\x00\x01\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
+    try ws.write(try ws.index(6), "chridx\x01\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
 
     var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 2));
     defer journal.deinit(io);
@@ -847,7 +847,7 @@ test "a temporary file a crash left behind is ignored" {
         for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
         try ws.write(try ws.sub("00000000000000000003.tmp"), "half a segment, no newline");
-        try ws.write(try ws.sub(zjournal.snapshot_name ++ ".tmp"), "{ not a snapshot");
+        try ws.write(try ws.sub(chronicle.snapshot_name ++ ".tmp"), "{ not a snapshot");
         try journal.refresh(io);
         try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
     }
@@ -896,7 +896,7 @@ test "dropSegmentsBefore unlinks whole segments and never the newest one" {
 
 test "a second writer is refused while the first holds the lock" {
     const io = testing.io;
-    const helper = testing.environ.getAlloc(testing.allocator, "ZJOURNAL_LOCK_HELPER") catch |err| switch (err) {
+    const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
         error.EnvironmentVariableMissing => return error.SkipZigTest,
         else => |e| return e,
     };
@@ -989,7 +989,7 @@ test "a reader beside a writer mid-record sees the records, not the fragment" {
     try testing.expectEqual(@as(u64, 1), try reader.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), reader.dropped_bytes);
     try testing.expectEqualStrings(before, try ws.read(try ws.segment(1)));
-    try testing.expect(!ws.exists(try ws.sub(zjournal.lock_name)));
+    try testing.expect(!ws.exists(try ws.sub(chronicle.lock_name)));
 }
 
 //========================================================================
@@ -1125,12 +1125,12 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
 
 const index_corpus = [_][]const u8{
     seeded(""),
-    seeded("zjidx\x00\x01\n"),
-    seeded("zjidx\x00\x01\n" ++ "\x00" ** 8),
-    seeded("zjidx\x00\x01\n" ++ "\x00" ** 16),
-    seeded("zjidx\x00\x01\n" ++ "\xff" ** 16),
+    seeded("chridx\x01\n"),
+    seeded("chridx\x01\n" ++ "\x00" ** 8),
+    seeded("chridx\x01\n" ++ "\x00" ** 16),
+    seeded("chridx\x01\n" ++ "\xff" ** 16),
     seeded("not an index at all"),
-    seeded("zjidx\x00\x01\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 8),
+    seeded("chridx\x01\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 8),
 };
 
 test "fuzz: an arbitrary index file is a cache, never an answer" {
@@ -1191,7 +1191,7 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     try ws.write(try ws.segment(1), a_record);
-    try ws.write(try ws.sub(zjournal.snapshot_name), bytes);
+    try ws.write(try ws.sub(chronicle.snapshot_name), bytes);
 
     // A snapshot is an optimisation. A bad one must be an error the caller can
     // name -- never a journal that opens with a wrong starting point.

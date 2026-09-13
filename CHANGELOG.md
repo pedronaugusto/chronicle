@@ -14,6 +14,10 @@ reason not to use it in the place it was written for.
 Breaking, and all of it in the same direction — what used to be a file is now a
 directory of segments:
 
+- **The package is called `chronicle`.** `@import("zjournal")` becomes
+  `@import("chronicle")`, `src/zjournal.zig` becomes `src/chronicle.zig`, and
+  the dependency name in `build.zig.zon` changes with them. Nothing else about
+  the name means anything: the type is still `Journal(Event)`.
 - **`path` names a directory.** `open(gpa, io, "ledger")` creates and owns
   `ledger/`, holding `lock`, the segments, their indexes and `snapshot`. A
   0.1.0 journal is a file where 0.2.0 expects a directory, so it is not read;

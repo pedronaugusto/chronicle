@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# zjournal — the suite on Linux, from a machine that is not one.
+# chronicle — the suite on Linux, from a machine that is not one.
 #
 # The promises this package makes are about files: an advisory lock, a rename,
 # an `fsync` of a directory. Those are the parts of a filesystem that differ
@@ -17,7 +17,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-image=${ZJOURNAL_LINUX_IMAGE:-zjournal-linux-zig-0.16.0}
+image=${CHRONICLE_LINUX_IMAGE:-chronicle-linux-zig-0.16.0}
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "ci/linux.sh needs docker on PATH." >&2
