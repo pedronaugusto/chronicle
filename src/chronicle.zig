@@ -734,6 +734,42 @@ pub fn Journal(comptime Event: type) type {
             return self.log.baseSeq() + 1;
         }
 
+        /// What the log is made of, in numbers.
+        pub const Stats = struct {
+            /// How many segment files it is spread over.
+            segments: usize,
+            /// How many records they hold.
+            records: u64,
+            /// The bytes of those records, over every segment. The index
+            /// sidecars, the lock and the snapshot are not counted: they are
+            /// caches and a copy of a fold, not the log.
+            bytes: u64,
+            /// The oldest sequence number still held and the newest. Both are
+            /// zero on a log with no records in it.
+            oldest_seq: u64,
+            newest_seq: u64,
+        };
+
+        /// `Stats`, read off the segments the journal already knows about: no
+        /// file is opened and nothing is scanned.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn stats(self: *Self, io: Io) Io.Cancelable!Stats {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            var bytes: u64 = 0;
+            for (self.log.segments.items) |segment| bytes += segment.bytes;
+            const oldest = self.log.baseSeq() + 1;
+            const empty = self.seq == 0 or oldest > self.seq;
+            return .{
+                .segments = self.log.segments.items.len,
+                .records = self.seq + 1 -| oldest,
+                .bytes = bytes,
+                .oldest_seq = if (empty) 0 else oldest,
+                .newest_seq = self.seq,
+            };
+        }
+
         /// Register a fold and hand it every record the journal holds, then
         /// every record appended afterwards.
         ///

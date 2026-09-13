@@ -544,6 +544,46 @@ test "the log rotates into segments named after their first record" {
     try testing.expectEqual(@as(u64, 10), all.records[9].seq);
 }
 
+test "stats counts the segments, the records and the bytes they take" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer journal.deinit(io);
+    // An empty log has one segment and no records, and says so in numbers
+    // rather than in a zero that could mean either.
+    try testing.expectEqual(Journal.Stats{
+        .segments = 1,
+        .records = 0,
+        .bytes = 0,
+        .oldest_seq = 0,
+        .newest_seq = 0,
+    }, try journal.stats(io));
+
+    for (1..8) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    const full = try journal.stats(io);
+    try testing.expectEqual(@as(usize, 3), full.segments);
+    try testing.expectEqual(@as(u64, 7), full.records);
+    try testing.expectEqual(@as(u64, 1), full.oldest_seq);
+    try testing.expectEqual(@as(u64, 7), full.newest_seq);
+    // The bytes are the segment files: the lines and the newlines that end
+    // them, and nothing else in the directory.
+    const on_disk = (try ws.read(try ws.segment(1))).len +
+        (try ws.read(try ws.segment(4))).len +
+        (try ws.read(try ws.segment(7))).len;
+    try testing.expectEqual(@as(u64, on_disk), full.bytes);
+
+    // Dropping a prefix moves the oldest sequence number and takes the bytes
+    // of the segments it unlinked with it.
+    _ = try journal.dropSegmentsBefore(io, 3);
+    const dropped = try journal.stats(io);
+    try testing.expectEqual(@as(usize, 2), dropped.segments);
+    try testing.expectEqual(@as(u64, 4), dropped.oldest_seq);
+    try testing.expectEqual(@as(u64, 4), dropped.records);
+    try testing.expect(dropped.bytes < full.bytes);
+}
+
 test "the tail is bounded and a cursor older than it is an incomplete window" {
     const io = testing.io;
     var ws = try Workspace.init("log");
