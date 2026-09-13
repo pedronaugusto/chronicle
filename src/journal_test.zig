@@ -121,12 +121,20 @@ test "an append returns the sequence number and puts one line in the first segme
     try testing.expectEqual(@as(u64, 1), try journal.append(io, 1_000, created(1, "one")));
     try testing.expectEqual(@as(u64, 2), try journal.append(io, 2_000, created(2, "two")));
 
+    // The line on the disk, checksum and all. `c` is the CRC32C of everything
+    // before it, so the literal here is also the definition of the format.
     const on_disk = try ws.read(try ws.segment(1));
     try testing.expectEqualStrings(
-        \\{"seq":1,"at":1000,"v":1,"ev":{"created":{"id":1,"name":"one"}}}
-        \\{"seq":2,"at":2000,"v":1,"ev":{"created":{"id":2,"name":"two"}}}
+        \\{"seq":1,"at":1000,"v":1,"ev":{"created":{"id":1,"name":"one"}},"c":294682814}
+        \\{"seq":2,"at":2000,"v":1,"ev":{"created":{"id":2,"name":"two"}},"c":1207820849}
         \\
     , on_disk);
+    try testing.expectEqual(
+        @as(u32, 294682814),
+        chronicle.checksum(
+            \\{"seq":1,"at":1000,"v":1,"ev":{"created":{"id":1,"name":"one"}}
+        ),
+    );
 
     // The record in memory is the line on the disk, parsed.
     const all = journal.records();
@@ -993,6 +1001,107 @@ test "a reader beside a writer mid-record sees the records, not the fragment" {
 }
 
 //========================================================================
+// Checksums.
+//========================================================================
+
+test "a flipped byte is caught by the checksum, and a parse would not have been" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+        _ = try journal.append(io, 2, created(2, "two"));
+    }
+
+    // A byte inside the payload, not the envelope. The line still parses as
+    // the object this format requires, its `ev` still parses as an `Event`,
+    // and the sequence still runs without a gap: the checksum is the only
+    // thing left that can say the bytes are not the ones that were written.
+    const bytes = try ws.read(try ws.segment(1));
+    bytes[std.mem.indexOf(u8, bytes, "two").?] = 'x';
+    try ws.write(try ws.segment(1), bytes);
+
+    try testing.expectError(
+        error.ChecksumMismatch,
+        Journal.open(testing.allocator, io, ws.path, .{}),
+    );
+}
+
+test "a flipped byte in a sealed segment is what the full open is for" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 2));
+        defer journal.deinit(io);
+        for (1..10) |i| {
+            const name: [2]u8 = .{ 'r', '0' + @as(u8, @intCast(i)) };
+            _ = try journal.append(io, @intCast(i), created(@intCast(i), &name));
+        }
+    }
+
+    // The second record of the oldest segment: not its last line, so nothing
+    // a quick open reads goes near it.
+    const bytes = try ws.read(try ws.segment(1));
+    bytes[std.mem.indexOf(u8, bytes, "r2").? + 1] = 'x';
+    try ws.write(try ws.segment(1), bytes);
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 2));
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 9), try journal.lastSeq(io));
+
+        // Reading it is what finds it, and `verify` is reading all of it.
+        try testing.expectError(error.ChecksumMismatch, journal.verify(io));
+    }
+
+    var full = small(3, 2);
+    full.verify = .full;
+    try testing.expectError(
+        error.ChecksumMismatch,
+        Journal.open(testing.allocator, io, ws.path, full),
+    );
+}
+
+test "a checksum that is not the last member of its line is not a checksum" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // A `c` this package cannot have written: there is no prefix it could be
+    // the checksum of, so the line is refused rather than read unverified.
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try testing.expectError(
+        error.CorruptRecord,
+        Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail }),
+    );
+}
+
+test "a record written before checksums existed is read as it always was" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // The envelope 0.2.0 wrote, with no `c` member. There is nothing to
+    // verify, and having nothing to verify is not a failure to verify.
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"old\"}}}\n");
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+    try testing.expectEqualStrings("old", journal.records().records[0].event.created.name);
+
+    // A record appended beside it carries one, so a journal gains checksums
+    // as it is written to rather than needing a conversion.
+    _ = try journal.append(io, 2, created(2, "new"));
+    const bytes = try ws.read(try ws.segment(1));
+    try testing.expect(std.mem.count(u8, bytes, ",\"c\":") == 1);
+    try testing.expectEqual(@as(u64, 2), try journal.verify(io));
+}
+
+//========================================================================
 // Size.
 //========================================================================
 
@@ -1056,6 +1165,10 @@ fn seeded(comptime body: []const u8) []const u8 {
 }
 
 const a_record = "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"x\"}}}\n";
+/// The same record as this version writes it: the checksum of everything
+/// before `,"c":`, which is `a_record` without its closing brace.
+const a_checked_record =
+    "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"x\"}},\"c\":825182072}\n";
 
 /// Inputs worth starting from: the empty file, a whole record, a record cut
 /// off mid-write, and the shapes that have to be refused by name.
@@ -1067,6 +1180,11 @@ const open_corpus = [_][]const u8{
     seeded(a_record),
     seeded(a_record ++ a_record),
     seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"crea"),
+    seeded(a_checked_record),
+    seeded(a_checked_record ++ a_checked_record),
+    seeded(a_checked_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":0}\n"),
+    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":null,\"c\":4294967296}\n"),
+    seeded("{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"ev\":null}\n"),
     seeded("{\"seq\":0,\"at\":0,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n"),
     seeded("{\"seq\":9223372036854775807,\"at\":0,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n"),
     seeded("{\"seq\":1,\"at\":1,\"v\":4294967296,\"ev\":null}\n"),

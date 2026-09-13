@@ -46,11 +46,32 @@ pub const snapshot_name = Log.snapshot_name;
 pub const segment_extension = Log.segment_extension;
 pub const index_extension = Log.index_extension;
 
+/// How much of a journal `open` reads back before it returns.
+pub const Verify = enum {
+    /// The newest segment and one line of each older one, which is enough to
+    /// know the sequence runs from the first record to the last without a gap.
+    /// The cost is one segment.
+    quick,
+    /// Every record of every segment, through the checks a replay makes: the
+    /// checksum, the envelope, the schema version and the sequence. The cost
+    /// is the log, which is why it is not the default.
+    full,
+};
+
 /// The name of the segment file whose first record is `base_seq`, relative to
 /// the journal's directory. Exposed because a journal's directory is meant to
 /// be read with `tail -f` and with your eyes.
 pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len]u8 {
     return Log.segmentName(base_seq, segment_extension);
+}
+
+/// The CRC32C of the bytes a record's checksum covers: its line up to, but not
+/// including, the `,"c":` that carries the checksum.
+///
+/// `append` writes it and every read verifies it. It is public so that a tool
+/// reading a segment with something other than this package can check one.
+pub fn checksum(covered: []const u8) u32 {
+    return std.hash.crc.Crc32Iscsi.hash(covered);
 }
 
 /// An append-only log of `Event` values.
@@ -188,6 +209,8 @@ pub fn Journal(comptime Event: type) type {
             /// What to do with an unterminated final line. Ignored under
             /// `.read`, which repairs nothing.
             on_truncated: OnTruncated = .drop,
+            /// How much of the log `open` reads back before it returns.
+            verify: Verify = .quick,
             /// Called for a record written at a version below
             /// `schema_version`. Without it, such a record becomes the `Event`
             /// arm named `unknown` if there is one, and `error.OlderSchema` if
@@ -239,6 +262,9 @@ pub fn Journal(comptime Event: type) type {
 
         /// What reading a record back can go wrong with.
         ///
+        /// * `ChecksumMismatch` — a line carries a checksum and does not
+        ///   match it: the bytes on the disk are not the bytes that were
+        ///   written. This is the one corruption a parse cannot find.
         /// * `CorruptRecord` — a line is not a JSON object with the members
         ///   this format requires, or its `ev` does not parse as `Event`.
         /// * `TruncatedRecord` — a line is unterminated where a complete one
@@ -252,7 +278,7 @@ pub fn Journal(comptime Event: type) type {
         ///   `Options.schema_version` and there is neither a `migrate` hook nor
         ///   an `unknown` arm to receive it.
         pub const ReadError = Allocator.Error || MigrateError || Log.ScanError ||
-            error{ CorruptRecord, TruncatedRecord, DiscontinuousSeq, NewerSchema, OlderSchema };
+            error{ ChecksumMismatch, CorruptRecord, TruncatedRecord, DiscontinuousSeq, NewerSchema, OlderSchema };
 
         /// `ReadError`, plus what opening a directory and taking its lock can
         /// go wrong with.
@@ -383,6 +409,7 @@ pub fn Journal(comptime Event: type) type {
                 self.scratch.deinit();
             }
             try self.fillTail(io);
+            if (options.verify == .full) _ = try self.verify(io);
             return self;
         }
 
@@ -452,7 +479,17 @@ pub fn Journal(comptime Event: type) type {
 
             const next = self.seq + 1;
             const line: Line = .{ .seq = next, .at = at, .v = self.options.schema_version, .ev = event };
-            const encoded = try std.json.Stringify.valueAlloc(self.gpa, line, .{});
+            const body = try std.json.Stringify.valueAlloc(self.gpa, line, .{});
+            defer self.gpa.free(body);
+            // The checksum covers everything the record says except the
+            // checksum itself. `std.json` closes the object with the one byte
+            // dropped here, and `,"c":<crc>}` closes it again.
+            const covered = body[0 .. body.len - 1];
+            const encoded = try std.fmt.allocPrint(
+                self.gpa,
+                "{s},\"c\":{d}}}",
+                .{ covered, checksum(covered) },
+            );
             defer self.gpa.free(encoded);
 
             // Built before the write: a record the journal could not hold is a
@@ -460,7 +497,12 @@ pub fn Journal(comptime Event: type) type {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             errdefer arena.deinit();
             const stored = try arena.allocator().dupe(u8, encoded);
-            const parsed = std.json.parseFromSliceLeaky(Line, arena.allocator(), stored, .{}) catch |err| switch (err) {
+            const parsed = std.json.parseFromSliceLeaky(
+                Line,
+                arena.allocator(),
+                stored,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.NotRoundTrippable,
             };
@@ -623,6 +665,21 @@ pub fn Journal(comptime Event: type) type {
                 .cursor = cursor,
                 .expected = null,
             };
+        }
+
+        /// Read every record of every segment back, through the checks a
+        /// replay makes — the checksum, the envelope, the schema version and
+        /// the sequence — and report how many there were.
+        ///
+        /// This is what `Options.verify = .full` runs at `open`, and it is
+        /// what a caller runs on a journal it has reason to doubt. It costs
+        /// the log rather than one segment.
+        pub fn verify(self: *Self, io: Io) ReplayError!u64 {
+            var walk = try self.replay(io, self.log.baseSeq());
+            defer walk.deinit(io);
+            var seen: u64 = 0;
+            while (try walk.next(io)) |_| seen += 1;
+            return seen;
         }
 
         /// The newest sequence number, or zero on an empty journal.
@@ -903,6 +960,19 @@ pub fn Journal(comptime Event: type) type {
             if (seq != .integer or at != .integer or v != .integer) return error.CorruptRecord;
             if (seq.integer < 1) return error.CorruptRecord;
             const version = std.math.cast(u32, v.integer) orelse return error.CorruptRecord;
+            // The checksum, when the record carries one. A record written
+            // before 0.3.0 does not, and is read exactly as it always was.
+            if (root.object.get("c")) |claimed| {
+                if (claimed != .integer) return error.CorruptRecord;
+                const want = std.math.cast(u32, claimed.integer) orelse return error.CorruptRecord;
+                var buffer: [32]u8 = undefined;
+                const suffix = std.fmt.bufPrint(&buffer, ",\"c\":{d}}}", .{want}) catch unreachable;
+                // The checksum is the last member of a line this package
+                // wrote, so a line that does not end in the one it claims is
+                // not one -- and there is nothing to check it against.
+                if (!std.mem.endsWith(u8, line, suffix)) return error.CorruptRecord;
+                if (checksum(line[0 .. line.len - suffix.len]) != want) return error.ChecksumMismatch;
+            }
             return .{
                 .seq = @intCast(seq.integer),
                 .at = at.integer,
