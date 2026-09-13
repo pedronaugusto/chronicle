@@ -504,3 +504,135 @@ test "twenty thousand records open within a bounded time and memory" {
     try testing.expect(journal.arena.queryCapacity() < 32 * file_bytes);
     try testing.expect(journal.scratch.queryCapacity() < 64 * 1024);
 }
+
+//========================================================================
+// Fuzzing.
+//
+// A journal file is written by the program that owns it, so these are not
+// about hostile input; they are about the crash cases, which produce file
+// contents nobody chose. Under `zig build test` each of these runs its
+// corpus and nothing else, which is fast; `zig build test --fuzz` is what
+// explores from there.
+//========================================================================
+
+/// One corpus entry for a test whose first call is `Smith.slice`: a
+/// little-endian byte count and then the bytes, which is how that call reads
+/// one byte string out of the fuzzer's input.
+fn seeded(comptime body: []const u8) []const u8 {
+    comptime {
+        var entry: [4 + body.len]u8 = undefined;
+        std.mem.writeInt(u32, entry[0..4], body.len, .little);
+        @memcpy(entry[4..], body);
+        const frozen = entry;
+        return &frozen;
+    }
+}
+
+const a_record = "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"x\"}}}\n";
+
+/// Inputs worth starting from: the empty file, a whole record, a record cut
+/// off mid-write, and the shapes that have to be refused by name.
+const open_corpus = [_][]const u8{
+    seeded(""),
+    seeded("\n"),
+    seeded("\n\n"),
+    seeded("{"),
+    seeded(a_record),
+    seeded(a_record ++ a_record),
+    seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"crea"),
+    seeded("{\"seq\":0,\"at\":0,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n"),
+    seeded("{\"seq\":9223372036854775807,\"at\":0,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n"),
+    seeded("{\"seq\":1,\"at\":1,\"v\":4294967296,\"ev\":null}\n"),
+    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":-1,\"name\":null}}}\n"),
+    seeded("[[[[[[[[[[[[[[[[[[[[\n"),
+    seeded("\x00\xff\xfe\n"),
+};
+
+test "fuzz: open of arbitrary file contents, and the repair it promises" {
+    try testing.fuzz({}, fuzzOpen, .{ .corpus = &open_corpus });
+}
+
+fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
+    const io = testing.io;
+    // Bounded so that a generated run of `[` cannot recurse the JSON parser
+    // deeper than a stack holds. A journal record is not adversarial input.
+    var buffer: [1024]u8 = undefined;
+    const bytes = buffer[0..smith.slice(&buffer)];
+
+    var ws = try Workspace.init("log.jsonl");
+    defer ws.deinit();
+    try ws.write("log.jsonl", bytes);
+
+    // `.fail` is the mode that promises to leave the file as it found it.
+    if (Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail })) |untouched| {
+        var journal = untouched;
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(usize, 0), journal.dropped_bytes);
+    } else |_| {}
+    try testing.expectEqualStrings(bytes, try ws.read("log.jsonl"));
+
+    // `.drop` promises a file the next append can extend. Whatever it made
+    // of these bytes, appending to it and opening again has to agree.
+    var held: usize = 0;
+    {
+        var journal = Journal.open(testing.allocator, io, ws.path, .{}) catch |err| {
+            try testing.expect(err != error.TruncatedRecord);
+            return;
+        };
+        defer journal.deinit(io);
+        _ = journal.append(io, 2, created(2, "after the repair")) catch |err| {
+            // The one refusal a well-formed journal can still give: the last
+            // sequence number a JSON integer can hold is already taken.
+            try testing.expectEqual(error.SequenceExhausted, err);
+            return;
+        };
+        held = journal.records().len;
+    }
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
+    defer reopened.deinit(io);
+    try testing.expectEqual(held, reopened.records().len);
+    try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
+    try testing.expectEqual(reopened.records()[held - 1].seq, try reopened.lastSeq(io));
+}
+
+const snapshot_corpus = [_][]const u8{
+    seeded(""),
+    seeded("{}"),
+    seeded("{\"seq\":1,\"state\":\"\"}"),
+    seeded("{\"seq\":1,\"state\":\"aGk=\"}"),
+    seeded("{\"seq\":1,\"state\":\"not base64!\"}"),
+    seeded("{\"seq\":-1,\"state\":\"aGk=\"}"),
+    seeded("{\"state\":\"aGk=\"}"),
+    seeded("[1,2,3]"),
+};
+
+test "fuzz: openWithSnapshot over an arbitrary snapshot file" {
+    try testing.fuzz({}, fuzzSnapshot, .{ .corpus = &snapshot_corpus });
+}
+
+fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
+    const io = testing.io;
+    var buffer: [1024]u8 = undefined;
+    const bytes = buffer[0..smith.slice(&buffer)];
+
+    var ws = try Workspace.init("log.jsonl");
+    defer ws.deinit();
+    try ws.write("log.jsonl", a_record);
+    try ws.write("log.jsonl" ++ zjournal.snapshot_suffix, bytes);
+
+    // A snapshot is an optimisation. A bad one must be an error the caller
+    // can name -- never a journal that opens with a wrong starting point.
+    const opened = Journal.openWithSnapshot(testing.allocator, io, ws.path, .{}) catch |err| {
+        try testing.expectEqual(error.CorruptSnapshot, err);
+        return;
+    };
+    var journal = opened.journal;
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(usize, 1), journal.records().len);
+    if (opened.snapshot) |snapshot| {
+        // Whatever sequence number the file claimed, a cursor is clamped to
+        // what the journal holds rather than indexing past it.
+        try testing.expect(journal.since(snapshot.seq).len <= journal.records().len);
+    }
+}

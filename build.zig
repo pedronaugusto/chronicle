@@ -33,6 +33,12 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run zjournal tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
+    // Compiling without running: the step a cross-compilation check uses, and
+    // the one an editor can keep warm. It covers the tests too, which the
+    // default install step does not.
+    const check_step = b.step("check", "Compile everything without running it");
+    check_step.dependOn(&tests.step);
+
     //=====================================================================
     // Examples
     //
@@ -55,6 +61,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         b.installArtifact(example);
+        check_step.dependOn(&example.step);
         const run = b.addRunArtifact(example);
         run.step.dependOn(b.getInstallStep());
         run.setCwd(b.path("zig-out"));

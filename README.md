@@ -113,13 +113,22 @@ Exactly these three, and nothing more:
    complete neighbouring file, flushes and `fsync`s it, and then renames it
    over the destination. A crash at any moment leaves either the whole old
    file or the whole new one. `compact` always keeps the newest record, so the
-   sequence survives a reopen even when you ask it to keep nothing.
+   sequence survives a reopen even when you ask it to keep nothing, and it
+   closes the journal's own handle before the rename and reopens it after, so
+   a rename that fails leaves the old journal open and appendable.
 
 What that leaves open, stated rather than implied: zjournal does not `fsync`
 the containing directory after a rename, so a power cut immediately after
 `compact` may leave the filesystem presenting either file — both of which are
 complete journals. And a snapshot is only ever an optimisation: deleting one
 costs replay time and nothing else.
+
+**Windows is compiled but unverified.** Every target below cross-compiles, and
+CI runs the suite on a Windows runner, but the author has not watched the
+atomic replacement behave on a real NTFS volume. `compact` is written for what
+Windows requires — the destination handle is closed before the rename — and
+`std.Io.Dir.rename` replaces an existing destination on every platform. Treat
+the third promise as proved on Linux and macOS and claimed on Windows.
 
 ## What it does not do
 
@@ -135,6 +144,10 @@ costs replay time and nothing else.
   fits; if yours cannot be, this is the wrong package.
 - **No encryption, no compression, no checksums.** A record is corrupt when
   it does not parse, which is not the same as a record being intact.
+- **No hardening against a hostile file.** Records go through `std.json` with
+  its defaults. A journal is written by the program that owns it; the file
+  contents this package is built to survive are the ones a crash produces,
+  not the ones an attacker chooses.
 - **No clock.** `append` stores the `at` you pass. zjournal never reads the
   time, so a test is deterministic and a replay is honest.
 - **No network, no server, no replication.** It is a file.
@@ -147,8 +160,10 @@ One record per line, newline-terminated, in the field order written:
 {"seq":<u64>,"at":<i64>,"v":<u32>,"ev":<your event as std.json>}
 ```
 
-`seq` starts at 1 and rises by one. `at` is whatever you passed; milliseconds
-since the Unix epoch is the intended unit. `v` is `Options.schema_version`.
+`seq` starts at 1 and rises by one, up to 2^63-1 — a sequence number is a JSON
+integer, and `append` refuses with `error.SequenceExhausted` rather than write
+one that cannot be read back. `at` is whatever you passed; milliseconds since
+the Unix epoch is the intended unit. `v` is `Options.schema_version`.
 
 A snapshot lives beside the journal at `<path>.snapshot`:
 
@@ -221,14 +236,22 @@ comment stating its contract; `src/zjournal.zig` is the reference.
 ## Testing
 
 ```
-zig build test        # the suite, and the examples, which are run
-zig build examples    # the examples on their own
+zig build test          # the suite, and the examples, which are run
+zig build examples      # the examples on their own
+zig build check         # compile everything, including the tests, run nothing
+zig build test --fuzz   # the fuzz tests, without a time limit
 zig fmt --check src examples build.zig
 ```
 
 Every test runs under `std.testing.allocator` and `std.testing.io`, against
 real files in a temporary directory, in Debug, ReleaseSafe, ReleaseFast and
 ReleaseSmall.
+
+Two of them are fuzz tests, over arbitrary journal and snapshot file
+contents: `open` must answer with a journal or a named error, the `.fail`
+mode must leave the file exactly as it found it, and a `.drop` open followed
+by an `append` must produce a file that opens again cleanly. Under `zig build
+test` they run their corpus and stop, which costs milliseconds.
 
 ## License
 

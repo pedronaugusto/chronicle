@@ -19,10 +19,10 @@
 //!
 //! See `Journal` for the API, and README.md for the durability promises.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const assert = std.debug.assert;
 
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
@@ -35,6 +35,8 @@ pub const OnTruncated = enum {
 };
 
 /// Suffix of the snapshot file `Journal.snapshot` writes beside the journal.
+/// It writes `<path>` ++ `snapshot_suffix` ++ `".tmp"` first and renames that
+/// over it, so a file with the doubled suffix is stale and never read.
 pub const snapshot_suffix = ".snapshot";
 
 /// Suffix of the file `Journal.compact` writes and then renames over the
@@ -55,6 +57,24 @@ pub fn Journal(comptime Event: type) type {
     return struct {
         const Self = @This();
 
+        // Three fields are part of the API and are documented as such. The
+        // rest, below the divider, are the journal's own bookkeeping: reading
+        // them is reading an implementation, and writing them is undefined.
+
+        /// How many unterminated bytes `open` dropped from the end of the
+        /// file. Zero unless a previous writer died mid-record, and zero when
+        /// `Options.on_truncated` is `.fail`, which fails instead.
+        dropped_bytes: usize,
+        /// Whether an `append` has failed to reach the disk. Once true it
+        /// stays true, and every `append` and `compact` is refused; see
+        /// `AppendError.PersistenceFailed`. Reopening the journal is the way
+        /// back.
+        persistence_failed: bool,
+        /// The options `open` was given, unchanged.
+        options: Options,
+
+        //-------------------------------------------------------------- internals
+
         /// The allocator every non-arena allocation comes from. Owned by the
         /// caller; the journal never outlives it.
         gpa: Allocator,
@@ -65,8 +85,6 @@ pub fn Journal(comptime Event: type) type {
         /// Reset once per record while reading the file back; never holds
         /// anything a caller can see.
         scratch: std.heap.ArenaAllocator,
-        /// The options `open` was given, unchanged.
-        options: Options,
         /// The journal's path, as given to `open`. Owned by the journal.
         path: []const u8,
         file: Io.File,
@@ -78,22 +96,18 @@ pub fn Journal(comptime Event: type) type {
         changed: Io.Condition,
         /// Bumped by `nudge`: a wake with no record behind it.
         nudges: u64,
-        /// The sequence number of the newest record. Zero on an empty journal.
+        /// The sequence number of the newest record, or zero. Read it with
+        /// `lastSeq`, which takes the lock.
         seq: u64,
         /// One below the sequence number of the oldest record still held.
         /// Zero until a `compact` drops a prefix.
         base_seq: u64,
-        /// Set by the first `append` that could not reach the disk. Latched:
-        /// see `AppendError.PersistenceFailed`.
-        persistence_failed: bool,
-        /// How many unterminated bytes `open` dropped from the end of the
-        /// file. Zero unless a previous writer died mid-record.
-        dropped_bytes: usize,
-        /// Test seam. When true, `compact` writes its replacement file and
-        /// then fails with `error.InterruptedForTest` instead of renaming it
-        /// into place, so a suite can prove the write-then-rename ordering
-        /// leaves the journal intact. Leave it false.
-        fail_compact_before_rename: bool,
+        /// Test seam, and `void` outside a test build. When true, `compact`
+        /// writes its replacement file and then fails with
+        /// `error.InterruptedForTest` instead of renaming it into place, so
+        /// the suite can prove that the write-then-rename ordering leaves the
+        /// journal intact.
+        fail_compact_before_rename: if (builtin.is_test) bool else void,
 
         /// One entry of the log, as held in memory.
         ///
@@ -102,7 +116,9 @@ pub fn Journal(comptime Event: type) type {
         /// `deinit`.
         pub const Record = struct {
             /// Position in the log. The first record of a journal that has
-            /// never been compacted is 1, and it rises by one per record.
+            /// never been compacted is 1, and it rises by one per record. It
+            /// is written as a JSON integer, so `maxInt(i64)` is the last one
+            /// a journal can hold; see `AppendError.SequenceExhausted`.
             seq: u64,
             /// Whatever the appender passed as `at`. zjournal never reads a
             /// clock; milliseconds since the Unix epoch is the intended unit.
@@ -217,8 +233,12 @@ pub fn Journal(comptime Event: type) type {
         ///   order. Reopen the journal to resume.
         /// * `NotRoundTrippable` — the event was written to JSON but did not
         ///   parse back as `Event`. Nothing was written to the file.
+        /// * `SequenceExhausted` — the newest sequence number is
+        ///   `maxInt(i64)`, and one more could not be read back, because a
+        ///   sequence number is a JSON integer.
         pub const AppendError = Allocator.Error || Io.Cancelable || Io.Writer.Error ||
-            Io.File.SyncError || error{ PersistenceFailed, NotRoundTrippable };
+            Io.File.SyncError ||
+            error{ PersistenceFailed, NotRoundTrippable, SequenceExhausted };
 
         /// Errors from `subscribe` and `subscribeFrom`.
         pub const SubscribeError = Allocator.Error || Io.Cancelable;
@@ -231,7 +251,8 @@ pub fn Journal(comptime Event: type) type {
         /// so every `OpenError` is possible; `InterruptedForTest` comes only
         /// from `fail_compact_before_rename`.
         pub const CompactError = OpenError || Io.Writer.Error || Io.File.SyncError ||
-            Io.Dir.RenameError || error{ PersistenceFailed, InterruptedForTest };
+            Io.Dir.RenameError || error{PersistenceFailed} ||
+            if (builtin.is_test) error{InterruptedForTest} else error{};
 
         /// The line, as written. Field order here is the field order on disk.
         const Line = struct {
@@ -298,7 +319,7 @@ pub fn Journal(comptime Event: type) type {
                 .base_seq = 0,
                 .persistence_failed = false,
                 .dropped_bytes = 0,
-                .fail_compact_before_rename = false,
+                .fail_compact_before_rename = if (builtin.is_test) false else {},
             };
             errdefer {
                 self.arena.deinit();
@@ -362,6 +383,7 @@ pub fn Journal(comptime Event: type) type {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             if (self.persistence_failed) return error.PersistenceFailed;
+            if (self.seq >= std.math.maxInt(i64)) return error.SequenceExhausted;
 
             const next = self.seq + 1;
             const line: Line = .{ .seq = next, .at = at, .v = self.options.schema_version, .ev = event };
@@ -401,7 +423,7 @@ pub fn Journal(comptime Event: type) type {
             return next;
         }
 
-        /// Every record held in memory, oldest first.
+        /// Every record held in memory, oldest first — `since(0)`, named.
         ///
         /// The slice is valid until `compact` or `deinit`, and its length
         /// grows with `append`. Call it from the task that appends, or under
@@ -414,7 +436,7 @@ pub fn Journal(comptime Event: type) type {
         /// The records after `cursor`, which may be none.
         ///
         /// A cursor is where a reader got to, so `since(0)` is everything and
-        /// `since(lastSeq())` is nothing. A cursor from before a `compact` —
+        /// a cursor at the newest sequence number is nothing. A cursor from before a `compact` —
         /// or from a journal this process has not caught up with — yields
         /// what is still held rather than an error; compare `records()[0].seq`
         /// against the cursor to detect the gap.
@@ -542,6 +564,9 @@ pub fn Journal(comptime Event: type) type {
         /// flushed and `fsync`ed, and then renamed over the journal. The
         /// rename is atomic, so an interrupted `compact` leaves either the
         /// whole old journal or the whole new one, never a partial file.
+        /// The journal's own handle is closed before the rename and reopened
+        /// after it, because Windows refuses to rename over an open file; a
+        /// rename that fails leaves the old journal open and appendable.
         ///
         /// Every slice the journal handed out before this call is invalid
         /// afterwards; subscribed sinks are not called again.
@@ -556,6 +581,10 @@ pub fn Journal(comptime Event: type) type {
             const temporary = try self.suffixedPath(compact_suffix);
             defer self.gpa.free(temporary);
 
+            // The journal's own buffer is free to borrow: every `append`
+            // flushes, and this makes that true even if one ever does not.
+            try self.writer.interface.flush();
+
             {
                 const out = try Io.Dir.cwd().createFile(io, temporary, .{ .truncate = true });
                 // Deleting comes after closing: an open file cannot be
@@ -564,9 +593,6 @@ pub fn Journal(comptime Event: type) type {
                 var closed = false;
                 errdefer if (!closed) out.close(io);
 
-                // `append` flushes every record, so the journal's own buffer
-                // is empty and the replacement can borrow it.
-                assert(self.writer.interface.end == 0);
                 var buffer = out.writer(io, self.write_buf);
                 for (self.list.items[self.sinceIndex(keep_after)..]) |record| {
                     try buffer.interface.writeAll(record.bytes);
@@ -578,13 +604,34 @@ pub fn Journal(comptime Event: type) type {
                 closed = true;
             }
 
-            if (self.fail_compact_before_rename) {
-                deletePath(io, temporary) catch {};
-                return error.InterruptedForTest;
+            if (builtin.is_test) {
+                if (self.fail_compact_before_rename) {
+                    deletePath(io, temporary) catch {};
+                    return error.InterruptedForTest;
+                }
             }
-            try Io.Dir.cwd().rename(temporary, .cwd(), self.path, io);
 
+            // Close before renaming, and put the old journal back in hand if
+            // the rename does not happen, so a failed compaction costs the
+            // caller nothing but the error.
+            const resume_pos = self.writer.pos;
             self.file.close(io);
+            Io.Dir.cwd().rename(temporary, .cwd(), self.path, io) catch |rename_err| {
+                self.file = Io.Dir.cwd().createFile(io, self.path, .{
+                    .read = true,
+                    .truncate = false,
+                }) catch {
+                    // The journal is no longer writable by this process; say
+                    // so the way a lost write says it.
+                    self.persistence_failed = true;
+                    return rename_err;
+                };
+                self.writer = self.file.writer(io, self.write_buf);
+                self.writer.pos = resume_pos;
+                deletePath(io, temporary) catch {};
+                return rename_err;
+            };
+
             _ = self.arena.reset(.free_all);
             self.list = .empty;
             self.seq = 0;
@@ -614,7 +661,10 @@ pub fn Journal(comptime Event: type) type {
             self.writer.pos = length;
             if (length == 0) return;
 
-            const buffer = try self.arena.allocator().alloc(u8, @intCast(length));
+            // A journal larger than this address space is out of memory, not
+            // a panic: `@intCast` here would be a crash on a 32-bit host.
+            const size = std.math.cast(usize, length) orelse return error.OutOfMemory;
+            const buffer = try self.arena.allocator().alloc(u8, size);
             const read = try self.file.readPositionalAll(io, buffer, 0);
             var bytes = buffer[0..read];
 
@@ -742,9 +792,12 @@ pub fn Journal(comptime Event: type) type {
     };
 }
 
+/// Errors from `writeFileDurably`.
+const DurableWriteError = Io.File.OpenError || Io.Writer.Error || Io.File.SyncError;
+
 /// Create `path`, write `bytes`, flush, `fsync`, close. On any failure the
 /// file is left behind for the caller to remove.
-fn writeFileDurably(io: Io, path: []const u8, bytes: []const u8) (Io.File.OpenError || Io.Writer.Error || Io.File.SyncError)!void {
+fn writeFileDurably(io: Io, path: []const u8, bytes: []const u8) DurableWriteError!void {
     const file = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
     defer file.close(io);
     var buffer: [4096]u8 = undefined;

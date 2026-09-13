@@ -26,3 +26,5 @@ back, with:
   compacted to empty would start counting from one again.
 - Every file operation and the wait primitive through `std.Io`, so the suite
   runs on `std.testing.io` and the package runs on a threaded one.
+- Fuzz tests over arbitrary journal and snapshot file contents, because the
+  file shapes this package exists to survive are the ones nobody chose.
