@@ -49,6 +49,8 @@ pub const snapshot_name = Log.snapshot_name;
 /// The extensions of the two files that make up one segment.
 pub const segment_extension = Log.segment_extension;
 pub const index_extension = Log.index_extension;
+/// A named reader's cursor file is its name plus this. See `Journal.Tailer`.
+pub const cursor_extension = Log.cursor_extension;
 
 /// How much of a journal `open` reads back before it returns.
 pub const Verify = enum {
@@ -331,6 +333,16 @@ pub fn Journal(comptime Event: type) type {
 
         /// Errors from `snapshot`.
         pub const SnapshotError = Allocator.Error || Log.SnapshotError;
+
+        /// Errors from `tailer` and from a `Tailer`'s own calls.
+        ///
+        /// * `InvalidName` — a tailer's name becomes a filename beside the
+        ///   log, so it has to be one path component of letters, digits, `-`
+        ///   and `_`, and no more than 64 of them.
+        /// * `CorruptCursor` — the cursor file is not the object `commit`
+        ///   writes. A missing one is not an error; it is a cursor of zero.
+        pub const TailerError = Allocator.Error || Io.Cancelable ||
+            Log.WriteFileError || error{ InvalidName, CorruptCursor };
 
         /// Errors from `compact`. It re-reads the journal it has just written,
         /// so every `OpenError` is possible.
@@ -840,6 +852,158 @@ pub fn Journal(comptime Event: type) type {
                 }
             }
             for (self.since(delivered).records) |record| sink.f(sink.ctx, record);
+        }
+
+        /// A named reader and the cursor it has committed.
+        ///
+        /// A cursor is a `u64` — the sequence number a reader has finished
+        /// with — and this is that number with a name and somewhere to live:
+        /// `<path>/<name>.cursor`, replaced whole the way a snapshot is, so a
+        /// reader that restarts picks up where it left off without the program
+        /// around it having to keep the number anywhere.
+        ///
+        /// **A tailer writes nothing to the log.** Its cursor file is the one
+        /// file a journal opened with `Options.access = .read` creates, and it
+        /// creates no other: no repair, no index, no compaction, no record. So
+        /// any number of readers, under any number of names, in any number of
+        /// processes, beside a live writer.
+        ///
+        /// Nothing advances the cursor for you. `replay` reads from where it
+        /// is, and `commit` is what moves it — after the records have been
+        /// handled, so that a crash in between replays them again rather than
+        /// losing them. It may move backwards, which is how a reader is asked
+        /// to do a stretch of history over.
+        pub const Tailer = struct {
+            journal: *Self,
+            /// This reader's name, owned by the tailer.
+            name: []const u8,
+            /// Where it has got to. Zero for a name that has never committed
+            /// one, and left where it was by a `compact` that dropped past
+            /// it — compare it against `oldestSeq` to see what has gone.
+            cursor: u64,
+
+            /// Release the name. The cursor file stays on the disk; that is
+            /// the point of it.
+            pub fn deinit(tail: *Tailer) void {
+                tail.journal.gpa.free(tail.name);
+                tail.* = undefined;
+            }
+
+            /// A walk over every record after the committed cursor, read from
+            /// the disk. `Journal.replay(io, tailer.cursor)`, named.
+            pub fn replay(tail: *Tailer, io: Io) ReplayError!Replay {
+                return tail.journal.replay(io, tail.cursor);
+            }
+
+            /// Record `seq` as where this reader has got to, durably, and move
+            /// `cursor` to it.
+            ///
+            /// The file is written beside the log and renamed into place, so a
+            /// crash leaves either the whole old cursor or the whole new one —
+            /// never a number that was never reached.
+            ///
+            /// Safe to call from any task or thread.
+            pub fn commit(tail: *Tailer, io: Io, seq: u64) TailerError!void {
+                const self = tail.journal;
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+
+                const document = try std.json.Stringify.valueAlloc(
+                    self.gpa,
+                    .{ .seq = seq },
+                    .{},
+                );
+                defer self.gpa.free(document);
+
+                const file = try cursorName(self.gpa, tail.name);
+                defer self.gpa.free(file);
+                try self.log.writeAtomic(io, file, document);
+                tail.cursor = seq;
+            }
+
+            /// Remove this reader's cursor file, so that the next `tailer`
+            /// under this name starts from zero. The tailer itself is left at
+            /// the cursor it had; `deinit` is still how it ends.
+            ///
+            /// Safe to call from any task or thread.
+            pub fn forget(tail: *Tailer, io: Io) TailerError!void {
+                const self = tail.journal;
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                const file = try cursorName(self.gpa, tail.name);
+                defer self.gpa.free(file);
+                self.log.dir.deleteFile(io, file) catch |err| switch (err) {
+                    error.FileNotFound => return,
+                    error.Canceled => return error.Canceled,
+                    else => |e| return e,
+                };
+                try self.log.syncDir(io);
+            }
+        };
+
+        /// Open the named reader `name`, reading back the cursor it last
+        /// committed — zero if it has never committed one.
+        ///
+        /// The name becomes a filename beside the log, so it is one path
+        /// component of letters, digits, `-` and `_`; anything else is
+        /// `error.InvalidName`. Release the handle with `Tailer.deinit`, which
+        /// leaves the cursor file where it is.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn tailer(self: *Self, io: Io, name: []const u8) TailerError!Tailer {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            if (!validTailerName(name)) return error.InvalidName;
+            const owned = try self.gpa.dupe(u8, name);
+            errdefer self.gpa.free(owned);
+            return .{ .journal = self, .name = owned, .cursor = try self.readCursor(io, owned) };
+        }
+
+        /// One path component of letters, digits, `-` and `_`: the characters
+        /// every filesystem this package runs on agrees about, and none of the
+        /// ones — a separator, a dot, a colon — that would let a name reach out
+        /// of the journal's directory or name a file already in it.
+        fn validTailerName(name: []const u8) bool {
+            if (name.len == 0 or name.len > 64) return false;
+            for (name) |byte| switch (byte) {
+                'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+                else => return false,
+            };
+            return true;
+        }
+
+        fn cursorName(gpa: Allocator, name: []const u8) Allocator.Error![]u8 {
+            return std.mem.concat(gpa, u8, &.{ name, cursor_extension });
+        }
+
+        fn readCursor(self: *Self, io: Io, name: []const u8) TailerError!u64 {
+            const file = try cursorName(self.gpa, name);
+            defer self.gpa.free(file);
+
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena.deinit();
+            const bytes = self.log.dir.readFileAlloc(
+                io,
+                file,
+                arena.allocator(),
+                .unlimited,
+            ) catch |err| switch (err) {
+                error.FileNotFound => return 0,
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                else => return error.CorruptCursor,
+            };
+            const Document = struct { seq: u64 };
+            const document = std.json.parseFromSliceLeaky(
+                Document,
+                arena.allocator(),
+                bytes,
+                .{},
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.CorruptCursor,
+            };
+            return document.seq;
         }
 
         //====================================================================

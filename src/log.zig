@@ -34,10 +34,13 @@ const can_sync_dir = builtin.os.tag != .windows;
 /// locking a data file instead would mean the lock changed identity every time
 /// a segment rotated.
 pub const lock_name = "lock";
-/// The snapshot `Journal.snapshot` writes, and the neighbouring file it goes
-/// to first. A file with the temporary name is stale and is never read.
+/// The snapshot `Journal.snapshot` writes. A file with the temporary name
+/// beside it is stale and is never read.
 pub const snapshot_name = "snapshot";
-pub const snapshot_temporary_name = "snapshot.tmp";
+
+/// A named reader's cursor: `<name>` plus this. It is written beside the log
+/// and is not part of it — nothing here reads one.
+pub const cursor_extension = ".cursor";
 
 /// A segment's name is the sequence number of its first record, zero-padded so
 /// that the directory sorts in sequence order, plus one of these.
@@ -135,8 +138,10 @@ pub const CompactError = OpenError || AppendError || Io.Dir.RenameError;
 
 pub const TruncateError = CompactError || error{SeqTooOld};
 
-pub const SnapshotError = Io.Cancelable || Io.File.OpenError || Io.Writer.Error ||
-    Io.File.SyncError || Io.Dir.RenameError || Io.Dir.DeleteFileError || error{ReadOnly};
+pub const WriteFileError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
+    Io.Writer.Error || Io.File.SyncError || Io.Dir.RenameError || Io.Dir.DeleteFileError;
+
+pub const SnapshotError = WriteFileError || error{ReadOnly};
 
 gpa: Allocator,
 /// The log's directory, as given to `open`. Owned.
@@ -866,7 +871,7 @@ fn closeActive(log: *Log, io: Io) void {
 /// `fsync` the log's directory, so that a file this process created or renamed
 /// is still named after a power cut. Windows has no equivalent; there the call
 /// is nothing, and README.md says so.
-fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
+pub fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
     if (!can_sync_dir) return;
     const as_file: Io.File = .{ .handle = log.dir.handle, .flags = .{ .nonblocking = false } };
     as_file.sync(io) catch |err| switch (err) {
@@ -1047,17 +1052,22 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
 }
 
 //========================================================================
-// The snapshot beside the log.
+// Whole files beside the log.
 //========================================================================
 
-/// Write `bytes` to a neighbouring file, `fsync` it, rename it over
-/// `<path>/snapshot` and `fsync` the directory, so a reader sees either the
-/// whole old snapshot or the whole new one.
-pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {
-    if (log.options.access == .read) return error.ReadOnly;
-    errdefer log.dir.deleteFile(io, snapshot_temporary_name) catch {};
+/// Write `bytes` to a neighbouring file, `fsync` it, rename it over `name` and
+/// `fsync` the directory, so a reader sees either the whole old file or the
+/// whole new one.
+///
+/// This checks nothing about `Options.access`: whether a file is part of the
+/// log is the caller's to know. A snapshot is; a named reader's cursor is not,
+/// which is what lets a `.read` log keep one.
+pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) WriteFileError!void {
+    const temporary = try std.mem.concat(log.gpa, u8, &.{ name, temporary_extension });
+    defer log.gpa.free(temporary);
+    errdefer log.dir.deleteFile(io, temporary) catch {};
     {
-        const file = try log.dir.createFile(io, snapshot_temporary_name, .{ .truncate = true });
+        const file = try log.dir.createFile(io, temporary, .{ .truncate = true });
         defer file.close(io);
         var buffer: [4096]u8 = undefined;
         var writer = file.writer(io, &buffer);
@@ -1065,8 +1075,14 @@ pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {
         try writer.interface.flush();
         try file.sync(io);
     }
-    try log.dir.rename(snapshot_temporary_name, log.dir, snapshot_name, io);
+    try log.dir.rename(temporary, log.dir, name, io);
     try log.syncDir(io);
+}
+
+/// `writeAtomic` over `<path>/snapshot`, which only a writer may replace.
+pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {
+    if (log.options.access == .read) return error.ReadOnly;
+    return log.writeAtomic(io, snapshot_name, bytes);
 }
 
 //========================================================================

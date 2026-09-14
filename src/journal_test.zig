@@ -818,6 +818,153 @@ test "subscribe folds a history longer than the tail, streaming from the disk" {
 }
 
 //========================================================================
+// Named readers.
+//========================================================================
+
+test "a tailer remembers where it got to, in a file of its own" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer journal.deinit(io);
+    for (1..10) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+
+    // A name that has never committed a cursor starts at the beginning.
+    var reports = try journal.tailer(io, "reports");
+    defer reports.deinit();
+    try testing.expectEqual(@as(u64, 0), reports.cursor);
+    try testing.expect(!ws.exists(try ws.sub("reports.cursor")));
+
+    // Read some records, then say so.
+    {
+        var walk = try reports.replay(io);
+        defer walk.deinit(io);
+        var seen: u64 = 0;
+        while (try walk.next(io)) |record| {
+            seen = record.seq;
+            if (seen == 4) break;
+        }
+        try reports.commit(io, seen);
+    }
+    try testing.expectEqual(@as(u64, 4), reports.cursor);
+    try testing.expectEqualStrings("{\"seq\":4}", try ws.read(try ws.sub("reports.cursor")));
+    try testing.expect(!ws.exists(try ws.sub("reports.cursor.tmp")));
+
+    // A tailer opened again under the same name is that reader again, and it
+    // reads on from where it stopped.
+    var again = try journal.tailer(io, "reports");
+    defer again.deinit();
+    try testing.expectEqual(@as(u64, 4), again.cursor);
+    var walk = try again.replay(io);
+    defer walk.deinit(io);
+    const next = (try walk.next(io)) orelse return error.TestExpectedRecord;
+    try testing.expectEqual(@as(u64, 5), next.seq);
+
+    // Two names are two readers, and neither moves the other.
+    var audit = try journal.tailer(io, "audit");
+    defer audit.deinit();
+    try testing.expectEqual(@as(u64, 0), audit.cursor);
+    try audit.commit(io, 9);
+    var unmoved = try journal.tailer(io, "reports");
+    defer unmoved.deinit();
+    try testing.expectEqual(@as(u64, 4), unmoved.cursor);
+
+    // A cursor may go backwards, which is how a reader is asked to do a
+    // stretch of history over.
+    try audit.commit(io, 2);
+    try testing.expectEqual(@as(u64, 2), audit.cursor);
+
+    // And forgetting a name puts it back where it started.
+    try audit.forget(io);
+    try testing.expect(!ws.exists(try ws.sub("audit.cursor")));
+    var fresh = try journal.tailer(io, "audit");
+    defer fresh.deinit();
+    try testing.expectEqual(@as(u64, 0), fresh.cursor);
+
+    // The cursor files sit beside the log and are not part of it.
+    try testing.expectEqual(@as(usize, 3), journal.segmentCount());
+    try testing.expectEqual(@as(u64, 9), try journal.verify(io));
+}
+
+test "a reader's tailer writes its cursor and nothing else" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var writer = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer writer.deinit(io);
+    for (1..7) |i| _ = try writer.append(io, @intCast(i), created(@intCast(i), "n"));
+
+    // A `.read` journal takes no lock and writes nothing to the log. Its
+    // tailer's cursor is the one file it may create.
+    var reader = try Journal.open(testing.allocator, io, ws.path, .{
+        .access = .read,
+        .tail_records = 1024,
+    });
+    defer reader.deinit(io);
+
+    var before: [8][]const u8 = undefined;
+    var count: usize = 0;
+    {
+        var it = ws.root.openDir(io, "log", .{ .iterate = true }) catch unreachable;
+        defer it.close(io);
+        var walk = it.iterate();
+        while (try walk.next(io)) |entry| : (count += 1) {
+            before[count] = try ws.arena.allocator().dupe(u8, entry.name);
+        }
+    }
+
+    var follower = try reader.tailer(io, "follower");
+    defer follower.deinit();
+    try follower.commit(io, 6);
+    try testing.expectEqualStrings("{\"seq\":6}", try ws.read(try ws.sub("follower.cursor")));
+
+    // Exactly one new name in the directory, and it is the cursor.
+    var added: usize = 0;
+    {
+        var it = ws.root.openDir(io, "log", .{ .iterate = true }) catch unreachable;
+        defer it.close(io);
+        var walk = it.iterate();
+        while (try walk.next(io)) |entry| {
+            var known = false;
+            for (before[0..count]) |name| known = known or std.mem.eql(u8, name, entry.name);
+            if (!known) {
+                added += 1;
+                try testing.expectEqualStrings("follower.cursor", entry.name);
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), added);
+
+    // Everything else a reader is refused is still refused.
+    try testing.expectError(error.ReadOnly, reader.append(io, 7, created(7, "no")));
+    try testing.expectError(error.ReadOnly, reader.snapshot(io, "no"));
+}
+
+test "a tailer's name has to be one that can be a file" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    _ = try journal.append(io, 1, created(1, "n"));
+
+    for ([_][]const u8{ "", "..", "a/b", "a\\b", ".hidden", "with space", "sub/dir", "a" ** 65 }) |name| {
+        try testing.expectError(error.InvalidName, journal.tailer(io, name));
+    }
+    var fine = try journal.tailer(io, "a_fine-Name9");
+    defer fine.deinit();
+    try testing.expectEqual(@as(u64, 0), fine.cursor);
+
+    // A cursor file that is not the object `commit` writes is named, never
+    // read as a number that was never reached.
+    try ws.write(try ws.sub("broken.cursor"), "{\"seq\":");
+    try testing.expectError(error.CorruptCursor, journal.tailer(io, "broken"));
+}
+
+//========================================================================
 // The index.
 //========================================================================
 

@@ -17,6 +17,15 @@ New:
   never sees a record the disk does not have. `Entry` is the pair `append`
   takes as two arguments.
 
+- **`Tailer`.** A named reader whose cursor lives in `<path>/<name>.cursor`,
+  beside the log: `tailer(io, name)` reads back the number that name last
+  committed, `Tailer.replay` walks from it, `Tailer.commit` moves it, and
+  `Tailer.forget` removes the file. The cursor is written to a neighbouring
+  file and renamed into place, so a crash leaves either the whole old number
+  or the whole new one. It is the one file a journal opened with
+  `Options.access = .read` writes: still nothing to the log, so a named reader
+  is safe beside the writer and beside every other named reader.
+
 ## 0.3.0
 
 A record that can say whether it is still the record that was written, and a

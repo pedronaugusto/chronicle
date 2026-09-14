@@ -357,6 +357,7 @@ with no re-encoding.
 | `oldestSeq()` | The oldest one still held. |
 | `segmentCount()` | How many files the log is spread over. |
 | `refresh(io)` | Read the directory again — how a reader tails a writer. |
+| `tailer(io, name)` | A named reader, with the cursor it last committed. |
 | `subscribe(io, sink)` | Fold every record, from the disk and then live. |
 | `subscribeFrom(io, sink, cursor)` | The same, starting after a snapshot. |
 | `snapshot(io, state_bytes)` | Write the fold out beside the log. |
@@ -366,9 +367,9 @@ with no re-encoding.
 | `verify(io)` | Read every record of every segment through every check. |
 | `stats(io)` | Segments, records, and the bytes they take. |
 
-Plus the types `Record`, `Entry`, `Window`, `Replay`, `Sink`, `Options`,
-`Snapshot`, `Opened`, `Migrate`, `Stats`, `Sync`, `Verify`, and one named error
-set per operation. Every public
+Plus the types `Record`, `Entry`, `Window`, `Replay`, `Tailer`, `Sink`,
+`Options`, `Snapshot`, `Opened`, `Migrate`, `Stats`, `Sync`, `Verify`, and one
+named error set per operation. Every public
 declaration carries a doc comment stating its contract; `src/chronicle.zig` is
 the reference, and `src/log.zig` is the segment store under it.
 
