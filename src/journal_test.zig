@@ -52,28 +52,73 @@ fn created(id: u32, name: []const u8) Event {
     return .{ .created = .{ .id = id, .name = name } };
 }
 
+/// This process's identifier — the one thing a worker forked from the test
+/// runner does not share with the runner or with its siblings.
+fn processId() u64 {
+    if (builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    return @intCast(std.posix.system.getpid());
+}
+
+/// Counts the workspaces this process has made, so that two of them in the
+/// same test binary cannot share a name either.
+var workspaces: std.atomic.Value(u64) = .init(0);
+
+/// A directory name no other process can choose.
+///
+/// `std.testing.tmpDir` names its directory from the test runner's random
+/// stream. A fuzzing run forks several workers, each inheriting that stream at
+/// the point it was forked, so every worker asks for the same directory in the
+/// same order: one of them removes the directory another is working in, and
+/// the failure that comes back is whatever the loser happened to be doing —
+/// `error.FileNotFound`, `error.Locked`, `error.BadPathName`. The process id
+/// and a counter are unique without depending on randomness at all; the
+/// trailing bytes come from `randomSecure`, which reads fresh entropy rather
+/// than a stored state a fork could have copied, so a directory a crashed run
+/// left behind is not picked up either.
+fn workspaceName(buffer: *[64]u8) []const u8 {
+    var fresh: [8]u8 = undefined;
+    testing.io.randomSecure(&fresh) catch testing.io.random(&fresh);
+    return std.fmt.bufPrint(buffer, ".zig-cache/tmp/chronicle-{d}-{d}-{x}", .{
+        processId(),
+        workspaces.fetchAdd(1, .monotonic),
+        std.mem.readInt(u64, &fresh, .little),
+    }) catch unreachable;
+}
+
 /// A temporary directory plus the absolute path of a journal inside it, torn
 /// down together. `sub` names a file relative to the temporary directory, so a
 /// test can write the file shapes a crash produces and open them.
 const Workspace = struct {
-    tmp: testing.TmpDir,
+    root: Io.Dir,
     arena: std.heap.ArenaAllocator,
     name: []const u8,
     path: []const u8,
+    /// Where `root` is, relative to the current directory, for `deleteTree`.
+    root_path: []const u8,
 
     fn init(name: []const u8) !Workspace {
-        var tmp = testing.tmpDir(.{});
-        errdefer tmp.cleanup();
+        const io = testing.io;
         var arena: std.heap.ArenaAllocator = .init(testing.allocator);
         errdefer arena.deinit();
-        const root = try tmp.dir.realPathFileAlloc(testing.io, ".", arena.allocator());
-        const path = try std.fs.path.join(arena.allocator(), &.{ root, name });
-        return .{ .tmp = tmp, .arena = arena, .name = name, .path = path };
+
+        var buffer: [64]u8 = undefined;
+        const root_path = try arena.allocator().dupe(u8, workspaceName(&buffer));
+        const cwd: Io.Dir = .cwd();
+        try cwd.createDirPath(io, root_path);
+        errdefer cwd.deleteTree(io, root_path) catch {};
+        const root = try cwd.openDir(io, root_path, .{ .iterate = true });
+        errdefer root.close(io);
+
+        const absolute = try root.realPathFileAlloc(io, ".", arena.allocator());
+        const path = try std.fs.path.join(arena.allocator(), &.{ absolute, name });
+        return .{ .root = root, .arena = arena, .name = name, .path = path, .root_path = root_path };
     }
 
     fn deinit(self: *Workspace) void {
+        const io = testing.io;
+        self.root.close(io);
+        Io.Dir.cwd().deleteTree(io, self.root_path) catch {};
         self.arena.deinit();
-        self.tmp.cleanup();
     }
 
     /// `<journal>/<file>`, relative to the temporary directory.
@@ -92,16 +137,16 @@ const Workspace = struct {
     }
 
     fn read(self: *Workspace, sub_path: []const u8) ![]u8 {
-        return self.tmp.dir.readFileAlloc(testing.io, sub_path, self.arena.allocator(), .unlimited);
+        return self.root.readFileAlloc(testing.io, sub_path, self.arena.allocator(), .unlimited);
     }
 
     fn write(self: *Workspace, sub_path: []const u8, data: []const u8) !void {
-        self.tmp.dir.createDirPath(testing.io, self.name) catch {};
-        return self.tmp.dir.writeFile(testing.io, .{ .sub_path = sub_path, .data = data });
+        self.root.createDirPath(testing.io, self.name) catch {};
+        return self.root.writeFile(testing.io, .{ .sub_path = sub_path, .data = data });
     }
 
     fn exists(self: *Workspace, sub_path: []const u8) bool {
-        self.tmp.dir.access(testing.io, sub_path, .{}) catch return false;
+        self.root.access(testing.io, sub_path, .{}) catch return false;
         return true;
     }
 };
@@ -685,7 +730,7 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     }
 
     // An index a crash never finished, and one from a different segment.
-    try ws.tmp.dir.deleteFile(io, try ws.index(1));
+    try ws.root.deleteFile(io, try ws.index(1));
     try ws.write(try ws.index(6), "chridx\x01\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
 
     var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 2));
