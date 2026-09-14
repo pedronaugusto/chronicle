@@ -115,7 +115,7 @@ A journal is a directory, and `path` names it:
 ledger/
   lock                          zero bytes; the writer's advisory lock
   00000000000000000001.log      records 1..800
-  00000000000000000001.idx      one byte offset per record
+  00000000000000000001.idx      a byte offset and a timestamp per record
   00000000000000000801.log      records 801..    <- the active segment
   00000000000000000801.idx
   snapshot                      whatever you last handed to `snapshot`
@@ -136,10 +136,12 @@ does most of the work here:
   numbering continues with no record left to carry it.
 
 The index is a cache and is treated as one: a header naming the segment length
-it was built from, then one little-endian `u64` per record. It is checked
-against that length and against the sequence number of the record at its last
-offset, and anything that disagrees is rebuilt from the segment. Deleting every
-`.idx` file costs one scan per segment and nothing else.
+it was built from and the lowest and highest timestamp in it, then a byte
+offset and a timestamp per record. It is checked against that length and
+against the sequence number of the record at its last offset, and anything that
+disagrees — including an index in an older format — is rebuilt from the
+segment. Deleting every `.idx` file costs one scan per segment and nothing
+else.
 
 ## The durability promises
 
@@ -282,9 +284,13 @@ snapshot format having an opinion about it. `seq` is the journal's newest
 sequence number at the moment the snapshot was taken: restore the state, then
 replay only the records after it.
 
-An index is a sixteen-byte header — the magic `chridx\x01\n`, then the
-segment length it describes as a little-endian `u64`, zero while that segment
-is still being appended to — followed by one little-endian `u64` per record.
+An index is a thirty-two-byte header — the magic `chridx\x02\n`, then three
+little-endian integers: the segment length it describes as a `u64`, zero while
+that segment is still being appended to, and the lowest and highest `at` in the
+segment as `i64`s — followed by one sixteen-byte entry per record: the record's
+byte offset as a `u64` and its `at` as an `i64`. The timestamps are what
+`seqAtOrAfter` reads, and the pair in the header is what lets it skip a whole
+segment without opening it.
 
 ## Memory
 
@@ -354,6 +360,7 @@ with no re-encoding.
 | `replay(io, cursor)` | A walk over every record after `cursor`, from the disk. |
 | `nudge(io)` | Wake the waiters with no record behind it. |
 | `lastSeq(io)` | The newest sequence number, or zero. |
+| `seqAtOrAfter(io, at)` | The lowest sequence number stamped at or after `at`. |
 | `oldestSeq()` | The oldest one still held. |
 | `segmentCount()` | How many files the log is spread over. |
 | `refresh(io)` | Read the directory again — how a reader tails a writer. |

@@ -327,6 +327,10 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `replay`, and from the `Replay` it returns.
         pub const ReplayError = ReadError;
 
+        /// Errors from `seqAtOrAfter`, which may have to rebuild an index
+        /// before it can answer and so can fail at everything `open` can.
+        pub const SeekError = OpenError;
+
         /// Errors from `subscribe` and `subscribeFrom`, which replay the
         /// records a cursor has missed before they register the sink.
         pub const SubscribeError = ReplayError || Io.Cancelable;
@@ -522,7 +526,7 @@ pub fn Journal(comptime Event: type) type {
 
             {
                 errdefer self.persistence_failed = true;
-                try self.log.appendLine(io, built.record.bytes);
+                try self.log.appendLine(io, built.record.bytes, built.record.at);
             }
             published = true;
 
@@ -583,7 +587,7 @@ pub fn Journal(comptime Event: type) type {
 
             {
                 errdefer self.persistence_failed = true;
-                for (built.items) |item| try self.log.stageLine(io, item.record.bytes);
+                for (built.items) |item| try self.log.stageLine(io, item.record.bytes, item.record.at);
                 try self.log.commit(io);
             }
             published = true;
@@ -747,6 +751,38 @@ pub fn Journal(comptime Event: type) type {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             return self.seq;
+        }
+
+        /// The lowest sequence number whose record's timestamp is at or after
+        /// `at`, or null when no record in the log has one.
+        ///
+        /// `at` is compared against the `at` each record was appended with —
+        /// chronicle never reads a clock, so this is a search over the numbers
+        /// you stored, in whatever unit you stored them in.
+        ///
+        /// The timestamps are not assumed to rise with the sequence numbers,
+        /// because nothing makes a caller pass them in order. So the index
+        /// carries each record's `at` beside its offset and its header carries
+        /// the lowest and the highest in the segment: a segment whose highest
+        /// is below `at` cannot hold a record that qualifies and is skipped
+        /// without its file being opened, and one that is not skipped is
+        /// answered from its index. The active segment's index is not sealed
+        /// yet, so that one is walked — bounded by
+        /// `Options.max_segment_bytes`, and only when its own timestamps say a
+        /// record could be in there.
+        ///
+        /// An index that is missing, stale or from an older format is rebuilt
+        /// on the way, as every other read does; a journal opened with
+        /// `Options.access = .read` cannot write one and walks the segment
+        /// instead. A record carrying no readable `at` is
+        /// `error.CorruptRecord`, because a lookup by time cannot step over a
+        /// record that has no time.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn seqAtOrAfter(self: *Self, io: Io, at: i64) SeekError!?u64 {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            return self.log.seqAtOrAfter(io, at);
         }
 
         /// Read the directory again: pick up segments another process has

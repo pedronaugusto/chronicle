@@ -979,7 +979,9 @@ test "a missing index is rebuilt and a stale one is not trusted" {
         for (1..21) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
 
-    // An index a crash never finished, and one from a different segment.
+    // An index a crash never finished, and one in the format an older
+    // version wrote -- which is stale by the same rule and rebuilt the same
+    // way, so an old journal opens and keeps working.
     try ws.root.deleteFile(io, try ws.index(1));
     try ws.write(try ws.index(6), "chridx\x01\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
 
@@ -995,9 +997,15 @@ test "a missing index is rebuilt and a stale one is not trusted" {
         try testing.expectEqual(cursor + 1, record.seq);
     }
 
-    // The missing one was rebuilt on the way, and it describes its segment.
+    // The missing one was rebuilt on the way, and it describes its segment:
+    // a thirty-two byte header and sixteen bytes -- an offset and a
+    // timestamp -- for each of the five records.
     try testing.expect(ws.exists(try ws.index(1)));
-    try testing.expectEqual(@as(usize, 16 + 5 * 8), (try ws.read(try ws.index(1))).len);
+    try testing.expectEqual(@as(usize, 32 + 5 * 16), (try ws.read(try ws.index(1))).len);
+    const rebuilt = try ws.read(try ws.index(1));
+    try testing.expectEqualStrings("chridx\x02\n", rebuilt[0..8]);
+    try testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, rebuilt[16..24], .little));
+    try testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, rebuilt[24..32], .little));
 }
 
 test "an index for the wrong segment length is refused and rebuilt" {
@@ -1026,6 +1034,156 @@ test "an index for the wrong segment length is refused and rebuilt" {
     const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
     try testing.expectEqual(@as(u64, 3), record.seq);
     try testing.expectEqualStrings(good, try ws.read(try ws.index(1)));
+}
+
+//========================================================================
+// Lookup by time.
+//========================================================================
+
+test "seqAtOrAfter finds the first record at or after a moment" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        defer journal.deinit(io);
+
+        // An empty log has nothing at any moment.
+        try testing.expectEqual(@as(?u64, null), try journal.seqAtOrAfter(io, 0));
+
+        // Nine records at 100, 200, ... 900, over three segments.
+        for (1..10) |i| _ = try journal.append(io, @intCast(i * 100), created(@intCast(i), "n"));
+        try testing.expectEqual(@as(usize, 3), journal.segmentCount());
+
+        // Before everything, exactly on a record, and between two of them.
+        try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, std.math.minInt(i64)));
+        try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, 100));
+        try testing.expectEqual(@as(?u64, 2), try journal.seqAtOrAfter(io, 101));
+        try testing.expectEqual(@as(?u64, 5), try journal.seqAtOrAfter(io, 500));
+        try testing.expectEqual(@as(?u64, 9), try journal.seqAtOrAfter(io, 900));
+
+        // Past the newest record there is nothing yet -- not record nine.
+        try testing.expectEqual(@as(?u64, null), try journal.seqAtOrAfter(io, 901));
+        try testing.expectEqual(@as(?u64, null), try journal.seqAtOrAfter(io, std.math.maxInt(i64)));
+    }
+
+    // The answer survives a reopen, where the timestamps of the sealed
+    // segments come back from their index headers rather than from appends.
+    var reopened = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(?u64, 4), try reopened.seqAtOrAfter(io, 350));
+    try testing.expectEqual(@as(?u64, 9), try reopened.seqAtOrAfter(io, 850));
+    try testing.expectEqual(@as(?u64, null), try reopened.seqAtOrAfter(io, 901));
+}
+
+test "an out-of-order timestamp is found, not assumed away" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(2, 1024));
+    defer journal.deinit(io);
+
+    // Nothing makes a caller pass its timestamps in order, so nothing here
+    // bisects: record 2 is older than record 1, and record 5 is older than
+    // everything before it.
+    const stamps = [_]i64{ 500, 100, 600, 700, 50, 800 };
+    for (stamps, 1..) |at, i| _ = try journal.append(io, at, created(@intCast(i), "n"));
+
+    // The lowest sequence number whose `at` reaches the moment -- which for 50
+    // is record 5, sitting in the middle of the log.
+    try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, 50));
+    try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, 500));
+    try testing.expectEqual(@as(?u64, 3), try journal.seqAtOrAfter(io, 501));
+    try testing.expectEqual(@as(?u64, 6), try journal.seqAtOrAfter(io, 750));
+    try testing.expectEqual(@as(?u64, null), try journal.seqAtOrAfter(io, 801));
+    // Record 5, at 50, is the oldest moment in the log and sits in the middle
+    // of it. Asking for 750 still answers 6 and not 5, and asking for 801
+    // still answers nothing, both of which a search that assumed the stamps
+    // rose with the sequence could get wrong.
+    try testing.expectEqual(@as(?u64, 4), try journal.seqAtOrAfter(io, 700));
+
+    // A negative timestamp is a timestamp.
+    var back = try Workspace.init("back");
+    defer back.deinit();
+    var earlier = try Journal.open(testing.allocator, io, back.path, small(2, 1024));
+    defer earlier.deinit(io);
+    for ([_]i64{ -500, -100, -900 }, 1..) |at, i| {
+        _ = try earlier.append(io, at, created(@intCast(i), "n"));
+    }
+    try testing.expectEqual(@as(?u64, 1), try earlier.seqAtOrAfter(io, -1_000));
+    try testing.expectEqual(@as(?u64, 1), try earlier.seqAtOrAfter(io, -500));
+    try testing.expectEqual(@as(?u64, 2), try earlier.seqAtOrAfter(io, -499));
+    try testing.expectEqual(@as(?u64, null), try earlier.seqAtOrAfter(io, 0));
+}
+
+test "a lookup by time rebuilds a stale index and reads the rest from it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..13) |i| _ = try journal.append(io, @intCast(i * 10), created(@intCast(i), "n"));
+    }
+
+    // One index gone, one in the older format, one full of nonsense: none of
+    // them is an answer, and all of them are rebuilt on the way past.
+    try ws.root.deleteFile(io, try ws.index(1));
+    try ws.write(try ws.index(5), "chridx\x01\n" ++ "\x00" ** 24);
+    try ws.write(try ws.index(9), "not an index");
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1));
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(?u64, 3), try journal.seqAtOrAfter(io, 25));
+    try testing.expectEqual(@as(?u64, 7), try journal.seqAtOrAfter(io, 65));
+    try testing.expectEqual(@as(?u64, 11), try journal.seqAtOrAfter(io, 105));
+
+    // The two sealed ones now describe their segments in the current format,
+    // timestamps and all. The newest is the active segment, whose index is
+    // not sealed until it is rotated away from or the journal is closed.
+    for ([_]u64{ 1, 5 }) |base| {
+        const bytes = try ws.read(try ws.index(base));
+        try testing.expectEqualStrings("chridx\x02\n", bytes[0..8]);
+        try testing.expectEqual(@as(usize, 32 + 4 * 16), bytes.len);
+        try testing.expectEqual(@as(i64, @intCast(base * 10)), std.mem.readInt(i64, bytes[16..24], .little));
+        try testing.expectEqual(@as(i64, @intCast((base + 3) * 10)), std.mem.readInt(i64, bytes[24..32], .little));
+    }
+
+    // A reader cannot write an index, and answers anyway.
+    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_records = 4 });
+    defer reader.deinit(io);
+    try ws.write(try ws.index(1), "gone again");
+    try testing.expectEqual(@as(?u64, 3), try reader.seqAtOrAfter(io, 25));
+    try testing.expectEqualStrings("gone again", try ws.read(try ws.index(1)));
+}
+
+test "a record with no timestamp is named rather than stepped over" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // A hand-written record with no `at`, in a sealed segment, in a journal
+    // whose tail does not reach back far enough to have read it. Every path
+    // that does read one refuses it as `CorruptRecord` already; this is the
+    // one that goes looking for records it has not parsed.
+    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":10,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n" ++
+        "{\"seq\":2,\"v\":1,\"ev\":{\"removed\":{\"id\":2}}}\n" ++
+        "{\"seq\":3,\"at\":30,\"v\":1,\"ev\":{\"removed\":{\"id\":3}}}\n");
+    try ws.write(try ws.segment(4), "{\"seq\":4,\"at\":40,\"v\":1,\"ev\":{\"removed\":{\"id\":4}}}\n");
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .tail_records = 0 });
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 4), try journal.lastSeq(io));
+
+    // The segment holding it has no range to skip by, so the lookup goes into
+    // it and says what it found rather than stepping over the record.
+    try testing.expectError(error.CorruptRecord, journal.seqAtOrAfter(io, 25));
+    // And the segment after it still answers, because the refusal is about
+    // one segment and not about the log.
+    try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, 5));
 }
 
 //========================================================================

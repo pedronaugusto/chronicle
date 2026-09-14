@@ -6,6 +6,21 @@ before 1.0 the minor is the breaking one.
 
 ## Unreleased
 
+Breaking, and only to the index sidecar — no journal needs converting and no
+record changes:
+
+- **The index format is version 2.** An index now carries a timestamp beside
+  every byte offset, and its header carries the lowest and highest timestamp in
+  the segment, which is what `seqAtOrAfter` needs to skip a whole segment
+  exactly rather than by assuming the timestamps rise with the sequence
+  numbers. The header grows from sixteen bytes to thirty-two and each entry
+  from eight to sixteen. **Old journals open unchanged**: an index in the older
+  format reads as stale, exactly as a missing or mismatched one does, and is
+  rebuilt from its segment the first time something asks for it. An index has
+  never been anything but a cache, and this is what that has always meant.
+  Anything reading a `.idx` file with something other than this package has to
+  be taught the new shape; README.md states it byte for byte.
+
 New:
 
 - **`appendAll(io, entries)`.** Write a batch of records under one `fsync`
@@ -25,6 +40,15 @@ New:
   or the whole new one. It is the one file a journal opened with
   `Options.access = .read` writes: still nothing to the log, so a named reader
   is safe beside the writer and beside every other named reader.
+
+- **`seqAtOrAfter(io, at)`.** The lowest sequence number whose record is
+  stamped at or after a given moment, or null when none is. It is a search and
+  not a bisection, because nothing makes a caller pass its timestamps in
+  order: every segment whose highest timestamp reaches the moment is looked
+  inside, oldest first, and one whose highest is below it is skipped without
+  its file being opened. A sealed segment is answered from its index; the
+  active one, whose index is not sealed yet, is walked, and only when its own
+  timestamps say a record could be in there.
 
 ## 0.3.0
 
