@@ -348,8 +348,8 @@ running it. CI does that for `x86_64-linux-gnu`, `aarch64-linux-gnu`,
 `x86_64-linux-musl`, `x86_64-windows-gnu`, `aarch64-windows-gnu`,
 `x86_64-macos` and `aarch64-macos`.
 
-Pending: the CI results above are from run 34797554781, for 0.3.0. The current
-commit has not been through CI yet.
+Every job in that matrix passed on run
+[`34804414740`](https://github.com/pedronaugusto/chronicle/actions/runs/34804414740).
 
 ## Testing
 
