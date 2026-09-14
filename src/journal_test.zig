@@ -126,6 +126,13 @@ const Workspace = struct {
         return std.fs.path.join(self.arena.allocator(), &.{ self.name, file });
     }
 
+    /// An absolute path beside the journal, for a second directory a test
+    /// needs — somewhere to copy into, and never inside the journal.
+    fn beside(self: *Workspace, other: []const u8) ![]const u8 {
+        const root = std.fs.path.dirname(self.path).?;
+        return std.fs.path.join(self.arena.allocator(), &.{ root, other });
+    }
+
     fn segment(self: *Workspace, base_seq: u64) ![]const u8 {
         return self.sub(&chronicle.segmentName(base_seq));
     }
@@ -1456,6 +1463,165 @@ test "dropSegmentsBefore unlinks whole segments and never the newest one" {
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 9), reopened.oldestSeq());
     try testing.expectEqual(@as(u64, 11), try reopened.lastSeq(io));
+}
+
+//========================================================================
+// Backup.
+//========================================================================
+
+test "a backup is a whole journal, snapshot and indexes and all" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const copy_path = try ws.beside("copy");
+
+    var whole: Registry = .{};
+    var copied: u64 = 0;
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        try journal.subscribe(io, whole.sink());
+        for (1..12) |i| _ = try journal.append(io, @intCast(i * 10), created(@intCast(i), "n"));
+        try journal.snapshot(io, std.mem.asBytes(&whole));
+        _ = try journal.append(io, 120, created(12, "after the snapshot"));
+
+        copied = try journal.backup(io, copy_path);
+        try testing.expectEqual(@as(u64, 12), copied);
+
+        // A copy over the journal's own directory would truncate the segments
+        // it was reading, so it is refused by name.
+        try testing.expectError(error.BackupInPlace, journal.backup(io, ws.path));
+    }
+
+    // What went into the copy, before anything opens it and adds to it: the
+    // three segments, the snapshot, the indexes of the two sealed segments --
+    // and no lock, which is this directory's and not the copy's.
+    {
+        var listing = try ws.root.openDir(io, "copy", .{ .iterate = true });
+        defer listing.close(io);
+        var names: std.ArrayList([]const u8) = .empty;
+        defer names.deinit(testing.allocator);
+        var walk = listing.iterate();
+        while (try walk.next(io)) |entry| {
+            try names.append(testing.allocator, try ws.arena.allocator().dupe(u8, entry.name));
+        }
+        std.mem.sort([]const u8, names.items, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        try testing.expectEqual(@as(usize, 6), names.items.len);
+        try testing.expectEqualStrings("00000000000000000001.idx", names.items[0]);
+        try testing.expectEqualStrings("00000000000000000001.log", names.items[1]);
+        try testing.expectEqualStrings("00000000000000000005.idx", names.items[2]);
+        try testing.expectEqualStrings("00000000000000000005.log", names.items[3]);
+        // The newest segment's index describes bytes that were still
+        // arriving, so it is left behind and the copy builds its own.
+        try testing.expectEqualStrings("00000000000000000009.log", names.items[4]);
+        try testing.expectEqualStrings(chronicle.snapshot_name, names.items[5]);
+    }
+
+    // The copy opens, holds the same records byte for byte, and carries the
+    // snapshot that was beside them.
+    const opened = try Journal.openWithSnapshot(testing.allocator, io, copy_path, small(4, 1024));
+    var copy = opened.journal;
+    defer copy.deinit(io);
+    const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
+    defer testing.allocator.free(snapshot.state);
+    try testing.expectEqual(@as(u64, 11), snapshot.seq);
+
+    try testing.expectEqual(copied, try copy.lastSeq(io));
+    try testing.expectEqual(copied, try copy.verify(io));
+    try testing.expectEqual(@as(usize, 3), copy.segmentCount());
+
+    var refolded: Registry = .{};
+    try copy.subscribe(io, refolded.sink());
+    try testing.expectEqual(whole, refolded);
+
+    // And the copy goes on from where it was cut.
+    try testing.expectEqual(@as(u64, 13), try copy.append(io, 130, created(13, "onwards")));
+}
+
+/// One line of a helper's output. `takeDelimiterExclusive` leaves the newline
+/// where it is, so the next call would answer with nothing at all.
+fn helperLine(reader: *Io.Reader) ![]const u8 {
+    const text = try reader.takeDelimiterExclusive('\n');
+    _ = reader.takeByte() catch {};
+    return text;
+}
+
+/// The helper's event type, so a test can read back what the second process
+/// wrote. The helper appends nothing else.
+const Ping = union(enum) { ping: u32 };
+const PingJournal = chronicle.Journal(Ping);
+
+test "a backup taken while another process appends opens as a journal" {
+    const io = testing.io;
+    const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer testing.allocator.free(helper);
+
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // A writer in another process, appending as fast as it can. Nothing in
+    // this process can hold it still: that is what makes the copy hot.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ helper, ws.path, "20000" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+
+    var buffer: [64]u8 = undefined;
+    var out = child.stdout.?.readerStreaming(io, &buffer);
+    try testing.expectEqualStrings("locked", try helperLine(&out.interface));
+    try testing.expectEqualStrings("appending", try helperLine(&out.interface));
+
+    // A reader takes no lock, so this one runs beside the writer.
+    var reader = try PingJournal.open(testing.allocator, io, ws.path, .{
+        .access = .read,
+        .tail_records = 0,
+    });
+    defer reader.deinit(io);
+
+    // Three copies at three moments. Each has to be a journal: a continuous
+    // run of records from the first to the last, every checksum right, and
+    // able to carry on.
+    var previous: u64 = 0;
+    for (0..3) |round| {
+        var destination: [16]u8 = undefined;
+        const copy_path = try ws.beside(try std.fmt.bufPrint(&destination, "copy{d}", .{round}));
+
+        try reader.refresh(io);
+        const copied = try reader.backup(io, copy_path);
+        try testing.expect(copied >= previous);
+        previous = copied;
+
+        var copy = try PingJournal.open(testing.allocator, io, copy_path, .{
+            .verify = .full,
+            .tail_records = 4,
+        });
+        defer copy.deinit(io);
+
+        // `.verify = .full` has already read every record of every segment
+        // through the checksum and the sequence; this says how many there
+        // were and that the copy agrees with what backup reported.
+        try testing.expectEqual(copied, try copy.lastSeq(io));
+        try testing.expectEqual(copied, try copy.verify(io));
+        try testing.expectEqual(@as(u64, 1), copy.oldestSeq());
+        try testing.expectEqual(copied + 1, try copy.append(io, 0, .{ .ping = 7 }));
+    }
+
+    // The writer is still the writer, and this process still cannot be one.
+    try testing.expectError(error.Locked, PingJournal.open(testing.allocator, io, ws.path, .{}));
+
+    child.stdin.?.close(io);
+    child.stdin = null;
+    _ = try child.wait(io);
 }
 
 //========================================================================

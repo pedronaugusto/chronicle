@@ -50,6 +50,18 @@ New:
   active one, whose index is not sealed yet, is walked, and only when its own
   timestamps say a record could be in there.
 
+- **`backup(io, dest)`.** Copy the journal into another directory while it is
+  running, and get back the newest sequence number the copy holds. Every
+  sealed segment goes whole, the newest one goes up to its last complete
+  record *at the moment of the call* — its length measured and its newlines
+  walked there and then, not taken from what this process last read — the
+  sealed indexes go with their segments, and the snapshot goes first so that
+  it can never name a record the copy does not hold. So the copy is a prefix
+  of the log and opens as a journal of its own. The lock is not copied, nor
+  are the cursor files of named readers: those belong to the readers of the
+  directory being copied. A destination that is the journal's own directory
+  is `error.BackupInPlace` rather than a log copied over itself.
+
 ## 0.3.0
 
 A record that can say whether it is still the record that was written, and a

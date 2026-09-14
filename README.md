@@ -368,6 +368,7 @@ with no re-encoding.
 | `subscribe(io, sink)` | Fold every record, from the disk and then live. |
 | `subscribeFrom(io, sink, cursor)` | The same, starting after a snapshot. |
 | `snapshot(io, state_bytes)` | Write the fold out beside the log. |
+| `backup(io, dest)` | Copy the journal into another directory while it runs. |
 | `compact(io, keep_after_seq)` | Rewrite the log, keeping the records after the cut. |
 | `dropSegmentsBefore(io, seq)` | Unlink the whole segments a snapshot covers. |
 | `truncateAfter(io, seq)` | Drop every record after `seq`, handing the numbers back. |

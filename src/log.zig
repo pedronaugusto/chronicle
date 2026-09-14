@@ -1126,8 +1126,12 @@ fn closeActive(log: *Log, io: Io) void {
 /// is still named after a power cut. Windows has no equivalent; there the call
 /// is nothing, and README.md says so.
 pub fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
+    return syncDirHandle(io, log.dir);
+}
+
+fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
     if (!can_sync_dir) return;
-    const as_file: Io.File = .{ .handle = log.dir.handle, .flags = .{ .nonblocking = false } };
+    const as_file: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
     as_file.sync(io) catch |err| switch (err) {
         // A filesystem that will not sync a directory handle is one where this
         // promise cannot be kept. It is not a reason to fail the write.
@@ -1337,6 +1341,124 @@ pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) Write
 pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {
     if (log.options.access == .read) return error.ReadOnly;
     return log.writeAtomic(io, snapshot_name, bytes);
+}
+
+//========================================================================
+// Copying a running log.
+//========================================================================
+
+pub const BackupError = OpenError || error{BackupInPlace};
+
+/// Copy a consistent view of the log into the directory `dest_path`, creating
+/// it if it is not there, and report the newest sequence number the copy
+/// holds.
+///
+/// What "consistent" means here, exactly:
+///
+/// * Every sealed segment goes whole. A sealed segment was made durable by the
+///   rotation that left it and cannot change again.
+/// * The newest segment goes up to its last complete record *at the moment of
+///   the call* — its length is measured and its newlines walked here, not
+///   taken from what this process last read — so the copy ends at a record
+///   boundary whoever is appending and however far they have got.
+/// * The snapshot is copied first, so it can never name a record the copy does
+///   not hold.
+/// * The sealed indexes go with their segments, because they describe exactly
+///   the bytes that were copied. The newest segment's does not: it describes
+///   bytes that are still arriving, so the copy is opened without it and
+///   builds its own, which is one scan of one segment.
+/// * The lock is not copied. It is this directory's, and the copy makes its
+///   own the first time it is opened for writing.
+///
+/// So the copy is a *prefix* of the log: every record in it is a record that
+/// was in the log, in order, with no gap, and it opens as a journal. Records
+/// appended after the call started may or may not be in it.
+///
+/// Taken by the writer, under the journal's lock, nothing can move underneath
+/// it. Taken by a reader beside a live writer, the only thing that can is a
+/// `compact` or a `dropSegmentsBefore` unlinking a segment while it is being
+/// read, which comes back as an error rather than as a copy with a hole in it:
+/// take it again.
+pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {
+    const cwd: Io.Dir = .cwd();
+    try cwd.createDirPath(io, dest_path);
+    var dest = try cwd.openDir(io, dest_path, .{ .iterate = true });
+    defer dest.close(io);
+    // Copying a directory over itself would truncate the segments it was
+    // reading. Nothing else here can tell the two apart.
+    if (log.sameDirectory(io, dest)) return error.BackupInPlace;
+    if (log.segments.items.len == 0) return 0;
+
+    // Everything this process has written goes into the files before anything
+    // is read back out of them.
+    if (log.active) |*active| {
+        try active.writer.interface.flush();
+        try active.index_writer.interface.flush();
+    }
+
+    _ = try log.copyFile(io, dest, snapshot_name, null);
+
+    const newest = log.segments.items.len - 1;
+    for (log.segments.items[0..newest]) |segment| {
+        const name = segmentName(segment.base_seq, segment_extension);
+        if (!try log.copyFile(io, dest, &name, segment.bytes)) return error.FileNotFound;
+        _ = try log.copyFile(io, dest, &segmentName(segment.base_seq, index_extension), null);
+    }
+
+    // The newest segment, measured now: a writer in another process may be
+    // part-way through a record, and the bytes after its last newline are not
+    // one yet.
+    var last = log.segments.items[newest];
+    const name = segmentName(last.base_seq, segment_extension);
+    last.bytes = try log.fileLength(io, &name);
+    const scanned = try log.scanSegment(io, last, null);
+    if (!try log.copyFile(io, dest, &name, scanned.complete_bytes)) return error.FileNotFound;
+
+    try syncDirHandle(io, dest);
+    if (scanned.lines == 0) return last.base_seq - 1;
+    return last.base_seq + scanned.lines - 1;
+}
+
+/// Copy `name` into `dest`, either the first `bytes` of it or all of it.
+/// False when there is no such file, which is not an error for a snapshot or
+/// an index — neither is part of the log.
+fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: []const u8, bytes: ?u64) OpenError!bool {
+    const from = log.dir.openFile(io, name, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => |e| return e,
+    };
+    defer from.close(io);
+    const length = bytes orelse try from.length(io);
+
+    const to = try dest.createFile(io, name, .{ .truncate = true });
+    defer to.close(io);
+
+    const chunk = try log.gpa.alloc(u8, log.options.read_buffer_size);
+    defer log.gpa.free(chunk);
+
+    var at: u64 = 0;
+    while (at < length) {
+        const want: usize = @intCast(@min(chunk.len, length - at));
+        const read = try from.readPositionalAll(io, chunk[0..want], at);
+        // The file was longer a moment ago. Something is rewriting the
+        // directory underneath this copy.
+        if (read == 0) return error.TruncatedRecord;
+        try to.writePositionalAll(io, chunk[0..read], at);
+        at += read;
+    }
+    try to.sync(io);
+    return true;
+}
+
+/// Whether `dest` is the directory this log lives in. False whenever that
+/// cannot be established, because a check that cannot be made is not a reason
+/// to refuse the call.
+fn sameDirectory(log: *Log, io: Io, dest: Io.Dir) bool {
+    var arena: std.heap.ArenaAllocator = .init(log.gpa);
+    defer arena.deinit();
+    const here = log.dir.realPathFileAlloc(io, ".", arena.allocator()) catch return false;
+    const there = dest.realPathFileAlloc(io, ".", arena.allocator()) catch return false;
+    return std.mem.eql(u8, here, there);
 }
 
 //========================================================================

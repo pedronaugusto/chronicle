@@ -355,6 +355,12 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `dropSegmentsBefore`.
         pub const DropError = Log.CompactError;
 
+        /// Errors from `backup`.
+        ///
+        /// * `BackupInPlace` — the destination is the journal's own directory,
+        ///   which would have meant copying its segments over themselves.
+        pub const BackupError = OpenError || Log.BackupError;
+
         /// Errors from `truncateAfter`.
         ///
         /// * `SeqTooOld` — the log no longer holds a record at or before the
@@ -1158,6 +1164,35 @@ pub fn Journal(comptime Event: type) type {
             try self.log.compact(io, keep_after_seq);
             self.clearTail();
             try self.fillTail(io);
+        }
+
+        /// Copy the journal into the directory `dest`, creating it if it is
+        /// not there, and return the newest sequence number the copy holds.
+        ///
+        /// The copy is a prefix of this log and opens as a journal of its own:
+        /// every sealed segment whole, the newest one up to its last complete
+        /// record at the moment of the call, the sealed indexes beside their
+        /// segments and the snapshot beside the log. The copy is opened by
+        /// pointing `open` at `dest`, and it takes its own lock when something
+        /// does.
+        ///
+        /// Taken by the writer this holds the journal's lock, so nothing can
+        /// move underneath it. Taken by a reader beside a live writer — which
+        /// is the point of calling it *hot* — the newest segment's length is
+        /// measured and its newlines walked here, so the copy still ends at a
+        /// record boundary however far the writer had got; records appended
+        /// while it runs may or may not be in it. What a reader cannot survive
+        /// is the writer unlinking a segment mid-copy, which comes back as an
+        /// error rather than as a copy with a hole in it: take it again.
+        ///
+        /// The lock is not copied, and neither are the cursor files of named
+        /// readers: those belong to the readers of *this* directory.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!u64 {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            return self.log.backup(io, dest);
         }
 
         //====================================================================
