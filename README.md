@@ -71,8 +71,15 @@ var last: u64 = 0;
     // can see it.
     const now = std.Io.Clock.real.now(io).toMilliseconds();
     _ = try ledger.append(io, now, .{ .account_opened = .{ .id = 1, .owner = "ada" } });
-    _ = try ledger.append(io, now, .{ .deposited = .{ .id = 1, .cents = 5_000 } });
-    last = try ledger.append(io, now, .{ .withdrawn = .{ .id = 1, .cents = 1_250 } });
+
+    // A batch goes down under one fsync instead of one each. It is group
+    // commit and not a transaction: a crash inside it leaves a prefix of
+    // it on the disk, exactly as a crash inside one append leaves a torn
+    // line, and the next open repairs it the same way.
+    last = try ledger.appendAll(io, &.{
+        .{ .at = now, .event = .{ .deposited = .{ .id = 1, .cents = 5_000 } } },
+        .{ .at = now, .event = .{ .withdrawn = .{ .id = 1, .cents = 1_250 } } },
+    });
 
     // Write the fold out beside the log and drop the records it covers,
     // so the next start replays three records instead of three million.
