@@ -6,6 +6,8 @@ before 1.0 the minor is the breaking one.
 
 ## Unreleased
 
+## 0.4.0
+
 Breaking, and only to the index sidecar — no journal needs converting and no
 record changes:
 
@@ -75,6 +77,12 @@ New:
   are the cursor files of named readers: those belong to the readers of the
   directory being copied. A destination that is the journal's own directory
   is `error.BackupInPlace` rather than a log copied over itself.
+
+Removed:
+
+- **`snapshot_temporary_name`.** Removed from `src/log.zig`, where it named
+  the file a snapshot is written to before it is renamed into place, and it
+  was never re-exported from the package root.
 
 ## 0.3.0
 
