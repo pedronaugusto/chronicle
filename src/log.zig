@@ -785,11 +785,22 @@ pub const Scan = struct {
                 error.ReadFailed => return scan.reader.err.?,
                 error.WriteFailed => return error.OutOfMemory,
             };
-            const terminated = if (scan.reader.interface.takeByte()) |_| true else |err| switch (err) {
-                error.EndOfStream => false,
+            // What follows what was streamed is the newline, or nothing at
+            // all: `streamDelimiterEnding` leaves the delimiter buffered when
+            // it found one and leaves the buffer empty when it ran out of
+            // file. Both have to be told apart by the *byte*, not by whether
+            // there is one. A writer in another process may have appended
+            // since the line ran out, in which case there is a byte and it is
+            // the rest of the record — and taking it for the newline would
+            // hand back half a record and leave the walk one byte out for
+            // every record after it.
+            const ending = scan.reader.interface.peekByte() catch |err| switch (err) {
+                error.EndOfStream => null,
                 error.ReadFailed => return scan.reader.err.?,
             };
+            const terminated = ending == @as(?u8, '\n');
             if (terminated) {
+                scan.reader.interface.toss(1);
                 scan.position += streamed + 1;
                 return scan.line.written();
             }

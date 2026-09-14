@@ -21,6 +21,20 @@ record changes:
   Anything reading a `.idx` file with something other than this package has to
   be taught the new shape; README.md states it byte for byte.
 
+Fixed:
+
+- **A walk over a log another process is appending to could hand back half a
+  record.** A scan that ran out of file part-way through a record asked the
+  reader for the byte after what it had streamed, and took *a* byte for the
+  newline that ends a record. A writer that appended in between made that byte
+  the rest of the record, so the walk returned a truncated line as if it were
+  whole and was one byte out for every record after it — `error.CorruptRecord`
+  or `error.ChecksumMismatch` from a log that was never damaged. The byte is
+  now compared against the newline rather than counted, so a record that was
+  not finished when the walk reached it is the end of the walk, which is what
+  `Options.access = .read` has always promised. Nothing on the disk was ever
+  wrong, so nothing needs repairing.
+
 New:
 
 - **`appendAll(io, entries)`.** Write a batch of records under one `fsync`

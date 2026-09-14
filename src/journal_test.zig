@@ -1596,7 +1596,11 @@ test "a backup taken while another process appends opens as a journal" {
         var destination: [16]u8 = undefined;
         const copy_path = try ws.beside(try std.fmt.bufPrint(&destination, "copy{d}", .{round}));
 
-        try reader.refresh(io);
+        // Read the growing log back repeatedly first. A walk that runs out of
+        // file part-way through a record has to say so, even when the writer
+        // has appended more by the time it looks again: the record it was
+        // reading is still half a record.
+        for (0..8) |_| try reader.refresh(io);
         const copied = try reader.backup(io, copy_path);
         try testing.expect(copied >= previous);
         previous = copied;
