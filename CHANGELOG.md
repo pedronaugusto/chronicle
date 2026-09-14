@@ -4,6 +4,19 @@ Each entry says what the old shape could not express, so a port has the reason
 and not only the diff. Versions follow [semantic versioning](https://semver.org);
 before 1.0 the minor is the breaking one.
 
+## Unreleased
+
+New:
+
+- **`appendAll(io, entries)`.** Write a batch of records under one `fsync`
+  instead of one each, and get back the sequence number of the last. It is
+  group commit and not a transaction, and says so: a crash inside the batch
+  leaves a prefix of it on the disk, with a torn final line at worst, which is
+  the same shape a crash inside a single `append` leaves and is repaired the
+  same way. Nothing is published until the bytes are durable, so a sink still
+  never sees a record the disk does not have. `Entry` is the pair `append`
+  takes as two arguments.
+
 ## 0.3.0
 
 A record that can say whether it is still the record that was written, and a

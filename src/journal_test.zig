@@ -231,6 +231,109 @@ test "a reopened journal continues the sequence and appends after the last line"
 }
 
 //========================================================================
+// Batches.
+//========================================================================
+
+test "appendAll writes every entry and numbers them in order" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var folded: Registry = .{};
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    try journal.subscribe(io, folded.sink());
+
+    // An empty batch writes nothing and says where the log got to.
+    try testing.expectEqual(@as(u64, 0), try journal.appendAll(io, &.{}));
+
+    _ = try journal.append(io, 1, created(1, "alone"));
+    const batch = [_]Journal.Entry{
+        .{ .at = 20, .event = created(2, "two") },
+        .{ .at = 30, .event = .{ .renamed = .{ .id = 2, .name = "three" } } },
+        .{ .at = 40, .event = .{ .removed = .{ .id = 2 } } },
+    };
+    // The returned number is the last of the batch, so the records it wrote
+    // are the three sequence numbers ending there.
+    try testing.expectEqual(@as(u64, 4), try journal.appendAll(io, &batch));
+    try testing.expectEqual(@as(u64, 4), try journal.lastSeq(io));
+
+    // Every record went to the sinks, in order, as if appended one at a time.
+    try testing.expectEqual(@as(u32, 4), folded.events);
+    try testing.expectEqual(@as(u64, 4), folded.last);
+    try testing.expectEqual(@as(u32, 1), folded.live);
+
+    // And the lines are on the disk with their own timestamps and checksums.
+    const on_disk = try ws.read(try ws.segment(1));
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, on_disk, "\n"));
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, on_disk, ",\"c\":"));
+    try testing.expect(std.mem.indexOf(u8, on_disk, "\"seq\":3,\"at\":30") != null);
+    try testing.expectEqual(@as(u64, 4), try journal.verify(io));
+
+    // A batch crossing a rotation is still one batch.
+    var rolled = try Workspace.init("rolled");
+    defer rolled.deinit();
+    var rolling = try Journal.open(testing.allocator, io, rolled.path, small(2, 1024));
+    defer rolling.deinit(io);
+    var many: [7]Journal.Entry = undefined;
+    for (&many, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "n") };
+    try testing.expectEqual(@as(u64, 7), try rolling.appendAll(io, &many));
+    try testing.expectEqual(@as(usize, 4), rolling.segmentCount());
+    try testing.expectEqual(@as(u64, 7), try rolling.verify(io));
+}
+
+test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // The bytes one batch puts on the disk. Every one of them is a moment a
+    // crash could have happened in.
+    const batch = [_]Journal.Entry{
+        .{ .at = 10, .event = created(1, "one") },
+        .{ .at = 20, .event = created(2, "two") },
+        .{ .at = 30, .event = created(3, "three") },
+        .{ .at = 40, .event = created(4, "four") },
+    };
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 4), try journal.appendAll(io, &batch));
+    }
+    const whole = try ws.read(try ws.segment(1));
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, whole, "\n"));
+
+    const name = try ws.segment(1);
+    var cut: usize = 0;
+    while (cut <= whole.len) : (cut += 1) {
+        const stopped = whole[0..cut];
+        // A prefix of the batch is whole records up to the last newline; the
+        // bytes after it are the line the writer was in the middle of.
+        const complete = std.mem.lastIndexOfScalar(u8, stopped, '\n');
+        const kept = if (complete) |at| stopped[0 .. at + 1] else stopped[0..0];
+        const records = std.mem.count(u8, kept, "\n");
+
+        try ws.write(name, stopped);
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+
+        // What survived is a prefix of the batch, byte for byte -- not a
+        // rewritten one, and never a record the batch did not write.
+        try testing.expectEqualStrings(kept, try ws.read(name));
+        try testing.expectEqual(@as(usize, stopped.len - kept.len), journal.dropped_bytes);
+        try testing.expectEqual(@as(u64, records), try journal.lastSeq(io));
+        try testing.expectEqual(@as(u64, records), try journal.verify(io));
+
+        // And the log the crash left is one that continues: the next record
+        // takes the number after the last one that survived.
+        try testing.expectEqual(
+            @as(u64, records + 1),
+            try journal.append(io, 99, created(9, "after the crash")),
+        );
+    }
+}
+
+//========================================================================
 // The crash cases.
 //========================================================================
 

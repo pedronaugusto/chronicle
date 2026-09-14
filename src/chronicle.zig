@@ -176,6 +176,13 @@ pub fn Journal(comptime Event: type) type {
             complete: bool,
         };
 
+        /// One record for `appendAll`: what `append` takes as two arguments.
+        pub const Entry = struct {
+            /// Stored as given; chronicle never reads a clock.
+            at: i64,
+            event: Event,
+        };
+
         /// A fold, called once per record: for the records the journal replays
         /// when it subscribes, and then for each one appended, in sequence
         /// order, with the journal's lock held.
@@ -490,34 +497,12 @@ pub fn Journal(comptime Event: type) type {
             if (self.seq >= std.math.maxInt(i64)) return error.SequenceExhausted;
 
             const next = self.seq + 1;
-            const line: Line = .{ .seq = next, .at = at, .v = self.options.schema_version, .ev = event };
-            const body = try std.json.Stringify.valueAlloc(self.gpa, line, .{});
-            defer self.gpa.free(body);
-            // The checksum covers everything the record says except the
-            // checksum itself. `std.json` closes the object with the one byte
-            // dropped here, and `,"c":<crc>}` closes it again.
-            const covered = body[0 .. body.len - 1];
-            const encoded = try std.fmt.allocPrint(
-                self.gpa,
-                "{s},\"c\":{d}}}",
-                .{ covered, checksum(covered) },
-            );
-            defer self.gpa.free(encoded);
-
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
-            var arena: std.heap.ArenaAllocator = .init(self.gpa);
-            errdefer arena.deinit();
-            const stored = try arena.allocator().dupe(u8, encoded);
-            const parsed = std.json.parseFromSliceLeaky(
-                Line,
-                arena.allocator(),
-                stored,
-                .{ .ignore_unknown_fields = true },
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.NotRoundTrippable,
-            };
+            var built = try self.encode(next, at, event);
+            var published = false;
+            defer if (!published) built.arena.deinit();
+
             // Reserve before writing: after the bytes are durable nothing may
             // fail, or the disk would hold a record memory does not.
             try self.tail.ensureUnusedCapacity(self.gpa, 1);
@@ -525,27 +510,76 @@ pub fn Journal(comptime Event: type) type {
 
             {
                 errdefer self.persistence_failed = true;
-                try self.log.appendLine(io, stored);
+                try self.log.appendLine(io, built.record.bytes);
             }
+            published = true;
 
-            const record: Record = .{
-                .seq = next,
-                .at = at,
-                .version = self.options.schema_version,
-                .event = parsed.ev,
-                .bytes = stored,
-            };
-            self.tail.appendAssumeCapacity(record);
-            self.tail_arenas.appendAssumeCapacity(arena);
-            self.tail_bytes += stored.len;
-            self.seq = next;
-
-            for (self.sinks.items) |sink| sink.f(sink.ctx, record);
+            self.publish(built);
             self.changed.broadcast(io);
             // Last, so that a sink reading this record was reading memory that
             // still existed.
             self.trimTail();
             return next;
+        }
+
+        /// Write every entry, in order, under one `fsync`, and return the
+        /// sequence number of the last one.
+        ///
+        /// This is group commit and not a transaction. The records go into the
+        /// log one line each, exactly as `append` writes them, and the whole
+        /// batch is made durable once at the end instead of once per record —
+        /// so a batch of a thousand costs one `fsync` under
+        /// `Options.sync = .always` rather than a thousand. What it does not
+        /// buy is atomicity: a crash inside the batch leaves a **prefix** of
+        /// it on the disk, with a torn final line at worst, which is the same
+        /// shape a crash inside a single `append` leaves and is repaired the
+        /// same way. If the batch must be all-or-nothing to your fold, say so
+        /// in the records — a record that opens the group and one that closes
+        /// it — because the log will not say it for you.
+        ///
+        /// Nothing is published unless the bytes reached the disk: no record
+        /// is added to the tail and no sink is called until the `fsync`
+        /// returns. A failure part-way through latches the journal exactly as
+        /// `append`'s does, and the disk may then hold some of the batch;
+        /// reopening reads back what survived.
+        ///
+        /// The batch is serialised before any of it is written, so memory
+        /// holds all of it at once: batch by the thousand, not by the million.
+        /// An empty slice writes nothing and returns `lastSeq`.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn appendAll(self: *Self, io: Io, entries: []const Entry) AppendError!u64 {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            if (self.options.access == .read) return error.ReadOnly;
+            if (self.persistence_failed) return error.PersistenceFailed;
+            if (entries.len == 0) return self.seq;
+            if (entries.len > std.math.maxInt(i64) - self.seq) return error.SequenceExhausted;
+
+            var built: std.ArrayList(Built) = .empty;
+            defer built.deinit(self.gpa);
+            var published = false;
+            defer if (!published) for (built.items) |*item| item.arena.deinit();
+
+            try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
+            for (entries, 0..) |entry, i| {
+                built.appendAssumeCapacity(try self.encode(self.seq + i + 1, entry.at, entry.event));
+            }
+
+            try self.tail.ensureUnusedCapacity(self.gpa, entries.len);
+            try self.tail_arenas.ensureUnusedCapacity(self.gpa, entries.len);
+
+            {
+                errdefer self.persistence_failed = true;
+                for (built.items) |item| try self.log.stageLine(io, item.record.bytes);
+                try self.log.commit(io);
+            }
+            published = true;
+
+            for (built.items) |item| self.publish(item);
+            self.changed.broadcast(io);
+            self.trimTail();
+            return self.seq;
         }
 
         /// Wake every `waitPast` with no new record — a shutdown, or something
@@ -929,6 +963,65 @@ pub fn Journal(comptime Event: type) type {
         //====================================================================
         // Internals.
         //====================================================================
+
+        /// A record serialised and parsed back, waiting to be written: the
+        /// arena owns every byte of it, and moves into `tail_arenas` once the
+        /// record is on the disk.
+        const Built = struct {
+            arena: std.heap.ArenaAllocator,
+            record: Record,
+        };
+
+        /// Serialise one record and parse it back out of the bytes that will
+        /// be written, so that what memory holds is exactly what a reopen
+        /// would produce: an `Event` whose slices point at a stack buffer is
+        /// safe to append.
+        fn encode(self: *Self, seq: u64, at: i64, event: Event) AppendError!Built {
+            const line: Line = .{ .seq = seq, .at = at, .v = self.options.schema_version, .ev = event };
+            const body = try std.json.Stringify.valueAlloc(self.gpa, line, .{});
+            defer self.gpa.free(body);
+            // The checksum covers everything the record says except the
+            // checksum itself. `std.json` closes the object with the one byte
+            // dropped here, and `,"c":<crc>}` closes it again.
+            const covered = body[0 .. body.len - 1];
+            const encoded = try std.fmt.allocPrint(
+                self.gpa,
+                "{s},\"c\":{d}}}",
+                .{ covered, checksum(covered) },
+            );
+            defer self.gpa.free(encoded);
+
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            errdefer arena.deinit();
+            const stored = try arena.allocator().dupe(u8, encoded);
+            const parsed = std.json.parseFromSliceLeaky(
+                Line,
+                arena.allocator(),
+                stored,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.NotRoundTrippable,
+            };
+            return .{ .arena = arena, .record = .{
+                .seq = seq,
+                .at = at,
+                .version = self.options.schema_version,
+                .event = parsed.ev,
+                .bytes = stored,
+            } };
+        }
+
+        /// Take a record the disk now holds into the tail and hand it to every
+        /// sink. Nothing here may fail: the capacity was reserved before the
+        /// write, because the disk must never hold a record memory does not.
+        fn publish(self: *Self, item: Built) void {
+            self.tail.appendAssumeCapacity(item.record);
+            self.tail_arenas.appendAssumeCapacity(item.arena);
+            self.tail_bytes += item.record.bytes.len;
+            self.seq = item.record.seq;
+            for (self.sinks.items) |sink| sink.f(sink.ctx, item.record);
+        }
 
         /// Read the newest records back into the tail, and check that they say
         /// what the segment names say.

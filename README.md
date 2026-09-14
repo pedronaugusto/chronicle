@@ -347,6 +347,7 @@ with no re-encoding.
 | `openWithSnapshot(gpa, io, path, options)` | The same, plus the snapshot beside it. |
 | `deinit(io)` | Flush, close, unlock, release. |
 | `append(io, at, event)` | Write one record durably; returns its sequence number. |
+| `appendAll(io, entries)` | Write a batch under one `fsync`; returns the last sequence number. |
 | `records()` | The tail, oldest first, as a `Window`. |
 | `since(cursor)` | The tail after `cursor`, as a `Window`. |
 | `waitPast(io, cursor)` | Block until there is one, then `since(cursor)`. |
@@ -365,9 +366,9 @@ with no re-encoding.
 | `verify(io)` | Read every record of every segment through every check. |
 | `stats(io)` | Segments, records, and the bytes they take. |
 
-Plus the types `Record`, `Window`, `Replay`, `Sink`, `Options`, `Snapshot`,
-`Opened`, `Migrate`, `Stats`, `Sync`, `Verify`, and one named error set per
-operation. Every public
+Plus the types `Record`, `Entry`, `Window`, `Replay`, `Sink`, `Options`,
+`Snapshot`, `Opened`, `Migrate`, `Stats`, `Sync`, `Verify`, and one named error
+set per operation. Every public
 declaration carries a doc comment stating its contract; `src/chronicle.zig` is
 the reference, and `src/log.zig` is the segment store under it.
 

@@ -67,7 +67,7 @@ pub const OnTruncated = enum {
 /// a snapshot, a compaction, a new segment's name -- are not optional under
 /// any of these, because they are what the replacement promise is.
 pub const Sync = enum {
-    /// `fsync` before every `appendLine` returns.
+    /// `fsync` before every `appendLine` returns, and once per `commit`.
     always,
     /// `fsync` when a segment is sealed and when the log is closed. Between
     /// those, an appended record has reached the operating system only.
@@ -94,8 +94,9 @@ pub const Segment = struct {
     /// The sequence number of its last record, or `base_seq - 1` when it holds
     /// none.
     last_seq: u64,
-    /// Its length in bytes. For the active segment this is what has been
-    /// flushed, which after any `appendLine` is everything.
+    /// Its length in bytes, records staged but not yet committed included.
+    /// For the active segment it is what has reached the file after any
+    /// `appendLine` or `commit`.
     bytes: u64,
 
     /// How many records it holds.
@@ -707,13 +708,27 @@ pub fn baseSeq(log: *const Log) u64 {
     return log.segments.items[0].base_seq - 1;
 }
 
-/// Append one record's bytes and the newline that ends it, rotating first if
-/// this record would take the active segment past its limits.
+/// Append one record's bytes and the newline that ends it, and make them
+/// durable.
 ///
-/// Returns only once the bytes are in the file and — unless `Options.fsync` is
-/// off — on the disk. The index entry goes out unflushed and unsynced: it is a
-/// cache, and a crash that loses it costs the next open a scan of one segment.
+/// Returns only once the bytes are in the file and — unless `Options.sync`
+/// says otherwise — on the disk. It is `stageLine` and `commit`, which is what
+/// a batch does once around many records rather than once around each.
 pub fn appendLine(log: *Log, io: Io, bytes: []const u8) AppendError!void {
+    try log.stageLine(io, bytes);
+    try log.commit(io);
+}
+
+/// Write one record's bytes and the newline that ends it into the active
+/// segment's buffer, rotating first if this record would take the segment past
+/// its limits.
+///
+/// Nothing written this way has reached the disk, or even the operating
+/// system, until `commit` returns: a caller that stages must commit. The index
+/// entry goes out unflushed and unsynced whichever way the record was written:
+/// it is a cache, and a crash that loses it costs the next open a scan of one
+/// segment.
+pub fn stageLine(log: *Log, io: Io, bytes: []const u8) AppendError!void {
     if (log.active == null) return error.ReadOnly;
     var segment = &log.segments.items[log.segments.items.len - 1];
 
@@ -721,6 +736,8 @@ pub fn appendLine(log: *Log, io: Io, bytes: []const u8) AppendError!void {
     const over_bytes = segment.bytes + needed > log.options.max_segment_bytes;
     const over_records = if (log.options.max_segment_records) |limit| segment.count() >= limit else false;
     if (segment.count() > 0 and (over_bytes or over_records)) {
+        // The rotation seals the segment being left, so the records staged
+        // into it are durable before the new one is named.
         try log.rotate(io);
         segment = &log.segments.items[log.segments.items.len - 1];
     }
@@ -729,12 +746,22 @@ pub fn appendLine(log: *Log, io: Io, bytes: []const u8) AppendError!void {
     const active = &log.active.?;
     try active.writer.interface.writeAll(bytes);
     try active.writer.interface.writeByte('\n');
-    try active.writer.interface.flush();
-    if (log.options.sync == .always) try active.file.sync(io);
 
     try active.index_writer.interface.writeInt(u64, at, .little);
     segment.bytes += needed;
     segment.last_seq += 1;
+}
+
+/// Put everything `stageLine` has written into the file, and — under
+/// `Options.sync = .always` — on the disk.
+///
+/// One `fsync` however many records were staged, which is what makes a batch
+/// cost one where a record at a time costs one each.
+pub fn commit(log: *Log, io: Io) AppendError!void {
+    if (log.active == null) return error.ReadOnly;
+    const active = &log.active.?;
+    try active.writer.interface.flush();
+    if (log.options.sync == .always) try active.file.sync(io);
 }
 
 /// Seal the active segment and start a new one named after the record that
