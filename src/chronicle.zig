@@ -1,11 +1,13 @@
 //! chronicle — an append-only, replayable event log.
 //!
-//! One JSON object per line, each carrying a sequence number, a timestamp and
-//! a schema version:
+//! One JSON object per line, each carrying a sequence number, a timestamp, a
+//! schema version, the checksum of the record before it and its own, under a
+//! line that says what the file is:
 //!
 //! ```
-//! {"seq":1,"at":1700000000000,"v":1,"ev":{"created":{"id":7}}}
-//! {"seq":2,"at":1700000000100,"v":1,"ev":{"renamed":{"id":7,"to":"b"}}}
+//! {"chronicle":1,"base":1,"root":3116291790}
+//! {"seq":1,"at":1700000000000,"v":1,"p":3116291790,"ev":{"created":{"id":7}},"c":2544158864}
+//! {"seq":2,"at":1700000000100,"v":1,"p":2544158864,"ev":{"renamed":{"id":7,"to":"b"}},"c":3032764768}
 //! ```
 //!
 //! The lines live in a directory of segment files, each named after the first

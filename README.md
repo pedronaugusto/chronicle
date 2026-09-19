@@ -2,10 +2,10 @@
 
 [![CI](https://github.com/pedronaugusto/chronicle/actions/workflows/ci.yml/badge.svg)](https://github.com/pedronaugusto/chronicle/actions/workflows/ci.yml)
 
-An append-only event log for Zig. A journal is a directory of segment files
-holding one JSON object per line, each with a sequence number, a timestamp and
-a schema version; a program folds those records into whatever state it needs,
-from the disk at startup and live afterwards.
+chronicle is an append-only event log. A journal is a directory of segment
+files holding one JSON object per line, each with a sequence number, a
+timestamp and a schema version, and a program folds those records into
+whatever state it needs — from the disk at startup and live afterwards.
 
 ```
 {"chronicle":1,"base":1,"root":3116291790}
@@ -134,9 +134,10 @@ One module, no dependencies and no build options: the only knobs are the
 Plus `chronicle.checksum(covered)`, which is the checksum a record carries,
 and `chronicle.segmentName(base_seq)`, which is the file a sequence number
 lives in; `chronicle.flush`, which names the call a durable write makes here;
-and the types `Record`, `Entry`, `Window`, `Replay`, `Tailer`, `Sink`,
-`Reader`, `Readers`, `Options`, `Snapshot`, `Opened`, `Migrate`, `Stats`,
-`Sync`, `Flush`, `Verify`, and one named error set per operation. Every
+and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Window`,
+`Replay`, `Tailer`, `Sink`, `Reader`, `Readers`, `Options`, `Snapshot`,
+`Opened`, `Migrate`, `Stats` and one named error set per operation, with
+`Sync`, `Flush` and `Verify` at the module root. Every
 public declaration carries a doc comment stating its contract;
 `src/chronicle.zig` is the reference and `src/log.zig` the segment store under
 it. `Event` may be any type `std.json` can write and read back; a tagged union
@@ -145,7 +146,7 @@ exhaustive `switch` in the fold.
 
 ## Design
 
-### What is on the disk
+**What a journal directory holds.**
 
 ```
 ledger/
@@ -185,9 +186,7 @@ every `.idx` file costs one scan per segment. By default it holds one entry per
 a bounded walk after the seek. `Options.index_interval_bytes = 0` is one entry
 per record.
 
-### Durability
-
-Five promises, and nothing more.
+**Five promises, and nothing more.**
 
 1. **A sequence number that `append` returned is on the disk**, as far as
    `Options.sync` asks. The record is serialised, written, flushed and made
@@ -205,7 +204,7 @@ Five promises, and nothing more.
 
    | Platform | The call | What it means |
    |---|---|---|
-   | macOS | `fcntl(F_FULLFSYNC)` | The drive was asked to flush its own cache to the media. `fsync` there returns before that, which is why it is not what this package uses — and why an `append` at `.always` costs milliseconds on a consumer drive rather than microseconds. A filesystem with no media flush to ask for falls back to `fsync`, and then this row is the Linux row. |
+   | macOS | `fcntl(F_FULLFSYNC)` | The drive was asked to flush its own cache to the media. `fsync` there returns before that, which is why it is not what this package uses — and why an `append` at `.always` costs milliseconds on a consumer drive rather than microseconds. A filesystem that will not take the call falls back to `fsync`, and then this row is the Linux row. |
    | Linux | `fdatasync` for a write into space the file already had, `fsync` otherwise | The bytes and what a reader needs to find them are with the drive. Whether the drive has them on its media is the drive's promise; `Options.preallocate_bytes` is what makes the cheaper of the two calls sufficient. |
    | Windows | `NtFlushBuffersFile` | The bytes are with the drive, on the same terms. |
 
@@ -252,28 +251,24 @@ all-or-nothing to your fold, say so in the records. A snapshot is only ever an
 optimisation, so deleting one costs replay time; an index is only ever a cache,
 so losing one costs a scan.
 
-### Memory
-
-Three things, each bounded by something you set. The tail is
+**Three things, each bounded by something you set.** The tail is
 `Options.tail_records` records and `Options.tail_bytes` bytes of them,
 whichever bites first, kept parsed for `records`, `since` and `waitPast`; the
 oldest half goes when either ceiling is reached, so a tail costs a constant
 amount per append. A `Replay`, and so a `subscribe`, holds the record it is on
 and one read buffer, `Options.read_buffer_size`; a line longer than
-`Options.max_record_bytes` is refused rather than held. `open` walks the newest
-segment's newlines, and the records in it land in the tail under its ceilings.
-Nothing grows with the length of the log, and every allocation comes from the
-allocator passed to `open`.
+`Options.max_record_bytes` is refused rather than held. `open` walks the
+newest segment's newlines, and the records in it land in the tail under its
+ceilings. Nothing grows with the length of the log, and every allocation comes
+from the allocator passed to `open`.
 
 A `Record` from a `Window` lasts until the tail releases it, which the next
 `append` may do; one from a `Replay` until the next `next`; one handed to a
 `Sink` for the call. Copy what you need — `record.bytes` is the durable form,
 ready to forward with no re-encoding.
 
-### More than one process
-
-The writer holds an exclusive advisory lock on `<path>/lock` for as long as it
-is open.
+**The writer holds an exclusive advisory lock on `<path>/lock` for as long as
+it is open.**
 
 | Situation | What holds |
 |---|---|
@@ -284,20 +279,17 @@ is open.
 | Two writers without the lock | Not available: this package gives no way to ask for it. A journal on a filesystem whose locks do not work is refused too — `open` returns `error.FileLocksUnsupported`. |
 | Cross-process wake-up | Not promised. `waitPast` is for tasks inside one process; across processes, poll. |
 
-### Schema versions
-
-Every record carries the version it was written at, compared on the way back
-against `Options.schema_version`. Equal is parsed as `Event`. Newer is
+**Every record carries the version it was written at, compared on the way back
+against `Options.schema_version`.** Equal is parsed as `Event`. Newer is
 `error.NewerSchema`: this process is the old one, and guessing at a record a
 newer writer wrote is how a fold silently goes wrong. Older goes to
 `Options.migrate` if you gave one, then to the `Event` arm named `unknown` if
 there is one, typed `void` or `std.json.Value`, then to `error.OlderSchema`.
-`compact` copies kept records byte for byte, so one read back through `migrate`
-or the `unknown` arm keeps the version and payload it was written with.
+`compact` copies kept records byte for byte, so one read back through
+`migrate` or the `unknown` arm keeps the version and payload it was written
+with.
 
-### Threads and tasks
-
-One mutex inside. `append`, `appendAll`, `waitPast`, `nudge`, `subscribe`,
+**One mutex inside.** `append`, `appendAll`, `waitPast`, `nudge`, `subscribe`,
 `subscribeFrom`, `subscribeAll`, `subscribeAllFrom`, `unsubscribe`, `lastSeq`,
 `seqAtOrAfter`, `tailer`, `readers`, `minCursor`, `snapshot`, `backup`,
 `compact`, `dropSegmentsBefore`, `truncateAfter` and `refresh` take it and are
@@ -311,10 +303,8 @@ the task that appends, or under coordination of your own. Every file operation
 and the wait primitive go through `std.Io`, so the package runs under
 `std.testing.io`, a threaded `Io`, or whatever comes next.
 
-### The format
-
-A segment file begins with one line saying what it is, and then holds one
-record per line, newline-terminated, in the field order written:
+**A segment file begins with one line saying what it is, and then holds one
+record per line, newline-terminated, in the field order written:**
 
 ```
 {"chronicle":<u32>,"base":<u64>,"root":<u32>}
@@ -343,8 +333,8 @@ package can check one; because `p` is inside the bytes it covers, one line can
 still be checked on its own.
 
 A snapshot lives at `<path>/snapshot`, and a named reader's cursor at
-`<path>/<name>.cursor`, where `name` is one path component of letters, digits,
-`-` and `_`:
+`<path>/<name>.cursor`, where `name` is one path component of at most
+sixty-four letters, digits, `-` and `_`:
 
 ```
 {"fmt":<u32>,"seq":<u64>,"state":"<your bytes, base64>"}
@@ -374,8 +364,6 @@ file being opened.
 
 ## Scope
 
-Things a log of this kind might be expected to carry, and this one does not:
-
 - **No query and no secondary indexes.** A range of sequence numbers, a lookup
   by time, and your fold.
 - **No automatic retention.** `dropSegmentsBefore` and `compact` are the calls
@@ -391,8 +379,8 @@ Things a log of this kind might be expected to carry, and this one does not:
 
 | Platform | Mechanism | Tested where |
 |---|---|---|
-| Linux | `flock`, directory `fsync`, `fdatasync`, `copy_file_range` | `test (ubuntu-latest)` on the CI runner, and `ci/linux.sh` in Docker from any machine |
-| macOS | `flock`, directory `fsync`, `F_FULLFSYNC`, `clonefile` | `test (macos-latest)` on the CI runner |
+| Linux | `flock`, directory `fsync`, `fdatasync`, `copy_file_range` | `test (ubuntu-latest)` on the CI runner |
+| macOS | `flock`, directory `fsync`, `F_FULLFSYNC`, `clonefileat` | `test (macos-latest)` on the CI runner |
 | Windows | `NtLockFile`; no directory `fsync` | `test (windows-latest)` on the CI runner |
 
 Locking goes through `std.Io`, which uses `NtLockFile` on Windows and `flock`
@@ -405,7 +393,13 @@ package's byte copy where it does not; the copy that lands is the same.
 `zig build check -Dtarget=…` compiles everything, tests included, without
 running it. CI does that for `x86_64-linux-gnu`, `aarch64-linux-gnu`,
 `x86_64-linux-musl`, `x86_64-windows-gnu`, `aarch64-windows-gnu`,
-`x86_64-macos` and `aarch64-macos`.
+`x86_64-macos` and `aarch64-macos`, with `x86_64-linux-gnu` and
+`aarch64-linux-gnu` built a second time at a raised baseline — `x86_64_v2` and
+`cortex_a72` — because the CRC32C instructions are chosen from the target's
+features at compile time, so a baseline build takes the table and only a raised
+one compiles the other arm. [`ci/linux.sh`](ci/linux.sh) runs the suite on
+Linux in Docker from any machine; it is a local script and no CI job calls
+it.
 
 ## Testing
 
@@ -436,7 +430,7 @@ the segment being written to against one into a sealed segment, an open of a
 log that was closed cleanly against the same open with the index deleted, five
 folds over one pass against one fold, and — in ReleaseFast — the rates an
 append and a replayed record run at. Ratios wherever a ratio will do, because
-an absolute number is a claim about a machine.
+an absolute number says more about the machine than about the package.
 
 Six fuzz tests. Five run over the contents of a file — arbitrary segment bytes,
 an arbitrary first line of a segment, an arbitrary index, an arbitrary snapshot
@@ -458,6 +452,6 @@ seed.
 
 Zig 0.16.0.
 
-## License
+## Licence
 
 MIT. See [LICENSE](LICENSE).

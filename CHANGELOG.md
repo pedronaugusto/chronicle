@@ -1,12 +1,10 @@
 # Changelog
 
-Each entry says what the old shape could not express, so a port has the reason
-and not only the diff. Versions follow [semantic versioning](https://semver.org);
-before 1.0 the minor is the breaking one.
+All notable changes to this project are documented here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
+adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
-
-## 0.5.0
+## [0.5.0] - 2026-09-19
 
 A log whose records say what they are and what came before them, a durable
 write that is durable on the platform it runs on, and an index that proves
@@ -14,7 +12,7 @@ itself. **A 0.4.0 journal does not open**: the framing carries its version
 now, and a file without one is refused by name rather than read as though it
 were this one. Replay an old journal into a new directory.
 
-Breaking, to the format:
+### Breaking
 
 - **A segment file starts with a line saying what it is.**
   `{"chronicle":1,"base":<u64>,"root":<u32>}` — the framing version, the
@@ -60,37 +58,7 @@ Breaking, to the format:
   now goes to the operating system by name.
 - **`Stats.bytes` counts records**, not the line at the head of each segment.
 
-Fixed:
-
-- **A seek into the segment being written to scanned it.** The active
-  segment's index file was created write-only, so the live-index fast path
-  could never read a byte back and every seek into the newest segment fell
-  through to a scan. Measured 27 070 µs before and 34 µs after, over a
-  million records.
-- **`.always` did not survive a power cut on macOS.** `fsync` there returns
-  once the bytes are in the drive's write cache. A durable write now goes
-  through `fcntl(F_FULLFSYNC)` on Darwin, which asks the drive to flush its
-  media, and through `fdatasync` on Linux when the write went into space the
-  file already had. The cost is real and was being hidden: an `append` at
-  `.always` measured 28 µs before and four to six milliseconds after on this
-  machine, which is what a media flush costs on a consumer drive. `appendAll`
-  is how to pay it once for many records, and `chronicle.flush` names the call
-  this platform makes.
-- **A clean close left an index nothing took.** `deinit` sealed the active
-  segment's index with the exact length it described and `open` then truncated
-  it and scanned the segment again. Opening a million-record log measured
-  69 ms before and under ten after.
-- **`replay()` could write.** It is public and takes no lock, and it could
-  reach the index rebuild — creating and filling a file, and flushing the
-  active segment's index writer, while another task was inside `append`. A
-  walk now reads an index that is there and otherwise starts at the segment's
-  first record; `open`, `refresh`, `subscribe` and `seqAtOrAfter` hold the
-  lock and are what build one.
-- **A cursor of every one overflowed.** `replay(maxInt(u64))`, which a
-  `.cursor` file can ask for, added one to it. Found by the new
-  crash-consistency fuzz target on its first run.
-
-New:
+### Added
 
 - **`subscribeAll(io, sinks)` and `subscribeAllFrom(io, sinks, cursor)`.**
   Five folds subscribed one at a time read the log five times. One pass fed to
@@ -151,10 +119,41 @@ New:
   Nothing in the suite would have caught the seek regression above; these
   would.
 
-## 0.4.0
+### Fixed
 
-Breaking, and only to the index sidecar — no journal needs converting and no
-record changes:
+- **A seek into the segment being written to scanned it.** The active
+  segment's index file was created write-only, so the live-index fast path
+  could never read a byte back and every seek into the newest segment fell
+  through to a scan. Measured 27 070 µs before and 34 µs after, over a
+  million records.
+- **`.always` did not survive a power cut on macOS.** `fsync` there returns
+  once the bytes are in the drive's write cache. A durable write now goes
+  through `fcntl(F_FULLFSYNC)` on Darwin, which asks the drive to flush its
+  media, and through `fdatasync` on Linux when the write went into space the
+  file already had. The cost is real and was being hidden: an `append` at
+  `.always` measured 28 µs before and four to six milliseconds after on this
+  machine, which is what a media flush costs on a consumer drive. `appendAll`
+  is how to pay it once for many records, and `chronicle.flush` names the call
+  this platform makes.
+- **A clean close left an index nothing took.** `deinit` sealed the active
+  segment's index with the exact length it described and `open` then truncated
+  it and scanned the segment again. Opening a million-record log measured
+  69 ms before and under ten after.
+- **`replay()` could write.** It is public and takes no lock, and it could
+  reach the index rebuild — creating and filling a file, and flushing the
+  active segment's index writer, while another task was inside `append`. A
+  walk now reads an index that is there and otherwise starts at the segment's
+  first record; `open`, `refresh`, `subscribe` and `seqAtOrAfter` hold the
+  lock and are what build one.
+- **A cursor of every one overflowed.** `replay(maxInt(u64))`, which a
+  `.cursor` file can ask for, added one to it. Found by the new
+  crash-consistency fuzz target on its first run.
+
+## [0.4.0] - 2026-09-14
+
+### Breaking
+
+Only the index sidecar: no journal needs converting and no record changes.
 
 - **The index format is version 2.** An index now carries a timestamp beside
   every byte offset, and its header carries the lowest and highest timestamp in
@@ -168,21 +167,7 @@ record changes:
   Anything reading a `.idx` file with something other than this package has to
   be taught the new shape; README.md states it byte for byte.
 
-Fixed:
-
-- **A walk over a log another process is appending to could hand back half a
-  record.** A scan that ran out of file part-way through a record asked the
-  reader for the byte after what it had streamed, and took *a* byte for the
-  newline that ends a record. A writer that appended in between made that byte
-  the rest of the record, so the walk returned a truncated line as if it were
-  whole and was one byte out for every record after it — `error.CorruptRecord`
-  or `error.ChecksumMismatch` from a log that was never damaged. The byte is
-  now compared against the newline rather than counted, so a record that was
-  not finished when the walk reached it is the end of the walk, which is what
-  `Options.access = .read` has always promised. Nothing on the disk was ever
-  wrong, so nothing needs repairing.
-
-New:
+### Added
 
 - **`appendAll(io, entries)`.** Write a batch of records under one `fsync`
   instead of one each, and get back the sequence number of the last. It is
@@ -223,20 +208,34 @@ New:
   directory being copied. A destination that is the journal's own directory
   is `error.BackupInPlace` rather than a log copied over itself.
 
-Removed:
+### Changed
 
-- **`snapshot_temporary_name`.** Removed from `src/log.zig`, where it named
-  the file a snapshot is written to before it is renamed into place, and it
-  was never re-exported from the package root.
+- **`snapshot_temporary_name` is gone** from `src/log.zig`, where it named the
+  file a snapshot is written to before it is renamed into place. It was never
+  re-exported from the package root.
 
-## 0.3.0
+### Fixed
+
+- **A walk over a log another process is appending to could hand back half a
+  record.** A scan that ran out of file part-way through a record asked the
+  reader for the byte after what it had streamed, and took *a* byte for the
+  newline that ends a record. A writer that appended in between made that byte
+  the rest of the record, so the walk returned a truncated line as if it were
+  whole and was one byte out for every record after it — `error.CorruptRecord`
+  or `error.ChecksumMismatch` from a log that was never damaged. The byte is
+  now compared against the newline rather than counted, so a record that was
+  not finished when the walk reached it is the end of the walk, which is what
+  `Options.access = .read` has always promised. Nothing on the disk was ever
+  wrong, so nothing needs repairing.
+
+## [0.3.0] - 2026-09-14
 
 A record that can say whether it is still the record that was written, and a
 durability setting that says what it is buying. 0.2.0 detected a torn tail and
 nothing else: a byte that changed after the fact produced a line that parsed,
 an event that type-checked and a fold that was quietly wrong.
 
-Breaking:
+### Breaking
 
 - **`Options.fsync: bool` is now `Options.sync: Sync`**, one of `.always`,
   `.on_segment` or `.never`. `fsync = true` is `.always`, which is the default,
@@ -246,7 +245,7 @@ Breaking:
   table, because a durability knob without one is a knob.
 - **Records carry a checksum.** A line written by 0.3.0 ends `,"c":<u32>}`
   where `c` is the CRC32C of everything before it. The format is still one
-  JSON object per line and `tail -f` is still a debugger. **Old journals open
+  JSON object per line, still readable with whatever reads lines. **Old journals open
   unchanged**: a record with no `c` has nothing to check and is read exactly as
   it was, so a 0.2.0 directory needs no conversion and gains checksums as it is
   appended to. A 0.3.0 journal read by 0.2.0 is also fine, since the extra
@@ -255,7 +254,7 @@ Breaking:
   `CorruptRecord` because the two say different things: one line is not a
   record, the other is a record that is not the one that was written.
 
-New:
+### Added
 
 - **A verified read path.** Every path that turns a line into a record checks
   the checksum before parsing the event — `open`, `replay`, `subscribe`.
@@ -277,15 +276,17 @@ New:
   numbers, read off what the journal already knows: no file is opened and
   nothing is scanned.
 
-## 0.2.0
+## [0.2.0] - 2026-09-13
 
 The log a daemon runs on for a year, rather than one that must fit in memory.
 0.1.0 read the whole file at `open` and kept every record there, took no lock,
 and had one file with no way to shed the front of it; every limit below was a
 reason not to use it in the place it was written for.
 
-Breaking, and all of it in the same direction — what used to be a file is now a
-directory of segments:
+### Breaking
+
+All of it in the same direction: what used to be a file is now a directory of
+segments.
 
 - **The package is called `chronicle`.** `@import("zjournal")` becomes
   `@import("chronicle")`, `src/zjournal.zig` becomes `src/chronicle.zig`, and
@@ -318,7 +319,7 @@ directory of segments:
   dies between its rename and its unlink, and opens that — so the seam does not
   have to exist in the package to be tested.
 
-New:
+### Added
 
 - **Streaming reads.** `open` reads the newest segment and one line of each
   older one. `replay(io, cursor)` walks the log from the disk holding one
@@ -353,10 +354,12 @@ New:
   because a lock, a rename and a directory `fsync` are exactly the things that
   differ between kernels.
 
-## 0.1.0
+## [0.1.0] - 2026-09-13
 
 First release. `Journal(Event)` over any type `std.json` can write and read
-back, with:
+back.
+
+### Added
 
 - One JSON object per line — `seq`, `at`, `v`, `ev` — read back into records
   that keep both the parsed event and the exact bytes it was stored as, so a
@@ -377,3 +380,9 @@ back, with:
   runs on `std.testing.io` and the package runs on a threaded one.
 - Fuzz tests over arbitrary journal and snapshot file contents, because the
   file shapes this package exists to survive are the ones nobody chose.
+
+[0.5.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.5.0
+[0.4.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.4.0
+[0.3.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.3.0
+[0.2.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.2.0
+[0.1.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.1.0

@@ -6,10 +6,11 @@
 //! mylog/
 //!   lock                          the writer's advisory lock
 //!   00000000000000000001.log      records 1..800
-//!   00000000000000000001.idx      byte offsets for those records
+//!   00000000000000000001.idx      where some of those records start, and when
 //!   00000000000000000801.log      records 801..  -- the active segment
 //!   00000000000000000801.idx
 //!   snapshot                      whatever the caller last wrote
+//!   reports.cursor                where the named reader `reports` got to
 //! ```
 //!
 //! Nothing here knows what a record means. It knows that a record is one line,
