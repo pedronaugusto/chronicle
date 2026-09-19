@@ -137,8 +137,9 @@ lives in; `chronicle.flush`, which names the call a durable write makes here;
 and the types `Record`, `Entry`, `Window`, `Replay`, `Tailer`, `Sink`,
 `Reader`, `Readers`, `Options`, `Snapshot`, `Opened`, `Migrate`, `Stats`,
 `Sync`, `Flush`, `Verify`, and one named error set per operation. Every
-public declaration carries a doc comment stating its contract; `src/chronicle.zig` is the reference and `src/log.zig`
-the segment store under it. `Event` may be any type `std.json` can write and
+public declaration carries a doc comment stating its contract;
+`src/chronicle.zig` is the reference and `src/log.zig` the segment store under
+it. `Event` may be any type `std.json` can write and
 read back; a tagged union is the expected shape, because it gives each record a
 name on disk and an exhaustive `switch` in the fold.
 
@@ -244,7 +245,7 @@ Five promises, and nothing more.
    `verify()` does the same on demand.
 
 `appendAll` is group commit and not a transaction. A batch goes down under one
-`fsync` instead of one each, and a crash inside it leaves a prefix on the disk,
+flush instead of one each, and a crash inside it leaves a prefix on the disk,
 with a torn final line at worst — the shape a crash inside a single `append`
 leaves, repaired the same way at the next open. If a group has to be
 all-or-nothing to your fold, say so in the records. A snapshot is only ever an
@@ -304,11 +305,11 @@ safe from any task or thread, several at once; the subscribe calls hold it for
 the whole of their replay, so the hand-over from the disk to the live records
 has no seam in it. A `Replay` takes no lock and writes nothing, so a segment
 whose index is missing is walked from its first record rather than indexed on
-the way; the calls above are what build an index. `records()`, `since()`, `segmentCount()`, `oldestSeq()` and a
-`Replay` do not take it: call them from the task that appends, or under
-coordination of your own. Every file operation and the wait primitive go
-through `std.Io`, so the package runs under `std.testing.io`, a threaded `Io`,
-or whatever comes next.
+the way; the calls above are what build an index. `records()`, `since()`,
+`segmentCount()`, `oldestSeq()` and a `Replay` do not take it: call them from
+the task that appends, or under coordination of your own. Every file operation
+and the wait primitive go through `std.Io`, so the package runs under
+`std.testing.io`, a threaded `Io`, or whatever comes next.
 
 ### The format
 
