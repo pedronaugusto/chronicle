@@ -1164,6 +1164,80 @@ pub fn Journal(comptime Event: type) type {
             }
         };
 
+        /// A named reader and where it has got to, as the directory holds
+        /// it: the pair `readers` lists, without opening a `Tailer`.
+        pub const Reader = struct {
+            /// Owned by the `Readers` it came in.
+            name: []const u8,
+            cursor: u64,
+        };
+
+        /// What `readers` returns. Release it with `deinit`.
+        pub const Readers = struct {
+            items: []const Reader,
+            gpa: Allocator,
+
+            pub fn deinit(list: *Readers) void {
+                for (list.items) |reader| list.gpa.free(reader.name);
+                list.gpa.free(list.items);
+                list.* = undefined;
+            }
+        };
+
+        /// Every named reader that has committed a cursor beside this log,
+        /// and the number each of them last committed.
+        ///
+        /// A cursor file is written by whoever holds the name, in whatever
+        /// process; this reads the directory rather than any register this
+        /// journal keeps, so a reader in another process is in the list.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn readers(self: *Self, io: Io) TailerError!Readers {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+
+            var found: std.ArrayList(Reader) = .empty;
+            errdefer {
+                for (found.items) |reader| self.gpa.free(reader.name);
+                found.deinit(self.gpa);
+            }
+
+            var iterator = self.log.dir.iterate();
+            while (try iterator.next(io)) |entry| {
+                if (entry.kind == .directory) continue;
+                if (!std.mem.endsWith(u8, entry.name, cursor_extension)) continue;
+                const name = entry.name[0 .. entry.name.len - cursor_extension.len];
+                if (!validTailerName(name)) continue;
+                const owned = try self.gpa.dupe(u8, name);
+                errdefer self.gpa.free(owned);
+                try found.append(self.gpa, .{
+                    .name = owned,
+                    .cursor = try self.readCursor(io, owned),
+                });
+            }
+            return .{ .items = try found.toOwnedSlice(self.gpa), .gpa = self.gpa };
+        }
+
+        /// The lowest cursor any named reader has committed, or null when no
+        /// reader has committed one.
+        ///
+        /// This is what retention is for: every record at or below it has
+        /// been handled by every reader that keeps a cursor, so
+        /// `dropSegmentsBefore(minCursor)` drops only what they are all past.
+        /// A reader that keeps no cursor is not in the answer, because
+        /// nothing beside the log says it exists.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn minCursor(self: *Self, io: Io) TailerError!?u64 {
+            var list = try self.readers(io);
+            defer list.deinit();
+            var lowest: ?u64 = null;
+            for (list.items) |reader| {
+                lowest = if (lowest) |value| @min(value, reader.cursor) else reader.cursor;
+            }
+            return lowest;
+        }
+
         /// Open the named reader `name`, reading back the cursor it last
         /// committed — zero if it has never committed one.
         ///

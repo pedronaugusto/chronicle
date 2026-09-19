@@ -1485,6 +1485,50 @@ test "a reader's tailer writes its cursor and nothing else" {
     try testing.expectError(error.ReadOnly, reader.snapshot(io, "no"));
 }
 
+test "retention can see what its readers have consumed" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer journal.deinit(io);
+    for (1..13) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+
+    // Nothing has committed a cursor, so there is nothing to keep for.
+    try testing.expectEqual(@as(?u64, null), try journal.minCursor(io));
+    {
+        var none = try journal.readers(io);
+        defer none.deinit();
+        try testing.expectEqual(@as(usize, 0), none.items.len);
+    }
+
+    {
+        var reports = try journal.tailer(io, "reports");
+        defer reports.deinit();
+        try reports.commit(io, 9);
+        var billing = try journal.tailer(io, "billing");
+        defer billing.deinit();
+        try billing.commit(io, 5);
+    }
+
+    // Both are in the list, whoever opened them, because the list is the
+    // directory rather than a register this journal keeps.
+    var list = try journal.readers(io);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    for (list.items) |reader| {
+        if (std.mem.eql(u8, reader.name, "reports")) try testing.expectEqual(@as(u64, 9), reader.cursor);
+        if (std.mem.eql(u8, reader.name, "billing")) try testing.expectEqual(@as(u64, 5), reader.cursor);
+    }
+
+    // And the lowest of them is what retention may drop up to: the records
+    // every reader is past.
+    const behind = (try journal.minCursor(io)).?;
+    try testing.expectEqual(@as(u64, 5), behind);
+    _ = try journal.dropSegmentsBefore(io, behind);
+    try testing.expectEqual(@as(u64, 5), journal.oldestSeq());
+}
+
 test "a tailer's name has to be one that can be a file" {
     const io = testing.io;
     var ws = try Workspace.init("log");
