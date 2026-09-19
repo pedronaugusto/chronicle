@@ -6,6 +6,150 @@ before 1.0 the minor is the breaking one.
 
 ## Unreleased
 
+## 0.5.0
+
+A log whose records say what they are and what came before them, a durable
+write that is durable on the platform it runs on, and an index that proves
+itself. **A 0.4.0 journal does not open**: the framing carries its version
+now, and a file without one is refused by name rather than read as though it
+were this one. Replay an old journal into a new directory.
+
+Breaking, to the format:
+
+- **A segment file starts with a line saying what it is.**
+  `{"chronicle":1,"base":<u64>,"root":<u32>}` — the framing version, the
+  sequence number the file starts at, and the number its first record links
+  back to. A `.log` whose first line is not one is `error.UnsupportedFormat`.
+  A zero-byte one is a segment whose creation did not finish, and the next
+  open writes the line again.
+- **Every record carries the checksum of the record before it.** A line is
+  `{"seq","at","v","p","ev","c"}` where `p` is the previous record's `c`, and
+  the first record in a file carries the file's root. A record spliced in from
+  somewhere else, or left over from an earlier life of a file, is
+  `error.BrokenChain` rather than a fold that is quietly wrong. The chain runs
+  across a rotation and across a compaction, because the records do; a file
+  whose predecessors have been dropped gets a random root, so nothing links
+  onto it by accident. `chronicle.checksum` is unchanged and still covers one
+  line on its own, because the link is inside the line.
+- **The index is version 3.** A ninety-six byte header with thirty-six spare
+  bytes in it, naming the segment and its record count as well as its length,
+  saying whether the timestamps rise, and carrying a checksum of the entries —
+  so an index proves itself against the header rather than by reading the
+  segment's last record back. Entries are twenty-four bytes and name their
+  record, which is what lets there be fewer of them than there are records.
+  An index in an older format reads as stale and is rebuilt, as it always has.
+- **`Options.index_interval_bytes`, 4096 by default.** One entry per 4096
+  bytes of segment instead of one per record: a fortieth of the size, with a
+  walk of at most one interval after the seek. Zero is one entry per record,
+  which is what 0.4.0 wrote.
+- **The snapshot and a reader's cursor carry `fmt`.** `{"fmt":1,"seq":…}`. A
+  version this package does not know is `error.UnsupportedFormat` rather than
+  a starting point that is quietly wrong.
+- **`Options.max_record_bytes`, one mebibyte by default.** `append` refuses a
+  longer line and a read refuses a segment with no newline within that many
+  bytes, so a damaged segment is not taken into memory whole to find out it
+  holds no record. `AppendError` gains `RecordTooLarge`.
+- **`Options.verify_round_trip`, false by default.** `append` used to parse
+  every record back out of the bytes it had just written, a third of what an
+  append costs, even where nothing would read the record. It still does so
+  wherever something will — a tail, a sink — because that is what makes an
+  `Event` whose slices point at a stack buffer safe to append; where nothing
+  will, this is how to ask for the check and the `NotRoundTrippable` answer
+  anyway.
+- **`chronicle.segmentName` returns a zero-terminated array**, because a copy
+  now goes to the operating system by name.
+- **`Stats.bytes` counts records**, not the line at the head of each segment.
+
+Fixed:
+
+- **A seek into the segment being written to scanned it.** The active
+  segment's index file was created write-only, so the live-index fast path
+  could never read a byte back and every seek into the newest segment fell
+  through to a scan. Measured 27 070 µs before and 38.5 µs after, over a
+  million records.
+- **`.always` did not survive a power cut on macOS.** `fsync` there returns
+  once the bytes are in the drive's write cache. A durable write now goes
+  through `fcntl(F_FULLFSYNC)` on Darwin, which asks the drive to flush its
+  media, and through `fdatasync` on Linux when the write went into space the
+  file already had. The cost is real and was being hidden: an `append` at
+  `.always` measured 28 µs before and 4.1 ms after on this machine, which is
+  what a media flush costs. `appendAll` is how to pay it once for many
+  records, and `chronicle.flush` names the call this platform makes.
+- **A clean close left an index nothing took.** `deinit` sealed the active
+  segment's index with the exact length it described and `open` then truncated
+  it and scanned the segment again. Opening a million-record log measured
+  69 ms before and 1.8 ms after.
+- **`replay()` could write.** It is public and takes no lock, and it could
+  reach the index rebuild — creating and filling a file, and flushing the
+  active segment's index writer, while another task was inside `append`. A
+  walk now reads an index that is there and otherwise starts at the segment's
+  first record; `open`, `refresh`, `subscribe` and `seqAtOrAfter` hold the
+  lock and are what build one.
+- **A cursor of every one overflowed.** `replay(maxInt(u64))`, which a
+  `.cursor` file can ask for, added one to it. Found by the new
+  crash-consistency fuzz target on its first run.
+
+New:
+
+- **`subscribeAll(io, sinks)` and `subscribeAllFrom(io, sinks, cursor)`.**
+  Five folds subscribed one at a time read the log five times. One pass fed to
+  all of them costs what one fold costs — the extra callbacks per record are
+  free beside the decode — and it is one call under one lock, so a record
+  appended beside it lands in all of them or in none. Measured 1238 ms against
+  250 ms for five folds over a million records.
+- **`unsubscribe(io, sink)`.** A fold could only ever be added. A reconnecting
+  client's fold is dropped when the client goes.
+- **`readers(io)` and `minCursor(io)`.** Every named reader that has committed
+  a cursor beside the log, and the lowest number any of them is past — which
+  is what retention needs and had no way to find out.
+- **The checksum goes through the instruction for it.** aarch64 and x86-64
+  have both had one for this polynomial since 2011, behind the target's
+  features, with the table where the machine has none. The same number:
+  128 ns per record before, 3.9 ns after, and 0.42 GB/s against 9.6 GB/s over
+  a large buffer. A replay of a million records measured 0.888 s before and
+  0.248 s after, which is this and the parse together.
+- **`Options.preallocate_bytes`, zero by default.** The active segment is kept
+  zero-filled that far ahead of its records, so an append writes into space the
+  file already has rather than extending it — which is what makes the cheaper
+  flush sufficient on the platforms that have one. A rotation and a close cut
+  the reservation back. A run of zeros at the end of a segment is therefore
+  space a writer reserved and never filled, not a record it did not finish: a
+  record can hold no zero byte, so the repair pass counts the bytes up to the
+  last one that is not zero and leaves the rest to the next append.
+- **`Options.max_snapshot_bytes`, sixty-four mebibytes by default.** What is
+  in a snapshot is the caller's fold, so how large one may be is the caller's
+  number. A larger one is `error.SnapshotTooLarge` instead of an unbounded
+  read.
+- **A backup asks the filesystem to copy the bytes.** A sealed segment is
+  bytes that will never change again: Darwin shares their extents, Linux hands
+  the copy to the filesystem. Every call may say no — a filesystem that will
+  not share, a kernel without it, two directories on different mounts — and
+  the answer is then the byte copy, so the copy that lands is the same either
+  way.
+- **A batch does not have to fit in memory first.** `appendAll` serialises each
+  record as it stages it and keeps only the ones something will read, so a
+  journal with no tail and no sink holds one line at a time however long the
+  batch. A record the journal cannot form takes back the lines already staged,
+  so a refused batch leaves the log exactly as it was.
+- **A lookup by time bisects where it can.** The index says whether the
+  timestamps in a segment rise; where they do, `seqAtOrAfter` halves the
+  entries instead of reading them. Measured 444 µs before and 34.8 µs after.
+  Where they do not, it is the search it always was.
+- **Two more fuzz targets, and one that fuzzes the calls.** One over an
+  arbitrary `.cursor` file, the one file whose contents come from outside the
+  log; one over an arbitrary first line of a segment; and one that drives a
+  random run of `append`, `appendAll`, `compact`, `truncateAfter`,
+  `dropSegmentsBefore`, `backup` and `snapshot`, cuts the newest segment at a
+  random byte, and asserts the invariant every promise rests on — a continuous
+  prefix, every checksum good, every record linked to the one before it, no
+  record that was never acknowledged, and a next append that takes the next
+  number.
+- **The numbers are tests.** A seek into the newest segment against one into a
+  sealed segment, an open against the same open with the index deleted, five
+  folds against one, and the rates an append and a replayed record run at.
+  Nothing in the suite would have caught the seek regression above; these
+  would.
+
 ## 0.4.0
 
 Breaking, and only to the index sidecar — no journal needs converting and no

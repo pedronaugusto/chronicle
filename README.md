@@ -8,8 +8,9 @@ a schema version; a program folds those records into whatever state it needs,
 from the disk at startup and live afterwards.
 
 ```
-{"seq":1,"at":1700000000000,"v":1,"ev":{"account_opened":{"id":1,"owner":"ada"}},"c":266789872}
-{"seq":2,"at":1700000000100,"v":1,"ev":{"deposited":{"id":1,"cents":5000}},"c":611212677}
+{"chronicle":1,"base":1,"root":3116291790}
+{"seq":1,"at":1700000000000,"v":1,"p":3116291790,"ev":{"account_opened":{"id":1,"owner":"ada"}},"c":2544158864}
+{"seq":2,"at":1700000000100,"v":1,"p":2544158864,"ev":{"deposited":{"id":1,"cents":5000}},"c":3032764768}
 ```
 
 ## Usage
@@ -117,6 +118,11 @@ One module, no dependencies and no build options: the only knobs are the
 | `tailer(io, name)` | A named reader, with the cursor it last committed. |
 | `subscribe(io, sink)` | Fold every record, from the disk and then live. |
 | `subscribeFrom(io, sink, cursor)` | The same, starting after a snapshot. |
+| `subscribeAll(io, sinks)` | Fold every record into several folds, over one pass. |
+| `subscribeAllFrom(io, sinks, cursor)` | The same, starting after a snapshot. |
+| `unsubscribe(io, sink)` | Drop a fold. |
+| `readers(io)` | Every named reader and the cursor it committed. |
+| `minCursor(io)` | The lowest of those, which is what retention may drop to. |
 | `snapshot(io, state_bytes)` | Write the fold out beside the log. |
 | `backup(io, dest)` | Copy the journal into another directory while it runs. |
 | `compact(io, keep_after_seq)` | Rewrite the log, keeping the records after the cut. |
@@ -125,9 +131,12 @@ One module, no dependencies and no build options: the only knobs are the
 | `verify(io)` | Read every record of every segment through every check. |
 | `stats(io)` | Segments, records, and the bytes they take. |
 
-Plus the types `Record`, `Entry`, `Window`, `Replay`, `Tailer`, `Sink`,
-`Options`, `Snapshot`, `Opened`, `Migrate`, `Stats`, `Sync`, `Verify`, and one
-named error set per operation. Every public declaration carries a doc comment
+Plus `chronicle.checksum(covered)`, which is the checksum a record carries,
+and `chronicle.segmentName(base_seq)`, which is the file a sequence number
+lives in; `chronicle.flush`, which names the call a durable write makes here;
+and the types `Record`, `Entry`, `Window`, `Replay`, `Tailer`, `Sink`,
+`Reader`, `Readers`, `Options`, `Snapshot`, `Opened`, `Migrate`, `Stats`,
+`Sync`, `Flush`, `Verify`, and one named error set per operation. Every public declaration carries a doc comment
 stating its contract; `src/chronicle.zig` is the reference and `src/log.zig`
 the segment store under it. `Event` may be any type `std.json` can write and
 read back; a tagged union is the expected shape, because it gives each record a
@@ -141,7 +150,7 @@ name on disk and an exhaustive `switch` in the fold.
 ledger/
   lock                          zero bytes; the writer's advisory lock
   00000000000000000001.log      records 1..800
-  00000000000000000001.idx      a byte offset and a timestamp per record
+  00000000000000000001.idx      where some of those records start, and when
   00000000000000000801.log      records 801..    <- the active segment
   00000000000000000801.idx
   snapshot                      whatever you last handed to `snapshot`
@@ -149,21 +158,31 @@ ledger/
 ```
 
 A segment is named for the sequence number of its first record, zero-padded to
-twenty digits so the directory sorts in sequence order. The segment a number is
-in comes from the names and the offset inside it from the index, so reading
-from the middle of a year of records costs two reads; `open` reads the newest
-segment through and takes one record from each older one, which proves the
-sequence runs without a gap; and a log `compact` empties still knows where it
-got to, because the empty segment left behind is named for the record that
-comes next. Segments rotate at `Options.max_segment_bytes` or
+twenty digits so the directory sorts in sequence order, and its first line says
+what the file is. The segment a number is in comes from the names, and where
+inside it to start reading comes from the index: a few reads and then at most
+`Options.index_interval_bytes` of the segment. A log `compact` empties still
+knows where it got to, because the empty segment left behind is named for the
+record that comes next. Segments rotate at `Options.max_segment_bytes` or
 `Options.max_segment_records`, on the append that would overflow the current
 one, with no background thread.
 
-The index is a cache. Its header names the segment length it was built from and
-the lowest and highest timestamp in it, and is checked against that length and
-against the sequence number of the record at its last offset; anything that
+`open` reads the index of each sealed segment, which says how many records it
+holds and what the lowest and highest timestamp in it are, and that is what
+proves the sequence runs without a gap; a segment whose index does not describe
+it is read instead. The newest segment is read through unless it was closed
+cleanly, in which case its index describes it at exactly its current length —
+which is also a proof that it ends at a record boundary, so the repair pass is
+skipped with it.
+
+The index is a cache. Its header names the segment it was built from, that
+segment's length and record count, the lowest and highest timestamp in it,
+whether those timestamps rise, and a checksum of its own entries; anything that
 disagrees, an older format included, is rebuilt from the segment. Deleting
-every `.idx` file costs one scan per segment.
+every `.idx` file costs one scan per segment. By default it holds one entry per
+4096 bytes of segment rather than one per record — a fortieth of the size, and
+a bounded walk after the seek. `Options.index_interval_bytes = 0` is one entry
+per record.
 
 ### Durability
 
@@ -176,11 +195,20 @@ Five promises, and nothing more.
 
    | `Options.sync` | What a returned sequence number means | What that survives |
    |---|---|---|
-   | `.always` (default) | The record's bytes have been `fsync`ed. | A process crash, and a power cut. |
-   | `.on_segment` | The bytes reached the operating system, and are `fsync`ed when the segment is sealed and when the journal is closed. | A process crash, including a kill. A power cut loses the records written since the last seal. |
+   | `.always` (default) | The record's bytes have been through the flush in the table below. | A process crash. A power cut, as far as that flush reaches. |
+   | `.on_segment` | The bytes reached the operating system, and go through that flush when the segment is sealed and when the journal is closed. | A process crash, including a kill. A power cut loses the records written since the last seal. |
    | `.never` | The bytes reached the operating system, and nothing asks it when it will write them back. | A process crash, including a kill. A power cut loses whatever had not been written back. |
 
-   The policy governs the record bytes. The `fsync`s that make a replacement
+   What "durable" costs is the platform's answer and not this package's, so it
+   is stated per platform. `chronicle.flush` is the same three answers in code.
+
+   | Platform | The call | What it means |
+   |---|---|---|
+   | macOS | `fcntl(F_FULLFSYNC)` | The drive was asked to flush its own cache to the media. `fsync` there returns before that, which is why it is not what this package uses — and why an `append` at `.always` costs milliseconds on a consumer drive rather than microseconds. A filesystem with no media flush to ask for falls back to `fsync`, and then this row is the Linux row. |
+   | Linux | `fdatasync` for a write into space the file already had, `fsync` otherwise | The bytes and what a reader needs to find them are with the drive. Whether the drive has them on its media is the drive's promise; `Options.preallocate_bytes` is what makes the cheaper of the two calls sufficient. |
+   | Windows | `NtFlushBuffersFile` | The bytes are with the drive, on the same terms. |
+
+   The policy governs the record bytes. The flushes that make a replacement
    atomic — promises 3 and 4 — are not optional under any of the three, because
    they are what those promises are.
 
@@ -206,10 +234,14 @@ Five promises, and nothing more.
    the event is parsed on every path that turns a line into a record: `open`,
    `replay`, `subscribe`, `verify`. An unfinished line is
    `error.TruncatedRecord`; one whose bytes have changed since is
-   `error.ChecksumMismatch`. `Options.verify = .full` makes `open` check every
-   record of every segment rather than only the newest, and `verify()` does the
-   same on demand. A record written before 0.3.0 carries no checksum and is
-   read as it always was.
+   `error.ChecksumMismatch`. Every record also carries the checksum of the
+   record before it, so a record spliced in from somewhere else — or left over
+   from an earlier life of a file — is `error.BrokenChain` rather than a fold
+   that is quietly wrong. A segment file whose first line is not one this
+   version writes is `error.UnsupportedFormat`, and so is a snapshot or a
+   cursor from a shape it does not know. `Options.verify = .full` makes `open`
+   check every record of every segment rather than only the newest, and
+   `verify()` does the same on demand.
 
 `appendAll` is group commit and not a transaction. A batch goes down under one
 `fsync` instead of one each, and a crash inside it leaves a prefix on the disk,
@@ -226,7 +258,8 @@ Three things, each bounded by something you set. The tail is
 whichever bites first, kept parsed for `records`, `since` and `waitPast`; the
 oldest half goes when either ceiling is reached, so a tail costs a constant
 amount per append. A `Replay`, and so a `subscribe`, holds the record it is on
-and one read buffer, `Options.read_buffer_size`. `open` walks the newest
+and one read buffer, `Options.read_buffer_size`; a line longer than
+`Options.max_record_bytes` is refused rather than held. `open` walks the newest
 segment's newlines, and the records in it land in the tail under its ceilings.
 Nothing grows with the length of the log, and every allocation comes from the
 allocator passed to `open`.
@@ -264,11 +297,14 @@ or the `unknown` arm keeps the version and payload it was written with.
 ### Threads and tasks
 
 One mutex inside. `append`, `appendAll`, `waitPast`, `nudge`, `subscribe`,
-`subscribeFrom`, `lastSeq`, `seqAtOrAfter`, `tailer`, `snapshot`, `backup`,
+`subscribeFrom`, `subscribeAll`, `subscribeAllFrom`, `unsubscribe`, `lastSeq`,
+`seqAtOrAfter`, `tailer`, `readers`, `minCursor`, `snapshot`, `backup`,
 `compact`, `dropSegmentsBefore`, `truncateAfter` and `refresh` take it and are
-safe from any task or thread, several at once; `subscribeFrom` holds it for the
-whole of its replay, so the hand-over from the disk to the live records has no
-seam in it. `records()`, `since()`, `segmentCount()`, `oldestSeq()` and a
+safe from any task or thread, several at once; the subscribe calls hold it for
+the whole of their replay, so the hand-over from the disk to the live records
+has no seam in it. A `Replay` takes no lock and writes nothing, so a segment
+whose index is missing is walked from its first record rather than indexed on
+the way; the calls above are what build an index. `records()`, `since()`, `segmentCount()`, `oldestSeq()` and a
 `Replay` do not take it: call them from the task that appends, or under
 coordination of your own. Every file operation and the wait primitive go
 through `std.Io`, so the package runs under `std.testing.io`, a threaded `Io`,
@@ -276,46 +312,64 @@ or whatever comes next.
 
 ### The format
 
-One record per line, newline-terminated, in the field order written:
+A segment file begins with one line saying what it is, and then holds one
+record per line, newline-terminated, in the field order written:
 
 ```
-{"seq":<u64>,"at":<i64>,"v":<u32>,"ev":<your event as std.json>,"c":<u32>}
+{"chronicle":<u32>,"base":<u64>,"root":<u32>}
+{"seq":<u64>,"at":<i64>,"v":<u32>,"p":<u32>,"ev":<your event as std.json>,"c":<u32>}
 ```
+
+`chronicle` is the version of this framing, and a file whose first line is not
+one this version knows is `error.UnsupportedFormat` rather than a file read as
+though its records were these. `base` is the sequence number the file starts
+at, which is also its name. `root` is the number the first record in the file
+carries as its `p`: a random one for a file whose predecessors are gone, and
+the last record of the previous file otherwise, so the chain below runs across
+a rotation and across a compaction.
 
 `seq` starts at 1 and rises by one, up to 2^63-1: a sequence number is a JSON
 integer, and `append` refuses with `error.SequenceExhausted` rather than write
 one that cannot be read back. `at` is whatever you passed, milliseconds since
 the Unix epoch being the intended unit; chronicle never reads a clock, so a
-test is deterministic and a replay exact. `v` is `Options.schema_version`. `c`
-is the CRC32C of every byte of the line before the `,"c":` that carries it —
-the record with its closing brace removed — written as a decimal integer and
-always last, which is what makes it checkable without re-encoding anything.
-`chronicle.checksum` is that function, public so a tool reading a segment with
-something other than this package can check one.
+test is deterministic and a replay exact. `v` is `Options.schema_version`. `p`
+is the checksum of the record before this one. `c` is the CRC32C of every byte
+of the line before the `,"c":` that carries it — the record with its closing
+brace removed — written as a decimal integer and always last, which is what
+makes it checkable without re-encoding anything. `chronicle.checksum` is that
+function, public so a tool reading a segment with something other than this
+package can check one; because `p` is inside the bytes it covers, one line can
+still be checked on its own.
 
 A snapshot lives at `<path>/snapshot`, and a named reader's cursor at
 `<path>/<name>.cursor`, where `name` is one path component of letters, digits,
 `-` and `_`:
 
 ```
-{"seq":<u64>,"state":"<your bytes, base64>"}
-{"seq":<u64>}
+{"fmt":<u32>,"seq":<u64>,"state":"<your bytes, base64>"}
+{"fmt":<u32>,"seq":<u64>}
 ```
 
-The snapshot's state is base64 rather than raw JSON so a fold may serialise to
-anything — a packed struct, a cache file — without the format having an opinion
-about it. Its `seq` is the journal's newest sequence number at the moment it
-was taken: restore the state, then replay only the records after it.
+`fmt` is the version of the document, and one this version does not know is
+`error.UnsupportedFormat`. The snapshot's state is base64 rather than raw JSON
+so a fold may serialise to anything — a packed struct, a cache file — without
+the format having an opinion about it. Its `seq` is the journal's newest
+sequence number at the moment it was taken: restore the state, then replay only
+the records after it.
 
-An index is a thirty-two-byte header — the magic `chridx\x02\n`, then three
-little-endian integers: the segment length it describes as a `u64`, zero while
-that segment is still being appended to, and the lowest and highest `at` in the
-segment as `i64`s — followed by one sixteen-byte entry per record: the record's
-byte offset as a `u64` and its `at` as an `i64`. The timestamps are what
-`seqAtOrAfter` reads. It does not bisect, because nothing makes a caller pass
-its timestamps in order: every segment whose highest reaches the moment is
-looked inside, oldest first, and one whose highest is below it is skipped
-without its file being opened.
+An index is a ninety-six-byte header, all of it little-endian: the magic
+`chridx\x03\n`, then the segment length it describes as a `u64` — zero while
+that segment is still being appended to — the lowest and highest `at` in the
+segment as `i64`s, the segment's first sequence number and its record count as
+`u64`s, the bytes of segment one entry covers as a `u32`, one `u32` of flags
+whose lowest bit says the timestamps do not fall, thirty-six spare bytes that
+are zero, and the CRC32C of the entries as a `u32`. Then the entries, each
+twenty-four bytes: a record's sequence number as a `u64`, its byte offset as a
+`u64` and its `at` as an `i64`. The timestamps are what `seqAtOrAfter` reads:
+where a segment's flag says they do not fall they are bisected, and where it
+does not they are read, because nothing makes a caller pass them in order.
+Either way a segment whose highest is below the moment is skipped without its
+file being opened.
 
 ## Scope
 
@@ -324,7 +378,8 @@ Things a log of this kind might be expected to carry, and this one does not:
 - **No query and no secondary indexes.** A range of sequence numbers, a lookup
   by time, and your fold.
 - **No automatic retention.** `dropSegmentsBefore` and `compact` are the calls
-  that drop history, and you decide when.
+  that drop history, and you decide when; `minCursor` is what the readers have
+  consumed, if that is how you want to decide.
 - **No encryption and no compression.** A record is stored as it was written.
 - **No replication and no network protocol.** A journal is a local directory.
 - **No hardening against a hostile file.** Records go through `std.json` with
@@ -335,21 +390,21 @@ Things a log of this kind might be expected to carry, and this one does not:
 
 | Platform | Mechanism | Tested where |
 |---|---|---|
-| Linux | `flock`, directory `fsync` | `test (ubuntu-latest)` on the CI runner, and `ci/linux.sh` in Docker from any machine |
-| macOS | `flock`, directory `fsync` | `test (macos-latest)` on the CI runner |
+| Linux | `flock`, directory `fsync`, `fdatasync`, `copy_file_range` | `test (ubuntu-latest)` on the CI runner, and `ci/linux.sh` in Docker from any machine |
+| macOS | `flock`, directory `fsync`, `F_FULLFSYNC`, `clonefile` | `test (macos-latest)` on the CI runner |
 | Windows | `NtLockFile`; no directory `fsync` | `test (windows-latest)` on the CI runner |
 
 Locking goes through `std.Io`, which uses `NtLockFile` on Windows and `flock`
-on POSIX. Durability promise 4 — that a created or renamed name is itself
-durable — has no Windows equivalent and is the operating system's there.
+on POSIX. The flush a durable write makes is in the Durability table above.
+Durability promise 4 — that a created or renamed name is itself durable — has
+no Windows equivalent and is the operating system's there. The copy a backup
+makes is the filesystem's where the platform has a call for it and this
+package's byte copy where it does not; the copy that lands is the same.
 
 `zig build check -Dtarget=…` compiles everything, tests included, without
 running it. CI does that for `x86_64-linux-gnu`, `aarch64-linux-gnu`,
 `x86_64-linux-musl`, `x86_64-windows-gnu`, `aarch64-windows-gnu`,
 `x86_64-macos` and `aarch64-macos`.
-
-Every job in that matrix passed on run
-[`34804414740`](https://github.com/pedronaugusto/chronicle/actions/runs/34804414740).
 
 ## Testing
 
@@ -366,20 +421,36 @@ Every test runs under `std.testing.allocator` and `std.testing.io`, against
 real directories, in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall. The
 crash shapes are made on the disk rather than simulated: a torn final line, a
 torn line in a sealed segment, a missing index, an index for the wrong bytes,
-an index in the older format, a `.tmp` file a crash left behind, a byte flipped
-inside a record that still parses, a record from before checksums existed, a
-batch cut off at every byte boundary in it, and the two segments a compaction
-leaves when it dies between its rename and its unlink. Two tests spawn a second
-process — one to hold the lock, one to append while a backup is taken beside
-it — and one builds a journal of two hundred thousand records and asserts that
-opening it is proportionate and that memory is not.
+an index in an older format, a segment in an older framing, a record that does
+not link to the one before it, a `.tmp` file a crash left behind, a byte
+flipped inside a record that still parses, space a writer reserved and never
+filled, a batch cut off at every byte boundary in it, and the two segments a
+compaction leaves when it dies between its rename and its unlink. Two tests
+spawn a second process — one to hold the lock, one to append while a backup is
+taken beside it — and one builds a journal of two hundred thousand records and
+asserts that opening it is proportionate and that memory is not.
 
-Three fuzz tests run over arbitrary segment, index and snapshot file contents:
-`open` must answer with a journal or a named error, `.fail` must leave the file
-exactly as it found it, a `.drop` open followed by an `append` must produce a
-log that opens again cleanly, and whatever an index says, the records must be
-the ones the segments hold. Under `zig build test` they run their corpus and
-stop, which costs milliseconds.
+The measurements this package is judged on are tests with budgets: a seek into
+the segment being written to against one into a sealed segment, an open of a
+log that was closed cleanly against the same open with the index deleted, five
+folds over one pass against one fold, and — in ReleaseFast — the rates an
+append and a replayed record run at. Ratios wherever a ratio will do, because
+an absolute number is a claim about a machine.
+
+Five fuzz tests. Four run over the contents of a file — arbitrary segment
+bytes, an arbitrary first line of a segment, an arbitrary index, an arbitrary
+snapshot and an arbitrary cursor — where `open` must answer with a journal or a
+named error, `.fail` must leave the file exactly as it found it, a `.drop` open
+followed by an `append` must produce a log that opens again cleanly, and
+whatever an index says, the records must be the ones the segments hold. The
+fifth runs over the *calls*: a random run of `append`, `appendAll`, `compact`,
+`truncateAfter`, `dropSegmentsBefore`, `backup` and `snapshot`, cut off at a
+random byte of the newest segment, after which the log must open as a
+continuous prefix with every checksum good and every record linked to the one
+before it, holding no record that was never acknowledged, and go on from there.
+Under `zig build test` each runs its corpus and stops, which costs
+milliseconds, and the last one also runs sixty-four sequences from a fixed
+seed.
 
 ## Requirements
 
