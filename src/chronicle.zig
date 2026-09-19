@@ -647,8 +647,15 @@ pub fn Journal(comptime Event: type) type {
         /// `append`'s does, and the disk may then hold some of the batch;
         /// reopening reads back what survived.
         ///
-        /// The batch is serialised before any of it is written, so memory
-        /// holds all of it at once: batch by the thousand, not by the million.
+        /// Each record is serialised as it is written rather than the batch
+        /// being formed first, so memory holds the batch only as far as the
+        /// tail and the sinks need it: a journal with neither holds one line
+        /// at a time however long the batch is. A record the journal cannot
+        /// form — one longer than `Options.max_record_bytes`, or an `Event`
+        /// that does not survive the round trip when that is checked — takes
+        /// back the lines of the batch already staged, so a refused batch
+        /// leaves the log exactly as it was.
+        ///
         /// An empty slice writes nothing and returns `lastSeq`.
         ///
         /// Safe to call from any task or thread.
@@ -660,35 +667,77 @@ pub fn Journal(comptime Event: type) type {
             if (entries.len == 0) return self.seq;
             if (entries.len > std.math.maxInt(i64) - self.seq) return error.SequenceExhausted;
 
+            // Reserved before anything is written: after the bytes are
+            // durable nothing may fail, or the disk would hold records
+            // memory does not.
+            try self.tail.ensureUnusedCapacity(self.gpa, entries.len);
+            try self.tail_arenas.ensureUnusedCapacity(self.gpa, entries.len);
+
+            // Only the records something will read are kept: a journal with
+            // no tail and no sink holds one line at a time, however long the
+            // batch is.
             var built: std.ArrayList(Built) = .empty;
             defer built.deinit(self.gpa);
             var published = false;
             defer if (!published) for (built.items) |*item| item.release(self.gpa);
+            if (self.needsRecord()) try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
 
-            try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
+            const before = self.seq;
             var link = self.log.chainTip();
             for (entries, 0..) |entry, i| {
-                const item = try self.encode(self.seq + i + 1, entry.at, link, entry.event);
+                var item = self.encode(self.seq + i + 1, entry.at, link, entry.event) catch |err| {
+                    self.unstage(io, before);
+                    return err;
+                };
                 link = item.checksum;
-                built.appendAssumeCapacity(item);
+                {
+                    errdefer self.persistence_failed = true;
+                    self.log.stageLine(io, item.bytes, item.at, item.checksum) catch |err| {
+                        item.release(self.gpa);
+                        return err;
+                    };
+                }
+                if (item.record != null) built.appendAssumeCapacity(item) else item.release(self.gpa);
             }
-
-            try self.tail.ensureUnusedCapacity(self.gpa, entries.len);
-            try self.tail_arenas.ensureUnusedCapacity(self.gpa, entries.len);
 
             {
                 errdefer self.persistence_failed = true;
-                for (built.items) |item| try self.log.stageLine(io, item.bytes, item.at, item.checksum);
                 try self.log.commit(io);
             }
             published = true;
 
             for (built.items) |*item| {
-                if (!self.publish(item.*)) item.release(self.gpa);
+                _ = self.publish(item.*);
             }
+            // A batch of records nothing keeps still moved the sequence.
+            self.seq = before + entries.len;
             self.changed.broadcast(io);
             self.trimTail();
             return self.seq;
+        }
+
+        /// Take back the lines of a batch that was staged and never
+        /// committed, so that a batch which could not be formed leaves the
+        /// log exactly as it was.
+        ///
+        /// It is the same shortening `truncateAfter` does, for the same
+        /// reason: what is on the disk has to end at a record boundary
+        /// whatever happened. Nothing here was ever acknowledged, so nothing
+        /// is lost by it.
+        fn unstage(self: *Self, io: Io, seq: u64) void {
+            if (self.seq <= seq and self.log.lastSeq() <= seq) return;
+            self.putBack(io, seq) catch {
+                // The log could not be put back. What is on the disk is
+                // still whole records in order, and a reopen reads them, but
+                // this process must not hand any of them out as appended.
+                self.persistence_failed = true;
+            };
+        }
+
+        fn putBack(self: *Self, io: Io, seq: u64) TruncateError!void {
+            try self.log.truncateAfter(io, seq);
+            self.clearTail();
+            try self.fillTail(io);
         }
 
         /// Wake every `waitPast` with no new record — a shutdown, or something

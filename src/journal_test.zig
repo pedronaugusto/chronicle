@@ -423,6 +423,45 @@ test "appendAll writes every entry and numbers them in order" {
     try testing.expectEqual(@as(u64, 7), try rolling.verify(io));
 }
 
+test "a batch this journal cannot form leaves the log exactly as it was" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const cap = 256;
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .max_record_bytes = cap,
+        .max_segment_records = 2,
+        .max_segment_bytes = 1 << 20,
+    });
+    defer journal.deinit(io);
+
+    _ = try journal.append(io, 1, created(1, "before"));
+    const was = try ws.read(try ws.segment(1));
+
+    // The fourth entry is a record this journal will not write. The three in
+    // front of it have been staged by then, and crossed a rotation on the
+    // way, so taking them back means unlinking a segment as well as
+    // shortening one.
+    const long: [cap]u8 = @splat('n');
+    const batch = [_]Journal.Entry{
+        .{ .at = 2, .event = created(2, "two") },
+        .{ .at = 3, .event = created(3, "three") },
+        .{ .at = 4, .event = created(4, "four") },
+        .{ .at = 5, .event = created(5, &long) },
+    };
+    try testing.expectError(error.RecordTooLarge, journal.appendAll(io, &batch));
+
+    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+    try testing.expectEqualStrings(was, try ws.read(try ws.segment(1)));
+    try testing.expectEqual(@as(u64, 1), try journal.verify(io));
+
+    // And the log goes on from where it was.
+    try testing.expectEqual(@as(u64, 2), try journal.append(io, 6, created(6, "after")));
+}
+
 test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
     const io = testing.io;
     var ws = try Workspace.init("log");
