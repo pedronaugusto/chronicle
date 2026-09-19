@@ -3398,3 +3398,208 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
         try testing.expect(journal.since(snapshot.seq).records.len <= journal.records().records.len);
     }
 }
+
+//========================================================================
+// Numbers.
+//
+// The measurements a release is judged on, as tests with budgets. They are
+// ratios wherever a ratio will do, because an absolute number is a claim
+// about a machine and these run on whatever CI was given; where an absolute
+// number is the only way to say it, the budget is loose enough to pass on a
+// slow shared runner and tight enough to fail if the thing it measures goes
+// back to what it replaced.
+//
+// The point is not to know how fast this is. It is that the four numbers
+// this release moved cannot quietly move back.
+//========================================================================
+
+/// How long `body` takes, in microseconds.
+fn microseconds(started: Io.Timestamp) u64 {
+    return @intCast(started.durationTo(Io.Clock.awake.now(testing.io)).toMicroseconds());
+}
+
+fn now() Io.Timestamp {
+    return Io.Clock.awake.now(testing.io);
+}
+
+test "a seek into the newest segment costs what a seek into a sealed one costs" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // Two segments of the same size: one sealed, one being appended to. A
+    // seek near the end of each. Before the index of the newest segment
+    // could be read back, the second was a scan of the whole segment and
+    // measured nine hundred times the first.
+    const per_segment = 20_000;
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .tail_records = 4,
+        .max_segment_records = per_segment,
+        .max_segment_bytes = 1 << 30,
+    });
+    defer journal.deinit(io);
+    for (1..2 * per_segment) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+    try testing.expectEqual(@as(usize, 2), journal.segmentCount());
+
+    const sealed = try seekMicroseconds(&journal, per_segment - 2, 20);
+    const active = try seekMicroseconds(&journal, 2 * per_segment - 3, 20);
+    // Ten times the sealed seek plus a millisecond: room for a runner that
+    // is busy, none for a scan of twenty thousand records.
+    try testing.expect(active <= 10 * sealed + 1_000);
+}
+
+/// How long it takes, on average over `rounds`, to replay from `cursor` and
+/// take the first record.
+fn seekMicroseconds(journal: *Journal, cursor: u64, rounds: usize) !u64 {
+    const io = testing.io;
+    const started = now();
+    for (0..rounds) |_| {
+        var walk = try journal.replay(io, cursor);
+        defer walk.deinit(io);
+        const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
+        try testing.expectEqual(cursor + 1, record.seq);
+    }
+    return microseconds(started) / rounds;
+}
+
+test "opening a log that was closed cleanly costs no scan of it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const count = 60_000;
+    const options: Journal.Options = .{
+        .sync = .never,
+        .tail_records = 8,
+        .max_segment_bytes = 1 << 30,
+    };
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+        try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+    }
+
+    const taken = try openMicroseconds(&ws, options);
+
+    // The same open with the index deleted, which is the work the open above
+    // does not do.
+    try ws.root.deleteFile(io, try ws.index(1));
+    const scanned = try openMicroseconds(&ws, options);
+
+    // Three times rather than the twenty the change is worth, because the
+    // fixed cost of opening a directory is in both numbers and a small log
+    // on a fast disk is mostly that. It measured seven here.
+    try testing.expect(scanned >= 3 * taken);
+}
+
+fn openMicroseconds(ws: *Workspace, options: Journal.Options) !u64 {
+    const io = testing.io;
+    const started = now();
+    var journal = try Journal.open(testing.allocator, io, ws.path, options);
+    defer journal.deinit(io);
+    const elapsed = microseconds(started);
+    try testing.expect(try journal.lastSeq(io) != 0);
+    return elapsed;
+}
+
+test "five folds over one pass cost what one fold costs" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const count = 20_000;
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .tail_records = 4,
+    });
+    defer journal.deinit(io);
+    for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+
+    var one: Registry = .{};
+    const single = single: {
+        const started = now();
+        try journal.subscribe(io, one.sink());
+        break :single microseconds(started);
+    };
+
+    var five: [5]Registry = @splat(.{});
+    var sinks: [5]Journal.Sink = undefined;
+    for (&five, &sinks) |*fold, *sink| sink.* = fold.sink();
+    const shared = shared: {
+        const started = now();
+        try journal.subscribeAll(io, &sinks);
+        break :shared microseconds(started);
+    };
+
+    for (&five) |fold| try testing.expectEqual(@as(u32, count), fold.events);
+    // Five folds fed one at a time would be five passes. The extra callbacks
+    // per record are free beside the decode, so this is one.
+    try testing.expect(shared <= 2 * single + 1_000);
+}
+
+test "a replay reads the log at a rate a fold can live with" {
+    const io = testing.io;
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const count = 50_000;
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .tail_records = 4,
+    });
+    defer journal.deinit(io);
+
+    const writing = now();
+    for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+    const per_append = microseconds(writing) * 1000 / count;
+
+    var counted: Registry = .{};
+    const reading = now();
+    try journal.subscribe(io, counted.sink());
+    const per_record = microseconds(reading) * 1000 / count;
+    try testing.expectEqual(@as(u32, count), counted.events);
+
+    // Nanoseconds per record, measured here at about 29 000 for an append
+    // through the testing `Io` and 250 for a record read back. Three times
+    // each is a budget a shared runner meets and a write path that started
+    // parsing every record again does not.
+    try testing.expect(per_append < 90_000);
+    try testing.expect(per_record < 1_000);
+}
+
+test "a batch under one flush is worth what it costs to form" {
+    const io = testing.io;
+    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
+
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .always,
+        .tail_records = 4,
+    });
+    defer journal.deinit(io);
+
+    const count = 300;
+    const singly = singly: {
+        const started = now();
+        for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+        break :singly microseconds(started);
+    };
+
+    var batch: [100]Journal.Entry = undefined;
+    for (&batch, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "a name") };
+    const batched = batched: {
+        const started = now();
+        for (0..count / batch.len) |_| _ = try journal.appendAll(io, &batch);
+        break :batched microseconds(started);
+    };
+
+    // A batch of a hundred measured sixty times a record at a time here,
+    // where a durable write asks the drive to flush its cache. Twice is the
+    // budget: the gain is the flush, and a batch that stopped sharing one
+    // would not make it.
+    try testing.expect(batched * 2 <= singly);
+}
