@@ -139,9 +139,9 @@ and the types `Record`, `Entry`, `Window`, `Replay`, `Tailer`, `Sink`,
 `Sync`, `Flush`, `Verify`, and one named error set per operation. Every
 public declaration carries a doc comment stating its contract;
 `src/chronicle.zig` is the reference and `src/log.zig` the segment store under
-it. `Event` may be any type `std.json` can write and
-read back; a tagged union is the expected shape, because it gives each record a
-name on disk and an exhaustive `switch` in the fold.
+it. `Event` may be any type `std.json` can write and read back; a tagged union
+is the expected shape, because it gives each record a name on disk and an
+exhaustive `switch` in the fold.
 
 ## Design
 
@@ -438,13 +438,14 @@ folds over one pass against one fold, and — in ReleaseFast — the rates an
 append and a replayed record run at. Ratios wherever a ratio will do, because
 an absolute number is a claim about a machine.
 
-Five fuzz tests. Four run over the contents of a file — arbitrary segment
-bytes, an arbitrary first line of a segment, an arbitrary index, an arbitrary
-snapshot and an arbitrary cursor — where `open` must answer with a journal or a
-named error, `.fail` must leave the file exactly as it found it, a `.drop` open
-followed by an `append` must produce a log that opens again cleanly, and
-whatever an index says, the records must be the ones the segments hold. The
-fifth runs over the *calls*: a random run of `append`, `appendAll`, `compact`,
+Six fuzz tests. Five run over the contents of a file — arbitrary segment bytes,
+an arbitrary first line of a segment, an arbitrary index, an arbitrary snapshot
+and an arbitrary cursor — where `open` must answer with a journal or a named
+error, `.fail` must refuse a record the writer did not finish rather than drop
+it and leave a file it refuses exactly as it found it, a `.drop` open followed
+by an `append` must produce a log that opens again cleanly, and whatever an
+index says, the records must be the ones the segments hold. The sixth runs over
+the *calls*: a random run of `append`, `appendAll`, `compact`,
 `truncateAfter`, `dropSegmentsBefore`, `backup` and `snapshot`, cut off at a
 random byte of the newest segment, after which the log must open as a
 continuous prefix with every checksum good and every record linked to the one
