@@ -73,8 +73,9 @@ Fixed:
   media, and through `fdatasync` on Linux when the write went into space the
   file already had. The cost is real and was being hidden: an `append` at
   `.always` measured 28 µs before and four to six milliseconds after on this
-  machine, which is what a media flush costs on a consumer drive. `appendAll` is how to pay it once for many
-  records, and `chronicle.flush` names the call this platform makes.
+  machine, which is what a media flush costs on a consumer drive. `appendAll`
+  is how to pay it once for many records, and `chronicle.flush` names the call
+  this platform makes.
 - **A clean close left an index nothing took.** `deinit` sealed the active
   segment's index with the exact length it described and `open` then truncated
   it and scanned the segment again. Opening a million-record log measured
