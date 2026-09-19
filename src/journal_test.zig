@@ -156,6 +156,111 @@ const Workspace = struct {
         self.root.access(testing.io, sub_path, .{}) catch return false;
         return true;
     }
+
+    /// One record, as a test writes them by hand.
+    const Line = struct {
+        seq: u64,
+        at: i64 = 1,
+        v: u32 = 1,
+        /// The event, as JSON.
+        ev: []const u8,
+    };
+
+    /// Write a segment file holding exactly these records, behind the line
+    /// that says what the file is.
+    fn writeRecords(self: *Workspace, base_seq: u64, root: u32, lines: []const Line) !void {
+        var written: Handwritten = try .init(base_seq, root);
+        defer written.deinit();
+        for (lines) |line| try written.record(line.seq, line.at, line.v, line.ev);
+        try self.write(try self.segment(base_seq), written.written());
+    }
+
+    /// Write a segment file holding exactly these bytes, behind that line:
+    /// for the shapes that are not records at all.
+    fn writeRaw(self: *Workspace, base_seq: u64, bytes: []const u8) !void {
+        var written: Handwritten = try .init(base_seq, 1);
+        defer written.deinit();
+        try written.raw(bytes);
+        try self.write(try self.segment(base_seq), written.written());
+    }
+};
+
+/// The `p` a record line carries: the checksum of the record before it.
+fn backLinkOf(line: []const u8) !u32 {
+    const opening = ",\"p\":";
+    const at = std.mem.indexOf(u8, line, opening) orelse return error.TestExpectedRecord;
+    var end = at + opening.len;
+    while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
+    return std.fmt.parseInt(u32, line[at + opening.len .. end], 10);
+}
+
+/// A segment file's records, without the line at its head that says what the
+/// file is.
+fn recordBytes(segment_bytes: []const u8) u64 {
+    const newline = std.mem.indexOfScalar(u8, segment_bytes, '\n') orelse return 0;
+    return segment_bytes.len - (newline + 1);
+}
+
+/// The chain root a segment file's first line names, for a test that has to
+/// rebuild what the journal wrote.
+fn rootOf(segment_bytes: []const u8) !u32 {
+    const newline = std.mem.indexOfScalar(u8, segment_bytes, '\n') orelse return error.TestExpectedHeader;
+    const opening = "\"root\":";
+    const at = std.mem.indexOf(u8, segment_bytes[0..newline], opening) orelse return error.TestExpectedHeader;
+    const digits = segment_bytes[at + opening.len .. newline - 1];
+    return std.fmt.parseInt(u32, digits, 10);
+}
+
+/// A segment file built by hand, for the tests that make the shapes a crash
+/// produces rather than simulating them.
+///
+/// It writes the line that says what the file is, and then records linked to
+/// each other exactly as `append` links them: each carries the checksum of
+/// the one before it, and the first carries the file's root.
+const Handwritten = struct {
+    bytes: std.ArrayList(u8),
+    link: u32,
+
+    fn init(base_seq: u64, root: u32) !Handwritten {
+        var self: Handwritten = .{ .bytes = .empty, .link = root };
+        errdefer self.bytes.deinit(testing.allocator);
+        try self.print("{{\"chronicle\":1,\"base\":{d},\"root\":{d}}}\n", .{ base_seq, root });
+        return self;
+    }
+
+    fn print(self: *Handwritten, comptime format: []const u8, args: anytype) !void {
+        const text = try std.fmt.allocPrint(testing.allocator, format, args);
+        defer testing.allocator.free(text);
+        try self.bytes.appendSlice(testing.allocator, text);
+    }
+
+    fn deinit(self: *Handwritten) void {
+        self.bytes.deinit(testing.allocator);
+    }
+
+    /// One record, checksummed and linked. `ev` is its event as JSON.
+    fn record(self: *Handwritten, seq: u64, at: i64, version: u32, ev: []const u8) !void {
+        const covered = try std.fmt.allocPrint(
+            testing.allocator,
+            "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":{s}",
+            .{ seq, at, version, self.link, ev },
+        );
+        defer testing.allocator.free(covered);
+        const sum = chronicle.checksum(covered);
+        try self.bytes.appendSlice(testing.allocator, covered);
+        try self.print(",\"c\":{d}}}\n", .{sum});
+        self.link = sum;
+    }
+
+    /// Bytes exactly as given: a torn line, a line that is not a record, the
+    /// half of a record a crash left.
+    fn raw(self: *Handwritten, bytes: []const u8) !void {
+        try self.bytes.appendSlice(testing.allocator, bytes);
+    }
+
+    fn written(self: *const Handwritten) []const u8 {
+        return self.bytes.items;
+    }
 };
 
 //========================================================================
@@ -173,20 +278,32 @@ test "an append returns the sequence number and puts one line in the first segme
     try testing.expectEqual(@as(u64, 1), try journal.append(io, 1_000, created(1, "one")));
     try testing.expectEqual(@as(u64, 2), try journal.append(io, 2_000, created(2, "two")));
 
-    // The line on the disk, checksum and all. `c` is the CRC32C of everything
-    // before it, so the literal here is also the definition of the format.
-    const on_disk = try ws.read(try ws.segment(1));
-    try testing.expectEqualStrings(
-        \\{"seq":1,"at":1000,"v":1,"ev":{"created":{"id":1,"name":"one"}},"c":294682814}
-        \\{"seq":2,"at":2000,"v":1,"ev":{"created":{"id":2,"name":"two"}},"c":1207820849}
-        \\
-    , on_disk);
-    try testing.expectEqual(
-        @as(u32, 294682814),
-        chronicle.checksum(
-            \\{"seq":1,"at":1000,"v":1,"ev":{"created":{"id":1,"name":"one"}}
-        ),
+    // What is on the disk: the line that says what the file is, then the
+    // records, each carrying the checksum of the one before it. `c` is the
+    // CRC32C of everything in the line before it, so a line with a known
+    // back-link is the definition of the format.
+    var shape: Handwritten = try .init(1, 0);
+    defer shape.deinit();
+    try shape.record(1, 1000, 1,
+        \\{"created":{"id":1,"name":"one"}}
     );
+    try testing.expectEqualStrings(
+        \\{"chronicle":1,"base":1,"root":0}
+        \\{"seq":1,"at":1000,"v":1,"p":0,"ev":{"created":{"id":1,"name":"one"}},"c":3839747689}
+        \\
+    , shape.written());
+
+    // And the file this journal wrote is that, with the root it was given.
+    const on_disk = try ws.read(try ws.segment(1));
+    var expected: Handwritten = try .init(1, try rootOf(on_disk));
+    defer expected.deinit();
+    try expected.record(1, 1000, 1,
+        \\{"created":{"id":1,"name":"one"}}
+    );
+    try expected.record(2, 2000, 1,
+        \\{"created":{"id":2,"name":"two"}}
+    );
+    try testing.expectEqualStrings(expected.written(), on_disk);
 
     // The record in memory is the line on the disk, parsed.
     const all = journal.records();
@@ -233,7 +350,7 @@ test "a reopened journal continues the sequence and appends after the last line"
     // history rather than over it.
     try testing.expectEqual(@as(u64, 3), try second.append(io, 3, created(3, "after")));
     const on_disk = try ws.read(try ws.segment(1));
-    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, on_disk, "\n"));
+    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, on_disk, "\n"));
     try testing.expect(std.mem.indexOf(u8, on_disk, "\"seq\":3") != null);
 }
 
@@ -272,7 +389,7 @@ test "appendAll writes every entry and numbers them in order" {
 
     // And the lines are on the disk with their own timestamps and checksums.
     const on_disk = try ws.read(try ws.segment(1));
-    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, on_disk, "\n"));
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, on_disk, "\n"));
     try testing.expectEqual(@as(usize, 4), std.mem.count(u8, on_disk, ",\"c\":"));
     try testing.expect(std.mem.indexOf(u8, on_disk, "\"seq\":3,\"at\":30") != null);
     try testing.expectEqual(@as(u64, 4), try journal.verify(io));
@@ -308,17 +425,19 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
         try testing.expectEqual(@as(u64, 4), try journal.appendAll(io, &batch));
     }
     const whole = try ws.read(try ws.segment(1));
-    try testing.expectEqual(@as(usize, 4), std.mem.count(u8, whole, "\n"));
+    try testing.expectEqual(@as(usize, 5), std.mem.count(u8, whole, "\n"));
 
     const name = try ws.segment(1);
-    var cut: usize = 0;
+    // From the end of the line that says what the file is: a crash before
+    // that leaves a file that is not a segment yet, which is the case below.
+    var cut = std.mem.indexOfScalar(u8, whole, '\n').? + 1;
     while (cut <= whole.len) : (cut += 1) {
         const stopped = whole[0..cut];
         // A prefix of the batch is whole records up to the last newline; the
         // bytes after it are the line the writer was in the middle of.
         const complete = std.mem.lastIndexOfScalar(u8, stopped, '\n');
         const kept = if (complete) |at| stopped[0 .. at + 1] else stopped[0..0];
-        const records = std.mem.count(u8, kept, "\n");
+        const records = std.mem.count(u8, kept, "\n") - 1;
 
         try ws.write(name, stopped);
         var journal = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -338,6 +457,17 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
             try journal.append(io, 99, created(9, "after the crash")),
         );
     }
+
+    // A crash inside the first line leaves a file that does not say what it
+    // is, which is a segment whose creation did not finish rather than a log
+    // with a record in it. The next open writes that line again and starts.
+    const head = std.mem.indexOfScalar(u8, whole, '\n').?;
+    try ws.write(name, whole[0 .. head - 3]);
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, head - 3), journal.dropped_bytes);
+    try testing.expectEqual(@as(u64, 1), try journal.append(io, 99, created(9, "the first")));
 }
 
 //========================================================================
@@ -349,12 +479,14 @@ test "a final line the writer did not finish is dropped and the segment repaired
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    const whole =
-        \\{"seq":1,"at":1,"v":1,"ev":{"created":{"id":1,"name":"kept"}}}
-        \\
-    ;
-    const partial = "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"crea";
-    try ws.write(try ws.segment(1), whole ++ partial);
+    const partial = "{\"seq\":2,\"at\":2,\"v\":1,\"p\":7,\"ev\":{\"crea";
+    var crashed: Handwritten = try .init(1, 7);
+    defer crashed.deinit();
+    try crashed.record(1, 1, 1,
+        \\{"created":{"id":1,"name":"kept"}}
+    );
+    try crashed.raw(partial);
+    try ws.write(try ws.segment(1), crashed.written());
 
     {
         var journal = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -369,7 +501,7 @@ test "a final line the writer did not finish is dropped and the segment repaired
         _ = try journal.append(io, 3, created(2, "next"));
         const on_disk = try ws.read(try ws.segment(1));
         try testing.expect(std.mem.indexOf(u8, on_disk, "crea\"") == null);
-        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, on_disk, "\n"));
+        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, on_disk, "\n"));
     }
 
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -383,7 +515,14 @@ test "on_truncated .fail refuses the journal and leaves the segment as found" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    const bytes = "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n{\"seq\":2";
+    var crashed: Handwritten = try .init(1, 3);
+    defer crashed.deinit();
+    try crashed.record(1, 1, 1,
+        \\{"removed":{"id":1}}
+    );
+    try crashed.raw("{\"seq\":2");
+    const bytes = try testing.allocator.dupe(u8, crashed.written());
+    defer testing.allocator.free(bytes);
     try ws.write(try ws.segment(1), bytes);
     try testing.expectError(
         error.TruncatedRecord,
@@ -399,9 +538,23 @@ test "a torn line in a sealed segment is refused when something reads it" {
 
     // Only the newest segment can end mid-record: an older one was made
     // durable before the next was created. A hole in one is damage.
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n" ++
-        "{\"seq\":2,\"at\":1,\"v\":1,\"ev\":{\"remo");
-    try ws.write(try ws.segment(3), "{\"seq\":3,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    var torn: Handwritten = try .init(1, 3);
+    defer torn.deinit();
+    try torn.record(1, 1, 1,
+        \\{"removed":{"id":1}}
+    );
+    try torn.record(2, 1, 1,
+        \\{"removed":{"id":1}}
+    );
+    try torn.raw("{\"seq\":3,\"at\":1,\"v\":1,\"p\":1,\"ev\":{\"remo");
+    try ws.write(try ws.segment(1), torn.written());
+
+    var newest: Handwritten = try .init(4, torn.link);
+    defer newest.deinit();
+    try newest.record(4, 1, 1,
+        \\{"removed":{"id":1}}
+    );
+    try ws.write(try ws.segment(4), newest.written());
     try testing.expectError(
         error.TruncatedRecord,
         Journal.open(testing.allocator, io, ws.path, .{}),
@@ -413,27 +566,48 @@ test "a corrupt or discontinuous line is refused" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    const cases = [_]struct { bytes: []const u8, want: anyerror }{
+    const removed =
+        \\{"removed":{"id":1}}
+    ;
+    // Lines that are not records, behind a header that says they should be.
+    const raw = [_]struct { bytes: []const u8, want: anyerror }{
         .{ .bytes = "not json\n", .want = error.CorruptRecord },
         .{ .bytes = "{\"seq\":1,\"at\":1,\"v\":1}\n", .want = error.CorruptRecord },
-        .{ .bytes = "{\"seq\":2,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n" ++
-            "{\"seq\":4,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n", .want = error.DiscontinuousSeq },
-        // A segment whose records disagree with the name it is under: a
-        // cursor into it would point at a record that is not there.
-        .{ .bytes = "{\"seq\":9,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n", .want = error.DiscontinuousSeq },
+        // Every member but the back-link, which the framing requires.
+        .{
+            .bytes = "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}},\"c\":1}\n",
+            .want = error.CorruptRecord,
+        },
     };
-    for (cases) |case| {
-        try ws.write(try ws.segment(1), case.bytes);
+    for (raw) |case| {
+        try ws.writeRaw(1, case.bytes);
         try testing.expectError(case.want, Journal.open(testing.allocator, io, ws.path, .{}));
     }
+
+    // Records that are records, in an order that cannot be.
+    try ws.writeRecords(2, 1, &.{
+        .{ .seq = 2, .ev = removed },
+        .{ .seq = 4, .ev = removed },
+    });
+    try ws.root.deleteFile(io, try ws.segment(1));
+    try testing.expectError(error.DiscontinuousSeq, Journal.open(testing.allocator, io, ws.path, .{}));
+
+    // A segment whose records disagree with the name it is under: a cursor
+    // into it would point at a record that is not there.
+    try ws.root.deleteFile(io, try ws.segment(2));
+    try ws.writeRecords(1, 1, &.{.{ .seq = 9, .ev = removed }});
+    try testing.expectError(error.DiscontinuousSeq, Journal.open(testing.allocator, io, ws.path, .{}));
 }
 
 test "a gap between two segments is refused" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
-    try ws.write(try ws.segment(7), "{\"seq\":7,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    const removed =
+        \\{"removed":{"id":1}}
+    ;
+    try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev = removed }});
+    try ws.writeRecords(7, 1, &.{.{ .seq = 7, .ev = removed }});
     try testing.expectError(error.DiscontinuousSeq, Journal.open(testing.allocator, io, ws.path, .{}));
 }
 
@@ -604,7 +778,9 @@ test "a record from a newer schema is refused rather than guessed at" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":9,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try ws.writeRecords(1, 1, &.{.{ .seq = 1, .v = 9, .ev =
+        \\{"removed":{"id":1}}
+    }});
     try testing.expectError(
         error.NewerSchema,
         Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2 }),
@@ -617,7 +793,9 @@ test "a record from an older schema goes through migrate" {
     defer ws.deinit();
 
     // Version 1 called the member `title`; version 2 calls it `name`.
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":7,\"title\":\"old\"}}}\n");
+    try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev =
+        \\{"created":{"id":7,"title":"old"}}
+    }});
 
     const migrate = struct {
         fn f(from_version: u32, value: std.json.Value) Journal.MigrateError!Event {
@@ -650,7 +828,9 @@ test "without a migrate hook an older record lands in the unknown arm" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"retired\":{\"id\":7}}}\n");
+    try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev =
+        \\{"retired":{"id":7}}
+    }});
 
     var journal = try Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2 });
     defer journal.deinit(io);
@@ -665,7 +845,9 @@ test "without a migrate hook and without an unknown arm an older record is refus
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev =
+        \\{"removed":{"id":1}}
+    }});
 
     const Strict = union(enum) { removed: struct { id: u32 } };
     try testing.expectError(
@@ -904,8 +1086,9 @@ test "the log rotates into segments named after their first record" {
         try testing.expect(ws.exists(try ws.segment(1)));
         try testing.expect(ws.exists(try ws.segment(5)));
         try testing.expect(ws.exists(try ws.segment(9)));
-        try testing.expectEqual(@as(usize, 4), std.mem.count(u8, try ws.read(try ws.segment(1)), "\n"));
-        try testing.expectEqual(@as(usize, 2), std.mem.count(u8, try ws.read(try ws.segment(9)), "\n"));
+        // One line saying what the file is, then its records.
+        try testing.expectEqual(@as(usize, 5), std.mem.count(u8, try ws.read(try ws.segment(1)), "\n"));
+        try testing.expectEqual(@as(usize, 3), std.mem.count(u8, try ws.read(try ws.segment(9)), "\n"));
     }
 
     // And a reopen walks them in order.
@@ -944,9 +1127,9 @@ test "stats counts the segments, the records and the bytes they take" {
     try testing.expectEqual(@as(u64, 7), full.newest_seq);
     // The bytes are the segment files: the lines and the newlines that end
     // them, and nothing else in the directory.
-    const on_disk = (try ws.read(try ws.segment(1))).len +
-        (try ws.read(try ws.segment(4))).len +
-        (try ws.read(try ws.segment(7))).len;
+    const on_disk = recordBytes(try ws.read(try ws.segment(1))) +
+        recordBytes(try ws.read(try ws.segment(4))) +
+        recordBytes(try ws.read(try ws.segment(7)));
     try testing.expectEqual(@as(u64, on_disk), full.bytes);
 
     // Dropping a prefix moves the oldest sequence number and takes the bytes
@@ -1321,7 +1504,7 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     // version wrote -- which is stale by the same rule and rebuilt the same
     // way, so an old journal opens and keeps working.
     try ws.root.deleteFile(io, try ws.index(1));
-    try ws.write(try ws.index(6), "chridx\x01\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
+    try ws.write(try ws.index(6), "chridx\x02\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
 
     var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 2));
     defer journal.deinit(io);
@@ -1340,15 +1523,32 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     // no lock and writes nothing.
     try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, 1));
 
-    // The missing one was rebuilt on the way, and it describes its segment:
-    // a thirty-two byte header and sixteen bytes -- an offset and a
-    // timestamp -- for each of the five records.
+    // The missing one was rebuilt on the way, and it describes its segment.
+    // These five records are well under one interval apart, so one entry
+    // names the first of them and the bisection walks to the rest.
     try testing.expect(ws.exists(try ws.index(1)));
-    try testing.expectEqual(@as(usize, 32 + 5 * 16), (try ws.read(try ws.index(1))).len);
     const rebuilt = try ws.read(try ws.index(1));
-    try testing.expectEqualStrings("chridx\x02\n", rebuilt[0..8]);
+    try testing.expectEqual(@as(usize, 96 + 24), rebuilt.len);
+    try testing.expectEqualStrings("chridx\x03\n", rebuilt[0..8]);
     try testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, rebuilt[16..24], .little));
     try testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, rebuilt[24..32], .little));
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, rebuilt[32..40], .little));
+    try testing.expectEqual(@as(u64, 5), std.mem.readInt(u64, rebuilt[40..48], .little));
+    try testing.expectEqual(@as(u32, 4096), std.mem.readInt(u32, rebuilt[48..52], .little));
+    // The timestamps rise, which is the bit that lets a lookup by time
+    // bisect rather than read every entry.
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, rebuilt[52..56], .little));
+    // The spare bytes are zero, and the last word is the checksum of the
+    // entries -- so the next fact an index carries is a field, not a format.
+    for (rebuilt[56..92]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    try testing.expectEqual(
+        chronicle.checksum(rebuilt[96..]),
+        std.mem.readInt(u32, rebuilt[92..96], .little),
+    );
+    // One entry: the sequence number, the byte offset and the timestamp of
+    // the first record.
+    try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, rebuilt[96..104], .little));
+    try testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, rebuilt[112..120], .little));
 }
 
 test "a clean close leaves an index the next open takes rather than rebuilds" {
@@ -1363,14 +1563,16 @@ test "a clean close leaves an index the next open takes rather than rebuilds" {
         try testing.expectEqual(@as(usize, 1), journal.segmentCount());
     }
 
-    // A mark nothing validates and a rescan would overwrite: the timestamp
-    // beside the first record's offset. If the next open rebuilds the index,
-    // the mark goes; if it takes the one the close left, the mark stays.
+    // A mark a rescan would overwrite: the timestamp beside the first
+    // record's offset, with the entries' checksum put right afterwards so the
+    // index is still a valid one. If the next open rebuilds it, the mark
+    // goes; if it takes the one the close left, the mark stays.
     const sealed = try ws.read(try ws.index(1));
     const marked = try testing.allocator.dupe(u8, sealed);
     defer testing.allocator.free(marked);
-    const entry_at = 32 + 8;
+    const entry_at = 96 + 16;
     std.mem.writeInt(i64, marked[entry_at..][0..8], -777, .little);
+    std.mem.writeInt(u32, marked[92..96], chronicle.checksum(marked[96..]), .little);
     try ws.write(try ws.index(1), marked);
 
     {
@@ -1382,9 +1584,9 @@ test "a clean close leaves an index the next open takes rather than rebuilds" {
 
     const after = try ws.read(try ws.index(1));
     try testing.expectEqual(@as(i64, -777), std.mem.readInt(i64, after[entry_at..][0..8], .little));
-    // And the index grew by the one record appended after the reopen, rather
-    // than being written again from the start.
-    try testing.expectEqual(marked.len + 16, after.len);
+    // And the index is still the one the close left: the record appended
+    // after the reopen is inside the same interval, so it earns no entry.
+    try testing.expectEqual(marked.len, after.len);
     try testing.expectEqualStrings(marked[0..8], after[0..8]);
 }
 
@@ -1575,7 +1777,7 @@ test "a lookup by time rebuilds a stale index and reads the rest from it" {
     // One index gone, one in the older format, one full of nonsense: none of
     // them is an answer, and all of them are rebuilt on the way past.
     try ws.root.deleteFile(io, try ws.index(1));
-    try ws.write(try ws.index(5), "chridx\x01\n" ++ "\x00" ** 24);
+    try ws.write(try ws.index(5), "chridx\x02\n" ++ "\x00" ** 24);
     try ws.write(try ws.index(9), "not an index");
 
     var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1));
@@ -1589,8 +1791,8 @@ test "a lookup by time rebuilds a stale index and reads the rest from it" {
     // not sealed until it is rotated away from or the journal is closed.
     for ([_]u64{ 1, 5 }) |base| {
         const bytes = try ws.read(try ws.index(base));
-        try testing.expectEqualStrings("chridx\x02\n", bytes[0..8]);
-        try testing.expectEqual(@as(usize, 32 + 4 * 16), bytes.len);
+        try testing.expectEqualStrings("chridx\x03\n", bytes[0..8]);
+        try testing.expectEqual(@as(usize, 96 + 24), bytes.len);
         try testing.expectEqual(@as(i64, @intCast(base * 10)), std.mem.readInt(i64, bytes[16..24], .little));
         try testing.expectEqual(@as(i64, @intCast((base + 3) * 10)), std.mem.readInt(i64, bytes[24..32], .little));
     }
@@ -1612,10 +1814,22 @@ test "a record with no timestamp is named rather than stepped over" {
     // whose tail does not reach back far enough to have read it. Every path
     // that does read one refuses it as `CorruptRecord` already; this is the
     // one that goes looking for records it has not parsed.
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":10,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n" ++
-        "{\"seq\":2,\"v\":1,\"ev\":{\"removed\":{\"id\":2}}}\n" ++
-        "{\"seq\":3,\"at\":30,\"v\":1,\"ev\":{\"removed\":{\"id\":3}}}\n");
-    try ws.write(try ws.segment(4), "{\"seq\":4,\"at\":40,\"v\":1,\"ev\":{\"removed\":{\"id\":4}}}\n");
+    var untimed: Handwritten = try .init(1, 1);
+    defer untimed.deinit();
+    try untimed.record(1, 10, 1,
+        \\{"removed":{"id":1}}
+    );
+    // The second carries no `at` at all, so it is written out rather than
+    // composed: nothing this package writes looks like this.
+    try untimed.raw("{\"seq\":2,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":2}},\"c\":0}\n");
+    untimed.link = 0;
+    try untimed.record(3, 30, 1,
+        \\{"removed":{"id":3}}
+    );
+    try ws.write(try ws.segment(1), untimed.written());
+    try ws.writeRecords(4, untimed.link, &.{.{ .seq = 4, .at = 40, .ev =
+        \\{"removed":{"id":4}}
+    }});
 
     var journal = try Journal.open(testing.allocator, io, ws.path, .{ .tail_records = 0 });
     defer journal.deinit(io);
@@ -1627,6 +1841,89 @@ test "a record with no timestamp is named rather than stepped over" {
     // And the segment after it still answers, because the refusal is about
     // one segment and not about the log.
     try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, 5));
+}
+
+test "a lookup by time halves the index when the timestamps rise" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // One sealed segment with an entry per record, so there is something to
+    // halve: the entries are what a lookup by time reads.
+    const count = 4_000;
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{
+            .sync = .never,
+            .index_interval_bytes = 0,
+            .max_segment_records = count,
+        });
+        defer journal.deinit(io);
+        for (1..count + 1) |i| _ = try journal.append(io, @intCast(i * 10), created(@intCast(i), "n"));
+        // One more, to seal the segment above by rotating away from it.
+        _ = try journal.append(io, (count + 1) * 10, created(1, "n"));
+    }
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .index_interval_bytes = 0,
+        .max_segment_records = count,
+        .tail_records = 1,
+    });
+    defer journal.deinit(io);
+
+    const before = journal.log.index_reads;
+    try testing.expectEqual(@as(?u64, 3_000), try journal.seqAtOrAfter(io, 30_000));
+    const read = journal.log.index_reads - before;
+    // Halving four thousand entries is twelve reads and a bit, not four
+    // thousand. The budget is loose enough not to be a transcription of the
+    // implementation and tight enough to fail if the bisection goes.
+    try testing.expect(read <= 20);
+
+    // The timestamps rose, which is what the index header says and what the
+    // lookup relied on.
+    const bytes = try ws.read(try ws.index(1));
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[52..56], .little));
+}
+
+test "an index of one entry per interval is a fortieth of one per record" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const count = 20_000;
+    var dense_bytes: usize = 0;
+    var sparse_bytes: usize = 0;
+
+    for ([_]u64{ 0, 4096 }) |interval| {
+        var each = try Workspace.init("log");
+        defer each.deinit();
+        var journal = try Journal.open(testing.allocator, io, each.path, .{
+            .sync = .never,
+            .index_interval_bytes = interval,
+            .tail_records = 1,
+            .max_segment_bytes = 1 << 30,
+        });
+        defer journal.deinit(io);
+        for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+
+        // Whatever the index holds, a seek lands on the record asked for:
+        // with one entry per interval the walk starts at the entry before it
+        // and steps over what is in between.
+        var cursor: u64 = 0;
+        while (cursor < count) : (cursor += 1) {
+            var walk = try journal.replay(io, cursor);
+            defer walk.deinit(io);
+            const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
+            try testing.expectEqual(cursor + 1, record.seq);
+        }
+
+        journal.log.active.?.index_writer.interface.flush() catch {};
+        const size = (try each.read(try each.index(1))).len;
+        if (interval == 0) dense_bytes = size else sparse_bytes = size;
+    }
+
+    try testing.expect(dense_bytes > 40 * sparse_bytes);
 }
 
 //========================================================================
@@ -1837,7 +2134,11 @@ test "a compaction interrupted after its rename leaves a segment the next open r
     // for records 3..4, and the segment it replaces, still there.
     const whole = try ws.read(try ws.segment(1));
     const cut = std.mem.indexOfPos(u8, whole, 0, "{\"seq\":3").?;
-    try ws.write(try ws.segment(3), whole[cut..]);
+    const link = try backLinkOf(whole[cut..]);
+    var replacement: Handwritten = try .init(3, link);
+    defer replacement.deinit();
+    try replacement.raw(whole[cut..]);
+    try ws.write(try ws.segment(3), replacement.written());
 
     var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer journal.deinit(io);
@@ -2154,8 +2455,13 @@ test "a reader beside a writer mid-record sees the records, not the fragment" {
     // What a reader finds if it looks between a writer's `write` and its
     // newline: a complete log and a fragment. The fragment is not damage and
     // the reader must not shorten the file to be rid of it.
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n" ++
-        "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"remo");
+    var midway: Handwritten = try .init(1, 5);
+    defer midway.deinit();
+    try midway.record(1, 1, 1,
+        \\{"removed":{"id":1}}
+    );
+    try midway.raw("{\"seq\":2,\"at\":2,\"v\":1,\"p\":9,\"ev\":{\"remo");
+    try ws.write(try ws.segment(1), midway.written());
     const before = try ws.read(try ws.segment(1));
 
     var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
@@ -2238,33 +2544,63 @@ test "a checksum that is not the last member of its line is not a checksum" {
 
     // A `c` this package cannot have written: there is no prefix it could be
     // the checksum of, so the line is refused rather than read unverified.
-    try ws.write(try ws.segment(1), "{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n");
+    try ws.writeRaw(1, "{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n");
     try testing.expectError(
         error.CorruptRecord,
         Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail }),
     );
 }
 
-test "a record written before checksums existed is read as it always was" {
+test "a segment in an older framing is refused by name, not read" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    // The envelope 0.2.0 wrote, with no `c` member. There is nothing to
-    // verify, and having nothing to verify is not a failure to verify.
+    // What a journal written before this version looks like: records, and no
+    // line in front of them saying what they are. Reading it as if the
+    // framing were the current one would mean records with no back-link and
+    // no way to tell one file's records from another's, so it is refused.
     try ws.write(try ws.segment(1), "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"old\"}}}\n");
+    try testing.expectError(
+        error.UnsupportedFormat,
+        Journal.open(testing.allocator, io, ws.path, .{}),
+    );
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
-    defer journal.deinit(io);
-    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
-    try testing.expectEqualStrings("old", journal.records().records[0].event.created.name);
+    // And a framing version this one does not know is refused the same way,
+    // rather than read as if the records behind it were these ones.
+    try ws.write(try ws.segment(1), "{\"chronicle\":99,\"base\":1,\"root\":0}\n");
+    try testing.expectError(
+        error.UnsupportedFormat,
+        Journal.open(testing.allocator, io, ws.path, .{}),
+    );
+}
 
-    // A record appended beside it carries one, so a journal gains checksums
-    // as it is written to rather than needing a conversion.
-    _ = try journal.append(io, 2, created(2, "new"));
-    const bytes = try ws.read(try ws.segment(1));
-    try testing.expect(std.mem.count(u8, bytes, ",\"c\":") == 1);
-    try testing.expectEqual(@as(u64, 2), try journal.verify(io));
+test "a record that does not link to the one before it is named" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // Two records that are each whole and each pass their own checksum, with
+    // a third spliced in between them from somewhere else. The sequence runs
+    // on, so only the chain says anything is wrong.
+    var spliced: Handwritten = try .init(1, 11);
+    defer spliced.deinit();
+    try spliced.record(1, 1, 1,
+        \\{"removed":{"id":1}}
+    );
+    spliced.link = 12345;
+    try spliced.record(2, 2, 1,
+        \\{"removed":{"id":2}}
+    );
+    try spliced.record(3, 3, 1,
+        \\{"removed":{"id":3}}
+    );
+    try ws.write(try ws.segment(1), spliced.written());
+
+    try testing.expectError(
+        error.BrokenChain,
+        Journal.open(testing.allocator, io, ws.path, .{}),
+    );
 }
 
 test "the checksum is the same number however it is computed" {
@@ -2356,11 +2692,17 @@ fn seeded(comptime body: []const u8) []const u8 {
     }
 }
 
-const a_record = "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"x\"}}}\n";
-/// The same record as this version writes it: the checksum of everything
-/// before `,"c":`, which is `a_record` without its closing brace.
-const a_checked_record =
-    "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"x\"}},\"c\":825182072}\n";
+/// The line that starts a segment file, in front of everything the fuzzer
+/// generates: what is being fuzzed is the records, not whether a file with no
+/// framing on it is read (it is not; there is a corpus entry for that below).
+const a_header = "{\"chronicle\":1,\"base\":1,\"root\":0}\n";
+
+/// One record as this version writes it: the first in its file, so its
+/// back-link is the file's root, and its checksum is of everything in the
+/// line before `,"c":`.
+const a_record = "{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":{\"created\":{\"id\":1,\"name\":\"x\"}},\"c\":4192667910}\n";
+/// The one after it, linked to it.
+const a_second_record = "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":2775085038}\n";
 
 /// Inputs worth starting from: the empty file, a whole record, a record cut
 /// off mid-write, and the shapes that have to be refused by name.
@@ -2370,17 +2712,22 @@ const open_corpus = [_][]const u8{
     seeded("\n\n"),
     seeded("{"),
     seeded(a_record),
-    seeded(a_record ++ a_record),
-    seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"crea"),
-    seeded(a_checked_record),
-    seeded(a_checked_record ++ a_checked_record),
-    seeded(a_checked_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":0}\n"),
-    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":null,\"c\":4294967296}\n"),
-    seeded("{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"ev\":null}\n"),
-    seeded("{\"seq\":0,\"at\":0,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n"),
-    seeded("{\"seq\":9223372036854775807,\"at\":0,\"v\":1,\"ev\":{\"removed\":{\"id\":1}}}\n"),
-    seeded("{\"seq\":1,\"at\":1,\"v\":4294967296,\"ev\":null}\n"),
-    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":-1,\"name\":null}}}\n"),
+    seeded(a_record ++ a_second_record),
+    seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"crea"),
+    // The zeros a writer's reservation leaves, after a whole record and
+    // after half of one.
+    seeded(a_record ++ "\x00" ** 64),
+    seeded(a_record ++ "{\"seq\":2,\"at\":2" ++ "\x00" ** 64),
+    // A record whose checksum is not its own, and one that does not link to
+    // the record before it.
+    seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":0}\n"),
+    seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":7,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":2105350390}\n"),
+    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":null,\"c\":4294967296}\n"),
+    seeded("{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"p\":0,\"ev\":null}\n"),
+    seeded("{\"seq\":0,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n"),
+    seeded("{\"seq\":9223372036854775807,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n"),
+    seeded("{\"seq\":1,\"at\":1,\"v\":4294967296,\"p\":0,\"ev\":null}\n"),
+    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":{\"created\":{\"id\":-1,\"name\":null}}}\n"),
     seeded("[[[[[[[[[[[[[[[[[[[[\n"),
     seeded("\x00\xff\xfe\n"),
 };
@@ -2399,15 +2746,27 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const name = try ws.segment(1);
-    try ws.write(name, bytes);
+    const whole = try testing.allocator.alloc(u8, a_header.len + bytes.len);
+    defer testing.allocator.free(whole);
+    @memcpy(whole[0..a_header.len], a_header);
+    @memcpy(whole[a_header.len..], bytes);
+    try ws.write(name, whole);
 
-    // `.fail` is the mode that promises to leave the file as it found it.
-    if (Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail })) |untouched| {
-        var journal = untouched;
-        defer journal.deinit(io);
-        try testing.expectEqual(@as(usize, 0), journal.dropped_bytes);
-    } else |_| {}
-    try testing.expectEqualStrings(bytes, try ws.read(name));
+    // `.fail` is the mode that refuses a record the writer did not finish
+    // rather than dropping it: nothing it opens has anything dropped, and a
+    // file it refuses is left exactly as it was found.
+    if (Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail })) |opened| {
+        var journal = opened;
+        journal.deinit(io);
+        // A close lets go of space that was reserved and never written into,
+        // which is zeros at the end and nothing else.
+        const after = try ws.read(name);
+        try testing.expect(after.len <= whole.len);
+        try testing.expectEqualStrings(whole[0..after.len], after);
+        for (whole[after.len..]) |byte| try testing.expectEqual(@as(u8, 0), byte);
+    } else |_| {
+        try testing.expectEqualStrings(whole, try ws.read(name));
+    }
 
     // `.drop` promises a log the next append can extend. Whatever it made of
     // these bytes, appending to it and opening again has to agree.
@@ -2433,14 +2792,60 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
     try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
 }
 
+/// Arbitrary bytes where the line that says what the file is should be.
+const framing_corpus = [_][]const u8{
+    seeded(""),
+    seeded("\n"),
+    seeded("{\"chronicle\":1,\"base\":1,\"root\":0}\n"),
+    seeded("{\"chronicle\":2,\"base\":1,\"root\":0}\n"),
+    seeded("{\"chronicle\":1,\"base\":9,\"root\":0}\n"),
+    seeded("{\"chronicle\":1,\"base\":1}\n"),
+    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{}}\n"),
+    seeded("chronicle\n"),
+};
+
+test "fuzz: a segment whose first line is arbitrary" {
+    try testing.fuzz({}, fuzzFraming, .{ .corpus = &framing_corpus });
+}
+
+fn fuzzFraming(_: void, smith: *testing.Smith) anyerror!void {
+    const io = testing.io;
+    var buffer: [256]u8 = undefined;
+    const head = buffer[0..smith.slice(&buffer)];
+
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const name = try ws.segment(1);
+    const whole = try testing.allocator.alloc(u8, head.len + a_record.len);
+    defer testing.allocator.free(whole);
+    @memcpy(whole[0..head.len], head);
+    @memcpy(whole[head.len..], a_record);
+    try ws.write(name, whole);
+
+    // A file whose first line does not say what it is must be refused by
+    // name -- never read as if its records were this version's.
+    var journal = Journal.open(testing.allocator, io, ws.path, .{}) catch |err| {
+        switch (err) {
+            error.UnsupportedFormat, error.CorruptRecord, error.DiscontinuousSeq, error.BrokenChain, error.ChecksumMismatch => return,
+            else => return err,
+        }
+    };
+    defer journal.deinit(io);
+    // If it opened, the first line was a header this version writes, and the
+    // records behind it are the ones the log holds.
+    try testing.expect(std.mem.startsWith(u8, whole, "{\"chronicle\":1,\"base\":1,"));
+    _ = try journal.verify(io);
+}
+
 const index_corpus = [_][]const u8{
     seeded(""),
-    seeded("chridx\x01\n"),
-    seeded("chridx\x01\n" ++ "\x00" ** 8),
-    seeded("chridx\x01\n" ++ "\x00" ** 16),
-    seeded("chridx\x01\n" ++ "\xff" ** 16),
+    seeded("chridx\x02\n"),
+    seeded("chridx\x03\n"),
+    seeded("chridx\x03\n" ++ "\x00" ** 88),
+    seeded("chridx\x03\n" ++ "\x00" ** 88 ++ "\x00" ** 24),
+    seeded("chridx\x03\n" ++ "\xff" ** 88),
     seeded("not an index at all"),
-    seeded("chridx\x01\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 8),
+    seeded("chridx\x03\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 80),
 };
 
 test "fuzz: an arbitrary index file is a cache, never an answer" {
@@ -2500,7 +2905,7 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    try ws.write(try ws.segment(1), a_record);
+    try ws.write(try ws.segment(1), a_header ++ a_record);
     try ws.write(try ws.sub(chronicle.snapshot_name), bytes);
 
     // A snapshot is an optimisation. A bad one must be an error the caller can

@@ -268,6 +268,18 @@ pub fn Journal(comptime Event: type) type {
             /// setting on a journal whose `sync` is `.always` and whose
             /// records are small, and worth leaving alone otherwise.
             preallocate_bytes: u64 = 0,
+            /// How many bytes of segment one index entry covers.
+            ///
+            /// The index is a cache that turns a cursor into a seek. One
+            /// entry per record makes the seek exact and costs a sixth of
+            /// the log's size in sidecars; one entry per 4096 bytes, the
+            /// default, costs a fortieth of that and puts a walk of at most
+            /// that many bytes after the seek. Zero is an entry per record.
+            ///
+            /// It is also what a lookup by time reads, so a larger interval
+            /// makes `seqAtOrAfter` read the segment where a smaller one
+            /// would have answered from the index alone.
+            index_interval_bytes: u64 = 4096,
             /// Size of the journal's write buffer. One `append` of a record
             /// larger than this costs an extra write syscall, nothing more.
             write_buffer_size: usize = 64 * 1024,
@@ -318,13 +330,22 @@ pub fn Journal(comptime Event: type) type {
         ///   `.fail`, or any line of a segment that is not the newest.
         /// * `DiscontinuousSeq` — sequence numbers skip or repeat, or the
         ///   records of a segment disagree with the name it is under.
+        /// * `BrokenChain` — a record does not link to the one before it.
+        ///   Every record carries the checksum of its predecessor, so a
+        ///   record spliced in from somewhere else, or a run of them left
+        ///   over from an earlier life of the file, is named here rather
+        ///   than folded.
+        /// * `UnsupportedFormat` — a segment file's first line is not one
+        ///   this version writes. The framing carries its version there, so
+        ///   a file from another one is refused by name and never read as if
+        ///   it were records.
         /// * `NewerSchema` — a record was written at a version above
         ///   `Options.schema_version`. This process is the old one.
         /// * `OlderSchema` — a record was written at a version below
         ///   `Options.schema_version` and there is neither a `migrate` hook nor
         ///   an `unknown` arm to receive it.
         pub const ReadError = Allocator.Error || MigrateError || Log.ScanError ||
-            error{ ChecksumMismatch, CorruptRecord, TruncatedRecord, DiscontinuousSeq, NewerSchema, OlderSchema };
+            error{ ChecksumMismatch, CorruptRecord, TruncatedRecord, DiscontinuousSeq, BrokenChain, NewerSchema, OlderSchema };
 
         /// `ReadError`, plus what opening a directory and taking its lock can
         /// go wrong with.
@@ -407,6 +428,9 @@ pub fn Journal(comptime Event: type) type {
             seq: u64,
             at: i64,
             v: u32,
+            /// The checksum of the record before this one, or the segment
+            /// header's `root` for the first record in a file.
+            p: u32,
             ev: Event,
         };
 
@@ -458,6 +482,7 @@ pub fn Journal(comptime Event: type) type {
                 .max_segment_bytes = options.max_segment_bytes,
                 .max_segment_records = options.max_segment_records,
                 .preallocate_bytes = options.preallocate_bytes,
+                .index_interval_bytes = options.index_interval_bytes,
             });
             errdefer log.deinit(io);
 
@@ -557,7 +582,7 @@ pub fn Journal(comptime Event: type) type {
             const next = self.seq + 1;
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
-            var built = try self.encode(next, at, event);
+            var built = try self.encode(next, at, self.log.chainTip(), event);
             var held = false;
             defer if (!held) built.release(self.gpa);
 
@@ -568,7 +593,7 @@ pub fn Journal(comptime Event: type) type {
 
             {
                 errdefer self.persistence_failed = true;
-                try self.log.appendLine(io, built.bytes, built.at);
+                try self.log.appendLine(io, built.bytes, built.at, built.checksum);
             }
 
             held = self.publish(built);
@@ -619,8 +644,11 @@ pub fn Journal(comptime Event: type) type {
             defer if (!published) for (built.items) |*item| item.release(self.gpa);
 
             try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
+            var link = self.log.chainTip();
             for (entries, 0..) |entry, i| {
-                built.appendAssumeCapacity(try self.encode(self.seq + i + 1, entry.at, entry.event));
+                const item = try self.encode(self.seq + i + 1, entry.at, link, entry.event);
+                link = item.checksum;
+                built.appendAssumeCapacity(item);
             }
 
             try self.tail.ensureUnusedCapacity(self.gpa, entries.len);
@@ -628,7 +656,7 @@ pub fn Journal(comptime Event: type) type {
 
             {
                 errdefer self.persistence_failed = true;
-                for (built.items) |item| try self.log.stageLine(io, item.bytes, item.at);
+                for (built.items) |item| try self.log.stageLine(io, item.bytes, item.at, item.checksum);
                 try self.log.commit(io);
             }
             published = true;
@@ -717,6 +745,10 @@ pub fn Journal(comptime Event: type) type {
             scratch: std.heap.ArenaAllocator,
             cursor: u64,
             expected: ?u64,
+            /// The checksum of the record before the next one, once the walk
+            /// has seen a record to take it from. A seek starts without one:
+            /// there is nothing in front of where it landed to link to.
+            link: ?u32,
 
             pub fn deinit(walk: *Replay, io: Io) void {
                 walk.scan.deinit(io);
@@ -735,10 +767,17 @@ pub fn Journal(comptime Event: type) type {
                     // because a segment is the unit a seek lands in. Skipping
                     // before the event is parsed is what lets a reader hold a
                     // cursor into a log whose events it does not know.
-                    if (header.seq <= walk.cursor) continue;
+                    if (header.seq <= walk.cursor) {
+                        walk.link = header.c;
+                        continue;
+                    }
                     if (walk.expected) |want| {
                         if (header.seq != want) return error.DiscontinuousSeq;
                     }
+                    if (walk.link) |want| {
+                        if (header.p != want) return error.BrokenChain;
+                    }
+                    walk.link = header.c;
                     _ = walk.arena.reset(.retain_capacity);
                     const record = try walk.journal.recordFrom(walk.arena.allocator(), header, line);
                     walk.expected = header.seq + 1;
@@ -781,6 +820,7 @@ pub fn Journal(comptime Event: type) type {
                 .scratch = .init(self.gpa),
                 .cursor = cursor,
                 .expected = null,
+                .link = null,
             };
         }
 
@@ -877,9 +917,10 @@ pub fn Journal(comptime Event: type) type {
             segments: usize,
             /// How many records they hold.
             records: u64,
-            /// The bytes of those records, over every segment. The index
-            /// sidecars, the lock and the snapshot are not counted: they are
-            /// caches and a copy of a fold, not the log.
+            /// The bytes of those records, over every segment. The line at
+            /// the head of each segment file is not counted, and neither are
+            /// the index sidecars, the lock and the snapshot: those are the
+            /// framing, a cache and a copy of a fold, not the log.
             bytes: u64,
             /// The oldest sequence number still held and the newest. Both are
             /// zero on a log with no records in it.
@@ -895,7 +936,7 @@ pub fn Journal(comptime Event: type) type {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             var bytes: u64 = 0;
-            for (self.log.segments.items) |segment| bytes += segment.bytes;
+            for (self.log.segments.items) |segment| bytes += segment.bytes - segment.header_bytes;
             const oldest = self.log.baseSeq() + 1;
             const empty = self.seq == 0 or oldest > self.seq;
             return .{
@@ -1314,6 +1355,8 @@ pub fn Journal(comptime Event: type) type {
             bytes: []const u8,
             seq: u64,
             at: i64,
+            /// This record's checksum, which the next one links back to.
+            checksum: u32,
             record: ?Record,
 
             fn release(built: *Built, gpa: Allocator) void {
@@ -1337,22 +1380,36 @@ pub fn Journal(comptime Event: type) type {
         /// would produce: an `Event` whose slices point at a stack buffer is
         /// safe to append. Where nothing will, that parse would build a record
         /// and drop it unread, so it is not done.
-        fn encode(self: *Self, seq: u64, at: i64, event: Event) AppendError!Built {
-            const line: Line = .{ .seq = seq, .at = at, .v = self.options.schema_version, .ev = event };
+        fn encode(self: *Self, seq: u64, at: i64, back_link: u32, event: Event) AppendError!Built {
+            const line: Line = .{
+                .seq = seq,
+                .at = at,
+                .v = self.options.schema_version,
+                .p = back_link,
+                .ev = event,
+            };
             const body = try std.json.Stringify.valueAlloc(self.gpa, line, .{});
             defer self.gpa.free(body);
             // The checksum covers everything the record says except the
             // checksum itself. `std.json` closes the object with the one byte
             // dropped here, and `,"c":<crc>}` closes it again.
             const covered = body[0 .. body.len - 1];
+            const sum = checksum(covered);
 
             if (!self.needsRecord()) {
                 const stored = try std.fmt.allocPrint(
                     self.gpa,
                     "{s},\"c\":{d}}}",
-                    .{ covered, checksum(covered) },
+                    .{ covered, sum },
                 );
-                return .{ .arena = null, .bytes = stored, .seq = seq, .at = at, .record = null };
+                return .{
+                    .arena = null,
+                    .bytes = stored,
+                    .seq = seq,
+                    .at = at,
+                    .checksum = sum,
+                    .record = null,
+                };
             }
 
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
@@ -1360,7 +1417,7 @@ pub fn Journal(comptime Event: type) type {
             const stored = try std.fmt.allocPrint(
                 arena.allocator(),
                 "{s},\"c\":{d}}}",
-                .{ covered, checksum(covered) },
+                .{ covered, sum },
             );
             const parsed = std.json.parseFromSliceLeaky(
                 Line,
@@ -1371,13 +1428,20 @@ pub fn Journal(comptime Event: type) type {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.NotRoundTrippable,
             };
-            return .{ .arena = arena, .bytes = stored, .seq = seq, .at = at, .record = .{
+            return .{
+                .arena = arena,
+                .bytes = stored,
                 .seq = seq,
                 .at = at,
-                .version = self.options.schema_version,
-                .event = parsed.ev,
-                .bytes = stored,
-            } };
+                .checksum = sum,
+                .record = .{
+                    .seq = seq,
+                    .at = at,
+                    .version = self.options.schema_version,
+                    .event = parsed.ev,
+                    .bytes = stored,
+                },
+            };
         }
 
         /// Take a record the disk now holds into the tail and hand it to every
@@ -1406,6 +1470,7 @@ pub fn Journal(comptime Event: type) type {
             defer scan.deinit(io);
 
             var expected: ?u64 = null;
+            var link: ?u32 = null;
             while (try scan.next(io)) |line| {
                 _ = self.scratch.reset(.retain_capacity);
                 const header = try parseHeader(self.scratch.allocator(), line);
@@ -1415,8 +1480,13 @@ pub fn Journal(comptime Event: type) type {
                     // The seek landed before the cursor, which a segment
                     // boundary makes normal: drop what is already behind,
                     // without going as far as parsing its event.
+                    link = header.c;
                     continue;
                 }
+                if (link) |previous| {
+                    if (header.p != previous) return error.BrokenChain;
+                }
+                link = header.c;
                 expected = header.seq + 1;
 
                 var arena: std.heap.ArenaAllocator = .init(self.gpa);
@@ -1483,6 +1553,11 @@ pub fn Journal(comptime Event: type) type {
             seq: u64,
             at: i64,
             version: u32,
+            /// The checksum of the record before this one.
+            p: u32,
+            /// This record's own checksum, which the next one carries as its
+            /// `p`.
+            c: u32,
             /// Borrowed from the `scratch` it was parsed into, so it lasts
             /// until that arena is next reset.
             ev: std.json.Value,
@@ -1504,26 +1579,29 @@ pub fn Journal(comptime Event: type) type {
             const at = root.object.get("at") orelse return error.CorruptRecord;
             const v = root.object.get("v") orelse return error.CorruptRecord;
             const ev = root.object.get("ev") orelse return error.CorruptRecord;
+            const back = root.object.get("p") orelse return error.CorruptRecord;
+            const claimed = root.object.get("c") orelse return error.CorruptRecord;
             if (seq != .integer or at != .integer or v != .integer) return error.CorruptRecord;
+            if (back != .integer or claimed != .integer) return error.CorruptRecord;
             if (seq.integer < 1) return error.CorruptRecord;
             const version = std.math.cast(u32, v.integer) orelse return error.CorruptRecord;
-            // The checksum, when the record carries one. A record written
-            // before 0.3.0 does not, and is read exactly as it always was.
-            if (root.object.get("c")) |claimed| {
-                if (claimed != .integer) return error.CorruptRecord;
-                const want = std.math.cast(u32, claimed.integer) orelse return error.CorruptRecord;
-                var buffer: [32]u8 = undefined;
-                const suffix = std.fmt.bufPrint(&buffer, ",\"c\":{d}}}", .{want}) catch unreachable;
-                // The checksum is the last member of a line this package
-                // wrote, so a line that does not end in the one it claims is
-                // not one -- and there is nothing to check it against.
-                if (!std.mem.endsWith(u8, line, suffix)) return error.CorruptRecord;
-                if (checksum(line[0 .. line.len - suffix.len]) != want) return error.ChecksumMismatch;
-            }
+            const link = std.math.cast(u32, back.integer) orelse return error.CorruptRecord;
+            const want = std.math.cast(u32, claimed.integer) orelse return error.CorruptRecord;
+
+            var buffer: [32]u8 = undefined;
+            const suffix = std.fmt.bufPrint(&buffer, ",\"c\":{d}}}", .{want}) catch unreachable;
+            // The checksum is the last member of a line this package wrote,
+            // so a line that does not end in the one it claims is not one --
+            // and there is nothing to check it against.
+            if (!std.mem.endsWith(u8, line, suffix)) return error.CorruptRecord;
+            if (checksum(line[0 .. line.len - suffix.len]) != want) return error.ChecksumMismatch;
+
             return .{
                 .seq = @intCast(seq.integer),
                 .at = at.integer,
                 .version = version,
+                .p = link,
+                .c = want,
                 .ev = ev,
             };
         }

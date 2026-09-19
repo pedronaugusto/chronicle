@@ -23,9 +23,22 @@ pub const hardware = switch (builtin.cpu.arch) {
 
 /// The CRC32C of `bytes`.
 pub fn hash(bytes: []const u8) u32 {
-    if (!hardware) return std.hash.crc.Crc32Iscsi.hash(bytes);
+    return ~update(initial, bytes);
+}
 
-    var crc: u32 = 0xffff_ffff;
+/// What a running checksum starts from, for a value built out of several
+/// pieces. `~` the last `update` is the checksum of the pieces joined.
+pub const initial: u32 = 0xffff_ffff;
+
+/// Carry a running checksum over `bytes`.
+pub fn update(from: u32, bytes: []const u8) u32 {
+    if (!hardware) {
+        var table: std.hash.crc.Crc32Iscsi = .{ .crc = from };
+        table.update(bytes);
+        return table.crc;
+    }
+
+    var crc: u32 = from;
     var at: usize = 0;
     while (at + 8 <= bytes.len) : (at += 8) {
         crc = eight(crc, std.mem.readInt(u64, bytes[at..][0..8], .little));
@@ -39,7 +52,7 @@ pub fn hash(bytes: []const u8) u32 {
         at += 2;
     }
     if (at < bytes.len) crc = one(crc, bytes[at]);
-    return ~crc;
+    return crc;
 }
 
 inline fn eight(crc: u32, value: u64) u32 {
