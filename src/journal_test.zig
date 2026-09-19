@@ -1216,13 +1216,18 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     defer journal.deinit(io);
     try testing.expectEqual(@as(u64, 20), try journal.lastSeq(io));
 
-    // A seek into either of those segments still lands on the right record.
+    // A seek into either of those segments still lands on the right record,
+    // index or no index.
     for ([_]u64{ 0, 2, 5, 7, 12, 19 }) |cursor| {
         var walk = try journal.replay(io, cursor);
         defer walk.deinit(io);
         const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
         try testing.expectEqual(cursor + 1, record.seq);
     }
+
+    // A call that holds the journal's lock is what builds one: a walk takes
+    // no lock and writes nothing.
+    try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, 1));
 
     // The missing one was rebuilt on the way, and it describes its segment:
     // a thirty-two byte header and sixteen bytes -- an offset and a
@@ -1270,6 +1275,39 @@ test "a clean close leaves an index the next open takes rather than rebuilds" {
     // than being written again from the start.
     try testing.expectEqual(marked.len + 16, after.len);
     try testing.expectEqualStrings(marked[0..8], after[0..8]);
+}
+
+test "the index of a sealed segment is checked once, not once a seek" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+        defer journal.deinit(io);
+        for (1..21) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1));
+    defer journal.deinit(io);
+
+    // The first seek into a segment is what checks its index. Every seek
+    // after it is a read of eight bytes through a handle that is already
+    // open: the index was proved good once and the proof does not expire,
+    // because nothing but this process writes the segment.
+    {
+        var warm = try journal.replay(io, 2);
+        defer warm.deinit(io);
+        _ = try warm.next(io);
+    }
+    const before = journal.log.index_opens;
+    for (0..10) |_| {
+        var walk = try journal.replay(io, 2);
+        defer walk.deinit(io);
+        const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
+        try testing.expectEqual(@as(u64, 3), record.seq);
+    }
+    try testing.expectEqual(before, journal.log.index_opens);
 }
 
 test "a seek into the segment being written to reads its index, not the segment" {
@@ -1320,10 +1358,13 @@ test "an index for the wrong segment length is refused and rebuilt" {
 
     var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1));
     defer journal.deinit(io);
-    var walk = try journal.replay(io, 2);
-    defer walk.deinit(io);
-    const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
-    try testing.expectEqual(@as(u64, 3), record.seq);
+    {
+        var walk = try journal.replay(io, 2);
+        defer walk.deinit(io);
+        const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
+        try testing.expectEqual(@as(u64, 3), record.seq);
+    }
+    try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(io, 1));
     try testing.expectEqualStrings(good, try ws.read(try ws.index(1)));
 }
 

@@ -747,10 +747,22 @@ pub fn Journal(comptime Event: type) type {
         /// Records appended while it runs may or may not appear: a `Replay`
         /// does not hold the journal's lock. `subscribeFrom` is the version
         /// that misses nothing.
+        ///
+        /// It writes nothing. A segment whose index is missing or stale is
+        /// walked from its start rather than indexed on the way, because
+        /// building an index beside an `append` that is writing one is not
+        /// something a call that takes no lock may do. `open`, `refresh` and
+        /// `seqAtOrAfter` hold the lock and are what build indexes.
         pub fn replay(self: *Self, io: Io, cursor: u64) ReplayError!Replay {
+            return self.replayFrom(io, cursor, false);
+        }
+
+        /// `replay`, saying whether the walk may build an index it finds
+        /// missing. Only a caller holding the journal's lock may say yes.
+        fn replayFrom(self: *Self, io: Io, cursor: u64, may_write: bool) ReplayError!Replay {
             return .{
                 .journal = self,
-                .scan = try self.log.scanFrom(io, cursor),
+                .scan = try self.log.scanFrom(io, cursor, may_write),
                 .arena = .init(self.gpa),
                 .scratch = .init(self.gpa),
                 .cursor = cursor,
@@ -938,7 +950,7 @@ pub fn Journal(comptime Event: type) type {
 
             var delivered = cursor;
             if (!self.since(cursor).complete) {
-                var walk = try self.replay(io, cursor);
+                var walk = try self.replayFrom(io, cursor, true);
                 defer walk.deinit(io);
                 while (try walk.next(io)) |record| {
                     for (registered) |sink| sink.f(sink.ctx, record);
@@ -1343,7 +1355,7 @@ pub fn Journal(comptime Event: type) type {
             const want = self.options.tail_records;
             const from = if (self.seq > want) self.seq - want else self.log.baseSeq();
 
-            var scan = try self.log.scanFrom(io, from);
+            var scan = try self.log.scanFrom(io, from, true);
             defer scan.deinit(io);
 
             var expected: ?u64 = null;

@@ -138,11 +138,39 @@ pub const Segment = struct {
     /// for the active one; a sealed segment whose index has to be rebuilt
     /// carries `Times.unknown` until something asks.
     times: Times,
+    /// What this segment's index has been proved to be. A sealed segment's
+    /// bytes do not change, and nothing but this process writes its index, so
+    /// the proof is taken once and held for as long as the log knows this
+    /// segment -- which is until `load` reads the directory again.
+    index: IndexState,
+
+    /// A segment as the directory first names it: a file whose length and
+    /// contents nothing has read yet.
+    pub fn named(base_seq: u64) Segment {
+        return .{
+            .base_seq = base_seq,
+            .last_seq = base_seq - 1,
+            .bytes = 0,
+            .times = .unknown,
+            .index = .unchecked,
+        };
+    }
 
     /// How many records it holds.
     pub fn count(segment: Segment) u64 {
         return segment.last_seq + 1 - segment.base_seq;
     }
+};
+
+/// Whether a segment's index has been checked against it, and what it said.
+pub const IndexState = union(enum) {
+    /// Nothing has asked yet.
+    unchecked,
+    /// There is no index describing these bytes, and this log has not been
+    /// able to build one.
+    none,
+    /// It describes exactly these bytes.
+    good: Indexed,
 };
 
 /// How a log is opened. `Journal.Options` forwards these.
@@ -204,6 +232,14 @@ index_buf: []u8,
 /// How many unterminated bytes `open` dropped from the end of the active
 /// segment.
 dropped_bytes: usize,
+/// How many files have been opened to consult a sealed segment's index. Not
+/// part of any promise: it is what the suite counts to prove that a seek
+/// costs the index once per segment and not once per seek.
+index_opens: u64,
+/// One open handle on a sealed segment's index, kept between seeks. A fold
+/// that seeks repeatedly stays in one segment for as long as it is reading
+/// it, so one handle is the whole of the win and a cache is not needed.
+held_index: ?HeldIndex,
 
 /// The two open files that make up the newest segment.
 const Active = struct {
@@ -287,6 +323,8 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenErro
         .write_buf = write_buf,
         .index_buf = index_buf,
         .dropped_bytes = 0,
+        .index_opens = 0,
+        .held_index = null,
     };
     errdefer {
         log.closeActive(io);
@@ -320,6 +358,7 @@ pub fn reload(log: *Log, io: Io) OpenError!void {
 /// `compact` picks up the files it has just rearranged.
 fn load(log: *Log, io: Io) OpenError!void {
     log.closeActive(io);
+    log.releaseIndex(io);
     log.segments.clearRetainingCapacity();
     try log.listSegments(io);
 
@@ -345,12 +384,7 @@ fn listSegments(log: *Log, io: Io) OpenError!void {
     while (try iterator.next(io)) |entry| {
         if (entry.kind == .directory) continue;
         const base_seq = parseSegmentName(entry.name) orelse continue;
-        try log.segments.append(log.gpa, .{
-            .base_seq = base_seq,
-            .last_seq = base_seq - 1,
-            .bytes = 0,
-            .times = .unknown,
-        });
+        try log.segments.append(log.gpa, .named(base_seq));
     }
     std.mem.sort(Segment, log.segments.items, {}, struct {
         fn lessThan(_: void, a: Segment, b: Segment) bool {
@@ -407,6 +441,7 @@ fn describeSealed(log: *Log, io: Io, segment: *Segment) OpenError!void {
     if (try log.readIndex(io, segment.*)) |indexed| {
         segment.last_seq = segment.base_seq + indexed.count - 1;
         segment.times = indexed.times;
+        segment.index = .{ .good = indexed };
         return;
     }
     const line = try log.lastLine(io, segment.*);
@@ -466,6 +501,7 @@ const Indexed = struct {
 /// offset must carry and must end the segment with: an index that agrees with
 /// both was built from exactly these bytes.
 fn readIndex(log: *Log, io: Io, segment: Segment) OpenError!?Indexed {
+    log.index_opens += 1;
     const file = log.dir.openFile(io, &segmentName(segment.base_seq, index_extension), .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => |e| return e,
@@ -493,6 +529,7 @@ fn readIndex(log: *Log, io: Io, segment: Segment) OpenError!?Indexed {
     const offset = std.mem.readInt(u64, &slot, .little);
     if (offset >= segment.bytes) return null;
 
+    log.index_opens += 1;
     const line = log.lineAt(io, segment, offset) catch return null;
     defer log.gpa.free(line.bytes);
     if (!line.terminated or offset + line.bytes.len + 1 != segment.bytes) return null;
@@ -501,14 +538,83 @@ fn readIndex(log: *Log, io: Io, segment: Segment) OpenError!?Indexed {
     return .{ .count = count, .times = times };
 }
 
-/// The byte offset of `seq` within its segment, from the index, or null when
-/// no usable index says. A null answer is never wrong — it costs a scan.
-fn indexedOffset(log: *Log, io: Io, segment: Segment, seq: u64) ?u64 {
+/// One sealed segment's index, open.
+const HeldIndex = struct {
+    base_seq: u64,
+    file: Io.File,
+};
+
+/// Let go of the index handle being held, if there is one.
+fn releaseIndex(log: *Log, io: Io) void {
+    if (log.held_index) |held| held.file.close(io);
+    log.held_index = null;
+}
+
+/// The open index of a sealed segment, opening it if the one being held is
+/// another segment's.
+fn holdIndex(log: *Log, io: Io, base_seq: u64) ?Io.File {
+    if (log.held_index) |held| {
+        if (held.base_seq == base_seq) return held.file;
+        held.file.close(io);
+        log.held_index = null;
+    }
+    log.index_opens += 1;
+    const file = log.dir.openFile(io, &segmentName(base_seq, index_extension), .{}) catch return null;
+    log.held_index = .{ .base_seq = base_seq, .file = file };
+    return file;
+}
+
+/// What a sealed segment's index says, proved against the segment once.
+///
+/// The proof is what used to happen on every lookup: open the index, read its
+/// header, open the segment, read the record at the last indexed offset and
+/// check that it ends the file. None of that can change while this log holds
+/// the write lock and the segment is sealed, so it is taken once and the
+/// answer kept on the segment.
+///
+/// `may_write` is false for a walk that does not hold the journal's lock: it
+/// reads an index that is already there and never builds one.
+fn provenIndex(log: *Log, io: Io, at: usize, may_write: bool) ?Indexed {
+    const segment = &log.segments.items[at];
+    switch (segment.index) {
+        .good => |indexed| return indexed,
+        .none => return null,
+        .unchecked => {},
+    }
+    if (log.readIndex(io, segment.*) catch null) |indexed| {
+        segment.index = .{ .good = indexed };
+        return indexed;
+    }
+    if (!may_write or log.options.access == .read) {
+        // Left unchecked rather than refused: a walk that may not write has
+        // not proved there is no index, only that it will not make one.
+        if (!may_write) return null;
+        segment.index = .none;
+        return null;
+    }
+    log.rebuildIndex(io, segment.*) catch {
+        segment.index = .none;
+        return null;
+    };
+    log.releaseIndex(io);
+    if (log.readIndex(io, segment.*) catch null) |indexed| {
+        segment.index = .{ .good = indexed };
+        return indexed;
+    }
+    segment.index = .none;
+    return null;
+}
+
+/// The byte offset of `seq` within the segment at `at`, from the index, or
+/// null when no usable index says. A null answer is never wrong — it costs a
+/// scan.
+fn indexedOffset(log: *Log, io: Io, at: usize, seq: u64, may_write: bool) ?u64 {
+    const segment = log.segments.items[at];
     if (seq <= segment.base_seq or seq > segment.last_seq) return null;
     const slot = index_header_len + (seq - segment.base_seq) * index_entry_len;
 
     if (log.active) |*active| {
-        if (segment.base_seq == log.segments.items[log.segments.items.len - 1].base_seq) {
+        if (at + 1 == log.segments.items.len) {
             // The live index: what has been appended is in the buffer or in
             // the file, so a flush is all it takes to read it back.
             active.index_writer.interface.flush() catch return null;
@@ -518,14 +624,10 @@ fn indexedOffset(log: *Log, io: Io, segment: Segment, seq: u64) ?u64 {
         }
     }
 
-    const indexed = (log.readIndex(io, segment) catch return null) orelse blk: {
-        log.rebuildIndex(io, segment) catch return null;
-        break :blk (log.readIndex(io, segment) catch return null) orelse return null;
-    };
+    const indexed = log.provenIndex(io, at, may_write) orelse return null;
     if (segment.base_seq + indexed.count - 1 != segment.last_seq) return null;
 
-    const file = log.dir.openFile(io, &segmentName(segment.base_seq, index_extension), .{}) catch return null;
-    defer file.close(io);
+    const file = log.holdIndex(io, segment.base_seq) orelse return null;
     var bytes: [8]u8 = undefined;
     if ((file.readPositionalAll(io, &bytes, slot) catch return null) != 8) return null;
     return std.mem.readInt(u64, &bytes, .little);
@@ -537,6 +639,7 @@ fn indexedOffset(log: *Log, io: Io, segment: Segment, seq: u64) ?u64 {
 /// and is simply rebuilt again.
 fn rebuildIndex(log: *Log, io: Io, segment: Segment) OpenError!void {
     if (log.options.access == .read) return error.ReadOnly;
+    log.releaseIndex(io);
     const file = try log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{ .truncate = true });
     defer file.close(io);
     var writer = file.writer(io, log.index_buf);
@@ -929,7 +1032,7 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
 ///
 /// The walk may begin a little before it — a caller with a cursor drops what it
 /// has already seen — but never after it.
-pub fn scanFrom(log: *Log, io: Io, cursor: u64) ScanError!Scan {
+pub fn scanFrom(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!Scan {
     if (log.segments.items.len == 0) return log.scanOver(&.{}, 0);
 
     var first: usize = 0;
@@ -939,7 +1042,7 @@ pub fn scanFrom(log: *Log, io: Io, cursor: u64) ScanError!Scan {
     if (log.segments.items[first].last_seq <= cursor and first + 1 < log.segments.items.len) {
         first += 1;
     }
-    const position = log.indexedOffset(io, log.segments.items[first], cursor + 1) orelse 0;
+    const position = log.indexedOffset(io, first, cursor + 1, may_write) orelse 0;
     return log.scanOver(log.segments.items[first..], position);
 }
 
@@ -967,7 +1070,7 @@ pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) OpenError!?u64 {
         if (!segment.times.known() and !active) {
             // A sealed segment whose index did not describe it at open. Build
             // one now and keep what it says, so a second lookup is free.
-            if (try log.sealedTimes(io, segment.*)) |times| segment.times = times;
+            if (log.provenIndex(io, i, true)) |indexed| segment.times = indexed.times;
         }
         if (segment.times.known()) {
             if (segment.times.highest < want) continue;
@@ -981,22 +1084,10 @@ pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) OpenError!?u64 {
     return null;
 }
 
-/// The timestamps a sealed segment's index carries, building the index first
-/// when it is missing, stale or from an older format. Null when there is no
-/// index to be had — a `.read` log may not write one — which costs a scan.
-fn sealedTimes(log: *Log, io: Io, segment: Segment) OpenError!?Times {
-    if (try log.readIndex(io, segment)) |indexed| return indexed.times;
-    if (log.options.access == .read) return null;
-    log.rebuildIndex(io, segment) catch return null;
-    const rebuilt = (try log.readIndex(io, segment)) orelse return null;
-    return rebuilt.times;
-}
-
 /// The first sequence number at or after `want` inside one segment, read from
 /// the timestamps in its index rather than from the segment itself.
 fn indexedSeqAtOrAfter(log: *Log, io: Io, segment: Segment, want: i64) OpenError!?u64 {
-    const file = log.dir.openFile(io, &segmentName(segment.base_seq, index_extension), .{}) catch return null;
-    defer file.close(io);
+    const file = log.holdIndex(io, segment.base_seq) orelse return null;
 
     const per_read = 64;
     var entries: [per_read * index_entry_len]u8 = undefined;
@@ -1148,12 +1239,7 @@ fn rotate(log: *Log, io: Io) AppendError!void {
     var index_writer = index_file.writer(io, log.index_buf);
     try index_writer.interface.writeAll(&indexHeader(0, .unknown));
 
-    try log.segments.append(log.gpa, .{
-        .base_seq = base_seq,
-        .last_seq = base_seq - 1,
-        .bytes = 0,
-        .times = .unknown,
-    });
+    try log.segments.append(log.gpa, .named(base_seq));
     log.active = .{
         .file = file,
         .writer = file.writer(io, log.write_buf),
@@ -1293,12 +1379,7 @@ fn createSegment(log: *Log, io: Io, base_seq: u64) OpenError!void {
     const file = try log.dir.createFile(io, &segmentName(base_seq, segment_extension), .{ .truncate = false });
     file.close(io);
     try log.syncDir(io);
-    try log.segments.append(log.gpa, .{
-        .base_seq = base_seq,
-        .last_seq = base_seq - 1,
-        .bytes = 0,
-        .times = .unknown,
-    });
+    try log.segments.append(log.gpa, .named(base_seq));
 }
 
 fn closeActive(log: *Log, io: Io) void {
@@ -1668,6 +1749,7 @@ pub fn deinit(log: *Log, io: Io) void {
         active.index_file.close(io);
         log.active = null;
     }
+    log.releaseIndex(io);
     if (log.lock_file) |file| file.close(io);
     log.segments.deinit(log.gpa);
     log.dir.close(io);
