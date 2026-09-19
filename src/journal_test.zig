@@ -1015,6 +1015,43 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     try testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, rebuilt[24..32], .little));
 }
 
+test "a clean close leaves an index the next open takes rather than rebuilds" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        for (1..2_001) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+    }
+
+    // A mark nothing validates and a rescan would overwrite: the timestamp
+    // beside the first record's offset. If the next open rebuilds the index,
+    // the mark goes; if it takes the one the close left, the mark stays.
+    const sealed = try ws.read(try ws.index(1));
+    const marked = try testing.allocator.dupe(u8, sealed);
+    defer testing.allocator.free(marked);
+    const entry_at = 32 + 8;
+    std.mem.writeInt(i64, marked[entry_at..][0..8], -777, .little);
+    try ws.write(try ws.index(1), marked);
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 2_000), try journal.lastSeq(io));
+        _ = try journal.append(io, 2_001, created(2_001, "n"));
+    }
+
+    const after = try ws.read(try ws.index(1));
+    try testing.expectEqual(@as(i64, -777), std.mem.readInt(i64, after[entry_at..][0..8], .little));
+    // And the index grew by the one record appended after the reopen, rather
+    // than being written again from the start.
+    try testing.expectEqual(marked.len + 16, after.len);
+    try testing.expectEqualStrings(marked[0..8], after[0..8]);
+}
+
 test "a seek into the segment being written to reads its index, not the segment" {
     const io = testing.io;
     var ws = try Workspace.init("log");

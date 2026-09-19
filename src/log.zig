@@ -535,6 +535,38 @@ fn rebuildIndex(log: *Log, io: Io, segment: Segment) OpenError!void {
     try sealIndex(io, file, segment.bytes, scanned.times);
 }
 
+/// The active segment's index, reopened for appending, when the one on the
+/// disk was sealed against exactly the bytes the segment now holds.
+const Resumed = struct {
+    file: Io.File,
+    writer: Io.File.Writer,
+    indexed: Indexed,
+};
+
+/// Take the index a clean close left, when it describes this segment at this
+/// length, so that opening a log costs no scan at all.
+///
+/// The header is stamped back to "still being appended to" before anything
+/// else happens, so a crash from here on leaves an index that reads as stale
+/// and is rebuilt, exactly as one a crash left half-written does.
+fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
+    if (segment.bytes == 0) return null;
+    const indexed = (try log.readIndex(io, segment)) orelse return null;
+
+    const file = log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{
+        .read = true,
+        .truncate = false,
+    }) catch return null;
+    errdefer file.close(io);
+    const length = index_header_len + indexed.count * index_entry_len;
+    file.setLength(io, length) catch return null;
+    file.writePositionalAll(io, &indexHeader(0, .unknown), 0) catch return null;
+
+    var writer = file.writer(io, log.index_buf);
+    writer.pos = length;
+    return .{ .file = file, .writer = writer, .indexed = indexed };
+}
+
 /// Stamp a finished index with the segment length and the timestamps it
 /// describes and make it durable, which is what turns it from a cache being
 /// filled into one a later process may take.
@@ -1081,6 +1113,26 @@ fn openActive(log: *Log, io: Io) OpenError!void {
     const file = try log.dir.createFile(io, &name, .{ .read = true, .truncate = false });
     errdefer file.close(io);
     segment.bytes = try file.length(io);
+
+    // A close seals the active segment's index with the exact length it
+    // describes, and an index that describes this file at this length was
+    // built from these bytes: the offsets are right, and the last record it
+    // names ends the file, which is the same proof a repair pass would go and
+    // get. So a clean restart takes it and the scan is skipped altogether.
+    if (try log.resumeIndex(io, segment.*)) |resumed| {
+        errdefer resumed.file.close(io);
+        segment.last_seq = segment.base_seq + resumed.indexed.count - 1;
+        segment.times = resumed.indexed.times;
+        var writer = file.writer(io, log.write_buf);
+        writer.pos = segment.bytes;
+        log.active = .{
+            .file = file,
+            .writer = writer,
+            .index_file = resumed.file,
+            .index_writer = resumed.writer,
+        };
+        return;
+    }
 
     // The index has no durability of its own, so the active segment's is
     // rebuilt here, from the bytes that are actually in the file. It is opened
