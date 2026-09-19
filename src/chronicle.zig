@@ -273,6 +273,16 @@ pub fn Journal(comptime Event: type) type {
             write_buffer_size: usize = 64 * 1024,
             /// Size of the buffer a read from the disk streams through.
             read_buffer_size: usize = 64 * 1024,
+            /// Whether `append` parses every record back out of the bytes it
+            /// is about to write, to prove the `Event` survives the round
+            /// trip, and answers `error.NotRoundTrippable` when it does not.
+            ///
+            /// A journal that keeps a tail or has a sink registered parses
+            /// the record back whatever this says, because it needs the
+            /// record; this is about the journal that keeps neither, where
+            /// the parsed record would be built and dropped unread. That
+            /// parse is a third of what an `append` costs.
+            verify_round_trip: bool = false,
         };
 
         /// A snapshot read back from disk.
@@ -521,10 +531,12 @@ pub fn Journal(comptime Event: type) type {
         /// Returns the new record's sequence number. `at` is stored as given;
         /// chronicle never reads a clock.
         ///
-        /// The record kept in memory is parsed back out of the bytes that were
-        /// written, so it owns its own memory and is exactly what a reopen
-        /// would produce: an `Event` whose slices point at a stack buffer is
-        /// safe to append.
+        /// A record the journal keeps — for the tail, or for a sink — is
+        /// parsed back out of the bytes that were written, so it owns its own
+        /// memory and is exactly what a reopen would produce: an `Event` whose
+        /// slices point at a stack buffer is safe to append. A journal that
+        /// keeps neither does not build that record at all; see
+        /// `Options.verify_round_trip`.
         ///
         /// Nothing is published unless the bytes reached the disk. If the
         /// write, the flush or the `fsync` fails, the error comes back, no
@@ -546,8 +558,8 @@ pub fn Journal(comptime Event: type) type {
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
             var built = try self.encode(next, at, event);
-            var published = false;
-            defer if (!published) built.arena.deinit();
+            var held = false;
+            defer if (!held) built.release(self.gpa);
 
             // Reserve before writing: after the bytes are durable nothing may
             // fail, or the disk would hold a record memory does not.
@@ -556,11 +568,10 @@ pub fn Journal(comptime Event: type) type {
 
             {
                 errdefer self.persistence_failed = true;
-                try self.log.appendLine(io, built.record.bytes, built.record.at);
+                try self.log.appendLine(io, built.bytes, built.at);
             }
-            published = true;
 
-            self.publish(built);
+            held = self.publish(built);
             self.changed.broadcast(io);
             // Last, so that a sink reading this record was reading memory that
             // still existed.
@@ -605,7 +616,7 @@ pub fn Journal(comptime Event: type) type {
             var built: std.ArrayList(Built) = .empty;
             defer built.deinit(self.gpa);
             var published = false;
-            defer if (!published) for (built.items) |*item| item.arena.deinit();
+            defer if (!published) for (built.items) |*item| item.release(self.gpa);
 
             try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
             for (entries, 0..) |entry, i| {
@@ -617,12 +628,14 @@ pub fn Journal(comptime Event: type) type {
 
             {
                 errdefer self.persistence_failed = true;
-                for (built.items) |item| try self.log.stageLine(io, item.record.bytes, item.record.at);
+                for (built.items) |item| try self.log.stageLine(io, item.bytes, item.at);
                 try self.log.commit(io);
             }
             published = true;
 
-            for (built.items) |item| self.publish(item);
+            for (built.items) |*item| {
+                if (!self.publish(item.*)) item.release(self.gpa);
+            }
             self.changed.broadcast(io);
             self.trimTail();
             return self.seq;
@@ -1290,18 +1303,40 @@ pub fn Journal(comptime Event: type) type {
         // Internals.
         //====================================================================
 
-        /// A record serialised and parsed back, waiting to be written: the
-        /// arena owns every byte of it, and moves into `tail_arenas` once the
-        /// record is on the disk.
+        /// A record serialised and waiting to be written.
+        ///
+        /// `record` is there when something will read it: an arena owns every
+        /// slice of it, and moves into `tail_arenas` once the record is on the
+        /// disk. When nothing will — no tail, no sink, no round-trip check —
+        /// the line is the only thing built, and the allocator owns it.
         const Built = struct {
-            arena: std.heap.ArenaAllocator,
-            record: Record,
+            arena: ?std.heap.ArenaAllocator,
+            bytes: []const u8,
+            seq: u64,
+            at: i64,
+            record: ?Record,
+
+            fn release(built: *Built, gpa: Allocator) void {
+                if (built.arena) |*arena| arena.deinit() else gpa.free(built.bytes);
+            }
         };
 
-        /// Serialise one record and parse it back out of the bytes that will
-        /// be written, so that what memory holds is exactly what a reopen
+        /// Whether an appended record has to be readable in memory as well as
+        /// on the disk.
+        fn needsRecord(self: *const Self) bool {
+            return self.options.tail_records != 0 or
+                self.sinks.items.len != 0 or
+                self.options.verify_round_trip;
+        }
+
+        /// Serialise one record.
+        ///
+        /// Where something will read the record back — a tail, a sink, or the
+        /// round-trip check asked for — it is parsed back out of the bytes
+        /// that will be written, so what memory holds is exactly what a reopen
         /// would produce: an `Event` whose slices point at a stack buffer is
-        /// safe to append.
+        /// safe to append. Where nothing will, that parse would build a record
+        /// and drop it unread, so it is not done.
         fn encode(self: *Self, seq: u64, at: i64, event: Event) AppendError!Built {
             const line: Line = .{ .seq = seq, .at = at, .v = self.options.schema_version, .ev = event };
             const body = try std.json.Stringify.valueAlloc(self.gpa, line, .{});
@@ -1310,16 +1345,23 @@ pub fn Journal(comptime Event: type) type {
             // checksum itself. `std.json` closes the object with the one byte
             // dropped here, and `,"c":<crc>}` closes it again.
             const covered = body[0 .. body.len - 1];
-            const encoded = try std.fmt.allocPrint(
-                self.gpa,
-                "{s},\"c\":{d}}}",
-                .{ covered, checksum(covered) },
-            );
-            defer self.gpa.free(encoded);
+
+            if (!self.needsRecord()) {
+                const stored = try std.fmt.allocPrint(
+                    self.gpa,
+                    "{s},\"c\":{d}}}",
+                    .{ covered, checksum(covered) },
+                );
+                return .{ .arena = null, .bytes = stored, .seq = seq, .at = at, .record = null };
+            }
 
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             errdefer arena.deinit();
-            const stored = try arena.allocator().dupe(u8, encoded);
+            const stored = try std.fmt.allocPrint(
+                arena.allocator(),
+                "{s},\"c\":{d}}}",
+                .{ covered, checksum(covered) },
+            );
             const parsed = std.json.parseFromSliceLeaky(
                 Line,
                 arena.allocator(),
@@ -1329,7 +1371,7 @@ pub fn Journal(comptime Event: type) type {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.NotRoundTrippable,
             };
-            return .{ .arena = arena, .record = .{
+            return .{ .arena = arena, .bytes = stored, .seq = seq, .at = at, .record = .{
                 .seq = seq,
                 .at = at,
                 .version = self.options.schema_version,
@@ -1339,14 +1381,18 @@ pub fn Journal(comptime Event: type) type {
         }
 
         /// Take a record the disk now holds into the tail and hand it to every
-        /// sink. Nothing here may fail: the capacity was reserved before the
-        /// write, because the disk must never hold a record memory does not.
-        fn publish(self: *Self, item: Built) void {
-            self.tail.appendAssumeCapacity(item.record);
-            self.tail_arenas.appendAssumeCapacity(item.arena);
-            self.tail_bytes += item.record.bytes.len;
-            self.seq = item.record.seq;
-            for (self.sinks.items) |sink| sink.f(sink.ctx, item.record);
+        /// sink, and report whether the tail took ownership of its arena.
+        ///
+        /// Nothing here may fail: the capacity was reserved before the write,
+        /// because the disk must never hold a record memory does not.
+        fn publish(self: *Self, item: Built) bool {
+            self.seq = item.seq;
+            const record = item.record orelse return false;
+            self.tail.appendAssumeCapacity(record);
+            self.tail_arenas.appendAssumeCapacity(item.arena.?);
+            self.tail_bytes += record.bytes.len;
+            for (self.sinks.items) |sink| sink.f(sink.ctx, record);
+            return true;
         }
 
         /// Read the newest records back into the tail, and check that they say

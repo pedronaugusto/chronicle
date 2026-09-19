@@ -1044,6 +1044,117 @@ test "subscribe folds a history longer than the tail, streaming from the disk" {
     try testing.expectEqual(@as(u32, 10), from_forty.events);
 }
 
+/// An event that `std.json` writes and cannot read back: a number member
+/// whose digits are not digits. It is the one shape that tells a record
+/// parsed back out of its own bytes from a record that was not.
+const NotRoundTrippable = union(enum) {
+    m: std.json.Value,
+};
+const Fragile = chronicle.Journal(NotRoundTrippable);
+
+fn fragile() NotRoundTrippable {
+    return .{ .m = .{ .number_string = "oops" } };
+}
+
+test "a record nothing will read is not parsed back, and one something will read is" {
+    const io = testing.io;
+
+    {
+        var ws = try Workspace.init("kept");
+        defer ws.deinit();
+        // A tail means the record is read back in memory, so it is built from
+        // the bytes that are about to be written -- and an event that does
+        // not survive that is refused before anything reaches the disk.
+        var journal = try Fragile.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        try testing.expectError(error.NotRoundTrippable, journal.append(io, 1, fragile()));
+        try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
+    }
+
+    {
+        var ws = try Workspace.init("asked");
+        defer ws.deinit();
+        // No tail and no sink, but the check asked for: same answer.
+        var journal = try Fragile.open(testing.allocator, io, ws.path, .{
+            .sync = .never,
+            .tail_records = 0,
+            .verify_round_trip = true,
+        });
+        defer journal.deinit(io);
+        try testing.expectError(error.NotRoundTrippable, journal.append(io, 1, fragile()));
+    }
+
+    {
+        var ws = try Workspace.init("unread");
+        defer ws.deinit();
+        // Nothing will read the record, so nothing parses it back: the line
+        // goes to the disk, and the fold that has to read it is the one that
+        // finds out. That is the trade `verify_round_trip` names.
+        var journal = try Fragile.open(testing.allocator, io, ws.path, .{
+            .sync = .never,
+            .tail_records = 0,
+        });
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 1), try journal.append(io, 1, fragile()));
+
+        var walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        try testing.expectError(error.CorruptRecord, walk.next(io));
+    }
+}
+
+test "a journal with no tail still appends, and a sink still gets every record" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .tail_records = 0,
+    });
+    defer journal.deinit(io);
+
+    for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    try testing.expectEqual(@as(usize, 0), journal.records().records.len);
+
+    // Subscribing makes the records needed again, from the disk and then
+    // live, and an event whose slices point at a stack buffer is still safe
+    // to append: what the sink is handed is parsed out of the bytes that were
+    // written, not out of the caller's memory.
+    var fold: LastName = .{};
+    try journal.subscribe(io, fold.sink());
+    var name: [8]u8 = "onstackk".*;
+    _ = try journal.append(io, 11, created(11, &name));
+    @memset(&name, 'z');
+    try testing.expectEqual(@as(u32, 11), fold.seen);
+    try testing.expectEqualStrings("onstackk", fold.name[0..fold.length]);
+}
+
+/// A fold that keeps a copy of the last name it was handed, taken during the
+/// call, so a test can change the caller's buffer afterwards and see whether
+/// the record was pointing at it.
+const LastName = struct {
+    name: [64]u8 = undefined,
+    length: usize = 0,
+    seen: u32 = 0,
+
+    fn sink(self: *LastName) Journal.Sink {
+        return .{ .ctx = self, .f = apply };
+    }
+
+    fn apply(ctx: *anyopaque, record: Journal.Record) void {
+        const self: *LastName = @ptrCast(@alignCast(ctx));
+        self.seen += 1;
+        const found = switch (record.event) {
+            .created => |e| e.name,
+            .renamed => |e| e.name,
+            else => return,
+        };
+        self.length = @min(found.len, self.name.len);
+        @memcpy(self.name[0..self.length], found[0..self.length]);
+    }
+};
+
 //========================================================================
 // Named readers.
 //========================================================================
