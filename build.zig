@@ -21,12 +21,17 @@ pub fn build(b: *std.Build) void {
     // Tests.
     //=====================================================================
 
+    // Error return traces are off on the test binary, so that the second
+    // binary `zig build test --fuzz` builds goes through Zig 0.16.0's test
+    // runner without them. The suite reports the same failures either way;
+    // what is lost is the chain of returns behind an unexpected error.
     const tests = b.addTest(.{
         .name = "chronicle-tests",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/chronicle.zig"),
             .target = target,
             .optimize = optimize,
+            .error_tracing = false,
         }),
     });
 
