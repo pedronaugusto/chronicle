@@ -757,6 +757,40 @@ pub fn Journal(comptime Event: type) type {
             return self.since(cursor);
         }
 
+        /// What a walk keeps between records so that the records it hands on
+        /// are a run: where the reader had got to, what the next sequence
+        /// number must be, and what the next record must link back to.
+        ///
+        /// A seek lands at a record at or before the cursor, because a
+        /// segment — and, with one index entry per interval, a run of records
+        /// — is the unit it lands in. So the first records a walk reads may
+        /// be ones the reader already has: those are stepped over, and their
+        /// checksums are still taken into the chain, so the first record
+        /// handed on is checked against the one in front of it.
+        const Continuity = struct {
+            cursor: u64,
+            expected: ?u64 = null,
+            link: ?u32 = null,
+
+            /// Whether this record is one to hand on. False means it is at or
+            /// behind the cursor and has been stepped over.
+            fn accept(walk: *Continuity, header: Header) ReadError!bool {
+                if (header.seq <= walk.cursor) {
+                    walk.link = header.c;
+                    return false;
+                }
+                if (walk.expected) |want| {
+                    if (header.seq != want) return error.DiscontinuousSeq;
+                }
+                if (walk.link) |previous| {
+                    if (header.p != previous) return error.BrokenChain;
+                }
+                walk.expected = header.seq + 1;
+                walk.link = header.c;
+                return true;
+            }
+        };
+
         /// What `replay` returns: a walk over the log from the disk.
         pub const Replay = struct {
             journal: *Self,
@@ -765,12 +799,7 @@ pub fn Journal(comptime Event: type) type {
             arena: std.heap.ArenaAllocator,
             /// Its own, so that two walks and an `append` never share one.
             scratch: std.heap.ArenaAllocator,
-            cursor: u64,
-            expected: ?u64,
-            /// The checksum of the record before the next one, once the walk
-            /// has seen a record to take it from. A seek starts without one:
-            /// there is nothing in front of where it landed to link to.
-            link: ?u32,
+            run: Continuity,
 
             pub fn deinit(walk: *Replay, io: Io) void {
                 walk.scan.deinit(io);
@@ -785,25 +814,12 @@ pub fn Journal(comptime Event: type) type {
                 while (try walk.scan.next(io)) |line| {
                     _ = walk.scratch.reset(.retain_capacity);
                     const header = try parseHeader(walk.scratch.allocator(), line);
-                    // The walk may have started a little before the cursor,
-                    // because a segment is the unit a seek lands in. Skipping
-                    // before the event is parsed is what lets a reader hold a
-                    // cursor into a log whose events it does not know.
-                    if (header.seq <= walk.cursor) {
-                        walk.link = header.c;
-                        continue;
-                    }
-                    if (walk.expected) |want| {
-                        if (header.seq != want) return error.DiscontinuousSeq;
-                    }
-                    if (walk.link) |want| {
-                        if (header.p != want) return error.BrokenChain;
-                    }
-                    walk.link = header.c;
+                    // Stepping over a record before its event is parsed is
+                    // what lets a reader hold a cursor into a log whose
+                    // events it does not know.
+                    if (!try walk.run.accept(header)) continue;
                     _ = walk.arena.reset(.retain_capacity);
-                    const record = try walk.journal.recordFrom(walk.arena.allocator(), header, line);
-                    walk.expected = header.seq + 1;
-                    return record;
+                    return try walk.journal.recordFrom(walk.arena.allocator(), header, line);
                 }
                 return null;
             }
@@ -840,9 +856,7 @@ pub fn Journal(comptime Event: type) type {
                 .scan = try self.log.scanFrom(io, cursor, may_write),
                 .arena = .init(self.gpa),
                 .scratch = .init(self.gpa),
-                .cursor = cursor,
-                .expected = null,
-                .link = null,
+                .run = .{ .cursor = cursor },
             };
         }
 
@@ -1538,25 +1552,11 @@ pub fn Journal(comptime Event: type) type {
             var scan = try self.log.scanFrom(io, from, true);
             defer scan.deinit(io);
 
-            var expected: ?u64 = null;
-            var link: ?u32 = null;
+            var run: Continuity = .{ .cursor = from };
             while (try scan.next(io)) |line| {
                 _ = self.scratch.reset(.retain_capacity);
                 const header = try parseHeader(self.scratch.allocator(), line);
-                if (expected) |value| {
-                    if (header.seq != value) return error.DiscontinuousSeq;
-                } else if (header.seq <= from) {
-                    // The seek landed before the cursor, which a segment
-                    // boundary makes normal: drop what is already behind,
-                    // without going as far as parsing its event.
-                    link = header.c;
-                    continue;
-                }
-                if (link) |previous| {
-                    if (header.p != previous) return error.BrokenChain;
-                }
-                link = header.c;
-                expected = header.seq + 1;
+                if (!try run.accept(header)) continue;
 
                 var arena: std.heap.ArenaAllocator = .init(self.gpa);
                 errdefer arena.deinit();
@@ -1627,13 +1627,107 @@ pub fn Journal(comptime Event: type) type {
             /// This record's own checksum, which the next one carries as its
             /// `p`.
             c: u32,
-            /// Borrowed from the `scratch` it was parsed into, so it lasts
-            /// until that arena is next reset.
-            ev: std.json.Value,
+            /// The event, still unparsed.
+            ev: Body,
         };
 
-        /// Read a line's envelope into `scratch`.
+        /// A record's event as the header reader leaves it.
+        ///
+        /// A line in the shape this package writes gives up its `ev` as a
+        /// slice of itself, and whatever wants the event parses that slice
+        /// once. A line in some other shape has already been through
+        /// `std.json` to be read at all, so its `ev` comes back as the value
+        /// that parse produced.
+        const Body = union(enum) {
+            /// Where the event sits in the line, as a pair of offsets rather
+            /// than as a slice: the line a record is built from may be a copy
+            /// of the one the header was read from.
+            span: struct { from: usize, to: usize },
+            /// The parse that read the line, and the line it read: the value
+            /// lives in the scratch that parse used, so anything that has to
+            /// outlast the call reads the line again into its own arena.
+            parsed: struct { value: std.json.Value, line: []const u8 },
+        };
+
+        /// Read a line's envelope, checking its checksum.
+        ///
+        /// `scratch` holds nothing unless the line is not in the shape this
+        /// package writes, in which case it holds the parse that read it.
         fn parseHeader(scratch: Allocator, line: []const u8) ReadError!Header {
+            // The checksum is the last member of every record this package
+            // writes, so it is found from the end and the rest of the line is
+            // what it covers. A line that does not end in one is not a record
+            // and there is nothing to check it against.
+            const covered = coveredBytes(line) orelse return error.CorruptRecord;
+            const claimed = std.fmt.parseInt(
+                u32,
+                line[covered.len + ",\"c\":".len .. line.len - 1],
+                10,
+            ) catch return error.CorruptRecord;
+            if (checksum(covered) != claimed) return error.ChecksumMismatch;
+
+            if (quickHeader(covered, claimed)) |header| return header;
+            return slowHeader(scratch, line, claimed);
+        }
+
+        /// The bytes a line's checksum covers: everything before the
+        /// `,"c":<digits>}` it ends with. Null when it does not end with one.
+        fn coveredBytes(line: []const u8) ?[]const u8 {
+            const opening = ",\"c\":";
+            if (line.len < opening.len + 2 or line[line.len - 1] != '}') return null;
+            var at = line.len - 1;
+            var digits: usize = 0;
+            while (at > 0 and std.ascii.isDigit(line[at - 1])) : (digits += 1) at -= 1;
+            if (digits == 0 or at < opening.len) return null;
+            if (!std.mem.eql(u8, line[at - opening.len .. at], opening)) return null;
+            return line[0 .. at - opening.len];
+        }
+
+        /// The envelope of a line in exactly the shape this package writes,
+        /// read straight off the bytes. Null to say "ask `std.json`".
+        ///
+        /// This is the path every record of every replay takes, so it parses
+        /// the four numbers itself and hands the event on as the slice it
+        /// already is, rather than building a `std.json.Value` for a line
+        /// that is about to be parsed into an `Event` anyway.
+        fn quickHeader(covered: []const u8, claimed: u32) ?Header {
+            var at: usize = 0;
+            const seq = member(covered, &at, "{\"seq\":") orelse return null;
+            const stamp = member(covered, &at, ",\"at\":") orelse return null;
+            const version = member(covered, &at, ",\"v\":") orelse return null;
+            const link = member(covered, &at, ",\"p\":") orelse return null;
+            const ev_prefix = ",\"ev\":";
+            if (!std.mem.startsWith(u8, covered[at..], ev_prefix)) return null;
+            if (seq < 1) return null;
+            return .{
+                .seq = std.math.cast(u64, seq) orelse return null,
+                .at = stamp,
+                .version = std.math.cast(u32, version) orelse return null,
+                .p = std.math.cast(u32, link) orelse return null,
+                .c = claimed,
+                .ev = .{ .span = .{ .from = at + ev_prefix.len, .to = covered.len } },
+            };
+        }
+
+        /// One integer member, read at `at` and stepped over. Null when the
+        /// member is not there, is not an integer, or does not end where a
+        /// member ends.
+        fn member(line: []const u8, at: *usize, comptime opening: []const u8) ?i64 {
+            if (!std.mem.startsWith(u8, line[at.*..], opening)) return null;
+            var end = at.* + opening.len;
+            const from = end;
+            if (end < line.len and line[end] == '-') end += 1;
+            const digits = end;
+            while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
+            if (end == digits) return null;
+            const value = std.fmt.parseInt(i64, line[from..end], 10) catch return null;
+            at.* = end;
+            return value;
+        }
+
+        /// The same envelope out of a line in some other shape: a record
+        /// written by hand, or a member in another order.
+        fn slowHeader(scratch: Allocator, line: []const u8, claimed: u32) ReadError!Header {
             const root = std.json.parseFromSliceLeaky(
                 std.json.Value,
                 scratch,
@@ -1649,29 +1743,15 @@ pub fn Journal(comptime Event: type) type {
             const v = root.object.get("v") orelse return error.CorruptRecord;
             const ev = root.object.get("ev") orelse return error.CorruptRecord;
             const back = root.object.get("p") orelse return error.CorruptRecord;
-            const claimed = root.object.get("c") orelse return error.CorruptRecord;
             if (seq != .integer or at != .integer or v != .integer) return error.CorruptRecord;
-            if (back != .integer or claimed != .integer) return error.CorruptRecord;
-            if (seq.integer < 1) return error.CorruptRecord;
-            const version = std.math.cast(u32, v.integer) orelse return error.CorruptRecord;
-            const link = std.math.cast(u32, back.integer) orelse return error.CorruptRecord;
-            const want = std.math.cast(u32, claimed.integer) orelse return error.CorruptRecord;
-
-            var buffer: [32]u8 = undefined;
-            const suffix = std.fmt.bufPrint(&buffer, ",\"c\":{d}}}", .{want}) catch unreachable;
-            // The checksum is the last member of a line this package wrote,
-            // so a line that does not end in the one it claims is not one --
-            // and there is nothing to check it against.
-            if (!std.mem.endsWith(u8, line, suffix)) return error.CorruptRecord;
-            if (checksum(line[0 .. line.len - suffix.len]) != want) return error.ChecksumMismatch;
-
+            if (back != .integer or seq.integer < 1) return error.CorruptRecord;
             return .{
                 .seq = @intCast(seq.integer),
                 .at = at.integer,
-                .version = version,
-                .p = link,
-                .c = want,
-                .ev = ev,
+                .version = std.math.cast(u32, v.integer) orelse return error.CorruptRecord,
+                .p = std.math.cast(u32, back.integer) orelse return error.CorruptRecord,
+                .c = claimed,
+                .ev = .{ .parsed = .{ .value = ev, .line = line } },
             };
         }
 
@@ -1690,37 +1770,56 @@ pub fn Journal(comptime Event: type) type {
             self: *Self,
             arena: Allocator,
             version: u32,
-            ev: std.json.Value,
+            ev: Body,
             line: []const u8,
         ) ReadError!Event {
             if (version == self.options.schema_version) {
-                return std.json.parseFromValueLeaky(Event, arena, ev, .{}) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.CorruptRecord,
+                return switch (ev) {
+                    .span => |at| std.json.parseFromSliceLeaky(Event, arena, line[at.from..at.to], .{}) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.CorruptRecord,
+                    },
+                    .parsed => |found| std.json.parseFromValueLeaky(Event, arena, found.value, .{}) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.CorruptRecord,
+                    },
                 };
             }
             if (version > self.options.schema_version) return error.NewerSchema;
-            if (self.options.migrate) |migrate| return migrate(version, try retainedEv(arena, line));
-            if (comptime unknown_arm != null) return unknownEvent(arena, line);
+            if (self.options.migrate) |migrate| return migrate(version, try retainedEv(arena, ev, line));
+            if (comptime unknown_arm != null) return unknownEvent(arena, ev, line);
             return error.OlderSchema;
         }
 
-        /// The record's `ev` member parsed into the record's own arena, so that
-        /// what a `migrate` hook or the `unknown` arm keeps lasts as long as
-        /// the record does.
-        fn retainedEv(arena: Allocator, line: []const u8) ReadError!std.json.Value {
+        /// The record's `ev` member in the record's own arena, so that what a
+        /// `migrate` hook or the `unknown` arm keeps lasts as long as the
+        /// record does.
+        fn retainedEv(arena: Allocator, ev: Body, line: []const u8) ReadError!std.json.Value {
+            const bytes = switch (ev) {
+                .span => |at| line[at.from..at.to],
+                // The value there belongs to the scratch that read the line.
+                // The line is read again, into the arena that will hold it.
+                .parsed => |found| return objectMember(arena, found.line, "ev"),
+            };
+            return std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.CorruptRecord,
+            };
+        }
+
+        fn objectMember(arena: Allocator, line: []const u8, name: []const u8) ReadError!std.json.Value {
             const root = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.CorruptRecord,
             };
             if (root != .object) return error.CorruptRecord;
-            return root.object.get("ev") orelse error.CorruptRecord;
+            return root.object.get(name) orelse error.CorruptRecord;
         }
 
-        fn unknownEvent(arena: Allocator, line: []const u8) ReadError!Event {
+        fn unknownEvent(arena: Allocator, ev: Body, line: []const u8) ReadError!Event {
             switch (comptime unknown_arm.?) {
                 .empty => return @unionInit(Event, "unknown", {}),
-                .json_value => return @unionInit(Event, "unknown", try retainedEv(arena, line)),
+                .json_value => return @unionInit(Event, "unknown", try retainedEv(arena, ev, line)),
             }
         }
 

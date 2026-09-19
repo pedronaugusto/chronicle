@@ -265,6 +265,16 @@ const Handwritten = struct {
         try self.bytes.appendSlice(testing.allocator, bytes);
     }
 
+    /// A line of the caller's own making, closed with the checksum it should
+    /// carry: for the envelopes this package would never write, where the
+    /// checksum must not be what is wrong with them.
+    fn checked(self: *Handwritten, covered: []const u8) !void {
+        const sum = chronicle.checksum(covered);
+        try self.bytes.appendSlice(testing.allocator, covered);
+        try self.print(",\"c\":{d}}}\n", .{sum});
+        self.link = sum;
+    }
+
     fn written(self: *const Handwritten) []const u8 {
         return self.bytes.items;
     }
@@ -580,16 +590,21 @@ test "a corrupt or discontinuous line is refused" {
     const raw = [_]struct { bytes: []const u8, want: anyerror }{
         .{ .bytes = "not json\n", .want = error.CorruptRecord },
         .{ .bytes = "{\"seq\":1,\"at\":1,\"v\":1}\n", .want = error.CorruptRecord },
-        // Every member but the back-link, which the framing requires.
-        .{
-            .bytes = "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"removed\":{\"id\":1}},\"c\":1}\n",
-            .want = error.CorruptRecord,
-        },
     };
     for (raw) |case| {
         try ws.writeRaw(1, case.bytes);
         try testing.expectError(case.want, Journal.open(testing.allocator, io, ws.path, .{}));
     }
+
+    // Every member but the back-link, and the checksum it should carry --
+    // so the checksum is not what is wrong with it.
+    var unlinked: Handwritten = try .init(1, 1);
+    defer unlinked.deinit();
+    try unlinked.checked(
+        \\{"seq":1,"at":1,"v":1,"ev":{"removed":{"id":1}}
+    );
+    try ws.write(try ws.segment(1), unlinked.written());
+    try testing.expectError(error.CorruptRecord, Journal.open(testing.allocator, io, ws.path, .{}));
 
     // Records that are records, in an order that cannot be.
     try ws.writeRecords(2, 1, &.{

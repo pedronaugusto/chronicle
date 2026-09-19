@@ -50,7 +50,7 @@ pub const segment_extension = ".log";
 pub const index_extension = ".idx";
 /// A segment `compact` is building. It is renamed into place once it is whole;
 /// one left behind by a crash is stale and is never read.
-pub const temporary_extension = ".tmp";
+const temporary_extension = ".tmp";
 
 /// Digits in a segment's name. The largest sequence number a record can carry
 /// is `maxInt(i64)`, nineteen digits, and twenty leaves the padding visibly
@@ -60,12 +60,12 @@ pub const name_digits = 20;
 /// The version of the record framing, written as the first line of every
 /// segment file. A file whose first line is not one of these is refused by
 /// name rather than read as if it were records.
-pub const log_format: u32 = 1;
+const log_format: u32 = 1;
 
 /// The first line of a segment: which format the records after it are in,
 /// which sequence number the segment starts at, and what the first record's
 /// back-link has to be.
-pub const SegmentHeader = struct {
+const SegmentHeader = struct {
     version: u32,
     base_seq: u64,
     /// The checksum the first record in this file carries as its `p`. A fresh
@@ -90,7 +90,7 @@ pub const SegmentHeader = struct {
 /// one. Nothing here guesses: a line that does not parse as this object is
 /// not a segment header, and a segment whose first line is not one is not a
 /// segment this package wrote.
-pub fn parseSegmentHeader(gpa: Allocator, line: []const u8) ?SegmentHeader {
+fn parseSegmentHeader(gpa: Allocator, line: []const u8) ?SegmentHeader {
     if (!std.mem.startsWith(u8, line, "{\"chronicle\":")) return null;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -151,7 +151,7 @@ pub const Access = enum {
 /// stores the `at` it was handed, and a caller may hand it anything. So it is
 /// the pair, not the ends, and a segment is skipped only when its *highest* is
 /// below what is being looked for.
-pub const Times = struct {
+const Times = struct {
     lowest: i64,
     highest: i64,
     /// Whether no record's `at` was below the one before it. A segment where
@@ -184,7 +184,7 @@ pub const Times = struct {
 };
 
 /// One segment, as the log knows it.
-pub const Segment = struct {
+const Segment = struct {
     /// The sequence number of this segment's first record, and its name.
     base_seq: u64,
     /// The sequence number of its last record, or `base_seq - 1` when it holds
@@ -228,7 +228,7 @@ pub const Segment = struct {
 };
 
 /// Whether a segment's index has been checked against it, and what it said.
-pub const IndexState = union(enum) {
+const IndexState = union(enum) {
     /// Nothing has asked yet.
     unchecked,
     /// There is no index describing these bytes, and this log has not been
@@ -1095,7 +1095,7 @@ fn envelopeOf(gpa: Allocator, line: []const u8) ?Envelope {
 /// The `p` a line carries: the checksum of the record before it. Read off
 /// the bytes where the shape is the one this package writes, and through
 /// `std.json` where it is not.
-pub fn backLinkOf(gpa: Allocator, line: []const u8) ?u32 {
+fn backLinkOf(gpa: Allocator, line: []const u8) ?u32 {
     const opening = ",\"p\":";
     if (std.mem.indexOf(u8, line, opening)) |found| {
         var at = found + opening.len;
