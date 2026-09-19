@@ -1039,7 +1039,10 @@ fn rotate(log: *Log, io: Io) AppendError!void {
     const file = try log.dir.createFile(io, &segmentName(base_seq, segment_extension), .{ .read = true, .truncate = false });
     errdefer file.close(io);
     try log.syncDir(io);
-    const index_file = try log.dir.createFile(io, &segmentName(base_seq, index_extension), .{ .truncate = true });
+    // Readable as well as writable: `indexedOffset` reads the live index back
+    // through this handle, which is what turns a seek into the segment being
+    // written to into a read rather than a scan of it.
+    const index_file = try log.dir.createFile(io, &segmentName(base_seq, index_extension), .{ .read = true, .truncate = true });
     errdefer index_file.close(io);
     var index_writer = index_file.writer(io, log.index_buf);
     try index_writer.interface.writeAll(&indexHeader(0, .unknown));
@@ -1080,8 +1083,10 @@ fn openActive(log: *Log, io: Io) OpenError!void {
     segment.bytes = try file.length(io);
 
     // The index has no durability of its own, so the active segment's is
-    // rebuilt here, from the bytes that are actually in the file.
-    const index_file = try log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{ .truncate = true });
+    // rebuilt here, from the bytes that are actually in the file. It is opened
+    // readable too: `indexedOffset` reads the live index back through this
+    // handle rather than scanning the segment.
+    const index_file = try log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{ .read = true, .truncate = true });
     errdefer index_file.close(io);
     var index_writer = index_file.writer(io, log.index_buf);
     try index_writer.interface.writeAll(&indexHeader(0, .unknown));

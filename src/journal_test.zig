@@ -1015,6 +1015,33 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     try testing.expectEqual(@as(i64, 5), std.mem.readInt(i64, rebuilt[24..32], .little));
 }
 
+test "a seek into the segment being written to reads its index, not the segment" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // One segment, many records, and a cursor near the end of it. The index of
+    // the segment being appended to is the only thing that can turn that into
+    // a seek; without it the walk starts at the first record and steps over
+    // every one of them.
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 4 });
+    defer journal.deinit(io);
+    const count = 5_000;
+    for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    try testing.expectEqual(@as(usize, 1), journal.segmentCount());
+
+    var walk = try journal.replay(io, count - 2);
+    defer walk.deinit(io);
+    const landed = walk.scan.position;
+    const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
+    try testing.expectEqual(@as(u64, count - 1), record.seq);
+
+    // Where the walk began: inside the last percent of the segment, which is
+    // where the record it was asked for is.
+    const bytes = journal.log.segments.items[0].bytes;
+    try testing.expect(landed > bytes - bytes / 100);
+}
+
 test "an index for the wrong segment length is refused and rebuilt" {
     const io = testing.io;
     var ws = try Workspace.init("log");
