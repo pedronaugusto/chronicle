@@ -3481,10 +3481,16 @@ test "opening a log that was closed cleanly costs no scan of it" {
         try testing.expectEqual(@as(usize, 1), journal.segmentCount());
     }
 
+    // The first open after those writes pays for a cold cache over the
+    // segment and the index that no later open pays again, and the scan
+    // below, running second, would never pay it. Both numbers are wanted
+    // warm, so the first open is thrown away.
+    _ = try openMicroseconds(&ws, options);
     const taken = try openMicroseconds(&ws, options);
 
     // The same open with the index deleted, which is the work the open above
-    // does not do.
+    // does not do. Measured once and not repeated: an open that finds no
+    // index builds one, so the second would not scan.
     try ws.root.deleteFile(io, try ws.index(1));
     const scanned = try openMicroseconds(&ws, options);
 
