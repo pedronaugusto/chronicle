@@ -1416,14 +1416,17 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
 pub fn scanFrom(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!Scan {
     if (log.segments.items.len == 0) return log.scanOver(&.{}, 0);
 
+    // Saturating: a cursor of every one is a reader past the end of any log
+    // this package can write, and it walks nothing rather than wrapping.
+    const wanted = cursor +| 1;
     var first: usize = 0;
     for (log.segments.items, 0..) |segment, i| {
-        if (segment.base_seq <= cursor + 1) first = i;
+        if (segment.base_seq <= wanted) first = i;
     }
     if (log.segments.items[first].last_seq <= cursor and first + 1 < log.segments.items.len) {
         first += 1;
     }
-    const position = log.indexedOffset(io, first, cursor + 1, may_write) orelse 0;
+    const position = log.indexedOffset(io, first, wanted, may_write) orelse 0;
     return log.scanOver(log.segments.items[first..], position);
 }
 
