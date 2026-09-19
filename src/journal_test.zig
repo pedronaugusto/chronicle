@@ -600,6 +600,118 @@ test "a fold built from the disk equals the fold built live" {
     try testing.expectEqual(@as(u32, 2), replayed.live);
 }
 
+test "one pass feeds every fold, and equals the folds fed one at a time" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 4 });
+    defer journal.deinit(io);
+    for (1..301) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+
+    var one_at_a_time: [5]Registry = @splat(.{});
+    for (&one_at_a_time) |*fold| try journal.subscribe(io, fold.sink());
+
+    var together: [5]Registry = @splat(.{});
+    var sinks: [5]Journal.Sink = undefined;
+    for (&together, &sinks) |*fold, *sink| sink.* = fold.sink();
+    try journal.subscribeAll(io, &sinks);
+
+    for (&together, &one_at_a_time) |shared, separate| {
+        try testing.expectEqual(separate, shared);
+        try testing.expectEqual(@as(u32, 300), shared.events);
+    }
+
+    // And every fold, however it was registered, takes the records that come
+    // after it.
+    _ = try journal.append(io, 301, created(301, "n"));
+    for (&together, &one_at_a_time) |shared, separate| {
+        try testing.expectEqual(@as(u64, 301), shared.last);
+        try testing.expectEqual(@as(u64, 301), separate.last);
+    }
+}
+
+test "a fold can be dropped, and stops being called" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+
+    var leaving: Registry = .{};
+    var staying: Registry = .{};
+    try journal.subscribe(io, leaving.sink());
+    try journal.subscribe(io, staying.sink());
+
+    _ = try journal.append(io, 1, created(1, "one"));
+    try testing.expect(try journal.unsubscribe(io, leaving.sink()));
+    _ = try journal.append(io, 2, created(2, "two"));
+
+    try testing.expectEqual(@as(u64, 1), leaving.last);
+    try testing.expectEqual(@as(u64, 2), staying.last);
+    // A fold that is not registered is not one that can be dropped.
+    try testing.expect(!try journal.unsubscribe(io, leaving.sink()));
+}
+
+test "a record appended beside a shared subscribe lands in every fold exactly once" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 2 });
+    defer journal.deinit(io);
+    for (1..2_001) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+
+    // The appender runs while the replay does. Whichever side of the
+    // hand-over the record falls on, each fold must see it once and the
+    // sequence each fold saw must have no gap and no repeat in it.
+    const appender = struct {
+        fn f(j: *Journal, inner: Io) void {
+            _ = j.append(inner, 2_001, created(2_001, "beside")) catch {};
+        }
+    }.f;
+
+    var folds: [4]Sequenced = @splat(.{});
+    var sinks: [4]Journal.Sink = undefined;
+    for (&folds, &sinks) |*fold, *sink| sink.* = fold.sink();
+
+    var group: Io.Group = .init;
+    defer group.cancel(io);
+    try group.concurrent(io, appender, .{ &journal, io });
+    try journal.subscribeAll(io, &sinks);
+    try group.await(io);
+
+    for (&folds) |fold| {
+        try testing.expect(fold.ok);
+        try testing.expect(fold.seen == 2_000 or fold.seen == 2_001);
+        try testing.expectEqual(fold.seen, fold.last);
+    }
+    // The append either landed in the replay or arrived live, but every fold
+    // has to agree about which.
+    for (&folds) |fold| try testing.expectEqual(folds[0].seen, fold.seen);
+}
+
+/// A fold that only checks the shape of what it is handed: the sequence
+/// numbers must arrive in order, one after another, with nothing missing and
+/// nothing twice.
+const Sequenced = struct {
+    seen: u64 = 0,
+    last: u64 = 0,
+    ok: bool = true,
+
+    fn sink(self: *Sequenced) Journal.Sink {
+        return .{ .ctx = self, .f = apply };
+    }
+
+    fn apply(ctx: *anyopaque, record: Journal.Record) void {
+        const self: *Sequenced = @ptrCast(@alignCast(ctx));
+        if (record.seq != self.last + 1) self.ok = false;
+        self.last = record.seq;
+        self.seen += 1;
+    }
+};
+
 test "waitPast blocks until an append arrives" {
     const io = testing.io;
     var ws = try Workspace.init("log");

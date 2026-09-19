@@ -864,10 +864,10 @@ pub fn Journal(comptime Event: type) type {
         /// A fold built this way is built the same way whether the records came
         /// off the disk or arrived live, which is the point.
         ///
-        /// The sink is called with the journal's lock held and lives until
-        /// `deinit`; there is no unsubscribe.
+        /// The sink is called with the journal's lock held, and lives until
+        /// `unsubscribe` or `deinit`.
         pub fn subscribe(self: *Self, io: Io, sink: Sink) SubscribeError!void {
-            return self.subscribeFrom(io, sink, 0);
+            return self.subscribeAllFrom(io, &.{sink}, 0);
         }
 
         /// `subscribe`, starting after `cursor` — the sequence number of a
@@ -879,21 +879,76 @@ pub fn Journal(comptime Event: type) type {
         /// `append` from another task waits for it, which is what makes the
         /// hand-over from the disk to the live records seamless.
         pub fn subscribeFrom(self: *Self, io: Io, sink: Sink, cursor: u64) SubscribeError!void {
+            return self.subscribeAllFrom(io, &.{sink}, cursor);
+        }
+
+        /// `subscribe` for several folds at once, over one pass of the log.
+        pub fn subscribeAll(self: *Self, io: Io, sinks: []const Sink) SubscribeError!void {
+            return self.subscribeAllFrom(io, sinks, 0);
+        }
+
+        /// Register every fold in `sinks` and hand each of them every record
+        /// after `cursor`, reading the disk once for all of them.
+        ///
+        /// Subscribing five folds one at a time reads the log five times: each
+        /// call opens its own walk, verifies every checksum again and parses
+        /// every event again. This does that work once and calls each sink per
+        /// record, which costs the same as one subscriber — the callbacks are
+        /// free beside the decode.
+        ///
+        /// It is one call under one lock, so it is also the way to start
+        /// several folds at the same record: a record appended beside it lands
+        /// in all of them or in none of them, never in some.
+        ///
+        /// The sinks are registered in the order given and are called in that
+        /// order for every record afterwards.
+        pub fn subscribeAllFrom(self: *Self, io: Io, sinks: []const Sink, cursor: u64) SubscribeError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
-            try self.sinks.append(self.gpa, sink);
-            errdefer _ = self.sinks.pop();
+            const before = self.sinks.items.len;
+            try self.sinks.appendSlice(self.gpa, sinks);
+            errdefer self.sinks.shrinkRetainingCapacity(before);
+            // The registered copies, not the caller's slice: a sink that is
+            // handed records here must be the same sink the next `append`
+            // finds, whatever the caller does with its own array.
+            const registered = self.sinks.items[before..];
 
             var delivered = cursor;
             if (!self.since(cursor).complete) {
                 var walk = try self.replay(io, cursor);
                 defer walk.deinit(io);
                 while (try walk.next(io)) |record| {
-                    sink.f(sink.ctx, record);
+                    for (registered) |sink| sink.f(sink.ctx, record);
                     delivered = record.seq;
                 }
             }
-            for (self.since(delivered).records) |record| sink.f(sink.ctx, record);
+            for (self.since(delivered).records) |record| {
+                for (registered) |sink| sink.f(sink.ctx, record);
+            }
+        }
+
+        /// Drop a fold registered by `subscribe`, `subscribeFrom`,
+        /// `subscribeAll` or `subscribeAllFrom`, and report whether one went.
+        ///
+        /// A sink is identified by the pair of pointers it is made of, so the
+        /// argument is the same `Sink` that was registered. Registering the
+        /// same pair twice takes two calls to remove. The remaining folds keep
+        /// the order they were registered in.
+        ///
+        /// This is what a reconnecting client's fold needs: it is added when
+        /// the client arrives and dropped when it goes, rather than living
+        /// until the journal closes.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn unsubscribe(self: *Self, io: Io, sink: Sink) Io.Cancelable!bool {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            for (self.sinks.items, 0..) |registered, i| {
+                if (registered.ctx != sink.ctx or registered.f != sink.f) continue;
+                _ = self.sinks.orderedRemove(i);
+                return true;
+            }
+            return false;
         }
 
         /// A named reader and the cursor it has committed.
