@@ -65,20 +65,20 @@ Fixed:
 - **A seek into the segment being written to scanned it.** The active
   segment's index file was created write-only, so the live-index fast path
   could never read a byte back and every seek into the newest segment fell
-  through to a scan. Measured 27 070 µs before and 38.5 µs after, over a
+  through to a scan. Measured 27 070 µs before and 34 µs after, over a
   million records.
 - **`.always` did not survive a power cut on macOS.** `fsync` there returns
   once the bytes are in the drive's write cache. A durable write now goes
   through `fcntl(F_FULLFSYNC)` on Darwin, which asks the drive to flush its
   media, and through `fdatasync` on Linux when the write went into space the
   file already had. The cost is real and was being hidden: an `append` at
-  `.always` measured 28 µs before and 4.1 ms after on this machine, which is
-  what a media flush costs. `appendAll` is how to pay it once for many
+  `.always` measured 28 µs before and four to six milliseconds after on this
+  machine, which is what a media flush costs on a consumer drive. `appendAll` is how to pay it once for many
   records, and `chronicle.flush` names the call this platform makes.
 - **A clean close left an index nothing took.** `deinit` sealed the active
   segment's index with the exact length it described and `open` then truncated
   it and scanned the segment again. Opening a million-record log measured
-  69 ms before and 1.8 ms after.
+  69 ms before and under ten after.
 - **`replay()` could write.** It is public and takes no lock, and it could
   reach the index rebuild — creating and filling a file, and flushing the
   active segment's index writer, while another task was inside `append`. A
@@ -96,7 +96,7 @@ New:
   all of them costs what one fold costs — the extra callbacks per record are
   free beside the decode — and it is one call under one lock, so a record
   appended beside it lands in all of them or in none. Measured 1238 ms against
-  250 ms for five folds over a million records.
+  248 ms for five folds over a million records, where one fold is 246 ms.
 - **`unsubscribe(io, sink)`.** A fold could only ever be added. A reconnecting
   client's fold is dropped when the client goes.
 - **`readers(io)` and `minCursor(io)`.** Every named reader that has committed
@@ -133,7 +133,7 @@ New:
   so a refused batch leaves the log exactly as it was.
 - **A lookup by time bisects where it can.** The index says whether the
   timestamps in a segment rise; where they do, `seqAtOrAfter` halves the
-  entries instead of reading them. Measured 444 µs before and 34.8 µs after.
+  entries instead of reading them. Measured 444 µs before and 34 µs after.
   Where they do not, it is the search it always was.
 - **Two more fuzz targets, and one that fuzzes the calls.** One over an
   arbitrary `.cursor` file, the one file whose contents come from outside the
