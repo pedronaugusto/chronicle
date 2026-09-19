@@ -30,6 +30,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Log = @import("log.zig");
 const durable = @import("durable.zig");
+const crc32c = @import("crc32c.zig");
 
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
@@ -86,7 +87,7 @@ pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len]u8 {
 /// `append` writes it and every read verifies it. It is public so that a tool
 /// reading a segment with something other than this package can check one.
 pub fn checksum(covered: []const u8) u32 {
-    return std.hash.crc.Crc32Iscsi.hash(covered);
+    return crc32c.hash(covered);
 }
 
 /// An append-only log of `Event` values.

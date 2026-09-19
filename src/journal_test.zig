@@ -2156,6 +2156,32 @@ test "a record written before checksums existed is read as it always was" {
     try testing.expectEqual(@as(u64, 2), try journal.verify(io));
 }
 
+test "the checksum is the same number however it is computed" {
+    // The instruction and the table have to agree byte for byte, at every
+    // length a record can be and at every alignment a buffer can start on --
+    // the value is on the disk, and a journal written on one machine is read
+    // on another.
+    var bytes: [4096 + 8]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(0x6d6f7274616c);
+    prng.random().bytes(&bytes);
+
+    for (0..8) |start| {
+        for (0..4097) |length| {
+            const slice = bytes[start..][0..length];
+            try testing.expectEqual(
+                std.hash.crc.Crc32Iscsi.hash(slice),
+                chronicle.checksum(slice),
+            );
+        }
+    }
+
+    // And the number a record on the disk carries has not moved.
+    try testing.expectEqual(
+        @as(u32, 825182072),
+        chronicle.checksum("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"x\"}}"),
+    );
+}
+
 //========================================================================
 // Size.
 //========================================================================

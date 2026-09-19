@@ -69,24 +69,34 @@ jobs:
   # Compile-only coverage of the targets the suite cannot execute on. These
   # prove the sources and the build graph are portable; the `test` job above
   # is what proves behaviour.
+  #
+  # Two of them name a CPU. The checksum has a path per instruction set,
+  # chosen from the target's features, and a baseline target compiles the
+  # table and nothing else -- so a target that has the instruction is built
+  # too, or the code that uses it would never be seen by a compiler. The
+  # runners the `test` job uses have it and run that path.
   cross-compile:
-    name: cross (${{ matrix.target }})
+    name: cross (${{ matrix.target }}${{ matrix.cpu && format(' {0}', matrix.cpu) || '' }})
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - x86_64-linux-gnu
-          - aarch64-linux-gnu
-          - x86_64-linux-musl
-          - x86_64-windows-gnu
-          - aarch64-windows-gnu
-          - x86_64-macos
-          - aarch64-macos
+        include:
+          - target: x86_64-linux-gnu
+          - target: x86_64-linux-gnu
+            cpu: x86_64_v2
+          - target: aarch64-linux-gnu
+          - target: aarch64-linux-gnu
+            cpu: cortex_a72
+          - target: x86_64-linux-musl
+          - target: x86_64-windows-gnu
+          - target: aarch64-windows-gnu
+          - target: x86_64-macos
+          - target: aarch64-macos
     steps:
       - uses: actions/checkout@v4
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
-      - run: zig build check -Dtarget=${{ matrix.target }}
+      - run: zig build check -Dtarget=${{ matrix.target }}${{ matrix.cpu && format(' -Dcpu={0}', matrix.cpu) || '' }}
