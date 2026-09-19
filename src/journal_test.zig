@@ -492,6 +492,114 @@ test "every fsync policy writes a log that opens with the same records" {
     }
 }
 
+test "the durable write is the one this platform needs" {
+    // `fsync` on Darwin returns when the bytes are in the drive's write
+    // cache, so a promise about a power cut there has to be `F_FULLFSYNC`.
+    // This is the assertion behind README.md's durability table: if the
+    // platform row changes, this fails rather than the document going quietly
+    // out of date.
+    const expected: chronicle.Flush = switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos, .visionos => .full_fsync,
+        .windows => .flush_buffers,
+        else => .fsync,
+    };
+    try testing.expectEqual(expected, chronicle.flush);
+}
+
+test "a reserved segment is written into rather than extended, and reserves nothing when closed" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const reserve = 64 * 1024;
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{
+            .sync = .always,
+            .preallocate_bytes = reserve,
+        });
+        defer journal.deinit(io);
+        for (1..51) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+
+        // The file is already longer than its records: the space after them
+        // is zeros, and the next append goes into it.
+        const held = (try ws.read(try ws.segment(1))).len;
+        try testing.expect(held >= reserve);
+        try testing.expectEqual(@as(u64, 50), try journal.lastSeq(io));
+    }
+
+    // A close cuts the reservation back, so a segment on the disk is its
+    // records and nothing else.
+    const closed = try ws.read(try ws.segment(1));
+    try testing.expect(closed.len < reserve);
+    try testing.expectEqual(@as(u8, '\n'), closed[closed.len - 1]);
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .preallocate_bytes = reserve });
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 50), try reopened.lastSeq(io));
+    try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
+}
+
+test "space a writer reserved and never filled is not a record it did not finish" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // What a crash leaves behind with a reservation outstanding: whole
+    // records, then the zeros nothing was written into.
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+    const records = try ws.read(try ws.segment(1));
+    const crashed = try testing.allocator.alloc(u8, records.len + 4096);
+    defer testing.allocator.free(crashed);
+    @memcpy(crashed[0..records.len], records);
+    @memset(crashed[records.len..], 0);
+    try ws.write(try ws.segment(1), crashed);
+
+    // Nothing was dropped, nothing was rewritten, and `.fail` -- which
+    // refuses a record the writer did not finish -- has nothing to refuse.
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 3), try journal.lastSeq(io));
+        try testing.expectEqual(@as(usize, 0), journal.dropped_bytes);
+        _ = try journal.append(io, 4, created(4, "into the space"));
+    }
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 4), try reopened.lastSeq(io));
+    try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
+}
+
+test "a half-written record before the reserved zeros is dropped, and only it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+    const records = try ws.read(try ws.segment(1));
+    const torn = "{\"seq\":4,\"at\":4,\"v\":1,\"ev\":{\"crea";
+    const crashed = try testing.allocator.alloc(u8, records.len + torn.len + 4096);
+    defer testing.allocator.free(crashed);
+    @memcpy(crashed[0..records.len], records);
+    @memcpy(crashed[records.len..][0..torn.len], torn);
+    @memset(crashed[records.len + torn.len ..], 0);
+    try ws.write(try ws.segment(1), crashed);
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 3), try journal.lastSeq(io));
+    // The count is the bytes somebody wrote, not the zeros nobody did.
+    try testing.expectEqual(torn.len, journal.dropped_bytes);
+}
+
 test "a record from a newer schema is refused rather than guessed at" {
     const io = testing.io;
     var ws = try Workspace.init("log");

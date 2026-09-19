@@ -23,6 +23,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+const durable = @import("durable.zig");
 
 const Log = @This();
 
@@ -66,13 +67,16 @@ pub const OnTruncated = enum {
 
 /// How often the bytes an append wrote are made durable.
 ///
-/// It governs the record bytes only. The `fsync`s that make a rename atomic --
+/// It governs the record bytes only. The flushes that make a rename atomic --
 /// a snapshot, a compaction, a new segment's name -- are not optional under
 /// any of these, because they are what the replacement promise is.
+///
+/// What "durable" costs is a platform's answer and not this package's:
+/// `durable.flush` names the call, and README.md has the row per platform.
 pub const Sync = enum {
-    /// `fsync` before every `appendLine` returns, and once per `commit`.
+    /// Flush before every `appendLine` returns, and once per `commit`.
     always,
-    /// `fsync` when a segment is sealed and when the log is closed. Between
+    /// Flush when a segment is sealed and when the log is closed. Between
     /// those, an appended record has reached the operating system only.
     on_segment,
     /// Never from an append, a seal or a close. The bytes reach the operating
@@ -150,6 +154,7 @@ pub const Options = struct {
     read_buffer_size: usize = 64 * 1024,
     max_segment_bytes: u64 = 8 * 1024 * 1024,
     max_segment_records: ?u64 = null,
+    preallocate_bytes: u64 = 0,
 };
 
 pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
@@ -162,8 +167,8 @@ pub const OpenError = ReadError || Io.File.SetLengthError || Io.File.SyncError |
     Io.Dir.DeleteFileError || error{ Locked, DiscontinuousSeq, ReadOnly };
 
 pub const AppendError = Io.Cancelable || Io.Writer.Error || Io.File.OpenError ||
-    Io.File.SyncError || Io.File.WritePositionalError || Allocator.Error ||
-    error{ReadOnly};
+    Io.File.SyncError || Io.File.WritePositionalError || Io.File.SetLengthError ||
+    Allocator.Error || error{ReadOnly};
 
 pub const ScanError = ReadError;
 
@@ -175,6 +180,8 @@ pub const WriteFileError = Allocator.Error || Io.Cancelable || Io.File.OpenError
     Io.Writer.Error || Io.File.SyncError || Io.Dir.RenameError || Io.Dir.DeleteFileError;
 
 pub const SnapshotError = WriteFileError || error{ReadOnly};
+
+pub const SealError = Io.File.WritePositionalError || Io.File.SyncError;
 
 gpa: Allocator,
 /// The log's directory, as given to `open`. Owned.
@@ -204,6 +211,10 @@ const Active = struct {
     writer: Io.File.Writer,
     index_file: Io.File,
     index_writer: Io.File.Writer,
+    /// How far the segment file has been zero-filled ahead of the records in
+    /// it. Equal to the committed length when `Options.preallocate_bytes` is
+    /// zero, which is to say when nothing is reserved.
+    preallocated: u64,
 };
 
 //========================================================================
@@ -570,9 +581,9 @@ fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
 /// Stamp a finished index with the segment length and the timestamps it
 /// describes and make it durable, which is what turns it from a cache being
 /// filled into one a later process may take.
-fn sealIndex(io: Io, file: Io.File, segment_bytes: u64, times: Times) OpenError!void {
+fn sealIndex(io: Io, file: Io.File, segment_bytes: u64, times: Times) SealError!void {
     try file.writePositionalAll(io, &indexHeader(segment_bytes, times), 0);
-    try file.sync(io);
+    try durable.sync(io, file, .whole);
 }
 
 //========================================================================
@@ -714,6 +725,11 @@ const Scanned = struct {
     lines: u64,
     /// Bytes up to and including the last newline.
     complete_bytes: u64,
+    /// How much of what follows the last newline was written by somebody:
+    /// the bytes up to the last one that is not zero. Zero when the tail is
+    /// all zeros, which is space a writer reserved and never filled, not a
+    /// record it did not finish.
+    partial_bytes: u64,
     /// The lowest and highest `at` over those lines, and `Times.unknown` when
     /// one of them did not carry a readable one.
     times: Times,
@@ -723,7 +739,7 @@ const Scanned = struct {
 /// timestamp to an index being built. Memory is one read buffer and one line:
 /// nothing grows with the segment.
 fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*Io.File.Writer) OpenError!Scanned {
-    var scanned: Scanned = .{ .lines = 0, .complete_bytes = 0, .times = .unknown };
+    var scanned: Scanned = .{ .lines = 0, .complete_bytes = 0, .partial_bytes = 0, .times = .unknown };
     if (segment.bytes == 0) return scanned;
 
     const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
@@ -765,10 +781,22 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*Io.File.Writer) Ope
             offset += chunk.len;
         }
     }
+    // What is left after the last newline. A record this package writes can
+    // hold no zero byte -- `std.json` escapes every control character -- so a
+    // run of zeros at the end of a segment is space that was reserved and
+    // never written into, and the writer simply carries on there.
+    scanned.partial_bytes = writtenLength(line.written());
     // One record with no readable timestamp and the pair says nothing, because
     // a range that does not cover every record cannot be used to skip one.
     if (!timed) scanned.times = .unknown;
     return scanned;
+}
+
+/// `bytes` up to and including the last one that is not zero.
+fn writtenLength(bytes: []const u8) u64 {
+    var at = bytes.len;
+    while (at > 0 and bytes[at - 1] == 0) at -= 1;
+    return at;
 }
 
 /// A walk over the log's lines from some sequence number onward, holding one
@@ -782,6 +810,10 @@ pub const Scan = struct {
     dir: Io.Dir,
     /// The base sequence numbers of the segments still to walk, oldest first.
     bases: []u64,
+    /// How far into each of them the records go. A writer knows that exactly;
+    /// a reader beside one does not, and walks to the end of the file and
+    /// stops at the first line the writer has not finished.
+    limits: []u64,
     at: usize,
     file: ?Io.File,
     reader: Io.File.Reader,
@@ -798,6 +830,7 @@ pub const Scan = struct {
         scan.line.deinit();
         scan.gpa.free(scan.buffer);
         scan.gpa.free(scan.bases);
+        scan.gpa.free(scan.limits);
         scan.* = undefined;
     }
 
@@ -805,8 +838,17 @@ pub const Scan = struct {
     /// the next call to `next` or to `deinit`.
     pub fn next(scan: *Scan, io: Io) ScanError!?[]const u8 {
         while (true) {
+            if (scan.at >= scan.bases.len) return null;
+            // Past the records of this segment: what follows them is space a
+            // writer reserved and has not filled, not a record.
+            if (scan.position >= scan.limits[scan.at]) {
+                if (scan.file) |file| file.close(io);
+                scan.file = null;
+                scan.at += 1;
+                scan.position = 0;
+                continue;
+            }
             if (scan.file == null) {
-                if (scan.at >= scan.bases.len) return null;
                 const file = try scan.dir.openFile(io, &segmentName(scan.bases[scan.at], segment_extension), .{});
                 scan.file = file;
                 scan.reader = file.reader(io, scan.buffer);
@@ -853,7 +895,16 @@ pub const Scan = struct {
 fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan {
     const bases = try log.gpa.alloc(u64, segments.len);
     errdefer log.gpa.free(bases);
-    for (segments, bases) |segment, *base| base.* = segment.base_seq;
+    const limits = try log.gpa.alloc(u64, segments.len);
+    errdefer log.gpa.free(limits);
+    // A reader has no committed length to go on -- the writer is still
+    // appending -- so it walks to the end of the file and lets the missing
+    // newline end it.
+    const unbounded = log.options.access == .read;
+    for (segments, bases, limits) |segment, *base, *limit| {
+        base.* = segment.base_seq;
+        limit.* = if (unbounded) std.math.maxInt(u64) else segment.bytes;
+    }
 
     const buffer = try log.gpa.alloc(u8, log.options.read_buffer_size);
     errdefer log.gpa.free(buffer);
@@ -862,6 +913,7 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
         .gpa = log.gpa,
         .dir = log.dir,
         .bases = bases,
+        .limits = limits,
         .at = 0,
         .file = null,
         .reader = undefined,
@@ -1030,6 +1082,8 @@ pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64) AppendError!void
         segment = &log.segments.items[log.segments.items.len - 1];
     }
 
+    try log.reserveAhead(io, needed);
+
     const offset = segment.bytes;
     const active = &log.active.?;
     try active.writer.interface.writeAll(bytes);
@@ -1051,7 +1105,17 @@ pub fn commit(log: *Log, io: Io) AppendError!void {
     if (log.active == null) return error.ReadOnly;
     const active = &log.active.?;
     try active.writer.interface.flush();
-    if (log.options.sync == .always) try active.file.sync(io);
+    if (log.options.sync == .always) try log.syncActive(io);
+}
+
+/// Make the active segment's bytes durable at the level the file's own shape
+/// allows: the contents alone when the write went into space the file already
+/// had, and the whole file when it grew.
+fn syncActive(log: *Log, io: Io) Io.File.SyncError!void {
+    const active = &log.active.?;
+    const segment = log.segments.items[log.segments.items.len - 1];
+    const level: durable.Level = if (segment.bytes <= active.preallocated) .contents else .whole;
+    return durable.sync(io, active.file, level);
 }
 
 /// Seal the active segment and start a new one named after the record that
@@ -1061,9 +1125,14 @@ fn rotate(log: *Log, io: Io) AppendError!void {
     {
         const active = &log.active.?;
         try active.writer.interface.flush();
-        if (log.options.sync != .never) try active.file.sync(io);
+        try log.trimPreallocation(io);
+        if (log.options.sync != .never) try durable.sync(io, active.file, .whole);
         try active.index_writer.interface.flush();
-        sealIndex(io, active.index_file, segment.bytes, segment.times) catch {};
+        // A seal that cannot be written leaves an index the next open reads
+        // as stale and rebuilds, which is a cost and not a wrong answer -- but
+        // a disk that has just refused a write is not something to pass over
+        // in silence on the way to writing more.
+        try sealIndex(io, active.index_file, segment.bytes, segment.times);
     }
     log.closeActive(io);
 
@@ -1090,6 +1159,7 @@ fn rotate(log: *Log, io: Io) AppendError!void {
         .writer = file.writer(io, log.write_buf),
         .index_file = index_file,
         .index_writer = index_writer,
+        .preallocated = 0,
     };
 }
 
@@ -1130,6 +1200,7 @@ fn openActive(log: *Log, io: Io) OpenError!void {
             .writer = writer,
             .index_file = resumed.file,
             .index_writer = resumed.writer,
+            .preallocated = segment.bytes,
         };
         return;
     }
@@ -1144,14 +1215,18 @@ fn openActive(log: *Log, io: Io) OpenError!void {
     try index_writer.interface.writeAll(&indexHeader(0, .unknown));
 
     const scanned = try log.scanSegment(io, segment.*, &index_writer);
-    if (scanned.complete_bytes != segment.bytes) switch (log.options.on_truncated) {
+    // Space reserved and never written into is not a record the writer did
+    // not finish: the writer carries on into it, and nothing was dropped.
+    var preallocated = segment.bytes;
+    if (scanned.partial_bytes != 0) switch (log.options.on_truncated) {
         .fail => return error.TruncatedRecord,
         .drop => {
-            log.dropped_bytes = @intCast(segment.bytes - scanned.complete_bytes);
+            log.dropped_bytes = @intCast(scanned.partial_bytes);
             try file.setLength(io, scanned.complete_bytes);
-            segment.bytes = scanned.complete_bytes;
+            preallocated = scanned.complete_bytes;
         },
     };
+    segment.bytes = scanned.complete_bytes;
     try index_writer.interface.flush();
     segment.last_seq = segment.base_seq + scanned.lines - 1;
     segment.times = scanned.times;
@@ -1163,7 +1238,53 @@ fn openActive(log: *Log, io: Io) OpenError!void {
         .writer = writer,
         .index_file = index_file,
         .index_writer = index_writer,
+        .preallocated = preallocated,
     };
+}
+
+/// Keep the active segment zero-filled `Options.preallocate_bytes` ahead of
+/// the record about to go into it.
+///
+/// A file that is not growing costs less to make durable -- the size in its
+/// inode does not have to go down with the bytes -- which is the whole of the
+/// reason to do this, and is why `syncActive` asks for the cheaper flush
+/// exactly while the writes land inside what was reserved. The cost is the
+/// zeros: a segment is written twice, once as zeros and once as records.
+///
+/// The reserved space is never past `Options.max_segment_bytes`, so a segment
+/// is no larger on the disk than it was without this, and a rotation or a
+/// close cuts back whatever is left of it.
+fn reserveAhead(log: *Log, io: Io, needed: u64) AppendError!void {
+    const ahead = log.options.preallocate_bytes;
+    if (ahead == 0) return;
+    const active = &log.active.?;
+    const segment = log.segments.items[log.segments.items.len - 1];
+    if (segment.bytes + needed <= active.preallocated) return;
+
+    const target = @min(
+        @max(log.options.max_segment_bytes, segment.bytes + needed),
+        segment.bytes + needed + ahead,
+    );
+    if (target <= active.preallocated) return;
+
+    var zeros: [8192]u8 = @splat(0);
+    var at = @max(active.preallocated, segment.bytes);
+    while (at < target) {
+        const want: usize = @intCast(@min(zeros.len, target - at));
+        try active.file.writePositionalAll(io, zeros[0..want], at);
+        at += want;
+    }
+    active.preallocated = target;
+}
+
+/// Cut the reserved space back to the records, so that a sealed segment is
+/// exactly its records and a closed log leaves no zeros behind.
+fn trimPreallocation(log: *Log, io: Io) Io.File.SetLengthError!void {
+    const active = &log.active.?;
+    const segment = log.segments.items[log.segments.items.len - 1];
+    if (active.preallocated <= segment.bytes) return;
+    try active.file.setLength(io, segment.bytes);
+    active.preallocated = segment.bytes;
 }
 
 /// Create an empty segment file and make its name durable.
@@ -1200,7 +1321,7 @@ pub fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
 fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
     if (!can_sync_dir) return;
     const as_file: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
-    as_file.sync(io) catch |err| switch (err) {
+    durable.sync(io, as_file, .whole) catch |err| switch (err) {
         // A filesystem that will not sync a directory handle is one where this
         // promise cannot be kept. It is not a reason to fail the write.
         error.AccessDenied, error.InputOutput => return,
@@ -1277,7 +1398,7 @@ pub fn truncateAfter(log: *Log, io: Io, seq: u64) TruncateError!void {
         const file = try log.dir.createFile(io, &segmentName(holder.base_seq, segment_extension), .{ .truncate = false });
         defer file.close(io);
         try file.setLength(io, offset);
-        if (log.options.sync != .never) try file.sync(io);
+        if (log.options.sync != .never) try durable.sync(io, file, .whole);
         // The index describes bytes that are no longer there. Removing it is
         // cheaper than leaving one the next open has to reject and rebuild.
         log.dir.deleteFile(io, &segmentName(holder.base_seq, index_extension)) catch {};
@@ -1365,7 +1486,7 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
             try writer.interface.writeByte('\n');
         }
         try writer.interface.flush();
-        try out.sync(io);
+        try durable.sync(io, out, .whole);
         out.close(io);
         closed = true;
     }
@@ -1399,7 +1520,7 @@ pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) Write
         var writer = file.writer(io, &buffer);
         try writer.interface.writeAll(bytes);
         try writer.interface.flush();
-        try file.sync(io);
+        try durable.sync(io, file, .whole);
     }
     try log.dir.rename(temporary, log.dir, name, io);
     try log.syncDir(io);
@@ -1514,7 +1635,7 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: []const u8, bytes: ?u64) Open
         try to.writePositionalAll(io, chunk[0..read], at);
         at += read;
     }
-    try to.sync(io);
+    try durable.sync(io, to, .whole);
     return true;
 }
 
@@ -1536,7 +1657,8 @@ fn sameDirectory(log: *Log, io: Io, dest: Io.Dir) bool {
 pub fn deinit(log: *Log, io: Io) void {
     if (log.active) |*active| {
         active.writer.interface.flush() catch {};
-        if (log.options.sync != .never) active.file.sync(io) catch {};
+        log.trimPreallocation(io) catch {};
+        if (log.options.sync != .never) durable.sync(io, active.file, .whole) catch {};
         active.index_writer.interface.flush() catch {};
         // Leave the active index stamped with the length it describes, so that
         // the next open can take it rather than rebuild it.

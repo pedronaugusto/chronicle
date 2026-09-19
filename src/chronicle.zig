@@ -29,6 +29,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Log = @import("log.zig");
+const durable = @import("durable.zig");
 
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
@@ -38,8 +39,16 @@ pub const OnTruncated = Log.OnTruncated;
 pub const Access = Log.Access;
 
 /// How often `append` makes the bytes it wrote durable. README.md states the
-/// promise each level carries.
+/// promise each level carries, per platform.
 pub const Sync = Log.Sync;
+
+/// The call a durable write makes on a platform.
+pub const Flush = durable.Flush;
+
+/// What `Options.sync = .always` issues here, which is what a returned
+/// sequence number survives here. README.md's durability table is the same
+/// three answers in words.
+pub const flush: Flush = durable.flush;
 
 /// The file inside a journal directory that a writer holds its advisory lock
 /// on. It is never read or written.
@@ -245,6 +254,19 @@ pub fn Journal(comptime Event: type) type {
             max_segment_bytes: u64 = 8 * 1024 * 1024,
             /// A second ceiling on a segment, over records. Null is none.
             max_segment_records: ?u64 = null,
+            /// How far ahead of the records the active segment is kept
+            /// zero-filled, so that an append writes into space the file
+            /// already has instead of extending it. Zero, the default,
+            /// reserves nothing.
+            ///
+            /// What it buys is a cheaper durable write: a file whose length
+            /// is not changing needs no size written out beside the bytes,
+            /// and on the platforms that have the cheaper call this is what
+            /// makes it sufficient. What it costs is the zeros — a segment is
+            /// written once as zeros and once as records — so it is worth
+            /// setting on a journal whose `sync` is `.always` and whose
+            /// records are small, and worth leaving alone otherwise.
+            preallocate_bytes: u64 = 0,
             /// Size of the journal's write buffer. One `append` of a record
             /// larger than this costs an extra write syscall, nothing more.
             write_buffer_size: usize = 64 * 1024,
@@ -424,6 +446,7 @@ pub fn Journal(comptime Event: type) type {
                 .read_buffer_size = options.read_buffer_size,
                 .max_segment_bytes = options.max_segment_bytes,
                 .max_segment_records = options.max_segment_records,
+                .preallocate_bytes = options.preallocate_bytes,
             });
             errdefer log.deinit(io);
 
