@@ -2397,6 +2397,38 @@ fn helperLine(reader: *Io.Reader) ![]const u8 {
 const Ping = union(enum) { ping: u32 };
 const PingJournal = chronicle.Journal(Ping);
 
+test "a backup shares the bytes of a sealed segment where the filesystem can" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer journal.deinit(io);
+    for (1..13) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+
+    // Twice into the same directory: the second copy has to replace the
+    // first, whichever way the bytes got there.
+    const dest = try ws.beside("copy");
+    _ = try journal.backup(io, dest);
+    try testing.expectEqual(@as(u64, 12), try journal.backup(io, dest));
+
+    var copied = try Journal.open(testing.allocator, io, dest, .{ .verify = .full });
+    defer copied.deinit(io);
+    try testing.expectEqual(@as(u64, 12), try copied.lastSeq(io));
+    try testing.expectEqual(@as(u64, 12), try copied.verify(io));
+
+    // Byte for byte, whether the filesystem shared the extents or this
+    // process moved them.
+    const here = try ws.read(try ws.segment(1));
+    const there = try ws.root.readFileAlloc(
+        io,
+        try std.fs.path.join(ws.arena.allocator(), &.{ "copy", &chronicle.segmentName(1) }),
+        ws.arena.allocator(),
+        .unlimited,
+    );
+    try testing.expectEqualStrings(here, there);
+}
+
 test "a backup taken while another process appends opens as a journal" {
     const io = testing.io;
     const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {

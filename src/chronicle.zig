@@ -77,7 +77,7 @@ pub const Verify = enum {
 /// The name of the segment file whose first record is `base_seq`, relative to
 /// the journal's directory. Exposed because a journal's directory is meant to
 /// be read with `tail -f` and with your eyes.
-pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len]u8 {
+pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len:0]u8 {
     return Log.segmentName(base_seq, segment_extension);
 }
 

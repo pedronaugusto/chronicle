@@ -25,6 +25,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
+const clone = @import("clone.zig");
 
 const Log = @This();
 
@@ -336,9 +337,12 @@ const Active = struct {
 pub fn segmentName(
     base_seq: u64,
     comptime extension: []const u8,
-) [name_digits + extension.len]u8 {
-    var out: [name_digits + extension.len]u8 = undefined;
+) [name_digits + extension.len:0]u8 {
+    // Zero-terminated: some of the calls a copy makes go to the operating
+    // system by name rather than through an open file.
+    var out: [name_digits + extension.len:0]u8 = undefined;
     _ = std.fmt.bufPrint(&out, "{d:0>20}" ++ extension, .{base_seq}) catch unreachable;
+    out[out.len] = 0;
     return out;
 }
 
@@ -2296,7 +2300,15 @@ pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {
 /// Copy `name` into `dest`, either the first `bytes` of it or all of it.
 /// False when there is no such file, which is not an error for a snapshot or
 /// an index — neither is part of the log.
-fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: []const u8, bytes: ?u64) OpenError!bool {
+fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) OpenError!bool {
+    // The filesystem's own copy first, where there is one. A sealed segment
+    // is bytes that will never change again, and sharing their extents makes
+    // a backup of a year of them the size of a directory entry.
+    if (bytes == null and clone.available) {
+        dest.deleteFile(io, name) catch {};
+        if (clone.whole(io, log.dir, dest, name)) return true;
+    }
+
     const from = log.dir.openFile(io, name, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => |e| return e,
@@ -2306,6 +2318,14 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: []const u8, bytes: ?u64) Open
 
     const to = try dest.createFile(io, name, .{ .truncate = true });
     defer to.close(io);
+
+    // A prefix of a file -- the newest segment, up to its last whole record
+    // -- can still go through the filesystem where the platform takes a
+    // length.
+    if (clone.range(to, from, length)) {
+        try durable.sync(io, to, .whole);
+        return true;
+    }
 
     const chunk = try log.gpa.alloc(u8, log.options.read_buffer_size);
     defer log.gpa.free(chunk);
