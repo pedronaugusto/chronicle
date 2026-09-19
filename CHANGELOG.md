@@ -105,7 +105,7 @@ New:
 - **The checksum goes through the instruction for it.** aarch64 and x86-64
   have both had one for this polynomial since 2011, behind the target's
   features, with the table where the machine has none. The same number:
-  128 ns per record before, 3.9 ns after, and 0.42 GB/s against 9.6 GB/s over
+  127 ns per record before, 3.0 ns after, and 0.43 GB/s against 9.6 GB/s over
   a large buffer. A replay of a million records measured 0.888 s before and
   0.248 s after, which is this and the parse together.
 - **`Options.preallocate_bytes`, zero by default.** The active segment is kept

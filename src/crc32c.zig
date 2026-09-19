@@ -32,27 +32,24 @@ pub const initial: u32 = 0xffff_ffff;
 
 /// Carry a running checksum over `bytes`.
 pub fn update(from: u32, bytes: []const u8) u32 {
-    if (!hardware) {
-        var table: std.hash.crc.Crc32Iscsi = .{ .crc = from };
-        table.update(bytes);
-        return table.crc;
-    }
+    if (!hardware) return table(from, bytes);
 
     var crc: u32 = from;
     var at: usize = 0;
     while (at + 8 <= bytes.len) : (at += 8) {
         crc = eight(crc, std.mem.readInt(u64, bytes[at..][0..8], .little));
     }
-    if (at + 4 <= bytes.len) {
-        crc = four(crc, std.mem.readInt(u32, bytes[at..][0..4], .little));
-        at += 4;
-    }
-    if (at + 2 <= bytes.len) {
-        crc = two(crc, std.mem.readInt(u16, bytes[at..][0..2], .little));
-        at += 2;
-    }
-    if (at < bytes.len) crc = one(crc, bytes[at]);
-    return crc;
+    // The last seven bytes go through the table. Both instruction sets have
+    // forms for a byte, two and four, and none of them is worth carrying a
+    // second code path for: a record is a hundred bytes, of which this is at
+    // most seven.
+    return table(crc, bytes[at..]);
+}
+
+fn table(from: u32, bytes: []const u8) u32 {
+    var state: std.hash.crc.Crc32Iscsi = .{ .crc = from };
+    state.update(bytes);
+    return state.crc;
 }
 
 inline fn eight(crc: u32, value: u64) u32 {
@@ -70,54 +67,6 @@ inline fn eight(crc: u32, value: u64) u32 {
             );
             return @truncate(wide);
         },
-        else => unreachable,
-    }
-}
-
-inline fn four(crc: u32, value: u32) u32 {
-    switch (builtin.cpu.arch) {
-        .aarch64, .aarch64_be => return asm ("crc32cw %[out:w], %[in:w], %[value:w]"
-            : [out] "=r" (-> u32),
-            : [in] "r" (crc),
-              [value] "r" (value),
-        ),
-        .x86_64 => return asm ("crc32l %[value], %[out]"
-            : [out] "=r" (-> u32),
-            : [in] "0" (crc),
-              [value] "r" (value),
-        ),
-        else => unreachable,
-    }
-}
-
-inline fn two(crc: u32, value: u16) u32 {
-    switch (builtin.cpu.arch) {
-        .aarch64, .aarch64_be => return asm ("crc32ch %[out:w], %[in:w], %[value:w]"
-            : [out] "=r" (-> u32),
-            : [in] "r" (crc),
-              [value] "r" (value),
-        ),
-        .x86_64 => return asm ("crc32w %[value], %[out]"
-            : [out] "=r" (-> u32),
-            : [in] "0" (crc),
-              [value] "r" (value),
-        ),
-        else => unreachable,
-    }
-}
-
-inline fn one(crc: u32, value: u8) u32 {
-    switch (builtin.cpu.arch) {
-        .aarch64, .aarch64_be => return asm ("crc32cb %[out:w], %[in:w], %[value:w]"
-            : [out] "=r" (-> u32),
-            : [in] "r" (crc),
-              [value] "r" (value),
-        ),
-        .x86_64 => return asm ("crc32b %[value], %[out]"
-            : [out] "=r" (-> u32),
-            : [in] "0" (crc),
-              [value] "r" (value),
-        ),
         else => unreachable,
     }
 }
