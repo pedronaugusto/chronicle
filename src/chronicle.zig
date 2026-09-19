@@ -81,6 +81,13 @@ pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len]u8 {
     return Log.segmentName(base_seq, segment_extension);
 }
 
+/// The version stamped into the two documents that live beside the log: the
+/// snapshot and a named reader's cursor. Neither is part of the log — one is
+/// a copy of a fold and the other is a number a reader keeps — but both are
+/// read back by this package, so both say which shape they are in and an
+/// unknown one is `error.UnsupportedFormat` rather than a guess.
+pub const document_format: u32 = 1;
+
 /// The CRC32C of the bytes a record's checksum covers: its line up to, but not
 /// including, the `,"c":` that carries the checksum.
 ///
@@ -280,6 +287,18 @@ pub fn Journal(comptime Event: type) type {
             /// makes `seqAtOrAfter` read the segment where a smaller one
             /// would have answered from the index alone.
             index_interval_bytes: u64 = 4096,
+            /// How long a record's line may be.
+            ///
+            /// `append` refuses a longer one, and a read refuses a segment
+            /// with no newline within that many bytes — which is what stops
+            /// a damaged segment being taken into memory whole to find out
+            /// that it holds no record.
+            max_record_bytes: usize = 1024 * 1024,
+            /// How large a snapshot file may be to be read back. It holds
+            /// whatever a fold serialises to, so this is the caller's number
+            /// and not the package's; a larger one is
+            /// `error.SnapshotTooLarge`.
+            max_snapshot_bytes: usize = 64 * 1024 * 1024,
             /// Size of the journal's write buffer. One `append` of a record
             /// larger than this costs an extra write syscall, nothing more.
             write_buffer_size: usize = 64 * 1024,
@@ -360,7 +379,7 @@ pub fn Journal(comptime Event: type) type {
         /// `OpenError`, plus `CorruptSnapshot` for a snapshot file that is not
         /// the object `snapshot` writes. A missing snapshot file is not an
         /// error; it yields `Opened.snapshot == null`.
-        pub const OpenWithSnapshotError = OpenError || error{CorruptSnapshot};
+        pub const OpenWithSnapshotError = OpenError || error{ CorruptSnapshot, SnapshotTooLarge };
 
         /// Errors from `append`.
         ///
@@ -374,9 +393,11 @@ pub fn Journal(comptime Event: type) type {
         /// * `SequenceExhausted` — the newest sequence number is
         ///   `maxInt(i64)`, and one more could not be read back, because a
         ///   sequence number is a JSON integer.
+        /// * `RecordTooLarge` — the line the record would be written as is
+        ///   longer than `Options.max_record_bytes`. Nothing was written.
         /// * `ReadOnly` — the journal was opened with `Access.read`.
         pub const AppendError = Allocator.Error || Log.AppendError ||
-            error{ PersistenceFailed, NotRoundTrippable, SequenceExhausted };
+            error{ PersistenceFailed, NotRoundTrippable, SequenceExhausted, RecordTooLarge };
 
         /// Errors from `replay`, and from the `Replay` it returns.
         pub const ReplayError = ReadError;
@@ -400,7 +421,7 @@ pub fn Journal(comptime Event: type) type {
         /// * `CorruptCursor` — the cursor file is not the object `commit`
         ///   writes. A missing one is not an error; it is a cursor of zero.
         pub const TailerError = Allocator.Error || Io.Cancelable ||
-            Log.WriteFileError || error{ InvalidName, CorruptCursor };
+            Log.WriteFileError || error{ InvalidName, CorruptCursor, UnsupportedFormat };
 
         /// Errors from `compact`. It re-reads the journal it has just written,
         /// so every `OpenError` is possible.
@@ -483,6 +504,7 @@ pub fn Journal(comptime Event: type) type {
                 .max_segment_records = options.max_segment_records,
                 .preallocate_bytes = options.preallocate_bytes,
                 .index_interval_bytes = options.index_interval_bytes,
+                .max_record_bytes = options.max_record_bytes,
             });
             errdefer log.deinit(io);
 
@@ -1097,7 +1119,7 @@ pub fn Journal(comptime Event: type) type {
 
                 const document = try std.json.Stringify.valueAlloc(
                     self.gpa,
-                    .{ .seq = seq },
+                    .{ .fmt = document_format, .seq = seq },
                     .{},
                 );
                 defer self.gpa.free(document);
@@ -1163,33 +1185,77 @@ pub fn Journal(comptime Event: type) type {
             return std.mem.concat(gpa, u8, &.{ name, cursor_extension });
         }
 
+        /// Read one of the two documents beside the log — the snapshot or a
+        /// cursor — into `arena`, bounded, and check the version it says it
+        /// is in. Null when there is no such file, which is not an error for
+        /// either of them.
+        ///
+        /// `Malformed` is what a file that is not the document becomes, so
+        /// that the two callers keep their own names for it.
+        fn readDocument(
+            self: *Self,
+            io: Io,
+            arena: Allocator,
+            Document: type,
+            name: []const u8,
+            limit: usize,
+            Malformed: anyerror,
+        ) (Allocator.Error || Io.Cancelable || anyerror)!?Document {
+            const bytes = self.log.dir.readFileAlloc(
+                io,
+                name,
+                arena,
+                .limited(limit),
+            ) catch |err| switch (err) {
+                error.FileNotFound => return null,
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                else => return Malformed,
+            };
+            const Versioned = struct { fmt: u32 };
+            const version = std.json.parseFromSliceLeaky(
+                Versioned,
+                arena,
+                bytes,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return Malformed,
+            };
+            if (version.fmt != document_format) return error.UnsupportedFormat;
+            return std.json.parseFromSliceLeaky(
+                Document,
+                arena,
+                bytes,
+                .{ .ignore_unknown_fields = true },
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return Malformed,
+            };
+        }
+
         fn readCursor(self: *Self, io: Io, name: []const u8) TailerError!u64 {
             const file = try cursorName(self.gpa, name);
             defer self.gpa.free(file);
 
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
-            const bytes = self.log.dir.readFileAlloc(
+            const Document = struct { seq: u64 };
+            // A cursor is a number with a name on it. Nothing this package
+            // writes there is longer than this, so nothing longer is read.
+            const document = self.readDocument(
                 io,
-                file,
                 arena.allocator(),
-                .unlimited,
+                Document,
+                file,
+                4096,
+                error.CorruptCursor,
             ) catch |err| switch (err) {
-                error.FileNotFound => return 0,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
+                error.UnsupportedFormat => return error.UnsupportedFormat,
                 else => return error.CorruptCursor,
-            };
-            const Document = struct { seq: u64 };
-            const document = std.json.parseFromSliceLeaky(
-                Document,
-                arena.allocator(),
-                bytes,
-                .{},
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.CorruptCursor,
-            };
+            } orelse return 0;
             return document.seq;
         }
 
@@ -1221,7 +1287,7 @@ pub fn Journal(comptime Event: type) type {
 
             const document = try std.json.Stringify.valueAlloc(
                 self.gpa,
-                .{ .seq = self.seq, .state = b64 },
+                .{ .fmt = document_format, .seq = self.seq, .state = b64 },
                 .{},
             );
             defer self.gpa.free(document);
@@ -1395,6 +1461,9 @@ pub fn Journal(comptime Event: type) type {
             // dropped here, and `,"c":<crc>}` closes it again.
             const covered = body[0 .. body.len - 1];
             const sum = checksum(covered);
+            // Checked before anything is written: a record longer than a
+            // read will accept is one the log must not be given.
+            if (covered.len + 32 > self.options.max_record_bytes) return error.RecordTooLarge;
 
             if (!self.needsRecord()) {
                 const stored = try std.fmt.allocPrint(
@@ -1659,27 +1728,21 @@ pub fn Journal(comptime Event: type) type {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
 
-            const bytes = self.log.dir.readFileAlloc(
+            const Document = struct { seq: u64, state: []const u8 };
+            const document = (self.readDocument(
                 io,
-                Log.snapshot_name,
                 arena.allocator(),
-                .unlimited,
+                Document,
+                Log.snapshot_name,
+                self.options.max_snapshot_bytes,
+                error.CorruptSnapshot,
             ) catch |err| switch (err) {
-                error.FileNotFound => return null,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
+                error.UnsupportedFormat => return error.UnsupportedFormat,
+                error.StreamTooLong => return error.SnapshotTooLarge,
                 else => return error.CorruptSnapshot,
-            };
-            const Document = struct { seq: u64, state: []const u8 };
-            const document = std.json.parseFromSliceLeaky(
-                Document,
-                arena.allocator(),
-                bytes,
-                .{},
-            ) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.CorruptSnapshot,
-            };
+            }) orelse return null;
             const decoder = std.base64.standard.Decoder;
             const size = decoder.calcSizeForSlice(document.state) catch return error.CorruptSnapshot;
             const state = try self.gpa.alloc(u8, size);

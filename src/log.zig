@@ -249,12 +249,13 @@ pub const Options = struct {
     max_segment_records: ?u64 = null,
     preallocate_bytes: u64 = 0,
     index_interval_bytes: u64 = 4096,
+    max_record_bytes: usize = 1024 * 1024,
 };
 
 pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
     Io.File.StatError || Io.File.ReadPositionalError || Io.File.Reader.Error ||
     Io.File.Reader.SeekError || Io.Writer.Error ||
-    error{ TruncatedRecord, CorruptRecord, UnsupportedFormat };
+    error{ TruncatedRecord, CorruptRecord, UnsupportedFormat, RecordTooLarge };
 
 pub const OpenError = ReadError || Io.File.SetLengthError || Io.File.SyncError ||
     Io.File.WritePositionalError || Io.Dir.OpenError || Io.Dir.CreateDirPathError ||
@@ -1206,13 +1207,24 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
     var reader = file.reader(io, buffer);
     var offset: u64 = 0;
     var timed = true;
+    const cap = log.options.max_record_bytes;
+    // How much of the line being read has been seen, and how much of it
+    // somebody wrote -- the bytes up to the last one that is not zero. Both
+    // are counted rather than measured off what was kept, because a line
+    // longer than a record may be is not kept.
+    var line_bytes: u64 = 0;
+    var line_written: u64 = 0;
     while (offset < segment.bytes) {
         const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
             error.EndOfStream => break,
             error.ReadFailed => return reader.err.?,
         };
         if (std.mem.indexOfScalar(u8, chunk, '\n')) |newline| {
-            line.writer.writeAll(chunk[0..newline]) catch return error.OutOfMemory;
+            const piece = chunk[0..newline];
+            if (writtenLength(piece) != 0) line_written = line_bytes + writtenLength(piece);
+            line_bytes += piece.len;
+            if (line_bytes > cap) return error.RecordTooLarge;
+            line.writer.writeAll(piece) catch return error.OutOfMemory;
             reader.interface.toss(newline + 1);
 
             if (offset == 0) {
@@ -1240,10 +1252,22 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
             }
 
             line.clearRetainingCapacity();
+            line_bytes = 0;
+            line_written = 0;
             offset += newline + 1;
             scanned.complete_bytes = offset;
         } else {
-            line.writer.writeAll(chunk) catch return error.OutOfMemory;
+            if (writtenLength(chunk) != 0) line_written = line_bytes + writtenLength(chunk);
+            // Only as far as a record may be. Past that the line is not one,
+            // and the bytes are counted rather than held: a segment ending in
+            // a writer's reserved space is mostly zeros, and reading them
+            // into memory to find that out would be the whole of the
+            // reservation.
+            if (line_bytes <= cap) {
+                const room = @min(chunk.len, cap - line_bytes);
+                line.writer.writeAll(chunk[0..room]) catch return error.OutOfMemory;
+            }
+            line_bytes += chunk.len;
             reader.interface.toss(chunk.len);
             offset += chunk.len;
         }
@@ -1252,7 +1276,7 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
     // hold no zero byte -- `std.json` escapes every control character -- so a
     // run of zeros at the end of a segment is space that was reserved and
     // never written into, and the writer simply carries on there.
-    scanned.partial_bytes = writtenLength(line.written());
+    scanned.partial_bytes = line_written;
     // One record with no readable timestamp and the pair says nothing, because
     // a range that does not cover every record cannot be used to skip one.
     if (!timed) scanned.times = .unknown;
@@ -1290,6 +1314,9 @@ pub const Scan = struct {
     position: u64,
     /// Whether the next line is the one that says what the file is.
     at_header: bool,
+    /// How long a line may be before it is not a record. A segment with no
+    /// newline left in it would otherwise be read into memory whole.
+    max_record_bytes: usize,
     /// Whether an unterminated final line in the newest segment is the end of
     /// the walk rather than damage — true for a reader beside a live writer.
     tolerate_partial_tail: bool,
@@ -1325,9 +1352,16 @@ pub const Scan = struct {
                 scan.at_header = scan.position == 0;
             }
             scan.line.clearRetainingCapacity();
-            const streamed = scan.reader.interface.streamDelimiterEnding(&scan.line.writer, '\n') catch |err| switch (err) {
+            const streamed = scan.reader.interface.streamDelimiterLimit(
+                &scan.line.writer,
+                '\n',
+                .limited(scan.max_record_bytes + 1),
+            ) catch |err| switch (err) {
                 error.ReadFailed => return scan.reader.err.?,
                 error.WriteFailed => return error.OutOfMemory,
+                // No newline within the length a record may be: whatever is
+                // there, it is not one of ours.
+                error.StreamTooLong => return error.RecordTooLarge,
             };
             // What follows what was streamed is the newline, or nothing at
             // all: `streamDelimiterEnding` leaves the delimiter buffered when
@@ -1404,6 +1438,7 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
         .line = .init(log.gpa),
         .position = position,
         .at_header = false,
+        .max_record_bytes = log.options.max_record_bytes,
         .tolerate_partial_tail = log.options.access == .read,
     };
 }

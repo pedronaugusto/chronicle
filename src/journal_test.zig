@@ -1376,7 +1376,7 @@ test "a tailer remembers where it got to, in a file of its own" {
         try reports.commit(io, seen);
     }
     try testing.expectEqual(@as(u64, 4), reports.cursor);
-    try testing.expectEqualStrings("{\"seq\":4}", try ws.read(try ws.sub("reports.cursor")));
+    try testing.expectEqualStrings("{\"fmt\":1,\"seq\":4}", try ws.read(try ws.sub("reports.cursor")));
     try testing.expect(!ws.exists(try ws.sub("reports.cursor.tmp")));
 
     // A tailer opened again under the same name is that reader again, and it
@@ -1446,7 +1446,7 @@ test "a reader's tailer writes its cursor and nothing else" {
     var follower = try reader.tailer(io, "follower");
     defer follower.deinit();
     try follower.commit(io, 6);
-    try testing.expectEqualStrings("{\"seq\":6}", try ws.read(try ws.sub("follower.cursor")));
+    try testing.expectEqualStrings("{\"fmt\":1,\"seq\":6}", try ws.read(try ws.sub("follower.cursor")));
 
     // Exactly one new name in the directory, and it is the cursor.
     var added: usize = 0;
@@ -2636,6 +2636,102 @@ test "the checksum is the same number however it is computed" {
     );
 }
 
+test "the two documents beside the log say which shape they are in" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+        try journal.snapshot(io, "hi");
+        var reader = try journal.tailer(io, "reports");
+        defer reader.deinit();
+        try reader.commit(io, 1);
+    }
+
+    // Byte for byte, both of them. The version is first so that a reader
+    // that does not know the rest can still say so.
+    try testing.expectEqualStrings(
+        \\{"fmt":1,"seq":1,"state":"aGk="}
+    , try ws.read(try ws.sub(chronicle.snapshot_name)));
+    try testing.expectEqualStrings(
+        \\{"fmt":1,"seq":1}
+    , try ws.read(try ws.sub("reports.cursor")));
+
+    // A version this package does not know is refused by name, not read as
+    // if it were this one.
+    try ws.write(try ws.sub(chronicle.snapshot_name),
+        \\{"fmt":2,"seq":1,"state":"aGk="}
+    );
+    try testing.expectError(
+        error.UnsupportedFormat,
+        Journal.openWithSnapshot(testing.allocator, io, ws.path, .{}),
+    );
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    try ws.write(try ws.sub("reports.cursor"),
+        \\{"fmt":2,"seq":1}
+    );
+    try testing.expectError(error.UnsupportedFormat, journal.tailer(io, "reports"));
+}
+
+test "a record longer than a record may be is refused, and so is a segment of one" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const cap = 512;
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{
+            .sync = .never,
+            .max_record_bytes = cap,
+        });
+        defer journal.deinit(io);
+
+        const name: [cap]u8 = @splat('n');
+        try testing.expectError(error.RecordTooLarge, journal.append(io, 1, created(1, &name)));
+        // Nothing reached the disk, so the log is still one a smaller record
+        // goes into.
+        try testing.expectEqual(@as(u64, 1), try journal.append(io, 1, created(1, "n")));
+    }
+
+    // And on the way back: a line longer than a record may be is not one,
+    // whoever wrote it.
+    {
+        var other = try Workspace.init("long");
+        defer other.deinit();
+        var long: Handwritten = try .init(1, 1);
+        defer long.deinit();
+        try long.raw(&([_]u8{'x'} ** (cap + 64)));
+        try long.raw("\n");
+        try other.write(try other.segment(1), long.written());
+        try testing.expectError(
+            error.RecordTooLarge,
+            Journal.open(testing.allocator, io, other.path, .{ .max_record_bytes = cap }),
+        );
+    }
+
+    // Without the newline it is the tail a crash left, and the repair does
+    // not take it into memory to find that out: it is counted and dropped.
+    var torn = try Workspace.init("torn");
+    defer torn.deinit();
+    var unfinished: Handwritten = try .init(1, 1);
+    defer unfinished.deinit();
+    try unfinished.record(1, 1, 1,
+        \\{"removed":{"id":1}}
+    );
+    try unfinished.raw(&([_]u8{'x'} ** (cap * 8)));
+    try torn.write(try torn.segment(1), unfinished.written());
+
+    var journal = try Journal.open(testing.allocator, io, torn.path, .{ .max_record_bytes = cap });
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(usize, cap * 8), journal.dropped_bytes);
+    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+}
+
 //========================================================================
 // Size.
 //========================================================================
@@ -3075,11 +3171,13 @@ test "a sequence of calls cut off part-way through leaves a log that opens" {
 const cursor_corpus = [_][]const u8{
     seeded(""),
     seeded("{}"),
-    seeded("{\"seq\":0}"),
+    seeded("{\"fmt\":1,\"seq\":0}"),
+    seeded("{\"fmt\":1,\"seq\":4}"),
+    seeded("{\"fmt\":1,\"seq\":-1}"),
+    seeded("{\"fmt\":1,\"seq\":18446744073709551615}"),
+    seeded("{\"fmt\":1,\"seq\":\"four\"}"),
+    seeded("{\"fmt\":2,\"seq\":4}"),
     seeded("{\"seq\":4}"),
-    seeded("{\"seq\":-1}"),
-    seeded("{\"seq\":18446744073709551615}"),
-    seeded("{\"seq\":\"four\"}"),
     seeded("not json"),
     seeded("[4]"),
 };
@@ -3107,9 +3205,9 @@ fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
 
     // Whatever the file says, the answer is a cursor or a named error --
     // never a walk that reads past the end of the log or before its start.
-    var reader = journal.tailer(io, "reports") catch |err| {
-        try testing.expectEqual(error.CorruptCursor, err);
-        return;
+    var reader = journal.tailer(io, "reports") catch |err| switch (err) {
+        error.CorruptCursor, error.UnsupportedFormat => return,
+        else => return err,
     };
     defer reader.deinit();
 
