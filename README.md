@@ -136,8 +136,8 @@ and `chronicle.segmentName(base_seq)`, which is the file a sequence number
 lives in; `chronicle.flush`, which names the call a durable write makes here;
 and the types `Record`, `Entry`, `Window`, `Replay`, `Tailer`, `Sink`,
 `Reader`, `Readers`, `Options`, `Snapshot`, `Opened`, `Migrate`, `Stats`,
-`Sync`, `Flush`, `Verify`, and one named error set per operation. Every public declaration carries a doc comment
-stating its contract; `src/chronicle.zig` is the reference and `src/log.zig`
+`Sync`, `Flush`, `Verify`, and one named error set per operation. Every
+public declaration carries a doc comment stating its contract; `src/chronicle.zig` is the reference and `src/log.zig`
 the segment store under it. `Event` may be any type `std.json` can write and
 read back; a tagged union is the expected shape, because it gives each record a
 name on disk and an exhaustive `switch` in the fold.
