@@ -1478,7 +1478,10 @@ pub fn scanFrom(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!Scan 
     if (log.segments.items[first].last_seq <= cursor and first + 1 < log.segments.items.len) {
         first += 1;
     }
-    const position = log.indexedOffset(io, first, wanted, may_write) orelse 0;
+    // Land on the cursor (or an earlier sparse entry), not directly on the
+    // first record to return. Stepping over the cursor seeds that record's
+    // predecessor checksum before its successor is accepted.
+    const position = log.indexedOffset(io, first, cursor, may_write) orelse 0;
     return log.scanOver(log.segments.items[first..], position);
 }
 

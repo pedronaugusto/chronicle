@@ -280,6 +280,35 @@ const Handwritten = struct {
     }
 };
 
+/// A dense v3 index for a handwritten segment whose timestamps equal its
+/// sequence numbers.
+fn denseIndex(segment: []const u8, base_seq: u64, records: u64) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(testing.allocator);
+    try out.appendNTimes(testing.allocator, 0, 96);
+    @memcpy(out.items[0..8], "chridx\x03\n");
+    std.mem.writeInt(u64, out.items[8..16], segment.len, .little);
+    std.mem.writeInt(i64, out.items[16..24], @intCast(base_seq), .little);
+    std.mem.writeInt(i64, out.items[24..32], @intCast(base_seq + records - 1), .little);
+    std.mem.writeInt(u64, out.items[32..40], base_seq, .little);
+    std.mem.writeInt(u64, out.items[40..48], records, .little);
+    std.mem.writeInt(u32, out.items[48..52], 0, .little);
+    std.mem.writeInt(u32, out.items[52..56], 1, .little);
+
+    var offset = std.mem.indexOfScalar(u8, segment, '\n').? + 1;
+    for (0..records) |ordinal| {
+        const start = out.items.len;
+        try out.appendNTimes(testing.allocator, 0, 24);
+        const seq = base_seq + ordinal;
+        std.mem.writeInt(u64, out.items[start..][0..8], seq, .little);
+        std.mem.writeInt(u64, out.items[start + 8 ..][0..8], offset, .little);
+        std.mem.writeInt(i64, out.items[start + 16 ..][0..8], @intCast(seq), .little);
+        offset = std.mem.indexOfScalarPos(u8, segment, offset, '\n').? + 1;
+    }
+    std.mem.writeInt(u32, out.items[92..96], chronicle.checksum(out.items[96..]), .little);
+    return out.toOwnedSlice(testing.allocator);
+}
+
 //========================================================================
 // The shape of the thing on the disk.
 //========================================================================
@@ -1654,6 +1683,47 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     // the first record.
     try testing.expectEqual(@as(u64, 1), std.mem.readInt(u64, rebuilt[96..104], .little));
     try testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, rebuilt[112..120], .little));
+}
+
+test "an indexed replay checks the record before its cursor" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var original: Handwritten = try .init(1, 91);
+    defer original.deinit();
+    var foreign: Handwritten = try .init(1, 91);
+    defer foreign.deinit();
+    for (1..6) |seq| {
+        try original.record(seq, @intCast(seq), 1,
+            \\{"removed":{"id":1}}
+        );
+        try foreign.record(seq, @intCast(seq), 1,
+            \\{"removed":{"id":2}}
+        );
+    }
+
+    const original_third = std.mem.indexOf(u8, original.written(), "{\"seq\":3").?;
+    const foreign_third = std.mem.indexOf(u8, foreign.written(), "{\"seq\":3").?;
+    const spliced = try std.mem.concat(testing.allocator, u8, &.{
+        original.written()[0..original_third],
+        foreign.written()[foreign_third..],
+    });
+    defer testing.allocator.free(spliced);
+    try ws.write(try ws.segment(1), spliced);
+    const index = try denseIndex(spliced, 1, 5);
+    defer testing.allocator.free(index);
+    try ws.write(try ws.index(1), index);
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .tail_records = 1,
+        .index_interval_bytes = 0,
+    });
+    defer journal.deinit(io);
+    var walk = try journal.replay(io, 2);
+    defer walk.deinit(io);
+    try testing.expectError(error.BrokenChain, walk.next(io));
 }
 
 test "a clean close leaves an index the next open takes rather than rebuilds" {
