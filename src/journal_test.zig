@@ -726,6 +726,12 @@ test "a write that does not reach the disk publishes nothing and latches" {
     try testing.expectEqual(@as(usize, 1), journal.records().records.len);
     try testing.expectError(error.PersistenceFailed, journal.append(io, 3, created(3, "also refused")));
     try testing.expectError(error.PersistenceFailed, journal.compact(io, 0));
+
+    // Reconciliation reopens the authoritative bytes, clears the latch and
+    // tells the caller whether the attempted sequence actually survived.
+    try testing.expectEqual(@as(u64, 1), try journal.reconcile(io));
+    try testing.expect(!journal.persistence_failed);
+    try testing.expectEqual(@as(u64, 2), try journal.append(io, 2, created(2, "retried")));
 }
 
 //========================================================================

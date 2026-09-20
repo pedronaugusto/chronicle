@@ -106,6 +106,7 @@ One module, no dependencies and no build options: the only knobs are the
 | `deinit(io)` | Best-effort close for a scope that cannot return an error. |
 | `append(io, at, event)` | Write one record durably; returns its sequence number. |
 | `appendAll(io, entries)` | Write a batch under one `fsync`; returns the last sequence number. |
+| `reconcile(io)` | After a persistence error, read back what survived and clear the latch. |
 | `records()` | The tail, oldest first, as a `Window`. |
 | `since(cursor)` | The tail after `cursor`, as a `Window`. |
 | `waitPast(io, cursor)` | Block until there is one, then `since(cursor)`. |
@@ -213,11 +214,12 @@ per record.
    atomic — promises 3 and 4 — are not optional under any of the three, because
    they are what those promises are.
 
-2. **A failure to reach the disk is permanent and loud.** A failed write, flush
-   or `fsync` returns its error, adds no record and calls no sink, and every
-   later `append` returns `error.PersistenceFailed`: once one record is
-   missing, every later one is a lie about the order. Reopening resumes and
-   repairs the partial line.
+2. **A failure to reach the disk is loud and must be reconciled.** A failed
+   write, flush or `fsync` returns its error, calls no sink and makes every
+   later `append` return `error.PersistenceFailed`. A complete record may have
+   reached the file before a flush reported failure; `reconcile` reads the
+   authoritative bytes back, repairs a partial line, reports the newest
+   sequence that survived and clears the latch. Reopening does the same work.
 3. **`snapshot`, `compact` and a tailer's cursor replace a file, never edit
    one.** Each writes a complete neighbouring file, flushes and `fsync`s it,
    then renames it into place, so a crash leaves either the whole old file or

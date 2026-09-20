@@ -122,9 +122,8 @@ pub fn Journal(comptime Event: type) type {
         /// zero when `Options.on_truncated` is `.fail`, which fails instead.
         dropped_bytes: usize,
         /// Whether an `append` has failed to reach the disk. Once true it stays
-        /// true, and every `append` and `compact` is refused; see
-        /// `AppendError.PersistenceFailed`. Reopening the journal is the way
-        /// back.
+        /// true until `reconcile`, and every `append` and `compact` is refused;
+        /// see `AppendError.PersistenceFailed`.
         persistence_failed: bool,
         /// The options `open` was given, unchanged.
         options: Options,
@@ -390,10 +389,8 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `append`.
         ///
         /// * `PersistenceFailed` — an earlier `append` could not reach the
-        ///   disk. It is latched for the life of the journal, because a reader
-        ///   must never see a record the disk does not have: once one record is
-        ///   missing, every later one would be a lie about the order. Reopen
-        ///   the journal to resume.
+        ///   disk. Later appends are latched until `reconcile` establishes
+        ///   whether the attempted record survived and restores the sequence.
         /// * `NotRoundTrippable` — the event was written to JSON but did not
         ///   parse back as `Event`. Nothing was written to the file.
         /// * `SequenceExhausted` — the newest sequence number is
@@ -404,6 +401,9 @@ pub fn Journal(comptime Event: type) type {
         /// * `ReadOnly` — the journal was opened with `Access.read`.
         pub const AppendError = Allocator.Error || Log.AppendError ||
             error{ PersistenceFailed, NotRoundTrippable, SequenceExhausted, RecordTooLarge };
+
+        /// Errors from reconciling the journal after a persistence failure.
+        pub const ReconcileError = OpenError;
 
         /// Errors from `replay`, and from the `Replay` it returns.
         pub const ReplayError = ReadError;
@@ -606,10 +606,11 @@ pub fn Journal(comptime Event: type) type {
         /// keeps neither does not build that record at all; see
         /// `Options.verify_round_trip`.
         ///
-        /// Nothing is published unless the bytes reached the disk. If the
-        /// write, the flush or the `fsync` fails, the error comes back, no
-        /// record is added, no sink is called, and every later `append` returns
-        /// `error.PersistenceFailed`.
+        /// Nothing is published to memory unless the durability operation
+        /// succeeds. If a write, flush or `fsync` fails, no sink is called and
+        /// later appends return `error.PersistenceFailed`. A complete record
+        /// may nevertheless have reached the file before the failure was
+        /// reported; `reconcile` reads the authoritative result back.
         ///
         /// Safe to call from any task or thread.
         pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
@@ -666,7 +667,7 @@ pub fn Journal(comptime Event: type) type {
         /// is added to the tail and no sink is called until the `fsync`
         /// returns. A failure part-way through latches the journal exactly as
         /// `append`'s does, and the disk may then hold some of the batch;
-        /// reopening reads back what survived.
+        /// `reconcile` or reopening reads back what survived.
         ///
         /// Each record is serialised as it is written rather than the batch
         /// being formed first, so memory holds the batch only as far as the
@@ -734,6 +735,29 @@ pub fn Journal(comptime Event: type) type {
             self.seq = before + entries.len;
             self.changed.broadcast(io);
             self.trimTail();
+            return self.seq;
+        }
+
+        /// Re-read the journal after an append persistence failure and report
+        /// the newest sequence number that actually survived.
+        ///
+        /// A failed flush or `fsync` cannot say whether the operating system
+        /// accepted the complete line before reporting the error. Until this
+        /// call succeeds, appends stay latched with `error.PersistenceFailed`.
+        /// On success the tail is rebuilt, the latch is cleared, and the
+        /// caller can compare the returned sequence with the attempted one
+        /// before deciding whether to retry it.
+        pub fn reconcile(self: *Self, io: Io) ReconcileError!u64 {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            if (self.options.access == .read) return error.ReadOnly;
+            if (!self.persistence_failed) return self.seq;
+
+            try self.log.reload(io);
+            self.clearTail();
+            try self.fillTail(io);
+            self.dropped_bytes = self.log.dropped_bytes;
+            self.persistence_failed = false;
             return self.seq;
         }
 
