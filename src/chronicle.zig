@@ -288,7 +288,8 @@ pub fn Journal(comptime Event: type) type {
             ///
             /// It is also what a lookup by time reads, so a larger interval
             /// makes `seqAtOrAfter` read the segment where a smaller one
-            /// would have answered from the index alone.
+            /// would have answered from the index alone. Values above
+            /// `maxInt(u32)` are refused with `error.IndexIntervalTooLarge`.
             index_interval_bytes: u64 = 4096,
             /// How long a record's line may be.
             ///
@@ -377,6 +378,8 @@ pub fn Journal(comptime Event: type) type {
         ///   interleaving half-records.
         /// * `ReadOnly` — `Options.access` is `.read` and something would have
         ///   had to be written.
+        /// * `IndexIntervalTooLarge` — `Options.index_interval_bytes` cannot
+        ///   be represented by the index format's 32-bit interval field.
         pub const OpenError = ReadError || Log.OpenError;
 
         /// `OpenError`, plus `CorruptSnapshot` for a snapshot file that is not

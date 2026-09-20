@@ -1736,6 +1736,20 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     try testing.expectEqual(@as(i64, 1), std.mem.readInt(i64, rebuilt[112..120], .little));
 }
 
+test "an index interval too wide for its on-disk field is refused" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    try testing.expectError(
+        error.IndexIntervalTooLarge,
+        Journal.open(testing.allocator, io, ws.path, .{
+            .index_interval_bytes = @as(u64, std.math.maxInt(u32)) + 1,
+        }),
+    );
+    try testing.expect(!ws.exists(ws.name));
+}
+
 test "an indexed replay checks the record before its cursor" {
     const io = testing.io;
     var ws = try Workspace.init("log");

@@ -261,7 +261,7 @@ pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
 
 pub const OpenError = ReadError || Io.File.SetLengthError || Io.File.SyncError ||
     Io.File.WritePositionalError || Io.Dir.OpenError || Io.Dir.CreateDirPathError ||
-    Io.Dir.DeleteFileError || error{ Locked, DiscontinuousSeq, ReadOnly };
+    Io.Dir.DeleteFileError || error{ Locked, DiscontinuousSeq, IndexIntervalTooLarge, ReadOnly };
 
 pub const AppendError = Io.Cancelable || Io.Writer.Error || Io.File.OpenError ||
     Io.File.SyncError || Io.File.WritePositionalError || Io.File.SetLengthError ||
@@ -375,6 +375,7 @@ fn parseNumberedName(name: []const u8, extension: []const u8) ?u64 {
 /// sealed segment. The cost is one segment plus one read per segment, never
 /// the size of the log.
 pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!Log {
+    if (options.index_interval_bytes > std.math.maxInt(u32)) return error.IndexIntervalTooLarge;
     const owned_path = try gpa.dupe(u8, path);
     errdefer gpa.free(owned_path);
     const write_buf = try gpa.alloc(u8, options.write_buffer_size);
