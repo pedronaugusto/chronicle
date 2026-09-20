@@ -2070,6 +2070,26 @@ test "a snapshot plus the records after it folds to the whole log" {
     try testing.expectEqual(@as(u64, 15), try reopened.lastSeq(io));
 }
 
+test "a snapshot newer than a truncated log is not restored" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        defer journal.deinit(io);
+        for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        try journal.snapshot(io, "state through ten");
+        try journal.truncateAfter(io, 5);
+    }
+
+    const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, small(3, 1024));
+    var reopened = opened.journal;
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 5), try reopened.lastSeq(io));
+    try testing.expect(opened.snapshot == null);
+}
+
 test "compact empties the log and the sequence still continues" {
     const io = testing.io;
     var ws = try Workspace.init("log");

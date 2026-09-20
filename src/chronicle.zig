@@ -1989,6 +1989,10 @@ pub fn Journal(comptime Event: type) type {
                 error.StreamTooLong => return error.SnapshotTooLarge,
                 else => return error.CorruptSnapshot,
             }) orelse return null;
+            // A truncation can move the log behind a snapshot that was
+            // already published. The log is authoritative; restoring state
+            // from beyond its newest record would resurrect the cut history.
+            if (document.seq > self.seq) return null;
             const decoder = std.base64.standard.Decoder;
             const size = decoder.calcSizeForSlice(document.state) catch return error.CorruptSnapshot;
             const state = try self.gpa.alloc(u8, size);
