@@ -1016,7 +1016,12 @@ test "close reports a failure while finalizing the active segment" {
     active.file = try journal.log.dir.openFile(io, &chronicle.segmentName(1), .{});
     active.writer = active.file.writer(io, journal.log.write_buf);
     active.writer.pos = position;
-    try testing.expectError(error.NonResizable, journal.close(io));
+    // Which error names the refusal is the platform's: POSIX says the file
+    // cannot be resized, Windows that the handle may not do it.
+    if (journal.close(io)) |_| return error.TestExpectedError else |err| switch (err) {
+        error.NonResizable, error.AccessDenied => {},
+        else => return err,
+    }
 
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer reopened.deinit(io);
