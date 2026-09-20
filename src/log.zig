@@ -1302,6 +1302,8 @@ fn writtenLength(bytes: []const u8) u64 {
 /// `dropSegmentsBefore` running beside it may leave it reading a file that has
 /// been replaced; it answers with an error rather than with wrong records.
 pub const Scan = struct {
+    pub const Boundary = struct { base_seq: u64, root: u32 };
+
     gpa: Allocator,
     dir: Io.Dir,
     /// The base sequence numbers of the segments still to walk, oldest first.
@@ -1319,6 +1321,8 @@ pub const Scan = struct {
     position: u64,
     /// Whether the next line is the one that says what the file is.
     at_header: bool,
+    /// The header crossed immediately before the next returned record.
+    boundary: ?Boundary,
     /// How long a line may be before it is not a record. A segment with no
     /// newline left in it would otherwise be read into memory whole.
     max_record_bytes: usize,
@@ -1333,6 +1337,12 @@ pub const Scan = struct {
         scan.gpa.free(scan.bases);
         scan.gpa.free(scan.limits);
         scan.* = undefined;
+    }
+
+    pub fn takeBoundary(scan: *Scan) ?Boundary {
+        const boundary = scan.boundary;
+        scan.boundary = null;
+        return boundary;
     }
 
     /// The next line, or null at the end of the log. The bytes are valid until
@@ -1396,6 +1406,7 @@ pub const Scan = struct {
                     if (header.version != log_format or header.base_seq != scan.bases[scan.at]) {
                         return error.UnsupportedFormat;
                     }
+                    scan.boundary = .{ .base_seq = header.base_seq, .root = header.root };
                     continue;
                 }
                 return scan.line.written();
@@ -1443,6 +1454,7 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
         .line = .init(log.gpa),
         .position = position,
         .at_header = false,
+        .boundary = null,
         .max_record_bytes = log.options.max_record_bytes,
         .tolerate_partial_tail = log.options.access == .read,
     };

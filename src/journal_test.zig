@@ -2783,6 +2783,34 @@ test "a record that does not link to the one before it is named" {
     );
 }
 
+test "the first record must match its segment base and root" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var first: Handwritten = try .init(1, 77);
+    defer first.deinit();
+    try first.record(2, 2, 1,
+        \\{"removed":{"id":2}}
+    );
+    try first.record(3, 3, 1,
+        \\{"removed":{"id":3}}
+    );
+    try ws.write(try ws.segment(1), first.written());
+
+    var second: Handwritten = try .init(4, first.link);
+    defer second.deinit();
+    try second.record(4, 4, 1,
+        \\{"removed":{"id":4}}
+    );
+    try ws.write(try ws.segment(4), second.written());
+
+    try testing.expectError(
+        error.DiscontinuousSeq,
+        Journal.open(testing.allocator, io, ws.path, .{ .verify = .full }),
+    );
+}
+
 test "the checksum is the same number however it is computed" {
     // The instruction and the table have to agree byte for byte, at every
     // length a record can be and at every alignment a buffer can start on --

@@ -823,13 +823,20 @@ pub fn Journal(comptime Event: type) type {
             expected: ?u64 = null,
             link: ?u32 = null,
 
+            fn beginSegment(walk: *Continuity, boundary: Log.Scan.Boundary) ReadError!void {
+                if (walk.expected) |want| {
+                    if (boundary.base_seq != want) return error.DiscontinuousSeq;
+                }
+                if (walk.link) |previous| {
+                    if (boundary.root != previous) return error.BrokenChain;
+                }
+                walk.expected = boundary.base_seq;
+                walk.link = boundary.root;
+            }
+
             /// Whether this record is one to hand on. False means it is at or
             /// behind the cursor and has been stepped over.
             fn accept(walk: *Continuity, header: Header) ReadError!bool {
-                if (header.seq <= walk.cursor) {
-                    walk.link = header.c;
-                    return false;
-                }
                 if (walk.expected) |want| {
                     if (header.seq != want) return error.DiscontinuousSeq;
                 }
@@ -838,7 +845,7 @@ pub fn Journal(comptime Event: type) type {
                 }
                 walk.expected = header.seq + 1;
                 walk.link = header.c;
-                return true;
+                return header.seq > walk.cursor;
             }
         };
 
@@ -863,6 +870,7 @@ pub fn Journal(comptime Event: type) type {
             /// until the next call to `next` or to `deinit`.
             pub fn next(walk: *Replay, io: Io) ReplayError!?Record {
                 while (try walk.scan.next(io)) |line| {
+                    if (walk.scan.takeBoundary()) |boundary| try walk.run.beginSegment(boundary);
                     _ = walk.scratch.reset(.retain_capacity);
                     const header = try parseHeader(walk.scratch.allocator(), line);
                     // Stepping over a record before its event is parsed is
@@ -1681,6 +1689,7 @@ pub fn Journal(comptime Event: type) type {
 
             var run: Continuity = .{ .cursor = from };
             while (try scan.next(io)) |line| {
+                if (scan.takeBoundary()) |boundary| try run.beginSegment(boundary);
                 _ = self.scratch.reset(.retain_capacity);
                 const header = try parseHeader(self.scratch.allocator(), line);
                 if (!try run.accept(header)) continue;
