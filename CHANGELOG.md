@@ -6,6 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+- Under `sync = .never`, sealing a segment's index and starting a new segment no longer flush to the drive: the index is held to the log's own level, and an index a power cut left ahead of its segment is checked against the segment and rebuilt on the next open, as before.
 - `append` writes a record's envelope by hand into the one buffer that becomes the stored bytes, sized from the record before it, so a record costs one allocation instead of three and no copy; the bytes are unchanged.
 - Clean reopening a million-record journal is 5.6 times faster, measured from 5.768 ms to 1.035 ms, by proving clean indexes without scanning the newest segment.
 - Backup stops when it cannot prove the destination differs from the source.

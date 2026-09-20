@@ -1102,7 +1102,7 @@ fn rebuildIndex(log: *Log, io: Io, segment: Segment) OpenError!void {
         .times = scanned.times,
         .interval = @intCast(builder.interval),
         .entries_checksum = ~builder.checksum,
-    });
+    }, log.options.sync);
     log.releaseIndex(io);
 }
 
@@ -1123,9 +1123,12 @@ fn placeholderHeader(base_seq: u64, interval: u64) [index_header_len]u8 {
 /// Stamp a finished index with everything that proves it and make it durable,
 /// which is what turns it from a cache being filled into one a later process
 /// may take.
-fn sealIndex(io: Io, file: Io.File, header: IndexHeader) SealError!void {
+fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync) SealError!void {
     try file.writePositionalAll(io, &header.bytes(), 0);
-    try durable.sync(io, file, .whole);
+    // Under `.never` the log itself is not asked to reach the drive, and a
+    // seal that outlives its segment is one the next open checks against the
+    // segment and rebuilds; so the index is held to the log's own level.
+    if (sync != .never) try durable.sync(io, file, .whole);
 }
 
 /// The active segment's index, reopened for appending, when the one on the
@@ -1927,7 +1930,7 @@ fn rotate(log: *Log, io: Io) AppendError!void {
             .times = segment.times,
             .interval = @intCast(active.builder.interval),
             .entries_checksum = ~active.builder.checksum,
-        });
+        }, log.options.sync);
     }
     log.closeActive(io);
 
@@ -1963,8 +1966,10 @@ fn startSegment(log: *Log, io: Io, base_seq: u64, root: u32) AppendError!Started
     try writer.interface.writeAll(header.line(&buffer));
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
-    if (log.options.sync != .never) try durable.sync(io, file, .whole);
-    try log.syncDir(io);
+    if (log.options.sync != .never) {
+        try durable.sync(io, file, .whole);
+        try log.syncDir(io);
+    }
     const header_bytes = writer.pos;
 
     // Readable as well as writable: `indexedOffset` reads the live index back
@@ -2686,7 +2691,7 @@ pub fn close(log: *Log, io: Io) CloseError!void {
             .times = segment.times,
             .interval = @intCast(active.builder.interval),
             .entries_checksum = ~active.builder.checksum,
-        }) catch {};
+        }, log.options.sync) catch {};
     }
 }
 
@@ -2706,7 +2711,7 @@ pub fn deinit(log: *Log, io: Io) void {
             .times = segment.times,
             .interval = @intCast(active.builder.interval),
             .entries_checksum = ~active.builder.checksum,
-        }) catch {};
+        }, log.options.sync) catch {};
     }
     log.release(io);
 }
