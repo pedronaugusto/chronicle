@@ -1455,6 +1455,7 @@ pub fn Journal(comptime Event: type) type {
             );
             defer self.gpa.free(document);
 
+            try self.log.syncBeforeSnapshot(io);
             try self.log.writeSnapshot(io, document);
         }
 

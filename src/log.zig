@@ -276,7 +276,7 @@ pub const TruncateError = CompactError || error{SeqTooOld};
 pub const WriteFileError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
     Io.Writer.Error || Io.File.SyncError || Io.Dir.RenameError || Io.Dir.DeleteFileError;
 
-pub const SnapshotError = WriteFileError || error{ReadOnly};
+pub const SnapshotError = WriteFileError || Io.Writer.Error || Io.File.SyncError || error{ReadOnly};
 
 pub const SealError = Io.File.WritePositionalError || Io.File.SyncError;
 
@@ -2232,6 +2232,15 @@ pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) Write
 pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {
     if (log.options.access == .read) return error.ReadOnly;
     return log.writeAtomic(io, snapshot_name, bytes);
+}
+
+/// Make every record a snapshot may describe durable before that snapshot is
+/// published, independent of the append sync policy.
+pub fn syncBeforeSnapshot(log: *Log, io: Io) SnapshotError!void {
+    if (log.active == null) return error.ReadOnly;
+    const active = &log.active.?;
+    try active.writer.interface.flush();
+    try durable.sync(io, active.file, .whole);
 }
 
 //========================================================================
