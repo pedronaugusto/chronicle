@@ -2293,6 +2293,9 @@ test "dropSegmentsBefore unlinks whole segments and never the newest one" {
         try testing.expectEqual(@as(u64, 5), journal.oldestSeq());
         try testing.expect(!ws.exists(try ws.segment(1)));
         try testing.expect(!ws.exists(try ws.index(1)));
+        const retained = journal.records();
+        try testing.expect(!retained.complete);
+        try testing.expectEqual(@as(u64, 5), retained.records[0].seq);
 
         // Asked to drop everything, it keeps the segment being written to.
         try testing.expectEqual(@as(u64, 1), try journal.dropSegmentsBefore(io, 1_000));

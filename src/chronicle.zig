@@ -1450,7 +1450,9 @@ pub fn Journal(comptime Event: type) type {
         pub fn dropSegmentsBefore(self: *Self, io: Io, seq: u64) DropError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
-            return self.log.dropSegmentsBefore(io, seq);
+            const dropped = try self.log.dropSegmentsBefore(io, seq);
+            if (dropped != 0) self.dropTailBefore(self.log.baseSeq() + 1);
+            return dropped;
         }
 
         /// Drop every record after `seq`, so that `lastSeq` becomes `seq` and
@@ -1739,6 +1741,26 @@ pub fn Journal(comptime Event: type) type {
             self.tail.clearRetainingCapacity();
             self.tail_arenas.clearRetainingCapacity();
             self.tail_bytes = 0;
+        }
+
+        /// Evict records whose segment retention just removed from the log.
+        fn dropTailBefore(self: *Self, first_seq: u64) void {
+            var drop: usize = 0;
+            while (drop < self.tail.items.len and self.tail.items[drop].seq < first_seq) : (drop += 1) {
+                self.tail_bytes -= self.tail.items[drop].bytes.len;
+                self.tail_arenas.items[drop].deinit();
+            }
+            if (drop == 0) return;
+
+            const kept = self.tail.items.len - drop;
+            std.mem.copyForwards(Record, self.tail.items[0..kept], self.tail.items[drop..]);
+            std.mem.copyForwards(
+                std.heap.ArenaAllocator,
+                self.tail_arenas.items[0..kept],
+                self.tail_arenas.items[drop..],
+            );
+            self.tail.shrinkRetainingCapacity(kept);
+            self.tail_arenas.shrinkRetainingCapacity(kept);
         }
 
         /// Everything in a line except the event: what a reader needs to decide
