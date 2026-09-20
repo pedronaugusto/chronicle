@@ -1380,9 +1380,19 @@ pub const Scan = struct {
             ) catch |err| switch (err) {
                 error.ReadFailed => return scan.reader.err.?,
                 error.WriteFailed => return error.OutOfMemory,
-                // No newline within the length a record may be: whatever is
-                // there, it is not one of ours.
-                error.StreamTooLong => return error.RecordTooLarge,
+                error.StreamTooLong => {
+                    const newest = scan.at + 1 == scan.bases.len;
+                    // A live writer may have reserved far more than one
+                    // record of zero-filled space. JSON emitted here contains
+                    // no zero byte, so the first zero marks unwritten tail,
+                    // not an oversized record.
+                    if (newest and scan.tolerate_partial_tail and
+                        std.mem.indexOfScalar(u8, scan.line.written(), 0) != null)
+                    {
+                        return null;
+                    }
+                    return error.RecordTooLarge;
+                },
             };
             // What follows what was streamed is the newline, or nothing at
             // all: `streamDelimiterEnding` leaves the delimiter buffered when

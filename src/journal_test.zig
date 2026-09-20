@@ -838,6 +838,30 @@ test "space a writer reserved and never filled is not a record it did not finish
     try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
 }
 
+test "a reader stops at a live writer's oversized zero reservation" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var writer = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .preallocate_bytes = 4096,
+        .max_record_bytes = 512,
+    });
+    defer writer.deinit(io);
+    _ = try writer.append(io, 1, created(1, "one"));
+
+    var reader = try Journal.open(testing.allocator, io, ws.path, .{
+        .access = .read,
+        .max_record_bytes = 512,
+    });
+    defer reader.deinit(io);
+    var replay = try reader.replay(io, 0);
+    defer replay.deinit(io);
+    try testing.expectEqual(@as(u64, 1), (try replay.next(io)).?.seq);
+    try testing.expect((try replay.next(io)) == null);
+}
+
 test "a half-written record before the reserved zeros is dropped, and only it" {
     const io = testing.io;
     var ws = try Workspace.init("log");
