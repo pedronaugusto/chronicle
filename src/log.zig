@@ -2005,12 +2005,7 @@ pub fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
 fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
     if (!can_sync_dir) return;
     const as_file: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
-    durable.sync(io, as_file, .whole) catch |err| switch (err) {
-        // A filesystem that will not sync a directory handle is one where this
-        // promise cannot be kept. It is not a reason to fail the write.
-        error.AccessDenied, error.InputOutput => return,
-        else => |e| return e,
-    };
+    try durable.sync(io, as_file, .whole);
 }
 
 fn deleteSegmentFiles(log: *Log, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {
