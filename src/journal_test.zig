@@ -48,6 +48,33 @@ const Registry = struct {
     }
 };
 
+/// `testing.allocator` for a fixture of tens of thousands of records: it
+/// finds leaks the same way, but captures no stack trace per allocation,
+/// which is where a Debug build of that many appends spends most of a
+/// minute. Deinit through `expectNoLeak`, after the journal that used it.
+const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+
+fn expectNoLeak(gpa: *FixtureAllocator) void {
+    if (gpa.deinit() == .leak) @panic("the fixture allocator found a leak");
+}
+
+/// Append the records `first` through `last`, each stamped with its own
+/// number, in batches: a fixture of tens of thousands of records written one
+/// flush per batch rather than one per record, and otherwise byte for byte
+/// what `append` would have written.
+fn fill(journal: *Journal, io: Io, first: u64, last: u64, name: []const u8) !void {
+    var batch: [500]Journal.Entry = undefined;
+    var next = first;
+    while (next <= last) {
+        var n: usize = 0;
+        while (n < batch.len and next <= last) : (next += 1) {
+            batch[n] = .{ .at = @intCast(next), .event = created(@intCast(next), name) };
+            n += 1;
+        }
+        _ = try journal.appendAll(io, batch[0..n]);
+    }
+}
+
 fn created(id: u32, name: []const u8) Event {
     return .{ .created = .{ .id = id, .name = name } };
 }
@@ -2136,14 +2163,16 @@ test "an index of one entry per interval is a fortieth of one per record" {
     for ([_]u64{ 0, 4096 }) |interval| {
         var each = try Workspace.init("log");
         defer each.deinit();
-        var journal = try Journal.open(testing.allocator, io, each.path, .{
+        var gpa: FixtureAllocator = .init;
+        defer expectNoLeak(&gpa);
+        var journal = try Journal.open(gpa.allocator(), io, each.path, .{
             .sync = .never,
             .index_interval_bytes = interval,
             .tail_records = 1,
             .max_segment_bytes = 1 << 30,
         });
         defer journal.deinit(io);
-        for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        try fill(&journal, io, 1, count, "n");
         try testing.expectEqual(@as(usize, 1), journal.segmentCount());
 
         // Whatever the index holds, a seek lands on the record asked for:
@@ -3206,10 +3235,12 @@ test "two hundred thousand records open within a bounded time and memory" {
 
     const count = 200_000;
     {
-        // No fsync here: this is building a fixture, not measuring durability.
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        // A fixture, not what is under test: batched, unsynced, no tail.
+        var gpa: FixtureAllocator = .init;
+        defer expectNoLeak(&gpa);
+        var journal = try Journal.open(gpa.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
         defer journal.deinit(io);
-        for (0..count) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name of some length"));
+        try fill(&journal, io, 0, count - 1, "a name of some length");
         try testing.expect(journal.segmentCount() > 1);
     }
 
@@ -3698,14 +3729,16 @@ test "a seek into the newest segment costs what a seek into a sealed one costs" 
     // could be read back, the second was a scan of the whole segment and
     // measured nine hundred times the first.
     const per_segment = 20_000;
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    var gpa: FixtureAllocator = .init;
+    defer expectNoLeak(&gpa);
+    var journal = try Journal.open(gpa.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 4,
         .max_segment_records = per_segment,
         .max_segment_bytes = 1 << 30,
     });
     defer journal.deinit(io);
-    for (1..2 * per_segment) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+    try fill(&journal, io, 1, 2 * per_segment - 1, "a name");
     try testing.expectEqual(@as(usize, 2), journal.segmentCount());
 
     const sealed = try seekMicroseconds(&journal, per_segment - 2, 20);
@@ -3741,9 +3774,11 @@ test "opening a log that was closed cleanly costs no scan of it" {
         .max_segment_bytes = 1 << 30,
     };
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, options);
+        var gpa: FixtureAllocator = .init;
+        defer expectNoLeak(&gpa);
+        var journal = try Journal.open(gpa.allocator(), io, ws.path, options);
         defer journal.deinit(io);
-        for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+        try fill(&journal, io, 1, count, "a name");
         try testing.expectEqual(@as(usize, 1), journal.segmentCount());
     }
 
@@ -3782,12 +3817,14 @@ test "five folds over one pass cost what one fold costs" {
     defer ws.deinit();
 
     const count = 20_000;
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    var gpa: FixtureAllocator = .init;
+    defer expectNoLeak(&gpa);
+    var journal = try Journal.open(gpa.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 4,
     });
     defer journal.deinit(io);
-    for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+    try fill(&journal, io, 1, count, "a name");
 
     var one: Registry = .{};
     const single = single: {
