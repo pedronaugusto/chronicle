@@ -489,8 +489,10 @@ fn listSegments(log: *Log, io: Io) OpenError!void {
 /// One overlap is legitimate. `compact` renames a rewritten segment into place
 /// before it removes the one it replaced, so a crash between the two leaves
 /// both: the replacement starts later and ends at the same record. That shape
-/// is recognised and the replaced segment removed. Every other disagreement is
-/// `error.DiscontinuousSeq`.
+/// is recognised and the replaced segment removed -- with every segment before
+/// it, because the rename was the compaction's commit and those were next to
+/// go; left standing they would be a hole in front of the rewrite. Every other
+/// disagreement is `error.DiscontinuousSeq`.
 fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
     var i: usize = 0;
     while (i + 1 < log.segments.items.len) {
@@ -538,10 +540,14 @@ fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
         if (earlier.last_seq < later.base_seq) return error.DiscontinuousSeq;
         if (try log.lastSeqOf(io, later) != earlier.last_seq) return error.DiscontinuousSeq;
         if (log.options.access == .write) {
-            try log.deleteSegmentFiles(io, earlier.base_seq);
+            for (log.segments.items[0 .. i + 1]) |segment| {
+                try log.deleteSegmentFiles(io, segment.base_seq);
+            }
             try log.syncDir(io);
         }
-        _ = log.segments.orderedRemove(i);
+        var remove = i + 1;
+        while (remove != 0) : (remove -= 1) _ = log.segments.orderedRemove(0);
+        i = 0;
     }
 }
 
@@ -2181,8 +2187,9 @@ fn offsetAfter(log: *Log, io: Io, segment: Segment, seq: u64) OpenError!u64 {
 /// Whole segments are unlinked. The one segment the cut falls inside is
 /// rewritten to a neighbouring file, which is `fsync`ed and renamed into place
 /// under the name of its new first record, so what is on the disk is always a
-/// whole log. A crash between that rename and the unlink leaves the replaced
-/// segment behind, and the next `open` recognises it and removes it.
+/// whole log. A crash between that rename and the unlinks leaves the replaced
+/// segment behind, and whatever stood before it; the next `open` recognises
+/// the shape and removes them.
 ///
 /// The sequence number survives a log emptied this way, because a segment's
 /// name is the record that will go into it.

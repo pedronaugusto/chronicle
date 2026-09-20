@@ -25,6 +25,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The memory contract now names the fixed metadata held per segment.
 - Empty compacted logs report both sequence bounds as zero in `stats`.
 - Interrupted compaction and segment creation recover after a writer is killed at an operation boundary.
+- A compaction killed after its rename no longer leaves the segments before the cut standing as a hole in front of the rewrite; the next open removes them with the segment it replaced.
 
 ## [0.5.0] - 2026-09-19
 

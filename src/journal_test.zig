@@ -2467,6 +2467,49 @@ test "a compaction interrupted after its rename leaves a segment the next open r
     try testing.expectEqual(@as(usize, 6), journal.records().records.len);
 }
 
+test "a compaction interrupted after its rename takes the older segments with it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..13) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        try testing.expectEqual(@as(usize, 3), journal.segmentCount());
+    }
+
+    // A compaction keeping the records after 9 renamed its rewrite of the
+    // third segment into place and was killed before any unlink: the two
+    // whole segments before the cut still stand, and so does the one the
+    // rewrite replaced. The crash fuzz found this shape.
+    const whole = try ws.read(try ws.segment(9));
+    const cut = std.mem.indexOfPos(u8, whole, 0, "{\"seq\":10").?;
+    var replacement: Handwritten = try .init(10, try backLinkOf(whole[cut..]));
+    defer replacement.deinit();
+    try replacement.raw(whole[cut..]);
+    try ws.write(try ws.segment(10), replacement.written());
+
+    // A reader unlinks nothing and still reads what the compaction meant.
+    {
+        var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+        defer reader.deinit(io);
+        try testing.expectEqual(@as(u64, 10), reader.oldestSeq());
+        try testing.expectEqual(@as(u64, 12), try reader.lastSeq(io));
+        try testing.expectEqual(@as(u64, 3), try reader.verify(io));
+        try testing.expect(ws.exists(try ws.segment(1)));
+    }
+
+    // The writer finishes what the compaction started.
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer journal.deinit(io);
+    for ([_]u64{ 1, 5, 9 }) |base| try testing.expect(!ws.exists(try ws.segment(base)));
+    try testing.expectEqual(@as(u64, 10), journal.oldestSeq());
+    try testing.expectEqual(@as(u64, 12), try journal.lastSeq(io));
+    try testing.expectEqual(@as(u64, 3), try journal.verify(io));
+    try testing.expectEqual(@as(u64, 13), try journal.append(io, 13, created(13, "n")));
+}
+
 test "an interrupted empty compaction drops the old prefix marker" {
     const io = testing.io;
     var ws = try Workspace.init("log");
