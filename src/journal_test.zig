@@ -2225,6 +2225,28 @@ test "a snapshot newer than a truncated log is not restored" {
     try testing.expect(opened.snapshot == null);
 }
 
+test "snapshot refuses a document larger than its read limit" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const options: Journal.Options = .{ .sync = .never, .max_snapshot_bytes = 64 };
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+        try journal.snapshot(io, "ok");
+        try testing.expectError(error.SnapshotTooLarge, journal.snapshot(io, "x" ** 64));
+    }
+
+    const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, options);
+    var reopened = opened.journal;
+    defer reopened.deinit(io);
+    const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
+    defer testing.allocator.free(snapshot.state);
+    try testing.expectEqualStrings("ok", snapshot.state);
+}
+
 test "compact empties the log and the sequence still continues" {
     const io = testing.io;
     var ws = try Workspace.init("log");

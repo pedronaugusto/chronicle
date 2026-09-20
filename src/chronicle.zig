@@ -298,7 +298,7 @@ pub fn Journal(comptime Event: type) type {
             /// a damaged segment being taken into memory whole to find out
             /// that it holds no record.
             max_record_bytes: usize = 1024 * 1024,
-            /// How large a snapshot file may be to be read back. It holds
+            /// How large a snapshot file may be to be written or read back. It holds
             /// whatever a fold serialises to, so this is the caller's number
             /// and not the package's; a larger one is
             /// `error.SnapshotTooLarge`.
@@ -417,7 +417,7 @@ pub fn Journal(comptime Event: type) type {
         pub const SubscribeError = ReplayError || Io.Cancelable;
 
         /// Errors from `snapshot`.
-        pub const SnapshotError = Allocator.Error || Log.SnapshotError;
+        pub const SnapshotError = Allocator.Error || Log.SnapshotError || error{SnapshotTooLarge};
 
         /// Errors from durably closing the active segment.
         pub const CloseError = Log.CloseError;
@@ -1435,6 +1435,8 @@ pub fn Journal(comptime Event: type) type {
         /// `state_bytes` is opaque to chronicle: whatever your fold serialises
         /// to. It is stored base64-encoded in a JSON object, so the snapshot
         /// file is text however binary the state is.
+        /// A document larger than `Options.max_snapshot_bytes` is refused
+        /// with `error.SnapshotTooLarge` before it replaces the old snapshot.
         ///
         /// The replacement is written to a neighbouring temporary file, flushed
         /// and `fsync`ed, and then renamed over the destination, so a reader
@@ -1447,7 +1449,17 @@ pub fn Journal(comptime Event: type) type {
             defer self.mutex.unlock(io);
 
             const encoder = std.base64.standard.Encoder;
-            const b64 = try self.gpa.alloc(u8, encoder.calcSize(state_bytes.len));
+            const encoded_size = encoder.calcSize(state_bytes.len);
+            const framing_size = std.fmt.count(
+                "{{\"fmt\":{d},\"seq\":{d},\"state\":\"\"}}",
+                .{ document_format, self.seq },
+            );
+            if (encoded_size > self.options.max_snapshot_bytes or
+                framing_size > self.options.max_snapshot_bytes - encoded_size)
+            {
+                return error.SnapshotTooLarge;
+            }
+            const b64 = try self.gpa.alloc(u8, encoded_size);
             defer self.gpa.free(b64);
             _ = encoder.encode(b64, state_bytes);
 
