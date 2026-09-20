@@ -4,7 +4,10 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## [0.6.0] - 2026-09-20
+
+A clean reopen proved rather than scanned, an append that costs one
+allocation, and the crash and backup cases a second reading found.
 
 - Under `sync = .never`, sealing a segment's index and starting a new segment no longer flush to the drive: the index is held to the log's own level, and an index a power cut left ahead of its segment is checked against the segment and rebuilt on the next open, as before.
 - `append` writes a record's envelope by hand into the one buffer that becomes the stored bytes, sized from the record before it, so a record costs one allocation instead of three and no copy; the bytes are unchanged.
