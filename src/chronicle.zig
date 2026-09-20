@@ -1568,6 +1568,14 @@ pub fn Journal(comptime Event: type) type {
         pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            if (self.options.access == .read) {
+                // A reader's segment inventory is a snapshot from its last
+                // open or refresh. Backup begins with a current directory
+                // view so rotations completed before this call are included.
+                try self.log.reload(io);
+                self.clearTail();
+                try self.fillTail(io);
+            }
             return self.log.backup(io, dest);
         }
 

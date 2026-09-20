@@ -2287,7 +2287,17 @@ pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {
         try active.index_writer.interface.flush();
     }
 
-    _ = try log.copyFile(io, dest, snapshot_name, null);
+    if (log.options.access == .write) {
+        _ = try log.copyFile(io, dest, snapshot_name, null);
+    } else {
+        // A reader cannot hold a concurrent writer still between observing a
+        // snapshot and measuring the copied log. Leaving this optional cache
+        // out is the only way to ensure it is never ahead of the backup.
+        dest.deleteFile(io, snapshot_name) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => |e| return e,
+        };
+    }
 
     const newest = log.segments.items.len - 1;
     for (log.segments.items[0..newest]) |segment| {

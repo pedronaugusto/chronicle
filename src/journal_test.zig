@@ -2642,6 +2642,34 @@ test "a backup taken while another process appends opens as a journal" {
     _ = try child.wait(io);
 }
 
+test "a reader backup refreshes rotations and never copies an ahead snapshot" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const copy_path = try ws.beside("copy");
+
+    var writer = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer writer.deinit(io);
+    for (1..4) |seq| _ = try writer.append(io, @intCast(seq), created(@intCast(seq), "n"));
+
+    var read_options = small(4, 1024);
+    read_options.access = .read;
+    var reader = try Journal.open(testing.allocator, io, ws.path, read_options);
+    defer reader.deinit(io);
+
+    for (4..11) |seq| _ = try writer.append(io, @intCast(seq), created(@intCast(seq), "n"));
+    try writer.snapshot(io, "state through ten");
+
+    try testing.expectEqual(@as(u64, 10), try reader.backup(io, copy_path));
+    const opened = try Journal.openWithSnapshot(testing.allocator, io, copy_path, small(4, 1024));
+    var copied = opened.journal;
+    defer copied.deinit(io);
+    try testing.expectEqual(@as(u64, 10), try copied.lastSeq(io));
+    // A reader cannot freeze a concurrent snapshot and segment view together,
+    // so it leaves the optional snapshot out rather than copy one ahead.
+    try testing.expect(opened.snapshot == null);
+}
+
 //========================================================================
 // More than one process.
 //========================================================================
