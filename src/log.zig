@@ -989,7 +989,8 @@ fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
         .read = true,
         .truncate = false,
     }) catch return null;
-    errdefer file.close(io);
+    var returned = false;
+    defer if (!returned) file.close(io);
     file.setLength(io, length) catch return null;
     file.writePositionalAll(
         io,
@@ -999,6 +1000,7 @@ fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
 
     var writer = file.writer(io, log.index_buf);
     writer.pos = length;
+    returned = true;
     return .{ .file = file, .writer = writer, .indexed = indexed, .builder = builder };
 }
 
