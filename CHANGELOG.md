@@ -6,6 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+- Clean reopening a million-record journal is 5.6 times faster, measured from 5.768 ms to 1.035 ms, by proving clean indexes without scanning the newest segment.
 - Backup stops when it cannot prove the destination differs from the source.
 - Dropping segments evicts the same records from the in-memory tail.
 - A snapshot newer than a truncated log is ignored instead of restoring rolled-back state.

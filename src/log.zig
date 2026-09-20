@@ -88,11 +88,14 @@ const SegmentHeader = struct {
     }
 };
 
+const SegmentHead = struct { root: u32, header_bytes: u64 };
+
 /// The header a segment's first line carries, or null when that line is not
 /// one. Nothing here guesses: a line that does not parse as this object is
 /// not a segment header, and a segment whose first line is not one is not a
 /// segment this package wrote.
 fn parseSegmentHeader(gpa: Allocator, line: []const u8) ?SegmentHeader {
+    if (quickSegmentHeader(line)) |header| return header;
     if (!std.mem.startsWith(u8, line, "{\"chronicle\":")) return null;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -107,6 +110,26 @@ fn parseSegmentHeader(gpa: Allocator, line: []const u8) ?SegmentHeader {
         .base_seq = std.math.cast(u64, base.integer) orelse return null,
         .root = std.math.cast(u32, chain.integer) orelse return null,
     };
+}
+
+fn quickSegmentHeader(line: []const u8) ?SegmentHeader {
+    var at: usize = 0;
+    const version = unsignedMember(u32, line, &at, "{\"chronicle\":") orelse return null;
+    const base_seq = unsignedMember(u64, line, &at, ",\"base\":") orelse return null;
+    const root = unsignedMember(u32, line, &at, ",\"root\":") orelse return null;
+    if (at + 1 != line.len or line[at] != '}') return null;
+    return .{ .version = version, .base_seq = base_seq, .root = root };
+}
+
+fn unsignedMember(comptime T: type, line: []const u8, at: *usize, comptime opening: []const u8) ?T {
+    if (!std.mem.startsWith(u8, line[at.*..], opening)) return null;
+    const from = at.* + opening.len;
+    var end = from;
+    while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
+    if (end == from) return null;
+    const value = std.fmt.parseInt(T, line[from..end], 10) catch return null;
+    at.* = end;
+    return value;
 }
 
 /// What `open` does with a final line the previous writer did not finish.
@@ -459,12 +482,90 @@ fn load(log: *Log, io: Io) OpenError!void {
     // Every segment but the last was sealed by a rotation, which makes it
     // durable before it writes anything else: its length and its last record
     // are whatever they were then, and one read each says what it covers.
-    for (log.segments.items[0 .. log.segments.items.len - 1]) |*segment| {
-        segment.bytes = try log.fileLength(io, &segmentName(segment.base_seq, segment_extension));
-        try log.describeSealed(io, segment);
-    }
+    try log.describeSealedSegments(io, log.segments.items[0 .. log.segments.items.len - 1]);
     try log.resolveOverlaps(io);
     try log.openActive(io);
+}
+
+/// Prove clean sealed segments in parallel. Each proof touches only its own
+/// segment and opens its own files; an unusual shape, stale index, or I/O
+/// failure is retried through the full sequential path so its exact error and
+/// repair behavior stay unchanged.
+fn describeSealedSegments(log: *Log, io: Io, segments: []Segment) OpenError!void {
+    if (segments.len < 4) {
+        for (segments) |*segment| try log.describeSealed(io, segment);
+        return;
+    }
+
+    const files = try log.gpa.alloc(?CleanSegmentFile, segments.len);
+    defer log.gpa.free(files);
+    @memset(files, null);
+    const indexes = try log.gpa.alloc(?IndexProof, segments.len);
+    defer log.gpa.free(indexes);
+    @memset(indexes, null);
+
+    const batch_size = 64;
+    var from: usize = 0;
+    while (from < segments.len) {
+        const to = @min(from + batch_size, segments.len);
+        var group: Io.Group = .init;
+        for (segments[from..to], files[from..to], indexes[from..to]) |segment, *file_proof, *index_proof| {
+            group.async(io, inspectCleanSegmentFile, .{ log, io, segment.base_seq, file_proof });
+            group.async(io, inspectCleanIndex, .{ log, io, segment.base_seq, index_proof });
+        }
+        try group.await(io);
+        from = to;
+    }
+
+    for (segments, files, indexes) |*segment, file_proof, index_proof| {
+        if (file_proof) |file| if (index_proof) |index| {
+            if (file.bytes == index.segment_bytes) {
+                segment.bytes = file.bytes;
+                segment.header_bytes = file.header_bytes;
+                segment.last_seq = segment.base_seq + index.indexed.count - 1;
+                segment.times = index.indexed.times;
+                segment.index = .{ .good = index.indexed };
+                continue;
+            }
+        };
+        try log.describeSealed(io, segment);
+    }
+}
+
+const CleanSegmentFile = struct {
+    bytes: u64,
+    header_bytes: u64,
+};
+
+fn inspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64, proof: *?CleanSegmentFile) Io.Cancelable!void {
+    proof.* = log.tryInspectCleanSegmentFile(io, base_seq);
+}
+
+fn tryInspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64) ?CleanSegmentFile {
+    const file = log.dir.openFile(io, &segmentName(base_seq, segment_extension), .{}) catch return null;
+    defer file.close(io);
+    const length = file.length(io) catch return null;
+    if (length == 0) return null;
+
+    var raw: [96]u8 = undefined;
+    const want: usize = @intCast(@min(raw.len, length));
+    if ((file.readPositionalAll(io, raw[0..want], 0) catch return null) != want) return null;
+    const newline = std.mem.indexOfScalar(u8, raw[0..want], '\n') orelse return null;
+    const head = quickSegmentHeader(raw[0..newline]) orelse return null;
+    if (head.version != log_format or head.base_seq != base_seq) return null;
+    return .{ .bytes = length, .header_bytes = newline + 1 };
+}
+
+fn inspectCleanIndex(log: *Log, io: Io, base_seq: u64, proof: *?IndexProof) Io.Cancelable!void {
+    proof.* = log.tryInspectCleanIndex(io, base_seq);
+}
+
+fn tryInspectCleanIndex(log: *Log, io: Io, base_seq: u64) ?IndexProof {
+    const file = log.dir.openFile(io, &segmentName(base_seq, index_extension), .{}) catch return null;
+    defer file.close(io);
+    const proof = proveIndexFrom(io, file) orelse return null;
+    if (proof.base_seq != base_seq) return null;
+    return proof;
 }
 
 /// Collect the segment files in the directory, in sequence order.
@@ -554,7 +655,6 @@ fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
 /// The last sequence number a segment holds, whether or not it is sealed.
 fn lastSeqOf(log: *Log, io: Io, segment: Segment) OpenError!u64 {
     var measured = segment;
-    measured.bytes = try log.fileLength(io, &segmentName(segment.base_seq, segment_extension));
     try log.describeSealed(io, &measured);
     return measured.last_seq;
 }
@@ -564,11 +664,14 @@ fn lastSeqOf(log: *Log, io: Io, segment: Segment) OpenError!u64 {
 /// and the timestamps its index header carries.
 fn describeSealed(log: *Log, io: Io, segment: *Segment) OpenError!void {
     segment.times = .unknown;
+    const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
+    defer file.close(io);
+    segment.bytes = try file.length(io);
     if (segment.bytes == 0) {
         segment.last_seq = segment.base_seq - 1;
         return;
     }
-    const head = try log.readSegmentHeader(io, segment.*);
+    const head = try log.readSegmentHeaderFrom(io, file, segment.*);
     segment.header_bytes = head.header_bytes;
     if (try log.readIndex(io, segment.*)) |indexed| {
         segment.last_seq = segment.base_seq + indexed.count - 1;
@@ -592,10 +695,10 @@ fn describeSealed(log: *Log, io: Io, segment: *Segment) OpenError!void {
         const scanned = try log.scanSegment(io, segment.*, null);
         if (scanned.partial_bytes != 0) return error.TruncatedRecord;
         if (log.options.access == .write) {
-            const file = try log.dir.createFile(io, &segmentName(segment.base_seq, segment_extension), .{ .truncate = false });
-            defer file.close(io);
-            try file.setLength(io, scanned.complete_bytes);
-            if (log.options.sync != .never) try durable.sync(io, file, .whole);
+            const repair_file = try log.dir.createFile(io, &segmentName(segment.base_seq, segment_extension), .{ .truncate = false });
+            defer repair_file.close(io);
+            try repair_file.setLength(io, scanned.complete_bytes);
+            if (log.options.sync != .never) try durable.sync(io, repair_file, .whole);
             log.dir.deleteFile(io, &segmentName(segment.base_seq, index_extension)) catch {};
             try log.syncDir(io);
         }
@@ -788,6 +891,12 @@ const Indexed = struct {
     times: Times,
 };
 
+const IndexProof = struct {
+    segment_bytes: u64,
+    base_seq: u64,
+    indexed: Indexed,
+};
+
 /// What a usable index says a segment holds, or null when the index is
 /// missing, stale, written by an older version, or does not describe this
 /// segment.
@@ -798,12 +907,20 @@ const Indexed = struct {
 /// from exactly these bytes and nothing has changed since.
 fn readIndex(log: *Log, io: Io, segment: Segment) OpenError!?Indexed {
     const file = log.holdIndex(io, segment.base_seq) orelse return null;
+    return readIndexFrom(io, file, segment);
+}
 
+fn readIndexFrom(io: Io, file: Io.File, segment: Segment) ?Indexed {
+    const proof = proveIndexFrom(io, file) orelse return null;
+    if (proof.segment_bytes != segment.bytes) return null;
+    if (proof.base_seq != segment.base_seq) return null;
+    return proof.indexed;
+}
+
+fn proveIndexFrom(io: Io, file: Io.File) ?IndexProof {
     var raw: [index_header_len]u8 = undefined;
     if ((file.readPositionalAll(io, &raw, 0) catch return null) != raw.len) return null;
     const header = IndexHeader.parse(&raw) orelse return null;
-    if (header.segment_bytes != segment.bytes) return null;
-    if (header.base_seq != segment.base_seq) return null;
 
     const length = file.length(io) catch return null;
     if (length < index_header_len) return null;
@@ -814,7 +931,10 @@ fn readIndex(log: *Log, io: Io, segment: Segment) OpenError!?Indexed {
     if (entries > header.records) return null;
 
     var checksum = crc32c.initial;
-    var buffer: [64 * index_entry_len]u8 = undefined;
+    // A default 8 MiB segment has about 48 KiB of sparse entries. Read that
+    // in one operation rather than in thirty-two 1.5 KiB pieces: proving an
+    // index is CPU work once the file is warm, not a succession of syscalls.
+    var buffer: [64 * 1024]u8 = undefined;
     var at: u64 = index_header_len;
     while (at < length) {
         const want: usize = @intCast(@min(buffer.len, length - at));
@@ -826,10 +946,14 @@ fn readIndex(log: *Log, io: Io, segment: Segment) OpenError!?Indexed {
     if (~checksum != header.entries_checksum) return null;
 
     return .{
-        .count = header.records,
-        .entries = entries,
-        .interval = header.interval,
-        .times = header.times,
+        .segment_bytes = header.segment_bytes,
+        .base_seq = header.base_seq,
+        .indexed = .{
+            .count = header.records,
+            .entries = entries,
+            .interval = header.interval,
+            .times = header.times,
+        },
     };
 }
 
@@ -1088,6 +1212,10 @@ fn lineAt(log: *Log, io: Io, segment: Segment, offset: u64) OpenError!Line {
     const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
     defer file.close(io);
 
+    return log.lineAtFrom(io, file, segment, offset);
+}
+
+fn lineAtFrom(log: *Log, io: Io, file: Io.File, segment: Segment, offset: u64) OpenError!Line {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(log.gpa);
     var chunk: [4096]u8 = undefined;
@@ -1112,6 +1240,10 @@ fn lastLine(log: *Log, io: Io, segment: Segment) OpenError!Line {
     const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
     defer file.close(io);
 
+    return log.lastLineFrom(io, file, segment);
+}
+
+fn lastLineFrom(log: *Log, io: Io, file: Io.File, segment: Segment) OpenError!Line {
     var window: u64 = 4096;
     while (true) {
         const from = segment.bytes -| window;
@@ -1867,7 +1999,29 @@ fn openActive(log: *Log, io: Io) OpenError!void {
     const name = segmentName(segment.base_seq, segment_extension);
 
     if (log.options.access == .read) {
-        segment.bytes = try log.fileLength(io, &name);
+        const file = try log.dir.openFile(io, &name, .{});
+        defer file.close(io);
+        segment.bytes = try file.length(io);
+        // A clean close seals the active index against the exact segment
+        // length. It proves the record boundary and count just as it does for
+        // a writer reopening the file, so a reader need only recover the
+        // framing root and chain tip. A missing or stale index still takes the
+        // repair scan below (without changing either file).
+        const head = try log.readSegmentHeaderFrom(io, file, segment.*);
+        segment.header_bytes = head.header_bytes;
+        if (try log.readIndex(io, segment.*)) |indexed| {
+            segment.last_seq = segment.base_seq + indexed.count - 1;
+            segment.times = indexed.times;
+            segment.index = .{ .good = indexed };
+            log.chain = if (segment.count() == 0) head.root else chain: {
+                const line = try log.lastLineFrom(io, file, segment.*);
+                defer log.gpa.free(line.bytes);
+                if (!line.terminated) return error.TruncatedRecord;
+                const envelope = envelopeOf(log.gpa, line.bytes) orelse return error.CorruptRecord;
+                break :chain envelope.c orelse return error.CorruptRecord;
+            };
+            return;
+        }
         const scanned = try log.scanSegment(io, segment.*, null);
         // A reader never shortens a file: bytes after the last newline are a
         // writer mid-append, not damage.
@@ -1985,9 +2139,19 @@ fn openActive(log: *Log, io: Io) OpenError!void {
 
 /// The first line of a segment, which says what format its records are in and
 /// what the first of them links back to.
-fn readSegmentHeader(log: *Log, io: Io, segment: Segment) OpenError!struct { root: u32, header_bytes: u64 } {
+fn readSegmentHeader(log: *Log, io: Io, segment: Segment) OpenError!SegmentHead {
     const line = try log.lineAt(io, segment, 0);
     defer log.gpa.free(line.bytes);
+    return log.segmentHeaderFromLine(segment, line);
+}
+
+fn readSegmentHeaderFrom(log: *Log, io: Io, file: Io.File, segment: Segment) OpenError!SegmentHead {
+    const line = try log.lineAtFrom(io, file, segment, 0);
+    defer log.gpa.free(line.bytes);
+    return log.segmentHeaderFromLine(segment, line);
+}
+
+fn segmentHeaderFromLine(log: *Log, segment: Segment, line: Line) OpenError!SegmentHead {
     if (!line.terminated) return error.UnsupportedFormat;
     const header = parseSegmentHeader(log.gpa, line.bytes) orelse return error.UnsupportedFormat;
     if (header.version != log_format or header.base_seq != segment.base_seq) return error.UnsupportedFormat;
