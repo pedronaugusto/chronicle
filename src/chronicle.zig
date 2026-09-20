@@ -142,6 +142,9 @@ pub fn Journal(comptime Event: type) type {
         tail_arenas: std.ArrayList(std.heap.ArenaAllocator),
         /// What the tail's records add up to, for `Options.tail_bytes`.
         tail_bytes: usize,
+        /// The length of the last record encoded, which sizes the next one's
+        /// buffer.
+        record_hint: usize,
         /// Reset once per record while reading records back; never holds
         /// anything a caller can see.
         scratch: std.heap.ArenaAllocator,
@@ -524,6 +527,7 @@ pub fn Journal(comptime Event: type) type {
                 .tail = .empty,
                 .tail_arenas = .empty,
                 .tail_bytes = 0,
+                .record_hint = 256,
                 .scratch = .init(gpa),
                 .sinks = .empty,
                 .mutex = .init,
@@ -1660,30 +1664,40 @@ pub fn Journal(comptime Event: type) type {
         /// safe to append. Where nothing will, that parse would build a record
         /// and drop it unread, so it is not done.
         fn encode(self: *Self, seq: u64, at: i64, back_link: u32, event: Event) AppendError!Built {
-            const line: Line = .{
-                .seq = seq,
-                .at = at,
-                .v = self.options.schema_version,
-                .p = back_link,
-                .ev = event,
-            };
-            const body = try std.json.Stringify.valueAlloc(self.gpa, line, .{});
-            defer self.gpa.free(body);
+            const needs_record = self.needsRecord();
+            var arena: ?std.heap.ArenaAllocator = if (needs_record) .init(self.gpa) else null;
+            errdefer if (arena) |*a| a.deinit();
+            const allocator = if (arena) |*a| a.allocator() else self.gpa;
+
+            // The envelope is written by hand, field by field in `Line`'s
+            // order, into the one buffer that becomes the stored bytes, and
+            // `std.json` writes only the event into it. The bytes are the
+            // ones `std.json.Stringify` writes for a `Line`; the suite's
+            // golden lines hold it to that.
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            errdefer out.deinit();
+            // Sized from the last record, so a run of records alike is written
+            // without growing the buffer.
+            out.ensureTotalCapacityPrecise(self.record_hint + 32) catch return error.OutOfMemory;
+            const w = &out.writer;
+            w.print(
+                "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":",
+                .{ seq, at, self.options.schema_version, back_link },
+            ) catch return error.OutOfMemory;
+            std.json.Stringify.value(event, .{}, w) catch return error.OutOfMemory;
             // The checksum covers everything the record says except the
-            // checksum itself. `std.json` closes the object with the one byte
-            // dropped here, and `,"c":<crc>}` closes it again.
-            const covered = body[0 .. body.len - 1];
+            // checksum itself: the object so far, before `,"c":<crc>}` closes
+            // it.
+            const covered = out.written();
             const sum = checksum(covered);
             // Checked before anything is written: a record longer than a
             // read will accept is one the log must not be given.
             if (covered.len + 32 > self.options.max_record_bytes) return error.RecordTooLarge;
+            w.print(",\"c\":{d}}}", .{sum}) catch return error.OutOfMemory;
+            const stored = out.toOwnedSlice() catch return error.OutOfMemory;
+            self.record_hint = stored.len;
 
-            if (!self.needsRecord()) {
-                const stored = try std.fmt.allocPrint(
-                    self.gpa,
-                    "{s},\"c\":{d}}}",
-                    .{ covered, sum },
-                );
+            if (!needs_record) {
                 return .{
                     .arena = null,
                     .bytes = stored,
@@ -1694,16 +1708,9 @@ pub fn Journal(comptime Event: type) type {
                 };
             }
 
-            var arena: std.heap.ArenaAllocator = .init(self.gpa);
-            errdefer arena.deinit();
-            const stored = try std.fmt.allocPrint(
-                arena.allocator(),
-                "{s},\"c\":{d}}}",
-                .{ covered, sum },
-            );
             const parsed = std.json.parseFromSliceLeaky(
                 Line,
-                arena.allocator(),
+                allocator,
                 stored,
                 .{ .ignore_unknown_fields = true },
             ) catch |err| switch (err) {
