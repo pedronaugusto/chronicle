@@ -280,6 +280,8 @@ pub const SnapshotError = WriteFileError || error{ReadOnly};
 
 pub const SealError = Io.File.WritePositionalError || Io.File.SyncError;
 
+pub const CloseError = Io.Writer.Error || Io.File.SetLengthError || Io.File.SyncError;
+
 gpa: Allocator,
 /// The log's directory, as given to `open`. Owned.
 path: []const u8,
@@ -2370,6 +2372,30 @@ fn sameDirectory(log: *Log, io: Io, dest: Io.Dir) Io.Dir.RealPathFileAllocError!
 // Teardown.
 //========================================================================
 
+/// Flush and durably close the active segment, then release every resource.
+/// The log is consumed even when durability fails.
+pub fn close(log: *Log, io: Io) CloseError!void {
+    defer log.release(io);
+    if (log.active) |*active| {
+        try active.writer.interface.flush();
+        try log.trimPreallocation(io);
+        if (log.options.sync != .never) try durable.sync(io, active.file, .whole);
+
+        // The index is only a cache. Failure to finish it costs the next open
+        // a scan and does not change whether the log itself was closed durably.
+        active.index_writer.interface.flush() catch {};
+        const segment = log.segments.items[log.segments.items.len - 1];
+        if (segment.bytes != 0) sealIndex(io, active.index_file, .{
+            .segment_bytes = segment.bytes,
+            .base_seq = segment.base_seq,
+            .records = segment.count(),
+            .times = segment.times,
+            .interval = @intCast(active.builder.interval),
+            .entries_checksum = ~active.builder.checksum,
+        }) catch {};
+    }
+}
+
 pub fn deinit(log: *Log, io: Io) void {
     if (log.active) |*active| {
         active.writer.interface.flush() catch {};
@@ -2387,6 +2413,12 @@ pub fn deinit(log: *Log, io: Io) void {
             .interval = @intCast(active.builder.interval),
             .entries_checksum = ~active.builder.checksum,
         }) catch {};
+    }
+    log.release(io);
+}
+
+fn release(log: *Log, io: Io) void {
+    if (log.active) |active| {
         active.file.close(io);
         active.index_file.close(io);
         log.active = null;

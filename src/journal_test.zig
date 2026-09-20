@@ -946,6 +946,33 @@ test "without a migrate hook and without an unknown arm an older record is refus
     );
 }
 
+test "close reports a failure while finalizing the active segment" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .on_segment,
+        .preallocate_bytes = 4096,
+    });
+    _ = try journal.append(io, 1, created(1, "one"));
+
+    // Leave close a read-only handle to the still-preallocated segment. Its
+    // mandatory trim cannot succeed, and the error must reach the caller even
+    // though close still releases the journal and its lock.
+    const active = &journal.log.active.?;
+    const position = active.writer.pos;
+    active.file.close(io);
+    active.file = try journal.log.dir.openFile(io, &chronicle.segmentName(1), .{});
+    active.writer = active.file.writer(io, journal.log.write_buf);
+    active.writer.pos = position;
+    try testing.expectError(error.NonResizable, journal.close(io));
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 1), try reopened.lastSeq(io));
+}
+
 //========================================================================
 // Folds, live and from the disk.
 //========================================================================

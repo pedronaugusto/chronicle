@@ -103,7 +103,8 @@ pub fn checksum(covered: []const u8) u32 {
 ///
 /// The returned type owns a directory, the newest segment's files, an advisory
 /// lock, a bounded tail of records in memory and one mutex. Create it with
-/// `open` or `openWithSnapshot` and release it with `deinit`.
+/// `open` or `openWithSnapshot` and release it with `close`, or with the
+/// best-effort `deinit` where an error cannot be returned.
 ///
 /// `Event` must round-trip through `std.json`: `std.json.Stringify.value` must
 /// accept it and `std.json.parseFromSlice` must read back what was written. A
@@ -415,6 +416,9 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `snapshot`.
         pub const SnapshotError = Allocator.Error || Log.SnapshotError;
 
+        /// Errors from durably closing the active segment.
+        pub const CloseError = Log.CloseError;
+
         /// Errors from `tailer` and from a `Tailer`'s own calls.
         ///
         /// * `InvalidName` — a tailer's name becomes a filename beside the
@@ -558,11 +562,23 @@ pub fn Journal(comptime Event: type) type {
             return .{ .journal = self, .snapshot = found };
         }
 
-        /// Flush, close every file, release the lock and release every
-        /// allocation. Every slice the journal handed out is invalid
-        /// afterwards.
+        /// Flush and durably close the active segment, then release the lock
+        /// and every allocation. The journal is consumed even when an error
+        /// is returned, and every slice it handed out is invalid afterwards.
+        pub fn close(self: *Self, io: Io) CloseError!void {
+            defer self.release();
+            try self.log.close(io);
+        }
+
+        /// Best-effort fallback for scopes that cannot return a close error.
+        /// Prefer `close` when `.on_segment` relies on shutdown for its final
+        /// durable write. Every slice the journal handed out is invalid.
         pub fn deinit(self: *Self, io: Io) void {
             self.log.deinit(io);
+            self.release();
+        }
+
+        fn release(self: *Self) void {
             self.clearTail();
             self.tail.deinit(self.gpa);
             self.tail_arenas.deinit(self.gpa);

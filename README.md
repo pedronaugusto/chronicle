@@ -102,7 +102,8 @@ One module, no dependencies and no build options: the only knobs are the
 |---|---|
 | `open(gpa, io, path, options)` | Create or read back a journal directory. |
 | `openWithSnapshot(gpa, io, path, options)` | The same, plus the snapshot beside it. |
-| `deinit(io)` | Flush, close, unlock, release. |
+| `close(io)` | Durably flush, close, unlock and release; returns a shutdown failure. |
+| `deinit(io)` | Best-effort close for a scope that cannot return an error. |
 | `append(io, at, event)` | Write one record durably; returns its sequence number. |
 | `appendAll(io, entries)` | Write a batch under one `fsync`; returns the last sequence number. |
 | `records()` | The tail, oldest first, as a `Window`. |
