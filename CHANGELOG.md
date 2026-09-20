@@ -4,6 +4,28 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- Backup stops when it cannot prove the destination differs from the source.
+- Dropping segments evicts the same records from the in-memory tail.
+- A snapshot newer than a truncated log is ignored instead of restoring rolled-back state.
+- Replay anchors each segment to the base sequence and chain root in its header.
+- Indexed replay checks the cursor record before accepting its successor.
+- Directory writeback failures are returned instead of treated as success.
+- `close` reports final flush and sync failures; `deinit` remains a best-effort fallback.
+- A read-only backup refreshes rotations and omits a snapshot it cannot freeze with the log.
+- Snapshot publication durably follows every record it describes under every sync policy.
+- Reusing a backup destination removes segment, index and snapshot files absent from the source.
+- Read-only replay stops at a live writer's zero-filled reservation even when it exceeds the record limit.
+- Segment headers are recognized when they span multiple read-buffer chunks.
+- An index interval wider than its on-disk field returns `error.IndexIntervalTooLarge`.
+- Writing a snapshot enforces the same size limit used to read it.
+- `reconcile` reports what survived an indeterminate append failure and clears the write latch.
+- Falling back from a sealed index closes the abandoned file handle.
+- The memory contract now names the fixed metadata held per segment.
+- Empty compacted logs report both sequence bounds as zero in `stats`.
+- Interrupted compaction and segment creation recover after a writer is killed at an operation boundary.
+
 ## [0.5.0] - 2026-09-19
 
 A log whose records say what they are and what came before them, a durable
