@@ -254,7 +254,7 @@ all-or-nothing to your fold, say so in the records. A snapshot is only ever an
 optimisation, so deleting one costs replay time; an index is only ever a cache,
 so losing one costs a scan.
 
-**Three things, each bounded by something you set.** The tail is
+**Record-sized working memory is bounded.** The tail is
 `Options.tail_records` records and `Options.tail_bytes` bytes of them,
 whichever bites first, kept parsed for `records`, `since` and `waitPast`; the
 oldest half goes when either ceiling is reached, so a tail costs a constant
@@ -262,8 +262,10 @@ amount per append. A `Replay`, and so a `subscribe`, holds the record it is on
 and one read buffer, `Options.read_buffer_size`; a line longer than
 `Options.max_record_bytes` is refused rather than held. `open` walks the
 newest segment's newlines, and the records in it land in the tail under its
-ceilings. Nothing grows with the length of the log, and every allocation comes
-from the allocator passed to `open`.
+ceilings. The journal also keeps fixed-size metadata for every segment, and a
+replay snapshots two numbers per segment it will visit, so that memory grows
+with the segment count even though it does not grow with the records inside a
+segment. Every allocation comes from the allocator passed to `open`.
 
 A `Record` from a `Window` lasts until the tail releases it, which the next
 `append` may do; one from a `Replay` until the next `next`; one handed to a

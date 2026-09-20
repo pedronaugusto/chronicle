@@ -3191,8 +3191,8 @@ test "two hundred thousand records open within a bounded time and memory" {
 
     try testing.expectEqual(@as(u64, count), try journal.lastSeq(io));
 
-    // Loose on purpose: the point is that opening a long log costs the newest
-    // segment and the tail, not the log, and that neither grows with it.
+    // Loose on purpose: record-sized working memory is the newest segment and
+    // the tail. Fixed-size segment metadata is accounted separately.
     try testing.expect(elapsed_ms < 30_000);
     try testing.expect(journal.tail.items.len <= journal.options.tail_records);
     var held: usize = journal.scratch.queryCapacity();

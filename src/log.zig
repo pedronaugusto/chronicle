@@ -1307,7 +1307,7 @@ fn writtenLength(bytes: []const u8) u64 {
 }
 
 /// A walk over the log's lines from some sequence number onward, holding one
-/// read buffer and one line at a time however long the log is.
+/// read buffer and one line at a time plus two integers per segment it visits.
 ///
 /// The segments it will visit are decided when it is made, so a `compact` or a
 /// `dropSegmentsBefore` running beside it may leave it reading a file that has

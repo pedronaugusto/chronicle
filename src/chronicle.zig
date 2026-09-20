@@ -929,9 +929,9 @@ pub fn Journal(comptime Event: type) type {
 
         /// A walk over every record after `cursor`, read from the disk.
         ///
-        /// This is how a fold covers a history longer than memory: it holds one
-        /// record and one read buffer at a time, however many segments it
-        /// crosses. Release it with `deinit`.
+        /// This is how a fold covers a history longer than memory: record data
+        /// is one record and one read buffer at a time. It also snapshots two
+        /// integers per segment it will cross. Release it with `deinit`.
         ///
         /// It reads the segments as they were when it was made. A `compact` or
         /// a `dropSegmentsBefore` beside it may leave it reading a file that
