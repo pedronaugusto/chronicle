@@ -497,6 +497,41 @@ fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
         const earlier = log.segments.items[i];
         const later = log.segments.items[i + 1];
         if (earlier.last_seq + 1 == later.base_seq) {
+            // Compacting everything publishes an empty segment with a fresh
+            // root before unlinking the old prefix. A crash in between looks
+            // sequence-contiguous, but its root deliberately does not link to
+            // the former active segment. That empty marker supersedes every
+            // segment before it.
+            if (later.count() == 0) {
+                var measured_later = later;
+                measured_later.bytes = try log.fileLength(io, &segmentName(later.base_seq, segment_extension));
+                if (measured_later.bytes == 0) {
+                    // The name was created but its header was not published.
+                    // Treat the rotation or empty compaction as not having
+                    // happened; the preceding segment is still authoritative.
+                    if (log.options.access == .write) {
+                        try log.deleteSegmentFiles(io, later.base_seq);
+                        try log.syncDir(io);
+                    }
+                    _ = log.segments.orderedRemove(i + 1);
+                    continue;
+                }
+                const later_head = try log.readSegmentHeader(io, measured_later);
+                const earlier_head = try log.readSegmentHeader(io, earlier);
+                const previous = try log.lastChecksum(io, earlier, earlier_head.root);
+                if (later_head.root != previous) {
+                    if (log.options.access == .write) {
+                        for (log.segments.items[0 .. i + 1]) |segment| {
+                            try log.deleteSegmentFiles(io, segment.base_seq);
+                        }
+                        try log.syncDir(io);
+                    }
+                    var remove = i + 1;
+                    while (remove != 0) : (remove -= 1) _ = log.segments.orderedRemove(0);
+                    i = 0;
+                    continue;
+                }
+            }
             i += 1;
             continue;
         }
@@ -543,7 +578,27 @@ fn describeSealed(log: *Log, io: Io, segment: *Segment) OpenError!void {
     }
     const line = try log.lastLine(io, segment.*);
     defer log.gpa.free(line.bytes);
-    if (!line.terminated) return error.TruncatedRecord;
+    if (!line.terminated) {
+        // A crash can make the formerly active segment older by publishing a
+        // compaction replacement before its zero reservation is trimmed. The
+        // zeros are not a record and are safe to discard; nonzero partial
+        // bytes in a sealed segment remain corruption.
+        const scanned = try log.scanSegment(io, segment.*, null);
+        if (scanned.partial_bytes != 0) return error.TruncatedRecord;
+        if (log.options.access == .write) {
+            const file = try log.dir.createFile(io, &segmentName(segment.base_seq, segment_extension), .{ .truncate = false });
+            defer file.close(io);
+            try file.setLength(io, scanned.complete_bytes);
+            if (log.options.sync != .never) try durable.sync(io, file, .whole);
+            log.dir.deleteFile(io, &segmentName(segment.base_seq, index_extension)) catch {};
+            try log.syncDir(io);
+        }
+        segment.bytes = scanned.complete_bytes;
+        segment.header_bytes = scanned.header_bytes;
+        segment.last_seq = segment.base_seq + scanned.lines - 1;
+        segment.times = scanned.times;
+        return;
+    }
     segment.last_seq = seqOf(log.gpa, line.bytes) orelse return error.CorruptRecord;
 }
 
@@ -2151,6 +2206,7 @@ pub fn compact(log: *Log, io: Io, keep_after_seq: u64) CompactError!void {
         // one named for the record that comes next carries the sequence. Its
         // chain starts again, because no record in it links to one before it.
         const chain = log.chain;
+        try log.trimPreallocation(io);
         log.closeActive(io);
         const started = try log.startSegment(io, keep_from, freshRoot(io));
         var active = started.active;
@@ -2213,7 +2269,10 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
     }
 
     // Let go of the active segment before anything is renamed: Windows refuses
-    // to replace a file this process still has open.
+    // to replace a file this process still has open. Its reservation must be
+    // trimmed first, because after the rename this formerly active segment is
+    // no longer newest and a crash must leave it looking sealed.
+    try log.trimPreallocation(io);
     log.closeActive(io);
     try log.dir.rename(&temporary, log.dir, &segmentName(keep_from, segment_extension), io);
     try log.syncDir(io);

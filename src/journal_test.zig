@@ -175,13 +175,6 @@ const Workspace = struct {
         try self.write(try self.segment(base_seq), written.written());
     }
 
-    /// The index beside a segment file named by `segment`.
-    fn indexBeside(self: *Workspace, segment_path: []const u8) ![]const u8 {
-        const owned = try self.arena.allocator().dupe(u8, segment_path);
-        @memcpy(owned[owned.len - 4 ..], chronicle.index_extension);
-        return owned;
-    }
-
     /// Write a segment file holding exactly these bytes, behind that line:
     /// for the shapes that are not records at all.
     fn writeRaw(self: *Workspace, base_seq: u64, bytes: []const u8) !void {
@@ -2440,6 +2433,38 @@ test "a compaction interrupted after its rename leaves a segment the next open r
     try testing.expectEqual(@as(usize, 6), journal.records().records.len);
 }
 
+test "an interrupted empty compaction drops the old prefix marker" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var old: Handwritten = try .init(1, 17);
+    defer old.deinit();
+    for (1..5) |seq| try old.record(seq, @intCast(seq), 1,
+        \\{"removed":{"id":1}}
+    );
+    try ws.write(try ws.segment(1), old.written());
+
+    // The on-disk instant after compact publishes the empty segment carrying
+    // the next sequence, but before it unlinks the history it supersedes.
+    var empty: Handwritten = try .init(5, old.link +% 1);
+    defer empty.deinit();
+    try ws.write(try ws.segment(5), empty.written());
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 5), journal.oldestSeq());
+        try testing.expect(!ws.exists(try ws.segment(1)));
+        try testing.expectEqual(@as(u64, 5), try journal.append(io, 5, created(5, "after")));
+    }
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 5), try reopened.lastSeq(io));
+    try testing.expectEqual(@as(u64, 1), try reopened.verify(io));
+}
+
 test "a temporary file a crash left behind is ignored" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -3430,15 +3455,13 @@ fn fuzzIndex(_: void, smith: *testing.Smith) anyerror!void {
 // this package exists for actually come from.
 //
 // The invariant after the crash is the one every promise rests on: the log
-// opens, what it holds is a continuous prefix of what was written, every
-// record in it passes its own checksum and links to the one before it, and
-// nothing survived that was never acknowledged.
+// opens, every surviving record passes its checksum and links to the one
+// before it, and the next append continues its sequence.
 test "fuzz: a sequence of calls, cut off part-way through" {
     try testing.fuzz({}, fuzzCrash, .{ .corpus = &crash_corpus });
 }
 
-/// Seeds for the shapes the suite already builds by hand: a batch, a
-/// compaction, a truncation, and a cut inside the newest segment.
+/// Seeds for different operation orders and kill delays.
 const crash_corpus = [_][]const u8{
     seeded("\x00"),
     seeded("\x00\x00\x00"),
@@ -3452,12 +3475,44 @@ const crash_corpus = [_][]const u8{
 
 fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
     const io = testing.io;
+    const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
+        error.EnvironmentVariableMissing => return error.SkipZigTest,
+        else => |e| return e,
+    };
+    defer testing.allocator.free(helper);
+
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    // Small segments, so a short sequence still rotates, compacts across a
-    // boundary and leaves more than one file behind.
-    const options: Journal.Options = .{
+    var input: [64]u8 = undefined;
+    const bytes = input[0..smith.slice(&input)];
+    const seed = std.hash.Wyhash.hash(0x6372617368, bytes);
+    var seed_buffer: [32]u8 = undefined;
+    const seed_text = try std.fmt.bufPrint(&seed_buffer, "{d}", .{seed});
+
+    // The helper loops over append, batch, compaction, truncation, retention,
+    // backup and snapshot in its own process. Once mutation has begun, the
+    // fuzzed delay chooses a real instruction at which the operating system
+    // kills it; no defer or error cleanup in the writer gets to run.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ helper, ws.path, "crash", seed_text },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    var output_buffer: [64]u8 = undefined;
+    var output = child.stdout.?.readerStreaming(io, &output_buffer);
+    try testing.expectEqualStrings("locked", try helperLine(&output.interface));
+    try testing.expectEqualStrings("mutating", try helperLine(&output.interface));
+    const delay_ns = 100_000 + seed % 10_000_000;
+    try (Io.Clock.Duration{
+        .clock = .awake,
+        .raw = .fromNanoseconds(@intCast(delay_ns)),
+    }).sleep(io);
+    child.kill(io);
+
+    const options: PingJournal.Options = .{
         .sync = .never,
         .max_segment_records = 4,
         .max_segment_bytes = 1 << 20,
@@ -3465,97 +3520,14 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
         .preallocate_bytes = 512,
     };
 
-    var acknowledged: u64 = 0;
-    var oldest: u64 = 1;
-    {
-        var journal = try Journal.open(testing.allocator, io, ws.path, options);
-        defer journal.deinit(io);
-
-        var steps: usize = 0;
-        while (steps < 24 and !smith.eos()) : (steps += 1) {
-            switch (smith.valueRangeAtMost(u8, 0, 6)) {
-                0 => {
-                    acknowledged = try journal.append(io, @intCast(steps), created(@intCast(steps), "n"));
-                },
-                1 => {
-                    const batch = [_]Journal.Entry{
-                        .{ .at = @intCast(steps), .event = created(1, "a") },
-                        .{ .at = @intCast(steps), .event = created(2, "b") },
-                        .{ .at = @intCast(steps), .event = .{ .removed = .{ .id = 1 } } },
-                    };
-                    acknowledged = try journal.appendAll(io, batch[0..smith.valueRangeAtMost(u8, 0, 3)]);
-                },
-                2 => {
-                    const keep = smith.valueRangeAtMost(u64, 0, acknowledged);
-                    try journal.compact(io, keep);
-                    oldest = journal.oldestSeq();
-                },
-                3 => {
-                    const cut = smith.valueRangeAtMost(u64, oldest -| 1, acknowledged);
-                    journal.truncateAfter(io, cut) catch |err| switch (err) {
-                        error.SeqTooOld => {},
-                        else => return err,
-                    };
-                    acknowledged = try journal.lastSeq(io);
-                },
-                4 => {
-                    _ = try journal.dropSegmentsBefore(io, smith.valueRangeAtMost(u64, 0, acknowledged));
-                    oldest = journal.oldestSeq();
-                },
-                5 => {
-                    const dest = try ws.beside("copy");
-                    const held = try journal.backup(io, dest);
-                    try testing.expect(held <= acknowledged);
-                },
-                else => try journal.snapshot(io, "a fold"),
-            }
-        }
-        acknowledged = try journal.lastSeq(io);
-        oldest = journal.oldestSeq();
-    }
-
-    // The crash: the newest segment stops at a byte the writer had not got
-    // past, and what was reserved beyond it is zeros.
-    const newest = try newestSegment(&ws);
-    const whole = try ws.read(newest);
-    if (whole.len != 0) {
-        const cut = smith.index(whole.len);
-        const zeros: usize = smith.valueRangeAtMost(u8, 0, 64);
-        const crashed = try testing.allocator.alloc(u8, cut + zeros);
-        defer testing.allocator.free(crashed);
-        @memcpy(crashed[0..cut], whole[0..cut]);
-        @memset(crashed[cut..], 0);
-        try ws.write(newest, crashed);
-    }
-    // And the index may have been left anywhere at all, because it is a
-    // cache with no durability of its own.
-    switch (smith.valueRangeAtMost(u8, 0, 2)) {
-        0 => {},
-        1 => ws.root.deleteFile(io, try ws.indexBeside(newest)) catch {},
-        else => ws.write(try ws.indexBeside(newest), "chridx\x03\n") catch {},
-    }
-
     var held: u64 = 0;
     {
-        var journal = Journal.open(testing.allocator, io, ws.path, options) catch |err| switch (err) {
-            // The named answers. What must not happen is a journal that
-            // opens and is wrong.
-            error.TruncatedRecord,
-            error.CorruptRecord,
-            error.ChecksumMismatch,
-            error.DiscontinuousSeq,
-            error.BrokenChain,
-            error.UnsupportedFormat,
-            => return,
-            else => return err,
-        };
+        var journal = try PingJournal.open(testing.allocator, io, ws.path, options);
         defer journal.deinit(io);
 
-        // A continuous prefix: every record from the oldest the log still
-        // holds to the newest, each passing its checksum and linked to the
-        // one before it.
+        // Every record that survived the killed operation is continuous,
+        // checksummed and linked, and the journal can continue from it.
         held = try journal.lastSeq(io);
-        try testing.expect(held <= acknowledged);
         const counted = try journal.verify(io);
         const numbers = try journal.stats(io);
         try testing.expectEqual(counted, numbers.records);
@@ -3566,34 +3538,20 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
 
         // And it is a log that goes on: the next record takes the next
         // number.
-        try testing.expectEqual(held + 1, try journal.append(io, 1, created(1, "after the crash")));
+        try testing.expectEqual(held + 1, try journal.append(io, 1, .{ .ping = 1 }));
     }
 
     // Reopening finds it, with nothing left to repair.
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
+    var reopened = try PingJournal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
     defer reopened.deinit(io);
     try testing.expectEqual(held + 1, try reopened.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
     try testing.expectEqual(held + 2 - reopened.oldestSeq(), try reopened.verify(io));
 }
 
-/// The name of the newest segment file in a workspace's journal directory.
-fn newestSegment(ws: *Workspace) ![]const u8 {
-    var found: u64 = 0;
-    const dir = try ws.root.openDir(testing.io, ws.name, .{ .iterate = true });
-    defer dir.close(testing.io);
-    var iterator = dir.iterate();
-    while (try iterator.next(testing.io)) |entry| {
-        if (!std.mem.endsWith(u8, entry.name, chronicle.segment_extension)) continue;
-        const seq = std.fmt.parseInt(u64, entry.name[0 .. entry.name.len - 4], 10) catch continue;
-        found = @max(found, seq);
-    }
-    return ws.segment(found);
-}
-
 // The same target, driven from a fixed seed rather than from the corpus, so
-// that a plain `zig build test` covers sequences nobody wrote down. The count
-// is what fits in a second; `zig build test --fuzz` is what explores further.
+// that a plain `zig build test` kills writers at instructions nobody chose;
+// `zig build test --fuzz` explores further.
 test "a sequence of calls cut off part-way through leaves a log that opens" {
     var prng: std.Random.DefaultPrng = .init(0x5eed5eed);
     var bytes: [64]u8 = undefined;

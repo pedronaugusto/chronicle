@@ -425,10 +425,11 @@ an index in an older format, a segment in an older framing, a record that does
 not link to the one before it, a `.tmp` file a crash left behind, a byte
 flipped inside a record that still parses, space a writer reserved and never
 filled, a batch cut off at every byte boundary in it, and the two segments a
-compaction leaves when it dies between its rename and its unlink. Two tests
+compaction leaves when it dies between its rename and its unlink. Three tests
 spawn a second process — one to hold the lock, one to append while a backup is
-taken beside it — and one builds a journal of two hundred thousand records and
-asserts that opening it is proportionate and that memory is not.
+taken beside it, and one to be killed while it mutates the journal — and one
+builds a journal of two hundred thousand records and asserts that opening it
+is proportionate and that record-sized working memory is bounded.
 
 The measurements this package is judged on are tests with budgets: a seek into
 the segment being written to against one into a sealed segment, an open of a
@@ -445,10 +446,10 @@ it and leave a file it refuses exactly as it found it, a `.drop` open followed
 by an `append` must produce a log that opens again cleanly, and whatever an
 index says, the records must be the ones the segments hold. The sixth runs over
 the *calls*: a random run of `append`, `appendAll`, `compact`,
-`truncateAfter`, `dropSegmentsBefore`, `backup` and `snapshot`, cut off at a
-random byte of the newest segment, after which the log must open as a
-continuous prefix with every checksum good and every record linked to the one
-before it, holding no record that was never acknowledged, and go on from there.
+`truncateAfter`, `dropSegmentsBefore`, `backup` and `snapshot` in a child
+process, killed after a fuzzed delay while that run is still executing. The
+surviving log must open with every checksum good and every record linked to the
+one before it, and go on from there.
 Under `zig build test` each runs its corpus and stops, which costs
 milliseconds, and the last one also runs sixty-four sequences from a fixed
 seed.
