@@ -352,8 +352,12 @@ pub fn segmentName(
 /// The sequence number a segment file's name encodes, or null when the name is
 /// not one this package writes. Everything else in the directory is ignored.
 fn parseSegmentName(name: []const u8) ?u64 {
-    if (name.len != name_digits + segment_extension.len) return null;
-    if (!std.mem.eql(u8, name[name_digits..], segment_extension)) return null;
+    return parseNumberedName(name, segment_extension);
+}
+
+fn parseNumberedName(name: []const u8, extension: []const u8) ?u64 {
+    if (name.len != name_digits + extension.len) return null;
+    if (!std.mem.eql(u8, name[name_digits..], extension)) return null;
     const seq = std.fmt.parseInt(u64, name[0..name_digits], 10) catch return null;
     if (seq == 0) return null;
     return seq;
@@ -2255,6 +2259,8 @@ pub const BackupError = OpenError || Io.Dir.RealPathFileAllocError || error{Back
 ///
 /// What "consistent" means here, exactly:
 ///
+/// * Segment, index and snapshot files from an earlier backup in `dest_path`
+///   are removed first. Locks and reader cursors there are left alone.
 /// * Every sealed segment goes whole. A sealed segment was made durable by the
 ///   rotation that left it and cannot change again.
 /// * The newest segment goes up to its last complete record *at the moment of
@@ -2287,7 +2293,11 @@ pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {
     // Copying a directory over itself would truncate the segments it was
     // reading. Nothing else here can tell the two apart.
     if (try log.sameDirectory(io, dest)) return error.BackupInPlace;
-    if (log.segments.items.len == 0) return 0;
+    try log.clearBackup(io, dest);
+    if (log.segments.items.len == 0) {
+        try syncDirHandle(io, dest);
+        return 0;
+    }
 
     // Everything this process has written goes into the files before anything
     // is read back out of them.
@@ -2374,6 +2384,26 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) Op
     }
     try durable.sync(io, to, .whole);
     return true;
+}
+
+/// Remove the previous backup's log-owned files before writing a new view.
+/// Locks and reader cursors belong to users of the destination and remain.
+fn clearBackup(log: *Log, io: Io, dest: Io.Dir) OpenError!void {
+    var names: std.ArrayList([]u8) = .empty;
+    defer {
+        for (names.items) |name| log.gpa.free(name);
+        names.deinit(log.gpa);
+    }
+
+    var iterator = dest.iterate();
+    while (try iterator.next(io)) |entry| {
+        if (entry.kind == .directory) continue;
+        const managed = std.mem.eql(u8, entry.name, snapshot_name) or
+            parseNumberedName(entry.name, segment_extension) != null or
+            parseNumberedName(entry.name, index_extension) != null;
+        if (managed) try names.append(log.gpa, try log.gpa.dupe(u8, entry.name));
+    }
+    for (names.items) |name| try dest.deleteFile(io, name);
 }
 
 /// Whether `dest` is the directory this log lives in. Failure to establish

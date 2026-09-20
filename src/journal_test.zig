@@ -2569,6 +2569,27 @@ test "a backup shares the bytes of a sealed segment where the filesystem can" {
     try testing.expectEqualStrings(here, there);
 }
 
+test "a second backup removes segments no longer in the source" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const dest = try ws.beside("copy");
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer journal.deinit(io);
+    for (1..13) |seq| _ = try journal.append(io, @intCast(seq), created(@intCast(seq), "n"));
+    try testing.expectEqual(@as(u64, 12), try journal.backup(io, dest));
+    try testing.expect(ws.exists(try ws.sub("../copy/00000000000000000009.log")));
+
+    try journal.truncateAfter(io, 5);
+    try testing.expectEqual(@as(u64, 5), try journal.backup(io, dest));
+    try testing.expect(!ws.exists(try ws.sub("../copy/00000000000000000009.log")));
+
+    var copied = try Journal.open(testing.allocator, io, dest, .{ .verify = .full });
+    defer copied.deinit(io);
+    try testing.expectEqual(@as(u64, 5), try copied.lastSeq(io));
+}
+
 test "a backup taken while another process appends opens as a journal" {
     const io = testing.io;
     const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
