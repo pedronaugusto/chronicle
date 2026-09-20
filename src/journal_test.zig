@@ -3519,6 +3519,7 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
+    errdefer dumpJournalFiles(&ws);
 
     var input: [64]u8 = undefined;
     const bytes = input[0..smith.slice(&input)];
@@ -3585,16 +3586,41 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
     try testing.expectEqual(held + 2 - reopened.oldestSeq(), try reopened.verify(io));
 }
 
+/// What a killed writer left behind, printed when the log it left cannot be
+/// opened or continued: the name, size and bytes of every file in the
+/// journal. A kill lands where the machine's timing puts it, so a failure
+/// seen once is reproduced from these bytes and not from the seed.
+fn dumpJournalFiles(ws: *Workspace) void {
+    const io = testing.io;
+    const dir = ws.root.openDir(io, ws.name, .{ .iterate = true }) catch |err| {
+        std.debug.print("journal directory: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer dir.close(io);
+    var files = dir.iterate();
+    while (files.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const bytes = dir.readFileAlloc(io, entry.name, ws.arena.allocator(), .limited(16 * 1024)) catch |err| {
+            std.debug.print("{s}: {s}\n", .{ entry.name, @errorName(err) });
+            continue;
+        };
+        std.debug.print("{s} ({d} bytes): {x}\n", .{ entry.name, bytes.len, bytes });
+    }
+}
+
 // The same target, driven from a fixed seed rather than from the corpus, so
 // that a plain `zig build test` kills writers at instructions nobody chose;
 // `zig build test --fuzz` explores further.
 test "a sequence of calls cut off part-way through leaves a log that opens" {
     var prng: std.Random.DefaultPrng = .init(0x5eed5eed);
     var bytes: [64]u8 = undefined;
-    for (0..64) |_| {
+    for (0..64) |i| {
         prng.random().bytes(&bytes);
         var smith: testing.Smith = .{ .in = &bytes };
-        try fuzzCrash({}, &smith);
+        fuzzCrash({}, &smith) catch |err| {
+            std.debug.print("crash iteration {d}: {s}\n", .{ i, @errorName(err) });
+            return err;
+        };
     }
 }
 
