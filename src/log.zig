@@ -1217,6 +1217,7 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
 
     var reader = file.reader(io, buffer);
     var offset: u64 = 0;
+    var at_header = true;
     var timed = true;
     const cap = log.options.max_record_bytes;
     // How much of the line being read has been seen, and how much of it
@@ -1238,7 +1239,7 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
             line.writer.writeAll(piece) catch return error.OutOfMemory;
             reader.interface.toss(newline + 1);
 
-            if (offset == 0) {
+            if (at_header) {
                 // The first line says what format the rest of the file is in
                 // and what the first record's back-link has to be. A file
                 // whose first line is not one is refused rather than read.
@@ -1248,7 +1249,8 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
                     return error.UnsupportedFormat;
                 }
                 scanned.chain = header.root;
-                scanned.header_bytes = newline + 1;
+                scanned.header_bytes = offset + newline + 1;
+                at_header = false;
             } else {
                 const envelope = envelopeOf(log.gpa, line.written());
                 const at: ?i64 = if (envelope) |found| found.at else null;

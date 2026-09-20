@@ -2925,6 +2925,27 @@ test "a segment in an older framing is refused by name, not read" {
     );
 }
 
+test "a segment header may span read-buffer chunks" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+    }
+    try ws.root.deleteFile(io, try ws.index(1));
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .read_buffer_size = 1,
+    });
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 1), try reopened.lastSeq(io));
+    try testing.expectEqual(@as(u64, 1), try reopened.verify(io));
+}
+
 test "a record that does not link to the one before it is named" {
     const io = testing.io;
     var ws = try Workspace.init("log");
