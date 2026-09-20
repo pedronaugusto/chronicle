@@ -2269,6 +2269,10 @@ test "compact empties the log and the sequence still continues" {
         try testing.expectEqual(@as(usize, 0), journal.records().records.len);
         try testing.expectEqual(@as(usize, 1), journal.segmentCount());
         try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
+        const empty = try journal.stats(io);
+        try testing.expectEqual(@as(u64, 0), empty.records);
+        try testing.expectEqual(@as(u64, 0), empty.oldest_seq);
+        try testing.expectEqual(@as(u64, 0), empty.newest_seq);
         try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "n")));
     }
 

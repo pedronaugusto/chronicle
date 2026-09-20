@@ -1082,7 +1082,7 @@ pub fn Journal(comptime Event: type) type {
                 .records = self.seq + 1 -| oldest,
                 .bytes = bytes,
                 .oldest_seq = if (empty) 0 else oldest,
-                .newest_seq = self.seq,
+                .newest_seq = if (empty) 0 else self.seq,
             };
         }
 
