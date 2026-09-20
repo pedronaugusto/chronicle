@@ -2226,7 +2226,7 @@ pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {
 // Copying a running log.
 //========================================================================
 
-pub const BackupError = OpenError || error{BackupInPlace};
+pub const BackupError = OpenError || Io.Dir.RealPathFileAllocError || error{BackupInPlace};
 
 /// Copy a consistent view of the log into the directory `dest_path`, creating
 /// it if it is not there, and report the newest sequence number the copy
@@ -2265,7 +2265,7 @@ pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {
     defer dest.close(io);
     // Copying a directory over itself would truncate the segments it was
     // reading. Nothing else here can tell the two apart.
-    if (log.sameDirectory(io, dest)) return error.BackupInPlace;
+    if (try log.sameDirectory(io, dest)) return error.BackupInPlace;
     if (log.segments.items.len == 0) return 0;
 
     // Everything this process has written goes into the files before anything
@@ -2345,14 +2345,14 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) Op
     return true;
 }
 
-/// Whether `dest` is the directory this log lives in. False whenever that
-/// cannot be established, because a check that cannot be made is not a reason
-/// to refuse the call.
-fn sameDirectory(log: *Log, io: Io, dest: Io.Dir) bool {
+/// Whether `dest` is the directory this log lives in. Failure to establish
+/// identity stops the copy: treating an unknown destination as different can
+/// open a source segment through the destination handle with truncation.
+fn sameDirectory(log: *Log, io: Io, dest: Io.Dir) Io.Dir.RealPathFileAllocError!bool {
     var arena: std.heap.ArenaAllocator = .init(log.gpa);
     defer arena.deinit();
-    const here = log.dir.realPathFileAlloc(io, ".", arena.allocator()) catch return false;
-    const there = dest.realPathFileAlloc(io, ".", arena.allocator()) catch return false;
+    const here = try log.dir.realPathFileAlloc(io, ".", arena.allocator());
+    const there = try dest.realPathFileAlloc(io, ".", arena.allocator());
     return std.mem.eql(u8, here, there);
 }
 

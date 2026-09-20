@@ -2384,6 +2384,26 @@ test "a backup is a whole journal, snapshot and indexes and all" {
     try testing.expectEqual(@as(u64, 13), try copy.append(io, 130, created(13, "onwards")));
 }
 
+test "a backup refuses its source when directory identity cannot be resolved" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var journal = try Journal.open(failing.allocator(), io, ws.path, small(1, 8));
+    defer journal.deinit(io);
+    _ = try journal.append(io, 1, created(1, "one"));
+    _ = try journal.append(io, 2, created(2, "two"));
+
+    // `sameDirectory` resolves both handles through the journal allocator.
+    // If that resolution cannot allocate, backup must stop before opening a
+    // source segment with truncation through the destination handle.
+    failing.fail_index = failing.alloc_index + 1;
+    try testing.expectError(error.OutOfMemory, journal.backup(io, ws.path));
+    failing.fail_index = std.math.maxInt(usize);
+    try testing.expectEqual(@as(u64, 2), try journal.verify(io));
+}
+
 /// One line of a helper's output. `takeDelimiterExclusive` leaves the newline
 /// where it is, so the next call would answer with nothing at all.
 fn helperLine(reader: *Io.Reader) ![]const u8 {
