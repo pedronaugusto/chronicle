@@ -50,6 +50,16 @@ jobs:
       - name: Test — ReleaseSmall
         run: zig build test -Doptimize=ReleaseSmall
 
+      # The suite under ThreadSanitizer. A journal is one mutex between an
+      # appender and the tasks waiting on it, and a clean reopen inspects
+      # the segments concurrently; a race there is a claim a detector can
+      # check and a reader cannot. Debug, because that is the mode the
+      # detector instruments most completely; not on Windows, because the
+      # runtime does not exist there.
+      - name: Test — ThreadSanitizer
+        if: runner.os != 'Windows'
+        run: zig build test -Dthread-sanitizer -Doptimize=Debug --test-timeout 120s
+
       # Built AND run: an example that only compiles proves the names still
       # resolve, and running it is what proves the package still works.
       - name: Examples

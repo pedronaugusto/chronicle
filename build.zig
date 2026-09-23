@@ -21,6 +21,17 @@ pub fn build(b: *std.Build) void {
     // Tests.
     //=====================================================================
 
+    // A journal is one mutex between an appender and the tasks that wait on
+    // `waitPast` or fold live through a sink, and a clean reopen inspects
+    // the segments concurrently. Whether those are free of races is a claim
+    // a race detector can check and a reader cannot:
+    // `zig build test -Dthread-sanitizer`.
+    const thread_sanitizer = b.option(
+        bool,
+        "thread-sanitizer",
+        "Build the tests with ThreadSanitizer",
+    ) orelse false;
+
     // Error return traces are off on the test binary, so that the second
     // binary `zig build test --fuzz` builds goes through Zig 0.16.0's test
     // runner without them. The suite reports the same failures either way;
@@ -31,6 +42,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/chronicle.zig"),
             .target = target,
             .optimize = optimize,
+            .sanitize_thread = if (thread_sanitizer) true else null,
             .error_tracing = false,
         }),
     });
