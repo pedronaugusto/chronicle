@@ -754,6 +754,74 @@ test "a write that does not reach the disk publishes nothing and latches" {
     try testing.expectEqual(@as(u64, 2), try journal.append(io, 2, created(2, "retried")));
 }
 
+/// Whether a file write made with cancelation not blocked is to be the
+/// cancel point a cancel lands on: `cancelingIo`'s one knob.
+var cancel_writes: std.atomic.Value(bool) = .init(false);
+
+/// `testing.io`, with every file write a cancel point that fires while
+/// `cancel_writes` is set: the write a cancel would interrupt returns
+/// `error.Canceled`, unless the task has blocked cancelation, exactly as a
+/// cancel landing on it does. Everything else is `testing.io`'s own.
+fn cancelingIo(vtable: *Io.VTable) Io {
+    vtable.* = testing.io.vtable.*;
+    vtable.fileWritePositional = struct {
+        fn write(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
+            if (cancel_writes.load(.acquire)) {
+                const protection = testing.io.swapCancelProtection(.blocked);
+                _ = testing.io.swapCancelProtection(protection);
+                if (protection == .unblocked) return error.Canceled;
+            }
+            return testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+        }
+    }.write;
+    return .{ .userdata = testing.io.userdata, .vtable = vtable };
+}
+
+/// The writes of a journal's life, each one a cancel point that fires: on a
+/// task of its own, since a task is what has a cancel protection to block.
+fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
+    try testing.expectEqual(@as(u64, 1), try journal.append(io, 1, created(1, "one")));
+    try testing.expectEqual(@as(u64, 3), try journal.appendAll(io, &.{
+        .{ .at = 2, .event = created(2, "two") },
+        .{ .at = 3, .event = created(3, "three") },
+    }));
+    try testing.expect(!journal.persistence_failed);
+    try testing.expectEqual(@as(u32, 3), fold.events);
+    try journal.snapshot(io, "state");
+    try journal.truncateAfter(io, 2);
+    try journal.compact(io, 1);
+    try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "again")));
+    // and nothing swallowed the cancel: a write outside the journal's is
+    // still where it lands
+    try testing.expectError(error.Canceled, io.vtable.fileWritePositional(io.userdata, journal.log.active.?.file, "", &.{""}, 1, 0));
+}
+
+test "a cancel that lands on a write is not a failed write" {
+    var vtable: Io.VTable = undefined;
+    const io = cancelingIo(&vtable);
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        var fold: Registry = .{};
+        try journal.subscribe(io, fold.sink());
+
+        // Every write from here is where a cancel would land. Each record
+        // still goes down whole, the journal is not latched, and the sink
+        // sees each once: a write that has begun runs to its end.
+        cancel_writes.store(true, .release);
+        defer cancel_writes.store(false, .release);
+        var task = try io.concurrent(writeThroughCancels, .{ io, &journal, &fold });
+        try task.await(io);
+    }
+
+    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 3), try reopened.lastSeq(io));
+}
+
 //========================================================================
 // Schema versions.
 //========================================================================

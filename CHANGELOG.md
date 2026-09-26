@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+- A cancel that lands on a write is no longer a failed write. `append`,
+  `appendAll`, `snapshot`, `compact`, `truncateAfter`, `dropSegmentsBefore`,
+  `reconcile`, `refresh`, `close` and `deinit` block the task's cancelation
+  once they hold the lock, so a record a cancel reached mid-write is written
+  and published whole, and the journal is not latched as though the disk had
+  refused it; the cancel is reported by the task's next cancelation point. A
+  cancel while one of them waits for the lock still returns `error.Canceled`
+  with nothing written.
+
 ## [0.6.0] - 2026-09-20
 
 A clean reopen proved rather than scanned, an append that costs one

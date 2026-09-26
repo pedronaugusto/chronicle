@@ -300,7 +300,13 @@ with.
 `compact`, `dropSegmentsBefore`, `truncateAfter` and `refresh` take it and are
 safe from any task or thread, several at once; the subscribe calls hold it for
 the whole of their replay, so the hand-over from the disk to the live records
-has no seam in it. A `Replay` takes no lock and writes nothing, so a segment
+has no seam in it. A cancel reaches those calls at the lock: waiting for it,
+a call returns `error.Canceled` with nothing done. Once a call that changes
+the files holds it — an append, a batch, a snapshot, a compaction, a
+truncation, a drop, a reconcile, a refresh — it runs to its end with the
+task's cancelation blocked, and the cancel is reported by the task's next
+cancelation point: a record a cancel landed on is written whole, never
+latched as a write that failed. So is a close. A `Replay` takes no lock and writes nothing, so a segment
 whose index is missing is walked from its first record rather than indexed on
 the way; the calls above are what build an index. `records()`, `since()`,
 `segmentCount()`, `oldestSeq()` and a `Replay` do not take it: call them from

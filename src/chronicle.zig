@@ -573,6 +573,10 @@ pub fn Journal(comptime Event: type) type {
         /// and every allocation. The journal is consumed even when an error
         /// is returned, and every slice it handed out is invalid afterwards.
         pub fn close(self: *Self, io: Io) CloseError!void {
+            // A close that has begun flushes and seals to its end, whatever
+            // a cancel asks of the task meanwhile.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             defer self.release();
             try self.log.close(io);
         }
@@ -581,6 +585,8 @@ pub fn Journal(comptime Event: type) type {
         /// Prefer `close` when `.on_segment` relies on shutdown for its final
         /// durable write. Every slice the journal handed out is invalid.
         pub fn deinit(self: *Self, io: Io) void {
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             self.log.deinit(io);
             self.release();
         }
@@ -616,10 +622,21 @@ pub fn Journal(comptime Event: type) type {
         /// may nevertheless have reached the file before the failure was
         /// reported; `reconcile` reads the authoritative result back.
         ///
+        /// A cancel is not a failure to reach the disk. One that arrives while
+        /// the call waits for the lock returns `error.Canceled` with nothing
+        /// written; once the record is being written it runs to its end, and
+        /// the cancel is the caller's next cancelation point's to report.
+        ///
         /// Safe to call from any task or thread.
         pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A change to the files, once begun, runs to its end: a cancel
+            // is taken at the lock, before anything is written, and after it
+            // at the caller's next cancelation point, never between the
+            // bytes of a record and its flush.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             // A journal opened for reading is refused before anything else: it
             // is not a journal that has failed, and it must not be latched as
             // one.
@@ -688,6 +705,12 @@ pub fn Journal(comptime Event: type) type {
         pub fn appendAll(self: *Self, io: Io, entries: []const Entry) AppendError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A change to the files, once begun, runs to its end: a cancel
+            // is taken at the lock, before anything is written, and after it
+            // at the caller's next cancelation point, never between the
+            // bytes of a record and its flush.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             if (self.options.access == .read) return error.ReadOnly;
             if (self.persistence_failed) return error.PersistenceFailed;
             if (entries.len == 0) return self.seq;
@@ -754,6 +777,12 @@ pub fn Journal(comptime Event: type) type {
         pub fn reconcile(self: *Self, io: Io) ReconcileError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A change to the files, once begun, runs to its end: a cancel
+            // is taken at the lock, before anything is written, and after it
+            // at the caller's next cancelation point, never between the
+            // bytes of a record and its flush.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             if (self.options.access == .read) return error.ReadOnly;
             if (!self.persistence_failed) return self.seq;
 
@@ -1034,6 +1063,12 @@ pub fn Journal(comptime Event: type) type {
         pub fn refresh(self: *Self, io: Io) OpenError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A change to the files, once begun, runs to its end: a cancel
+            // is taken at the lock, before anything is written, and after it
+            // at the caller's next cancelation point, never between the
+            // bytes of a record and its flush.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             try self.log.reload(io);
             self.clearTail();
             try self.fillTail(io);
@@ -1475,6 +1510,12 @@ pub fn Journal(comptime Event: type) type {
         pub fn snapshot(self: *Self, io: Io, state_bytes: []const u8) SnapshotError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A change to the files, once begun, runs to its end: a cancel
+            // is taken at the lock, before anything is written, and after it
+            // at the caller's next cancelation point, never between the
+            // bytes of a record and its flush.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
 
             const encoder = std.base64.standard.Encoder;
             const encoded_size = encoder.calcSize(state_bytes.len);
@@ -1518,6 +1559,12 @@ pub fn Journal(comptime Event: type) type {
         pub fn dropSegmentsBefore(self: *Self, io: Io, seq: u64) DropError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A change to the files, once begun, runs to its end: a cancel
+            // is taken at the lock, before anything is written, and after it
+            // at the caller's next cancelation point, never between the
+            // bytes of a record and its flush.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             const dropped = try self.log.dropSegmentsBefore(io, seq);
             if (dropped != 0) self.dropTailBefore(self.log.baseSeq() + 1);
             return dropped;
@@ -1550,6 +1597,12 @@ pub fn Journal(comptime Event: type) type {
         pub fn truncateAfter(self: *Self, io: Io, seq: u64) TruncateError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A change to the files, once begun, runs to its end: a cancel
+            // is taken at the lock, before anything is written, and after it
+            // at the caller's next cancelation point, never between the
+            // bytes of a record and its flush.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             if (self.options.access == .read) return error.ReadOnly;
             if (self.persistence_failed) return error.PersistenceFailed;
             try self.log.truncateAfter(io, seq);
@@ -1579,6 +1632,12 @@ pub fn Journal(comptime Event: type) type {
         pub fn compact(self: *Self, io: Io, keep_after_seq: u64) CompactError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A change to the files, once begun, runs to its end: a cancel
+            // is taken at the lock, before anything is written, and after it
+            // at the caller's next cancelation point, never between the
+            // bytes of a record and its flush.
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
             if (self.options.access == .read) return error.ReadOnly;
             if (self.persistence_failed) return error.PersistenceFailed;
             try self.log.compact(io, keep_after_seq);
