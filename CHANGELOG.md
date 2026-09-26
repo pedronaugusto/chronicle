@@ -22,6 +22,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cancel while one of them waits for the lock still returns `error.Canceled`
   with nothing written.
 
+- A reader canceled as a record or a nudge arrives is canceled. `waitPast`
+  waited on an `Io.Condition`, and Zig 0.16.0's condition lets a broadcast
+  swallow a cancel that lands in the same instant: the wait takes the
+  broadcast, returns without `error.Canceled`, and the cancel is gone, so
+  the reader's next wait never returned and whatever canceled it waited on
+  it. `waitPast` now waits on a futex word the appends and nudges bump, and
+  returns `error.Canceled` whichever wins.
+
 ## [0.6.0] - 2026-09-20
 
 A clean reopen proved rather than scanned, an append that costs one

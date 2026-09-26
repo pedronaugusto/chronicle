@@ -1327,6 +1327,62 @@ test "waitPast is woken by a nudge with no record behind it" {
     try group.await(io);
 }
 
+test "a reader stopped as a record arrives is stopped" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+
+    // A reader waiting past the newest record, canceled while a nudge lands
+    // on it: the two race, and whichever wins the reader must return
+    // `error.Canceled` or a window, never wait on. `Io.Condition` in Zig
+    // 0.16.0 let the broadcast swallow the cancel and hung here within a
+    // few hundred rounds; a watchdog turns a hang into a failure.
+    const reader = struct {
+        fn f(j: *Journal, inner: Io, waiting: *std.atomic.Value(bool)) Io.Cancelable!void {
+            while (true) {
+                waiting.store(true, .release);
+                _ = try j.waitPast(inner, try j.lastSeq(inner));
+            }
+        }
+    }.f;
+    const nudger = struct {
+        fn f(j: *Journal, inner: Io, go: *std.atomic.Value(bool), spins: u32) void {
+            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+            for (0..spins) |_| std.atomic.spinLoopHint();
+            j.nudge(inner);
+        }
+    }.f;
+    var rounds: std.atomic.Value(u32) = .init(0);
+    const watchdog = struct {
+        fn f(inner: Io, count: *std.atomic.Value(u32)) Io.Cancelable!void {
+            var last = count.load(.acquire);
+            while (true) {
+                try inner.sleep(.fromSeconds(5), .awake);
+                const at = count.load(.acquire);
+                if (at == last) @panic("a reader canceled as a nudge landed waited on");
+                last = at;
+            }
+        }
+    }.f;
+    var dog = try io.concurrent(watchdog, .{ io, &rounds });
+    defer dog.cancel(io) catch {};
+
+    for (0..3000) |round| {
+        var waiting: std.atomic.Value(bool) = .init(false);
+        var go: std.atomic.Value(bool) = .init(false);
+        var future = try io.concurrent(reader, .{ &journal, io, &waiting });
+        while (!waiting.load(.acquire)) std.atomic.spinLoopHint();
+        const other = try std.Thread.spawn(.{}, nudger, .{ &journal, io, &go, @as(u32, @intCast(round % 64)) * 50 });
+        go.store(true, .release);
+        future.cancel(io) catch {};
+        other.join();
+        rounds.store(@intCast(round + 1), .release);
+    }
+}
+
 //========================================================================
 // Segments, the tail, and reading from the disk.
 //========================================================================

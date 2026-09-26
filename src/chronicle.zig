@@ -150,7 +150,13 @@ pub fn Journal(comptime Event: type) type {
         scratch: std.heap.ArenaAllocator,
         sinks: std.ArrayList(Sink),
         mutex: Io.Mutex,
-        changed: Io.Condition,
+        /// Bumped under the lock by every append and every nudge, and
+        /// waited on by `waitPast` (`wake`). A futex word rather than an
+        /// `Io.Condition`: Zig 0.16.0's condition drops a cancel that
+        /// lands in the same instant as a broadcast — its wait consumes the
+        /// broadcast and returns without `error.Canceled`, and the cancel is
+        /// gone — so a reader stopped as a record arrives waited on forever.
+        changed: std.atomic.Value(u32),
         /// Bumped by `nudge`: a wake with no record behind it.
         nudges: u64,
         /// The sequence number of the newest record, or zero. Read it with
@@ -531,7 +537,7 @@ pub fn Journal(comptime Event: type) type {
                 .scratch = .init(gpa),
                 .sinks = .empty,
                 .mutex = .init,
-                .changed = .init,
+                .changed = .init(0),
                 .nudges = 0,
                 .seq = 0,
                 .persistence_failed = false,
@@ -697,7 +703,7 @@ pub fn Journal(comptime Event: type) type {
             }
 
             held = self.publish(built);
-            self.changed.broadcast(io);
+            self.wake(io);
             // Last, so that a sink reading this record was reading memory that
             // still existed.
             self.trimTail();
@@ -795,7 +801,7 @@ pub fn Journal(comptime Event: type) type {
             }
             // A batch of records nothing keeps still moved the sequence.
             self.seq = before + entries.len;
-            self.changed.broadcast(io);
+            self.wake(io);
             self.trimTail();
             return self.seq;
         }
@@ -866,7 +872,7 @@ pub fn Journal(comptime Event: type) type {
             self.mutex.lockUncancelable(io);
             defer self.mutex.unlock(io);
             self.nudges +%= 1;
-            self.changed.broadcast(io);
+            self.wake(io);
         }
 
         //====================================================================
@@ -915,8 +921,22 @@ pub fn Journal(comptime Event: type) type {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             const nudged = self.nudges;
-            while (self.seq <= cursor and self.nudges == nudged) try self.changed.wait(io, &self.mutex);
+            while (self.seq <= cursor and self.nudges == nudged) {
+                // read under the lock: whatever wakes this reader bumps the
+                // word under the same lock, after this, so the wait returns
+                const seen = self.changed.load(.acquire);
+                self.mutex.unlock(io);
+                const waited = io.futexWait(u32, &self.changed.raw, seen);
+                self.mutex.lockUncancelable(io);
+                try waited;
+            }
             return self.since(cursor);
+        }
+
+        /// Every `waitPast` woken to look again. Called under the lock.
+        fn wake(self: *Self, io: Io) void {
+            _ = self.changed.fetchAdd(1, .release);
+            io.futexWake(u32, &self.changed.raw, std.math.maxInt(u32));
         }
 
         /// What a walk keeps between records so that the records it hands on
