@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- `appendDeferred(io, at, event)`: a record written, handed to the operating
+  system and published at once, and made durable with the next flush of the
+  file — an `append` or `appendAll` under `Sync.always`, a rotation, a
+  snapshot, a close. Group commit asked for record by record: a process
+  crash loses none of them, and a power cut at most the deferred records
+  since the last flush, a suffix and never a gap.
+
 - A cancel that lands on a write is no longer a failed write. `append`,
   `appendAll`, `snapshot`, `compact`, `truncateAfter`, `dropSegmentsBefore`,
   `reconcile`, `refresh`, `close` and `deinit` block the task's cancelation

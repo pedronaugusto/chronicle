@@ -791,6 +791,7 @@ fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
     try journal.truncateAfter(io, 2);
     try journal.compact(io, 1);
     try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "again")));
+    try testing.expectEqual(@as(u64, 4), try journal.appendDeferred(io, 4, created(4, "deferred")));
     // and nothing swallowed the cancel: a write outside the journal's is
     // still where it lands
     try testing.expectError(error.Canceled, io.vtable.fileWritePositional(io.userdata, journal.log.active.?.file, "", &.{""}, 1, 0));
@@ -819,12 +820,41 @@ test "a cancel that lands on a write is not a failed write" {
 
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
     defer reopened.deinit(io);
-    try testing.expectEqual(@as(u64, 3), try reopened.lastSeq(io));
+    try testing.expectEqual(@as(u64, 4), try reopened.lastSeq(io));
 }
 
 //========================================================================
 // Schema versions.
 //========================================================================
+
+test "a deferred record is published at once and made durable with the next flush" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    var fold: Registry = .{};
+    try journal.subscribe(io, fold.sink());
+
+    const syncs = journal.log.record_syncs;
+    try testing.expectEqual(@as(u64, 1), try journal.appendDeferred(io, 1, created(1, "one")));
+    try testing.expectEqual(@as(u64, 2), try journal.appendDeferred(io, 2, created(2, "two")));
+    // Published at once: the fold has both, and a reader of the files
+    // beside the writer finds them there.
+    try testing.expectEqual(@as(u32, 2), fold.events);
+    try testing.expectEqual(@as(u64, 2), try journal.lastSeq(io));
+    {
+        var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+        defer reader.deinit(io);
+        try testing.expectEqual(@as(u64, 2), try reader.lastSeq(io));
+    }
+    // Nothing was made durable for them, and the next record that asks
+    // for it makes all three durable with one flush.
+    try testing.expectEqual(syncs, journal.log.record_syncs);
+    try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "three")));
+    try testing.expectEqual(syncs + 1, journal.log.record_syncs);
+    try testing.expectEqual(@as(u32, 3), fold.events);
+}
 
 test "every fsync policy writes a log that opens with the same records" {
     const io = testing.io;

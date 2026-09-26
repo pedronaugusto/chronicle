@@ -106,6 +106,7 @@ One module, no dependencies and no build options: the only knobs are the
 | `deinit(io)` | Best-effort close for a scope that cannot return an error. |
 | `append(io, at, event)` | Write one record durably; returns its sequence number. |
 | `appendAll(io, entries)` | Write a batch under one `fsync`; returns the last sequence number. |
+| `appendDeferred(io, at, event)` | Write and publish one record now, durable with the next flush. |
 | `reconcile(io)` | After a persistence error, read back what survived and clear the latch. |
 | `records()` | The tail, oldest first, as a `Window`. |
 | `since(cursor)` | The tail after `cursor`, as a `Window`. |
@@ -191,9 +192,12 @@ per record.
 **Five promises, and nothing more.**
 
 1. **A sequence number that `append` returned is on the disk**, as far as
-   `Options.sync` asks. The record is serialised, written, flushed and made
+   `Options.sync` asks, and one `appendDeferred` returned is once the next
+   flush is. The record is serialised, written, flushed and made
    durable before `append` returns, before any sink is called and before any
-   `waitPast` is woken, so a reader never sees a record the disk does not have.
+   `waitPast` is woken, so a reader never sees a record the disk does not
+   have — unless the writer deferred it, and then the operating system has
+   it.
 
    | `Options.sync` | What a returned sequence number means | What that survives |
    |---|---|---|
@@ -213,6 +217,16 @@ per record.
    The policy governs the record bytes. The flushes that make a replacement
    atomic — promises 3 and 4 — are not optional under any of the three, because
    they are what those promises are.
+
+   `appendDeferred` asks for less, record by record: the record is written,
+   handed to the operating system and published at once, and made durable
+   with whatever flushes the file next — an `append` or `appendAll` under
+   `.always`, a rotation, a snapshot, a close. It is group commit where the
+   caller knows which of its records must be on the disk before it acts and
+   which may ride with the next one that must. A process crash loses none of
+   them; a power cut may lose the deferred records since the last flush, and
+   only those, since the file is written in order and a flush is of the whole
+   file: what it can take is a suffix, never a gap.
 
 2. **A failure to reach the disk is loud and must be reconciled.** A failed
    write, flush or `fsync` returns its error, calls no sink and makes every

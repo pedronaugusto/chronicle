@@ -629,6 +629,35 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// Safe to call from any task or thread.
         pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
+            return self.appendOne(io, at, event, .now);
+        }
+
+        /// `append`, with the record's durability left to the next flush:
+        /// the record is written, handed to the operating system and
+        /// published — the sinks called, the waiters woken — at once, and
+        /// made durable with whatever makes the file durable next: an
+        /// `append` or `appendAll` under `Options.sync = .always`, a
+        /// rotation, a snapshot, `close`. This is group commit asked for
+        /// record by record, where the caller knows which of its records
+        /// must be on the disk before it acts and which may ride with the
+        /// next one that must.
+        ///
+        /// What it promises is what `.on_segment` promises for every
+        /// record: a process crash, a kill included, loses nothing, since
+        /// the operating system has the bytes; a power cut may lose the
+        /// deferred records written since the last flush. Only those: the
+        /// file is written in order and a flush is of the whole file, so a
+        /// record that is durable has every record before it durable too,
+        /// and what a power cut can take is a suffix, never a gap.
+        ///
+        /// Under `.on_segment` and `.never` it is `append`.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn appendDeferred(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
+            return self.appendOne(io, at, event, .deferred);
+        }
+
+        fn appendOne(self: *Self, io: Io, at: i64, event: Event, durability: enum { now, deferred }) AppendError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -658,7 +687,13 @@ pub fn Journal(comptime Event: type) type {
 
             {
                 errdefer self.persistence_failed = true;
-                try self.log.appendLine(io, built.bytes, built.at, built.checksum);
+                switch (durability) {
+                    .now => try self.log.appendLine(io, built.bytes, built.at, built.checksum),
+                    .deferred => {
+                        try self.log.stageLine(io, built.bytes, built.at, built.checksum);
+                        try self.log.commitDeferred();
+                    },
+                }
             }
 
             held = self.publish(built);

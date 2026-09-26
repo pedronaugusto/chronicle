@@ -336,6 +336,10 @@ chain: u32,
 /// time halves the entries rather than reading them.
 index_opens: u64,
 index_reads: u64,
+/// How many times the records of the active segment have been made durable
+/// by a commit. Not part of any promise either: what the suite counts to
+/// prove that a deferred record is left to the next one.
+record_syncs: u64,
 /// One open handle on a sealed segment's index, kept between seeks. A fold
 /// that seeks repeatedly stays in one segment for as long as it is reading
 /// it, so one handle is the whole of the win and a cache is not needed.
@@ -436,6 +440,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenErro
         .chain = 0,
         .index_opens = 0,
         .index_reads = 0,
+        .record_syncs = 0,
         .held_index = null,
     };
     errdefer {
@@ -1893,10 +1898,20 @@ pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32) A
 /// One `fsync` however many records were staged, which is what makes a batch
 /// cost one where a record at a time costs one each.
 pub fn commit(log: *Log, io: Io) AppendError!void {
+    try log.commitDeferred();
+    if (log.options.sync == .always) {
+        try log.syncActive(io);
+        log.record_syncs += 1;
+    }
+}
+
+/// Put everything `stageLine` has written into the file and no further: the
+/// bytes reach the operating system, and whatever makes the file durable
+/// next — a `commit` under `Options.sync = .always`, a rotation, a close —
+/// makes them durable with it, the file being written in order.
+pub fn commitDeferred(log: *Log) AppendError!void {
     if (log.active == null) return error.ReadOnly;
-    const active = &log.active.?;
-    try active.writer.interface.flush();
-    if (log.options.sync == .always) try log.syncActive(io);
+    try log.active.?.writer.interface.flush();
 }
 
 /// Make the active segment's bytes durable at the level the file's own shape
