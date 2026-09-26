@@ -2883,24 +2883,48 @@ test "a backup is a whole journal, snapshot and indexes and all" {
     try testing.expectEqual(@as(u64, 13), try copy.append(io, 130, created(13, "onwards")));
 }
 
-test "a backup refuses its source when directory identity cannot be resolved" {
+test "a backup refuses its own directory reached through a symbolic link" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var journal = try Journal.open(failing.allocator(), io, ws.path, small(1, 8));
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(1, 8));
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "one"));
     _ = try journal.append(io, 2, created(2, "two"));
+    const before = try ws.read(try ws.segment(1));
 
-    // `sameDirectory` resolves both handles through the journal allocator.
-    // If that resolution cannot allocate, backup must stop before opening a
-    // source segment with truncation through the destination handle.
-    failing.fail_index = failing.alloc_index + 1;
-    try testing.expectError(error.OutOfMemory, journal.backup(io, ws.path));
-    failing.fail_index = std.math.maxInt(usize);
+    // A second name for the journal's directory. Its path is not the
+    // journal's, so only the directory's identity says they are one.
+    const link = try ws.beside("alias");
+    const cwd: Io.Dir = .cwd();
+    cwd.symLink(io, ws.path, link, .{ .is_directory = true }) catch |err| switch (err) {
+        // Windows lets a process make a symbolic link only with the
+        // privilege for it or in developer mode.
+        error.AccessDenied, error.PermissionDenied => if (builtin.os.tag == .windows)
+            return error.SkipZigTest
+        else
+            return err,
+        else => return err,
+    };
+
+    // The link itself, and a path that passes through a link to the
+    // directory above: neither spells the journal's path.
+    try testing.expectError(error.BackupInPlace, journal.backup(io, link));
+    const root_link = try ws.beside("root-alias");
+    try cwd.symLink(io, std.fs.path.dirname(ws.path).?, root_link, .{ .is_directory = true });
+    const through = try std.fs.path.join(ws.arena.allocator(), &.{ root_link, ws.name });
+    try testing.expectError(error.BackupInPlace, journal.backup(io, through));
+
+    // Nothing was cleared or copied over: the segments are as they were, and
+    // the journal reads back whole.
+    const after = try ws.read(try ws.segment(1));
+    try testing.expectEqualStrings(before, after);
     try testing.expectEqual(@as(u64, 2), try journal.verify(io));
+
+    // And a directory that is not the journal's, beside it, is still a
+    // destination.
+    try testing.expectEqual(@as(u64, 2), try journal.backup(io, try ws.beside("copy")));
 }
 
 /// One line of a helper's output. `takeDelimiterExclusive` leaves the newline

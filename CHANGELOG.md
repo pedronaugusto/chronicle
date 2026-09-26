@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- `backup` knows its own directory by what the filesystem calls it — device
+  and inode on POSIX, volume serial and file id on Windows — and no longer by
+  its resolved path. A destination that reaches the journal's directory
+  through a symbolic link or a bind mount is refused with `BackupInPlace`;
+  the check allocates nothing, and `BackupError` carries `Io.File.StatError`
+  where it carried the errors of resolving a path. A destination that is
+  itself a symbolic link to a directory is now that directory, where it was
+  refused with `NotDir`.
+
 - `appendDeferred(io, at, event)`: a record written, handed to the operating
   system and published at once, and made durable with the next flush of the
   file — an `append` or `appendAll` under `Sync.always`, a rotation, a

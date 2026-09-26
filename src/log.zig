@@ -27,6 +27,7 @@ const Io = std.Io;
 const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
 const clone = @import("clone.zig");
+const identity = @import("identity.zig");
 
 const Log = @This();
 
@@ -2576,7 +2577,7 @@ pub fn syncBeforeSnapshot(log: *Log, io: Io) SnapshotError!void {
 // Copying a running log.
 //========================================================================
 
-pub const BackupError = OpenError || Io.Dir.RealPathFileAllocError || error{BackupInPlace};
+pub const BackupError = OpenError || identity.Error || error{BackupInPlace};
 
 /// Copy a consistent view of the log into the directory `dest_path`, creating
 /// it if it is not there, and report the newest sequence number the copy
@@ -2612,12 +2613,20 @@ pub const BackupError = OpenError || Io.Dir.RealPathFileAllocError || error{Back
 /// take it again.
 pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {
     const cwd: Io.Dir = .cwd();
-    try cwd.createDirPath(io, dest_path);
-    var dest = try cwd.openDir(io, dest_path, .{ .iterate = true });
+    // Opened first, so a destination that is a symbolic link to a directory
+    // is that directory: std's `createDirPath` refuses an existing link with
+    // `NotDir` where `mkdir -p` would follow it.
+    var dest = cwd.openDir(io, dest_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => created: {
+            try cwd.createDirPath(io, dest_path);
+            break :created try cwd.openDir(io, dest_path, .{ .iterate = true });
+        },
+        else => |e| return e,
+    };
     defer dest.close(io);
     // Copying a directory over itself would truncate the segments it was
     // reading. Nothing else here can tell the two apart.
-    if (try log.sameDirectory(io, dest)) return error.BackupInPlace;
+    if (try log.sameDirectory(dest)) return error.BackupInPlace;
     try log.clearBackup(io, dest);
     if (log.segments.items.len == 0) {
         try syncDirHandle(io, dest);
@@ -2731,15 +2740,16 @@ fn clearBackup(log: *Log, io: Io, dest: Io.Dir) OpenError!void {
     for (names.items) |name| try dest.deleteFile(io, name);
 }
 
-/// Whether `dest` is the directory this log lives in. Failure to establish
+/// Whether `dest` is the directory this log lives in, by the filesystem's
+/// identity of the two handles (device and inode, or volume and file id), so
+/// a second path to the same directory — a symbolic link, a bind mount — is
+/// caught where a comparison of paths would miss it. Failure to establish
 /// identity stops the copy: treating an unknown destination as different can
 /// open a source segment through the destination handle with truncation.
-fn sameDirectory(log: *Log, io: Io, dest: Io.Dir) Io.Dir.RealPathFileAllocError!bool {
-    var arena: std.heap.ArenaAllocator = .init(log.gpa);
-    defer arena.deinit();
-    const here = try log.dir.realPathFileAlloc(io, ".", arena.allocator());
-    const there = try dest.realPathFileAlloc(io, ".", arena.allocator());
-    return std.mem.eql(u8, here, there);
+fn sameDirectory(log: *Log, dest: Io.Dir) identity.Error!bool {
+    const here = try identity.of(log.dir);
+    const there = try identity.of(dest);
+    return here.eql(there);
 }
 
 //========================================================================

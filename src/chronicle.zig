@@ -451,6 +451,7 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `backup`.
         ///
         /// * `BackupInPlace` — the destination is the journal's own directory,
+        ///   by whatever path it was named (a symbolic link to it included),
         ///   which would have meant copying its segments over themselves.
         pub const BackupError = OpenError || Log.BackupError;
 
