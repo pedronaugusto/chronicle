@@ -543,18 +543,30 @@ const CleanSegmentFile = struct {
 };
 
 fn inspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64, proof: *?CleanSegmentFile) Io.Cancelable!void {
-    proof.* = log.tryInspectCleanSegmentFile(io, base_seq);
+    // a group drops what its task returns, and a task it ran on the
+    // caller's own thread would take the caller's cancel with it: put back
+    proof.* = log.tryInspectCleanSegmentFile(io, base_seq) catch return io.recancel();
 }
 
-fn tryInspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64) ?CleanSegmentFile {
-    const file = log.dir.openFile(io, &segmentName(base_seq, segment_extension), .{}) catch return null;
+fn tryInspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?CleanSegmentFile {
+    const file = log.dir.openFile(io, &segmentName(base_seq, segment_extension), .{}) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
     defer file.close(io);
-    const length = file.length(io) catch return null;
+    const length = file.length(io) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
     if (length == 0) return null;
 
     var raw: [96]u8 = undefined;
     const want: usize = @intCast(@min(raw.len, length));
-    if ((file.readPositionalAll(io, raw[0..want], 0) catch return null) != want) return null;
+    const read = file.readPositionalAll(io, raw[0..want], 0) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
+    if (read != want) return null;
     const newline = std.mem.indexOfScalar(u8, raw[0..want], '\n') orelse return null;
     const head = quickSegmentHeader(raw[0..newline]) orelse return null;
     if (head.version != log_format or head.base_seq != base_seq) return null;
@@ -562,13 +574,17 @@ fn tryInspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64) ?CleanSegmentFil
 }
 
 fn inspectCleanIndex(log: *Log, io: Io, base_seq: u64, proof: *?IndexProof) Io.Cancelable!void {
-    proof.* = log.tryInspectCleanIndex(io, base_seq);
+    // as for the segment file: the cancel is put back, never dropped
+    proof.* = log.tryInspectCleanIndex(io, base_seq) catch return io.recancel();
 }
 
-fn tryInspectCleanIndex(log: *Log, io: Io, base_seq: u64) ?IndexProof {
-    const file = log.dir.openFile(io, &segmentName(base_seq, index_extension), .{}) catch return null;
+fn tryInspectCleanIndex(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?IndexProof {
+    const file = log.dir.openFile(io, &segmentName(base_seq, index_extension), .{}) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
     defer file.close(io);
-    const proof = proveIndexFrom(io, file) orelse return null;
+    const proof = (try proveIndexFrom(io, file)) orelse return null;
     if (proof.base_seq != base_seq) return null;
     return proof;
 }
@@ -910,24 +926,31 @@ const IndexProof = struct {
 /// length it currently has, and the checksum in the header is the checksum of
 /// the entries that follow it. An index that agrees with all three was built
 /// from exactly these bytes and nothing has changed since.
-fn readIndex(log: *Log, io: Io, segment: Segment) OpenError!?Indexed {
-    const file = log.holdIndex(io, segment.base_seq) orelse return null;
+fn readIndex(log: *Log, io: Io, segment: Segment) Io.Cancelable!?Indexed {
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     return readIndexFrom(io, file, segment);
 }
 
-fn readIndexFrom(io: Io, file: Io.File, segment: Segment) ?Indexed {
-    const proof = proveIndexFrom(io, file) orelse return null;
+fn readIndexFrom(io: Io, file: Io.File, segment: Segment) Io.Cancelable!?Indexed {
+    const proof = (try proveIndexFrom(io, file)) orelse return null;
     if (proof.segment_bytes != segment.bytes) return null;
     if (proof.base_seq != segment.base_seq) return null;
     return proof.indexed;
 }
 
-fn proveIndexFrom(io: Io, file: Io.File) ?IndexProof {
+fn proveIndexFrom(io: Io, file: Io.File) Io.Cancelable!?IndexProof {
     var raw: [index_header_len]u8 = undefined;
-    if ((file.readPositionalAll(io, &raw, 0) catch return null) != raw.len) return null;
+    const read_header = file.readPositionalAll(io, &raw, 0) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
+    if (read_header != raw.len) return null;
     const header = IndexHeader.parse(&raw) orelse return null;
 
-    const length = file.length(io) catch return null;
+    const length = file.length(io) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
     if (length < index_header_len) return null;
     const body = length - index_header_len;
     if (body % index_entry_len != 0) return null;
@@ -943,7 +966,10 @@ fn proveIndexFrom(io: Io, file: Io.File) ?IndexProof {
     var at: u64 = index_header_len;
     while (at < length) {
         const want: usize = @intCast(@min(buffer.len, length - at));
-        const read = file.readPositionalAll(io, buffer[0..want], at) catch return null;
+        const read = file.readPositionalAll(io, buffer[0..want], at) catch |e| {
+            try cancelOf(e);
+            return null;
+        };
         if (read != want) return null;
         checksum = crc32c.update(checksum, buffer[0..want]);
         at += want;
@@ -962,24 +988,37 @@ fn proveIndexFrom(io: Io, file: Io.File) ?IndexProof {
     };
 }
 
+/// What a failed read comes to where the answer can do without it — an
+/// index, which only saves a walk, or a file a clean open only inspects:
+/// nothing, unless it was a cancel. A cancel is no failure of the read, and
+/// taken as "no index" it was gone: the task went on, and waited on where it
+/// meant to stop.
+fn cancelOf(err: anyerror) Io.Cancelable!void {
+    if (err == error.Canceled) return error.Canceled;
+}
+
 /// The entry at `slot` of a segment's index, read through an open handle.
-fn indexEntryAt(log: *Log, io: Io, file: Io.File, slot: u64) ?IndexEntry {
+fn indexEntryAt(log: *Log, io: Io, file: Io.File, slot: u64) Io.Cancelable!?IndexEntry {
     log.index_reads += 1;
     var raw: [index_entry_len]u8 = undefined;
     const offset = index_header_len + slot * index_entry_len;
-    if ((file.readPositionalAll(io, &raw, offset) catch return null) != raw.len) return null;
+    const read = file.readPositionalAll(io, &raw, offset) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
+    if (read != raw.len) return null;
     return IndexEntry.parse(&raw);
 }
 
 /// The slot of the last entry whose sequence number is at or below `seq`, or
 /// null when the first entry is already past it.
-fn bisectSeq(log: *Log, io: Io, file: Io.File, entries: u64, seq: u64) ?u64 {
+fn bisectSeq(log: *Log, io: Io, file: Io.File, entries: u64, seq: u64) Io.Cancelable!?u64 {
     var low: u64 = 0;
     var high: u64 = entries;
     var found: ?u64 = null;
     while (low < high) {
         const middle = low + (high - low) / 2;
-        const entry = log.indexEntryAt(io, file, middle) orelse return null;
+        const entry = (try log.indexEntryAt(io, file, middle)) orelse return null;
         if (entry.seq <= seq) {
             found = middle;
             low = middle + 1;
@@ -1004,14 +1043,17 @@ fn releaseIndex(log: *Log, io: Io) void {
 
 /// The open index of a sealed segment, opening it if the one being held is
 /// another segment's.
-fn holdIndex(log: *Log, io: Io, base_seq: u64) ?Io.File {
+fn holdIndex(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?Io.File {
     if (log.held_index) |held| {
         if (held.base_seq == base_seq) return held.file;
         held.file.close(io);
         log.held_index = null;
     }
     log.index_opens += 1;
-    const file = log.dir.openFile(io, &segmentName(base_seq, index_extension), .{}) catch return null;
+    const file = log.dir.openFile(io, &segmentName(base_seq, index_extension), .{}) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
     log.held_index = .{ .base_seq = base_seq, .file = file };
     return file;
 }
@@ -1024,14 +1066,14 @@ fn holdIndex(log: *Log, io: Io, base_seq: u64) ?Io.File {
 ///
 /// `may_write` is false for a walk that does not hold the journal's lock: it
 /// reads an index that is already there and never builds one.
-fn provenIndex(log: *Log, io: Io, at: usize, may_write: bool) ?Indexed {
+fn provenIndex(log: *Log, io: Io, at: usize, may_write: bool) Io.Cancelable!?Indexed {
     const segment = &log.segments.items[at];
     switch (segment.index) {
         .good => |indexed| return indexed,
         .none => return null,
         .unchecked => {},
     }
-    if (log.readIndex(io, segment.*) catch null) |indexed| {
+    if (try log.readIndex(io, segment.*)) |indexed| {
         segment.index = .{ .good = indexed };
         return indexed;
     }
@@ -1042,11 +1084,13 @@ fn provenIndex(log: *Log, io: Io, at: usize, may_write: bool) ?Indexed {
         segment.index = .none;
         return null;
     }
-    log.rebuildIndex(io, segment.*) catch {
+    log.rebuildIndex(io, segment.*) catch |e| {
+        // a cancel is no proof there can be no index: the next walk tries
+        try cancelOf(e);
         segment.index = .none;
         return null;
     };
-    if (log.readIndex(io, segment.*) catch null) |indexed| {
+    if (try log.readIndex(io, segment.*)) |indexed| {
         segment.index = .{ .good = indexed };
         return indexed;
     }
@@ -1061,7 +1105,7 @@ fn provenIndex(log: *Log, io: Io, at: usize, may_write: bool) ?Indexed {
 /// `index_interval_bytes` the answer is the entry before the record, and the
 /// walk steps over what is between them. A null answer is never wrong — it
 /// costs a walk from the segment's first record.
-fn indexedOffset(log: *Log, io: Io, at: usize, seq: u64, may_write: bool) ?u64 {
+fn indexedOffset(log: *Log, io: Io, at: usize, seq: u64, may_write: bool) Io.Cancelable!?u64 {
     const segment = log.segments.items[at];
     if (seq <= segment.base_seq or seq > segment.last_seq) return null;
 
@@ -1069,19 +1113,22 @@ fn indexedOffset(log: *Log, io: Io, at: usize, seq: u64, may_write: bool) ?u64 {
         if (at + 1 == log.segments.items.len) {
             // The live index: what has been appended is in the buffer or in
             // the file, so a flush is all it takes to read it back.
-            active.index_writer.interface.flush() catch return null;
-            const slot = log.bisectSeq(io, active.index_file, active.builder.entries, seq) orelse return null;
-            const entry = log.indexEntryAt(io, active.index_file, slot) orelse return null;
+            active.index_writer.interface.flush() catch {
+                if (active.index_writer.err) |e| try cancelOf(e);
+                return null;
+            };
+            const slot = (try log.bisectSeq(io, active.index_file, active.builder.entries, seq)) orelse return null;
+            const entry = (try log.indexEntryAt(io, active.index_file, slot)) orelse return null;
             return entry.offset;
         }
     }
 
-    const indexed = log.provenIndex(io, at, may_write) orelse return null;
+    const indexed = (try log.provenIndex(io, at, may_write)) orelse return null;
     if (segment.base_seq + indexed.count - 1 != segment.last_seq) return null;
 
-    const file = log.holdIndex(io, segment.base_seq) orelse return null;
-    const slot = log.bisectSeq(io, file, indexed.entries, seq) orelse return null;
-    const entry = log.indexEntryAt(io, file, slot) orelse return null;
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
+    const slot = (try log.bisectSeq(io, file, indexed.entries, seq)) orelse return null;
+    const entry = (try log.indexEntryAt(io, file, slot)) orelse return null;
     return entry.offset;
 }
 
@@ -1158,11 +1205,11 @@ fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
 
     // The running checksum has to carry on from the entries already there,
     // and the bisection has to know where the last one sits.
-    const held = log.holdIndex(io, segment.base_seq) orelse return null;
+    const held = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     var builder: Builder = .init(segment.base_seq, indexed.interval);
     builder.entries = indexed.entries;
     if (indexed.entries != 0) {
-        const last = log.indexEntryAt(io, held, indexed.entries - 1) orelse return null;
+        const last = (try log.indexEntryAt(io, held, indexed.entries - 1)) orelse return null;
         builder.last_offset = last.offset;
     }
     const length = index_header_len + indexed.entries * index_entry_len;
@@ -1171,7 +1218,11 @@ fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
         var at: u64 = index_header_len;
         while (at < length) {
             const want: usize = @intCast(@min(buffer.len, length - at));
-            if ((held.readPositionalAll(io, buffer[0..want], at) catch return null) != want) return null;
+            const read = held.readPositionalAll(io, buffer[0..want], at) catch |e| {
+                try cancelOf(e);
+                return null;
+            };
+            if (read != want) return null;
             builder.checksum = crc32c.update(builder.checksum, buffer[0..want]);
             at += want;
         }
@@ -1181,15 +1232,24 @@ fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
     const file = log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{
         .read = true,
         .truncate = false,
-    }) catch return null;
+    }) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
     var returned = false;
     defer if (!returned) file.close(io);
-    file.setLength(io, length) catch return null;
+    file.setLength(io, length) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
     file.writePositionalAll(
         io,
         &placeholderHeader(segment.base_seq, indexed.interval),
         0,
-    ) catch return null;
+    ) catch |e| {
+        try cancelOf(e);
+        return null;
+    };
 
     var writer = file.writer(io, log.index_buf);
     writer.pos = length;
@@ -1703,7 +1763,7 @@ pub fn scanFrom(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!Scan 
     // Land on the cursor (or an earlier sparse entry), not directly on the
     // first record to return. Stepping over the cursor seeds that record's
     // predecessor checksum before its successor is accepted.
-    const position = log.indexedOffset(io, first, cursor, may_write) orelse 0;
+    const position = (try log.indexedOffset(io, first, cursor, may_write)) orelse 0;
     return log.scanOver(log.segments.items[first..], position);
 }
 
@@ -1731,7 +1791,7 @@ pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) OpenError!?u64 {
         if (!segment.times.known() and !active) {
             // A sealed segment whose index did not describe it at open. Build
             // one now and keep what it says, so a second lookup is free.
-            if (log.provenIndex(io, i, true)) |indexed| segment.times = indexed.times;
+            if (try log.provenIndex(io, i, true)) |indexed| segment.times = indexed.times;
         }
         if (segment.times.known()) {
             if (segment.times.highest < want) continue;
@@ -1749,9 +1809,9 @@ pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) OpenError!?u64 {
 /// the timestamps in its index rather than from the segment itself.
 fn indexedSeqAtOrAfter(log: *Log, io: Io, at: usize, want: i64) OpenError!?u64 {
     const segment = log.segments.items[at];
-    const indexed = log.provenIndex(io, at, true) orelse return null;
+    const indexed = (try log.provenIndex(io, at, true)) orelse return null;
     if (indexed.entries == 0) return null;
-    const file = log.holdIndex(io, segment.base_seq) orelse return null;
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
 
     if (indexed.times.rising) {
         // The timestamps do not fall, so the entry to start from is found by
@@ -1761,7 +1821,7 @@ fn indexedSeqAtOrAfter(log: *Log, io: Io, at: usize, want: i64) OpenError!?u64 {
         var from: ?IndexEntry = null;
         while (low < high) {
             const middle = low + (high - low) / 2;
-            const entry = log.indexEntryAt(io, file, middle) orelse return null;
+            const entry = (try log.indexEntryAt(io, file, middle)) orelse return null;
             if (entry.at < want) {
                 from = entry;
                 low = middle + 1;
@@ -1775,7 +1835,7 @@ fn indexedSeqAtOrAfter(log: *Log, io: Io, at: usize, want: i64) OpenError!?u64 {
             // run that starts here: at most `interval` bytes of segment.
             return log.scannedSeqAtOrAfter(io, segment, want, entry.offset, entry.seq);
         }
-        const first = log.indexEntryAt(io, file, 0) orelse return null;
+        const first = (try log.indexEntryAt(io, file, 0)) orelse return null;
         if (indexed.interval == 0) return first.seq;
         return log.scannedSeqAtOrAfter(io, segment, want, first.offset, first.seq);
     }
@@ -1787,7 +1847,7 @@ fn indexedSeqAtOrAfter(log: *Log, io: Io, at: usize, want: i64) OpenError!?u64 {
     }
     var slot: u64 = 0;
     while (slot < indexed.entries) : (slot += 1) {
-        const entry = log.indexEntryAt(io, file, slot) orelse return null;
+        const entry = (try log.indexEntryAt(io, file, slot)) orelse return null;
         if (entry.at >= want) return entry.seq;
     }
     return null;

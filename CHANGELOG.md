@@ -30,6 +30,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it. `waitPast` now waits on a futex word the appends and nudges bump, and
   returns `error.Canceled` whichever wins.
 
+- A cancel that lands on an index read is a cancel. The lookups an index
+  only speeds up — where a walk starts, `seqAtOrAfter`, a clean open's
+  inspection, resuming an index — took any failed read as "no index" and
+  went on without it, a cancel included: the cancel was spent, the walk
+  carried on, and the task's next wait could not be canceled. They return
+  `error.Canceled` now (a clean open's inspection tasks put it back for
+  their caller), and a canceled rebuild no longer marks a segment as
+  having no index.
+
 ## [0.6.0] - 2026-09-20
 
 A clean reopen proved rather than scanned, an append that costs one

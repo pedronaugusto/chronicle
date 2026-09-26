@@ -1383,6 +1383,59 @@ test "a reader stopped as a record arrives is stopped" {
     }
 }
 
+test "a walk canceled as it reads an index is canceled" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // Sealed segments with an entry every record, and the tail too small to
+    // hold them: a walk from the middle looks its start up in an index.
+    var options = small(20, 4);
+    options.index_interval_bytes = 0;
+    var journal = try Journal.open(testing.allocator, io, ws.path, options);
+    defer journal.deinit(io);
+    for (0..200) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "indexed"));
+
+    // A reader walking from record 150 until it is canceled. A cancel that
+    // lands on the index's read is a cancel, not a missing index: taken as
+    // the second, the walk went on from the segment's start, never saw
+    // the cancel again, and walked forever. A watchdog turns that into a
+    // failure.
+    const reader = struct {
+        fn f(j: *Journal, inner: Io, started: *std.atomic.Value(bool)) Journal.ReplayError!void {
+            while (true) {
+                started.store(true, .release);
+                var walk = try j.replay(inner, 150);
+                defer walk.deinit(inner);
+                while (try walk.next(inner)) |_| {}
+            }
+        }
+    }.f;
+    var rounds: std.atomic.Value(u32) = .init(0);
+    const watchdog = struct {
+        fn f(inner: Io, count: *std.atomic.Value(u32)) Io.Cancelable!void {
+            var last = count.load(.acquire);
+            while (true) {
+                try inner.sleep(.fromSeconds(5), .awake);
+                const at = count.load(.acquire);
+                if (at == last) @panic("a walk canceled as it read an index walked on");
+                last = at;
+            }
+        }
+    }.f;
+    var dog = try io.concurrent(watchdog, .{ io, &rounds });
+    defer dog.cancel(io) catch {};
+
+    for (0..500) |round| {
+        var started: std.atomic.Value(bool) = .init(false);
+        var future = try io.concurrent(reader, .{ &journal, io, &started });
+        while (!started.load(.acquire)) std.atomic.spinLoopHint();
+        for (0..(round % 32) * 20) |_| std.atomic.spinLoopHint();
+        if (future.cancel(io)) |_| {} else |err| try testing.expectEqual(error.Canceled, err);
+        rounds.store(@intCast(round + 1), .release);
+    }
+}
+
 //========================================================================
 // Segments, the tail, and reading from the disk.
 //========================================================================
