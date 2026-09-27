@@ -1035,13 +1035,20 @@ test "a record from an older schema goes through migrate" {
         \\{"created":{"id":7,"title":"old"}}
     }});
 
+    // The hook reads the old shape as a type, and puts the new name
+    // together, both in the record's arena.
     const migrate = struct {
-        fn f(from_version: u32, value: std.json.Value) Journal.MigrateError!Event {
+        const V1 = union(enum) { created: struct { id: u32, title: []const u8 } };
+
+        fn f(arena: std.mem.Allocator, from_version: u32, value: std.json.Value) Journal.MigrateError!Event {
             if (from_version != 1) return error.Unmigratable;
-            const made = value.object.get("created") orelse return error.Unmigratable;
+            const old = std.json.parseFromValueLeaky(V1, arena, value, .{}) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Unmigratable,
+            };
             return .{ .created = .{
-                .id = @intCast(made.object.get("id").?.integer),
-                .name = made.object.get("title").?.string,
+                .id = old.created.id,
+                .name = try std.fmt.allocPrint(arena, "{s} (v1)", .{old.created.title}),
             } };
         }
     }.f;
@@ -1054,12 +1061,14 @@ test "a record from an older schema goes through migrate" {
 
     const record = journal.records().records[0];
     try testing.expectEqual(@as(u32, 1), record.version);
-    try testing.expectEqualStrings("old", record.event.created.name);
+    try testing.expectEqual(@as(u32, 7), record.event.created.id);
+    try testing.expectEqualStrings("old (v1)", record.event.created.name);
 
-    // What the hook returned borrows from the record's own arena, so it is
-    // still there after the bytes it was read from would have gone.
+    // What the hook made lives in the record's own arena, so it is still there
+    // after the bytes it was read from would have gone, and nothing leaks
+    // under the testing allocator when the record goes.
     _ = try journal.append(io, 2, created(8, "new"));
-    try testing.expectEqualStrings("old", journal.records().records[0].event.created.name);
+    try testing.expectEqualStrings("old (v1)", journal.records().records[0].event.created.name);
 }
 
 test "without a migrate hook an older record lands in the unknown arm" {

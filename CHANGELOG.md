@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Breaking:** the `migrate` hook takes an allocator:
+  `fn (arena: Allocator, from_version: u32, value: std.json.Value)`. It is
+  the arena that owns the record being built, so a hook can parse the old
+  shape as a type and allocate what the new `Event` holds, and it all lives
+  as long as the record. A hook that allocated nothing adds the parameter
+  and ignores it. `examples/migrate.zig` reads version 1 records at
+  version 2.
+
 - `backup` knows its own directory by what the filesystem calls it — device
   and inode on POSIX, volume serial and file id on Windows — and no longer by
   its resolved path. A destination that reaches the journal's directory

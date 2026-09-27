@@ -231,10 +231,14 @@ pub fn Journal(comptime Event: type) type {
         /// Translates a record written at an older schema version into the
         /// current `Event`.
         ///
-        /// `value` is the record's `ev` member, parsed into the arena that owns
-        /// the record being built: an `Event` the hook returns may borrow from
-        /// it, and lasts exactly as long as that record does.
-        pub const Migrate = *const fn (from_version: u32, value: std.json.Value) MigrateError!Event;
+        /// `arena` is the arena that owns the record being built, and `value`
+        /// is the record's `ev` member, already parsed into it. What the hook
+        /// allocates from `arena` — the old shape parsed as a type with
+        /// `std.json.parseFromValueLeaky`, a string put together, a slice of
+        /// the new form — lasts exactly as long as the record does, and so
+        /// does anything in `value` the returned `Event` borrows. Nothing
+        /// needs freeing: the arena goes with the record.
+        pub const Migrate = *const fn (arena: Allocator, from_version: u32, value: std.json.Value) MigrateError!Event;
 
         /// How a journal is opened. Every field has a default; the defaults are
         /// the durable, forgiving ones.
@@ -2128,7 +2132,7 @@ pub fn Journal(comptime Event: type) type {
                 };
             }
             if (version > self.options.schema_version) return error.NewerSchema;
-            if (self.options.migrate) |migrate| return migrate(version, try retainedEv(arena, ev, line));
+            if (self.options.migrate) |migrate| return migrate(arena, version, try retainedEv(arena, ev, line));
             if (comptime unknown_arm != null) return unknownEvent(arena, ev, line);
             return error.OlderSchema;
         }

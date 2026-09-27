@@ -304,6 +304,12 @@ against `Options.schema_version`.** Equal is parsed as `Event`. Newer is
 newer writer wrote is how a fold silently goes wrong. Older goes to
 `Options.migrate` if you gave one, then to the `Event` arm named `unknown` if
 there is one, typed `void` or `std.json.Value`, then to `error.OlderSchema`.
+The hook is `fn (arena, from_version, value) MigrateError!Event`: `value` is
+the record's event as JSON, and `arena` is the record's own, so the old shape
+parsed as a type and whatever the new `Event` needs allocated live as long as
+the record and are never freed by hand.
+[`examples/migrate.zig`](examples/migrate.zig) reads version 1 records back at
+version 2.
 `compact` copies kept records byte for byte, so one read back through
 `migrate` or the `unknown` arm keeps the version and payload it was written
 with.
