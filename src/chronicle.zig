@@ -159,6 +159,16 @@ pub fn Journal(comptime Event: type) type {
         changed: std.atomic.Value(u32),
         /// Bumped by `nudge`: a wake with no record behind it.
         nudges: u64,
+        /// How many `waitPast` calls are between letting go of the lock and
+        /// taking it back, which is to say may be asleep on `changed`.
+        /// Kept under the lock. With none, a wake bumps the word and makes
+        /// no system call: an append nobody waits on pays nothing for the
+        /// readers it does not have.
+        waiters: u32,
+        /// How many wakes went to the operating system. Not part of any
+        /// promise: what the suite counts to prove that an append with no
+        /// reader waiting makes none.
+        futex_wakes: u64,
         /// The sequence number of the newest record, or zero. Read it with
         /// `lastSeq`, which takes the lock.
         seq: u64,
@@ -544,6 +554,8 @@ pub fn Journal(comptime Event: type) type {
                 .mutex = .init,
                 .changed = .init(0),
                 .nudges = 0,
+                .waiters = 0,
+                .futex_wakes = 0,
                 .seq = 0,
                 .persistence_failed = false,
                 .dropped_bytes = log.dropped_bytes,
@@ -930,17 +942,29 @@ pub fn Journal(comptime Event: type) type {
                 // read under the lock: whatever wakes this reader bumps the
                 // word under the same lock, after this, so the wait returns
                 const seen = self.changed.load(.acquire);
+                // counted before the lock goes, so a wake from here on
+                // knows there is somebody to wake
+                self.waiters += 1;
                 self.mutex.unlock(io);
                 const waited = io.futexWait(u32, &self.changed.raw, seen);
                 self.mutex.lockUncancelable(io);
+                self.waiters -= 1;
                 try waited;
             }
             return self.since(cursor);
         }
 
         /// Every `waitPast` woken to look again. Called under the lock.
+        ///
+        /// The word is bumped whatever happens, so a reader that counted
+        /// itself in and has not reached its wait yet finds it moved and
+        /// does not sleep. The system call is made only when a reader has
+        /// counted itself in: `waiters` is read under the same lock the
+        /// reader counts itself in under, so none can be missed.
         fn wake(self: *Self, io: Io) void {
             _ = self.changed.fetchAdd(1, .release);
+            if (self.waiters == 0) return;
+            self.futex_wakes += 1;
             io.futexWake(u32, &self.changed.raw, std.math.maxInt(u32));
         }
 

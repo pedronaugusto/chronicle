@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- An append nobody is waiting on no longer makes a system call to wake
+  one. `waitPast` counts itself in under the journal's lock before it
+  sleeps, and a record or a nudge asks the operating system to wake
+  readers only when one has; every `append` used to pay for a futex wake
+  whether anyone waited or not.
+
 - **Breaking:** the `migrate` hook takes an allocator:
   `fn (arena: Allocator, from_version: u32, value: std.json.Value)`. It is
   the arena that owns the record being built, so a hook can parse the old

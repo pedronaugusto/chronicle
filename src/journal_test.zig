@@ -1305,6 +1305,41 @@ test "waitPast blocks until an append arrives" {
     try group.await(io);
 }
 
+test "an append nobody waits on wakes nobody, and one somebody waits on wakes them" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+
+    // No reader: the word moves and no system call is made for it.
+    for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "alone"));
+    journal.nudge(io);
+    try testing.expectEqual(@as(u64, 0), journal.futex_wakes);
+
+    const reader = struct {
+        fn f(j: *Journal, inner: Io, cursor: u64) Io.Cancelable!usize {
+            return (try j.waitPast(inner, cursor)).records.len;
+        }
+    }.f;
+    var future = try io.concurrent(reader, .{ &journal, io, @as(u64, 3) });
+    defer _ = future.cancel(io) catch {};
+
+    // Once the reader has counted itself in — read under the lock it counts
+    // itself in under — the next append has somebody to wake, and does.
+    while (true) {
+        journal.mutex.lockUncancelable(io);
+        const counted = journal.waiters;
+        journal.mutex.unlock(io);
+        if (counted == 1) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    _ = try journal.append(io, 4, created(4, "awaited"));
+    try testing.expectEqual(@as(usize, 1), try future.await(io));
+    try testing.expectEqual(@as(u64, 1), journal.futex_wakes);
+}
+
 test "waitPast is woken by a nudge with no record behind it" {
     const io = testing.io;
     var ws = try Workspace.init("log");
