@@ -145,6 +145,11 @@ pub fn Journal(comptime Event: type) type {
         /// The length of the last record encoded, which sizes the next one's
         /// buffer.
         record_hint: usize,
+        /// The line of a record nothing keeps — no tail, no sink, no
+        /// round-trip check — written here and handed to the log, which
+        /// copies it. Reused, so once it has held a record that long such an
+        /// append allocates nothing.
+        line: std.ArrayList(u8),
         /// Reset once per record while reading records back; never holds
         /// anything a caller can see.
         scratch: std.heap.ArenaAllocator,
@@ -549,6 +554,7 @@ pub fn Journal(comptime Event: type) type {
                 .tail_arenas = .empty,
                 .tail_bytes = 0,
                 .record_hint = 256,
+                .line = .empty,
                 .scratch = .init(gpa),
                 .sinks = .empty,
                 .mutex = .init,
@@ -564,6 +570,7 @@ pub fn Journal(comptime Event: type) type {
                 self.clearTail();
                 self.tail.deinit(gpa);
                 self.tail_arenas.deinit(gpa);
+                self.line.deinit(gpa);
                 self.scratch.deinit();
             }
             try self.fillTail(io);
@@ -618,6 +625,7 @@ pub fn Journal(comptime Event: type) type {
             self.clearTail();
             self.tail.deinit(self.gpa);
             self.tail_arenas.deinit(self.gpa);
+            self.line.deinit(self.gpa);
             self.sinks.deinit(self.gpa);
             self.scratch.deinit();
             self.* = undefined;
@@ -701,7 +709,7 @@ pub fn Journal(comptime Event: type) type {
             // record that must not reach the disk either.
             var built = try self.encode(next, at, self.log.chainTip(), event);
             var held = false;
-            defer if (!held) built.release(self.gpa);
+            defer if (!held) built.release();
 
             // Reserve before writing: after the bytes are durable nothing may
             // fail, or the disk would hold a record memory does not.
@@ -786,7 +794,7 @@ pub fn Journal(comptime Event: type) type {
             var built: std.ArrayList(Built) = .empty;
             defer built.deinit(self.gpa);
             var published = false;
-            defer if (!published) for (built.items) |*item| item.release(self.gpa);
+            defer if (!published) for (built.items) |*item| item.release();
             if (self.needsRecord()) try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
 
             const before = self.seq;
@@ -800,11 +808,11 @@ pub fn Journal(comptime Event: type) type {
                 {
                     errdefer self.persistence_failed = true;
                     self.log.stageLine(io, item.bytes, item.at, item.checksum) catch |err| {
-                        item.release(self.gpa);
+                        item.release();
                         return err;
                     };
                 }
-                if (item.record != null) built.appendAssumeCapacity(item) else item.release(self.gpa);
+                if (item.record != null) built.appendAssumeCapacity(item) else item.release();
             }
 
             {
@@ -1775,7 +1783,9 @@ pub fn Journal(comptime Event: type) type {
         /// `record` is there when something will read it: an arena owns every
         /// slice of it, and moves into `tail_arenas` once the record is on the
         /// disk. When nothing will — no tail, no sink, no round-trip check —
-        /// the line is the only thing built, and the allocator owns it.
+        /// the line is the only thing built, and it is the journal's `line`:
+        /// valid until the next record is encoded, which is after this one
+        /// has been handed to the log.
         const Built = struct {
             arena: ?std.heap.ArenaAllocator,
             bytes: []const u8,
@@ -1785,8 +1795,8 @@ pub fn Journal(comptime Event: type) type {
             checksum: u32,
             record: ?Record,
 
-            fn release(built: *Built, gpa: Allocator) void {
-                if (built.arena) |*arena| arena.deinit() else gpa.free(built.bytes);
+            fn release(built: *Built) void {
+                if (built.arena) |*arena| arena.deinit();
             }
         };
 
@@ -1810,18 +1820,26 @@ pub fn Journal(comptime Event: type) type {
             const needs_record = self.needsRecord();
             var arena: ?std.heap.ArenaAllocator = if (needs_record) .init(self.gpa) else null;
             errdefer if (arena) |*a| a.deinit();
-            const allocator = if (arena) |*a| a.allocator() else self.gpa;
 
             // The envelope is written by hand, field by field in `Line`'s
             // order, into the one buffer that becomes the stored bytes, and
             // `std.json` writes only the event into it. The bytes are the
             // ones `std.json.Stringify` writes for a `Line`; the suite's
             // golden lines hold it to that.
-            var out: std.Io.Writer.Allocating = .init(allocator);
-            errdefer out.deinit();
-            // Sized from the last record, so a run of records alike is written
-            // without growing the buffer.
-            out.ensureTotalCapacityPrecise(self.record_hint + 32) catch return error.OutOfMemory;
+            //
+            // A record something keeps is written into its own arena, sized
+            // from the last record so a run of records alike is written
+            // without growing the buffer. One nothing keeps is written into
+            // the journal's `line`, which it hands back grown or not.
+            var out: std.Io.Writer.Allocating = if (arena) |*a| .init(a.allocator()) else .fromArrayList(self.gpa, &self.line);
+            defer if (!needs_record) {
+                self.line = out.toArrayList();
+            };
+            if (needs_record) {
+                out.ensureTotalCapacityPrecise(self.record_hint + 32) catch return error.OutOfMemory;
+            } else {
+                out.clearRetainingCapacity();
+            }
             const w = &out.writer;
             w.print(
                 "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":",
@@ -1837,10 +1855,9 @@ pub fn Journal(comptime Event: type) type {
             // read will accept is one the log must not be given.
             if (covered.len + 32 > self.options.max_record_bytes) return error.RecordTooLarge;
             w.print(",\"c\":{d}}}", .{sum}) catch return error.OutOfMemory;
-            const stored = out.toOwnedSlice() catch return error.OutOfMemory;
-            self.record_hint = stored.len;
 
             if (!needs_record) {
+                const stored = out.written();
                 return .{
                     .arena = null,
                     .bytes = stored,
@@ -1851,9 +1868,11 @@ pub fn Journal(comptime Event: type) type {
                 };
             }
 
+            const stored = out.toOwnedSlice() catch return error.OutOfMemory;
+            self.record_hint = stored.len;
             const parsed = std.json.parseFromSliceLeaky(
                 Line,
-                allocator,
+                arena.?.allocator(),
                 stored,
                 .{ .ignore_unknown_fields = true },
             ) catch |err| switch (err) {

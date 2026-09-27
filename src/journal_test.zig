@@ -3548,6 +3548,40 @@ test "a record longer than a record may be is refused, and so is a segment of on
 }
 
 //========================================================================
+// The bytes an append writes.
+//========================================================================
+
+test "an append that keeps no record allocates nothing" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var journal = try Journal.open(counting.allocator(), io, ws.path, .{
+        .sync = .never,
+        .tail_records = 0,
+        .tail_bytes = 0,
+    });
+    defer journal.deinit(io);
+
+    // The first of each call sizes what the journal reuses after it.
+    _ = try journal.append(io, 1, created(1, "a name of some length"));
+    var batch: [10]Journal.Entry = undefined;
+    for (&batch, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "a name of some length") };
+    _ = try journal.appendAll(io, &batch);
+    const settled = counting.allocations;
+
+    for (0..200) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name of some length"));
+    for (0..20) |_| _ = try journal.appendAll(io, &batch);
+    try testing.expectEqual(settled, counting.allocations);
+
+    // And what it wrote is what a reader reads.
+    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    defer reader.deinit(io);
+    try testing.expectEqual(@as(u64, 1 + 10 + 200 + 20 * 10), try reader.verify(io));
+}
+
+//========================================================================
 // Size.
 //========================================================================
 

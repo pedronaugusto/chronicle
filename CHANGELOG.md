@@ -6,6 +6,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- An `append` or `appendAll` on a journal that keeps no record — no tail,
+  no sink, no round-trip check — allocates nothing once the journal's line
+  buffer has grown to the record's size. The line was a fresh allocation
+  per record, freed as soon as the log had copied it.
+
 - An append nobody is waiting on no longer makes a system call to wake
   one. `waitPast` counts itself in under the journal's lock before it
   sleeps, and a record or a nudge asks the operating system to wake
