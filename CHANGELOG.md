@@ -6,6 +6,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Measured on a million 200-byte events, best of seven runs interleaved
+  with the previous release's code: an append without `fsync` from 603,000
+  to 745,000 records a second, a replay of all of them from 2.60 to 7.32
+  million a second, a replay of the last hundred thousand from 38.4 to
+  13.8 ms.
+
+- An event in the shape this package writes is read back by the package's
+  own reader instead of `std.json`, into the same value: its strings are
+  scanned sixteen bytes at a time and handed back as slices of the line, as
+  `std.json` hands them back, and member names are compared as constants.
+  Anything else — whitespace, members out of order, missing or unknown, an
+  escape, a number with a fraction, a type it does not read — goes to
+  `std.json` whole, so every error is `std.json`'s. Replay, `subscribe`,
+  the tail an `open` fills and the read-back of an append that keeps its
+  record all take it. A differential property over written and mutated
+  bytes and a fuzz target hold it to `std.json`.
+
 - An event is written by the package's own encoder instead of
   `std.json.Stringify`, to the same bytes: a string is scanned sixteen bytes
   at a time for what JSON escapes rather than one byte at a time, and member

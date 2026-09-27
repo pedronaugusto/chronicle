@@ -145,7 +145,11 @@ public declaration carries a doc comment stating its contract;
 `src/chronicle.zig` is the reference and `src/log.zig` the segment store under
 it. `Event` may be any type `std.json` can write and read back; a tagged union
 is the expected shape, because it gives each record a name on disk and an
-exhaustive `switch` in the fold.
+exhaustive `switch` in the fold. The usual shapes of an event — structs,
+tagged unions, enums, optionals, integers, booleans, strings and slices of
+them — are written and read by the package's own code, to the bytes
+`std.json` writes and the values it reads; anything else, and any line not
+in the shape this package writes, goes through `std.json` itself.
 
 ## Design
 
@@ -402,9 +406,9 @@ file being opened.
   consumed, if that is how you want to decide.
 - **No encryption and no compression.** A record is stored as it was written.
 - **No replication and no network protocol.** A journal is a local directory.
-- **No hardening against a hostile file.** Records go through `std.json` with
-  its defaults; the file contents this package survives are the ones a crash
-  produces, not the ones an attacker chooses.
+- **No hardening against a hostile file.** Records are read as `std.json`
+  reads them with its defaults; the file contents this package survives are
+  the ones a crash produces, not the ones an attacker chooses.
 
 ## Platforms
 

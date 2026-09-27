@@ -7,6 +7,7 @@ const testing = std.testing;
 const Io = std.Io;
 const chronicle = @import("chronicle.zig");
 const stringify = @import("stringify.zig");
+const parse = @import("parse.zig");
 
 /// The events of a tiny registry: enough shape to fold, and an `unknown` arm
 /// so a record from an older schema has somewhere to land.
@@ -3691,6 +3692,223 @@ test "an event is written as std.json writes it, whatever its shape" {
     try expectSameAsStdJson(struct { a: void }{ .a = {} });
 }
 
+/// An event every part of which the fast reader reads itself, so that a
+/// value of it takes that path wherever its bytes are in the written shape.
+///
+/// No 128-bit integers here, though the reader reads them: std.json in Zig
+/// 0.16.0 reads a number with a fraction or an exponent into one through an
+/// `i128`, and panics on one near or past `maxInt(i128)` rather than
+/// returning an error, so a mutated or fuzzed input could not be compared.
+/// The fixed edges below cover them.
+const Plain = union(enum) {
+    empty,
+    flag: bool,
+    small: i8,
+    wide: u64,
+    signed: i64,
+    text: []const u8,
+    maybe: ?[]const u8,
+    hue: Hue,
+    list: []const u32,
+    fixed: [3]u16,
+    nested: struct { a: ?u8, b: []const []const u8, d: Hue, e: ?*const Plain },
+    many: []const ?Hue,
+    twice: ??bool,
+    @"odd \"tag\"": u8,
+};
+
+/// The benchmark's event, and the shape of most: a number and a string.
+const Pair = struct { value: u64, padding: []const u8 };
+
+/// A string with nothing in it JSON escapes: what most events carry, and
+/// what the fast reader reads without handing it on.
+fn clean(random: std.Random, buffer: []u8) []const u8 {
+    const pieces = [_][]const u8{ "a", "Z", " ", "0", "/", "~", "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80", "a longer run of clean bytes" };
+    var len: usize = 0;
+    for (0..random.uintLessThan(usize, 12)) |_| {
+        const pick = pieces[random.uintLessThan(usize, pieces.len)];
+        if (len + pick.len > buffer.len) break;
+        @memcpy(buffer[len..][0..pick.len], pick);
+        len += pick.len;
+    }
+    return buffer[0..len];
+}
+
+/// A `Plain`, its strings clean or awkward as asked.
+fn randomPlain(random: std.Random, a: std.mem.Allocator, depth: u8, clean_strings: bool) !Plain {
+    const text = if (clean_strings)
+        try a.dupe(u8, clean(random, try a.alloc(u8, 200)))
+    else
+        try a.dupe(u8, awkward(random, try a.alloc(u8, 96)));
+    return switch (random.uintLessThan(u8, 16)) {
+        0 => .empty,
+        1 => .{ .flag = random.boolean() },
+        2 => .{ .small = random.int(i8) },
+        3 => .{ .wide = random.int(u64) >> random.int(u6) },
+        4 => .{ .signed = random.int(i64) >> random.int(u6) },
+        5 => .{ .wide = std.math.maxInt(u64) },
+        6 => .{ .signed = std.math.minInt(i64) },
+        7 => .{ .text = text },
+        8 => .{ .maybe = if (random.boolean()) text else null },
+        9 => .{ .hue = random.enumValue(Hue) },
+        10 => .{ .list = try a.dupe(u32, &.{ random.int(u32), 0, std.math.maxInt(u32) }) },
+        11 => .{ .fixed = .{ random.int(u16), 0, 7 } },
+        12 => .{ .nested = .{
+            .a = if (random.boolean()) random.int(u8) else null,
+            .b = try a.dupe([]const u8, &.{ text, "second" }),
+            .d = random.enumValue(Hue),
+            .e = if (depth < 3 and random.boolean()) blk: {
+                const inner = try a.create(Plain);
+                inner.* = try randomPlain(random, a, depth + 1, clean_strings);
+                break :blk inner;
+            } else null,
+        } },
+        13 => .{ .many = try a.dupe(?Hue, &.{ null, random.enumValue(Hue) }) },
+        14 => .{ .twice = switch (random.uintLessThan(u8, 3)) {
+            0 => null,
+            1 => @as(?bool, null),
+            else => random.boolean(),
+        } },
+        else => .{ .@"odd \"tag\"" = random.int(u8) },
+    };
+}
+
+/// `parse.fromSlice` and `std.json` given the same bytes: the same value,
+/// or the same error.
+fn expectSameParse(comptime T: type, bytes: []const u8) !void {
+    var ours_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer ours_arena.deinit();
+    var theirs_arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer theirs_arena.deinit();
+    const ours = parse.fromSlice(T, ours_arena.allocator(), bytes, .{});
+    const theirs = std.json.parseFromSliceLeaky(T, theirs_arena.allocator(), bytes, .{});
+    if (theirs) |value| {
+        try testing.expectEqualDeep(value, try ours);
+    } else |err| {
+        try testing.expectError(err, ours);
+    }
+}
+
+/// Bytes in the written shape, changed in one of the ways a line in some
+/// other shape differs from it: whitespace, a byte replaced, dropped or
+/// doubled, a string escaped, a number written as a fraction, a member
+/// written that the type does not have.
+fn mutate(random: std.Random, a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    if (bytes.len == 0) return bytes;
+    const at = random.uintLessThan(usize, bytes.len);
+    const replacements = "{}[]\":,\\0-.e1anu\x00\xff";
+    return switch (random.uintLessThan(u8, 8)) {
+        0 => try std.mem.concat(a, u8, &.{ bytes[0..at], " ", bytes[at..] }),
+        1 => try std.mem.concat(a, u8, &.{ bytes[0..at], "\n\t", bytes[at..] }),
+        2 => try std.mem.concat(a, u8, &.{ bytes[0..at], bytes[at + 1 ..] }),
+        3 => try std.mem.concat(a, u8, &.{ bytes[0 .. at + 1], bytes[at..] }),
+        4 => blk: {
+            const copy = try a.dupe(u8, bytes);
+            copy[at] = replacements[random.uintLessThan(usize, replacements.len)];
+            break :blk copy;
+        },
+        5 => try std.mem.replaceOwned(u8, a, bytes, "a", "\\u0061"),
+        6 => try std.mem.replaceOwned(u8, a, bytes, "0", "0.0"),
+        else => try std.mem.replaceOwned(u8, a, bytes, ",", ",\"wide\":1,"),
+    };
+}
+
+test "an event is read as std.json reads it, in the written shape and out of it" {
+    var prng: std.Random.DefaultPrng = .init(0x9a55_ed17);
+    const random = prng.random();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    for (0..20_000) |_| {
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        const clean_strings = random.boolean();
+        const value = try randomPlain(random, a, 0, clean_strings);
+        var written: std.Io.Writer.Allocating = .init(a);
+        try stringify.value(value, &written.writer);
+        const bytes = written.written();
+        try expectSameParse(Plain, bytes);
+        // With nothing in its strings to escape, read by the fast reader.
+        // (What it read is `std.json`'s value, checked above; not always
+        // `value`, since `??bool` written as `null` reads back as the outer
+        // null.)
+        if (clean_strings) {
+            _ = (try parse.fast(Plain, a, bytes)) orelse return error.TestUnexpectedResult;
+        }
+        for (0..4) |_| try expectSameParse(Plain, try mutate(random, a, bytes));
+        try expectSameParse(Event, bytes);
+        try expectSameParse(Pair, bytes);
+
+        const pair: Pair = .{ .value = random.int(u64), .padding = awkward(random, try a.alloc(u8, 200)) };
+        written.clearRetainingCapacity();
+        try stringify.value(pair, &written.writer);
+        try expectSameParse(Pair, written.written());
+        try expectSameParse(Pair, try mutate(random, a, written.written()));
+    }
+    // The suite's own event, which the fast reader hands to std.json
+    // whole for its `std.json.Value` arm, and the integers at their edges.
+    try expectSameParse(Event, "{\"created\":{\"id\":1,\"name\":\"x\"}}");
+    inline for (.{ u0, u1, i1, u8, i8, u64, i64, u128, i128 }) |Int| {
+        for ([_]Int{ std.math.minInt(Int), std.math.maxInt(Int) }) |edge| {
+            var buffer: [48]u8 = undefined;
+            try expectSameParse(Int, try std.fmt.bufPrint(&buffer, "{d}", .{edge}));
+        }
+    }
+    for ([_][]const u8{
+        "0",  "-0", "00",                                      "-",     "1e2", "1.0",
+        "-1", "01", "18446744073709551616",                    "\"1\"", " 1",  "1 ",
+        "1x", "",   "340282366920938463463374607431768211456", "-00",
+    }) |text| {
+        try expectSameParse(u64, text);
+        try expectSameParse(i128, text);
+        try expectSameParse(u128, text);
+        try expectSameParse(u1, text);
+    }
+}
+
+test "a journal of events the fast reader reads gives them back as appended" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const PairJournal = chronicle.Journal(Pair);
+
+    var prng: std.Random.DefaultPrng = .init(0x9a1e_5eed);
+    const random = prng.random();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Clean strings, which the fast reader reads, and awkward ones, which
+    // it hands to std.json; through the tail, which reads each record back
+    // as it is appended, and through a replay after a reopen.
+    var appended: std.ArrayList(Pair) = .empty;
+    {
+        var journal = try PairJournal.open(testing.allocator, io, ws.path, .{ .sync = .never, .max_segment_bytes = 16 * 1024 });
+        defer journal.deinit(io);
+        for (0..500) |i| {
+            const padding = if (random.boolean())
+                try a.dupe(u8, clean(random, try a.alloc(u8, 200)))
+            else
+                try a.dupe(u8, awkward(random, try a.alloc(u8, 96)));
+            const pair: Pair = .{ .value = random.int(u64), .padding = padding };
+            try appended.append(a, pair);
+            _ = try journal.append(io, @intCast(i), pair);
+            const window = journal.records();
+            try testing.expectEqualDeep(pair, window.records[window.records.len - 1].event);
+        }
+    }
+
+    var journal = try PairJournal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    defer journal.deinit(io);
+    var walk = try journal.replay(io, 0);
+    defer walk.deinit(io);
+    var seen: usize = 0;
+    while (try walk.next(io)) |record| : (seen += 1) {
+        try testing.expectEqualDeep(appended.items[seen], record.event);
+    }
+    try testing.expectEqual(appended.items.len, seen);
+}
+
 test "a record's envelope is the digits std.json would write" {
     var prng: std.Random.DefaultPrng = .init(0xe4e1_09e5);
     const random = prng.random();
@@ -3938,6 +4156,29 @@ fn fuzzStringify(_: void, smith: *testing.Smith) anyerror!void {
     try expectSameAsStdJson(bytes);
     try expectSameAsStdJson(created(7, bytes));
     try expectSameAsStdJson(Inner{ .a = null, .b = &.{ bytes, bytes }, .c = {}, .d = .blue });
+}
+
+test "fuzz: an event is read as std.json reads it" {
+    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_corpus });
+}
+
+const parse_corpus = [_][]const u8{
+    seeded("{\"text\":\"plain\"}"),
+    seeded("{\"nested\":{\"a\":null,\"b\":[\"x\",\"y\"],\"d\":\"red\",\"e\":{\"empty\":{}}}}"),
+    seeded("{\"list\":[1,0,4294967295]}"),
+    seeded("{\"twice\":null}"),
+    seeded("{\"hue\":\"gr\\\"een\"}"),
+    seeded("{\"signed\":-9223372036854775808}"),
+    seeded("{\"text\":\"caf\xc3\xa9 \\u0041\"}"),
+    seeded("{ \"flag\" : true }"),
+    seeded("{\"value\":1,\"padding\":\"pppp\"}"),
+};
+
+fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    const bytes = buffer[0..smith.slice(&buffer)];
+    try expectSameParse(Plain, bytes);
+    try expectSameParse(Pair, bytes);
 }
 
 test "fuzz: a segment whose first line is arbitrary" {

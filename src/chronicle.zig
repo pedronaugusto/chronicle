@@ -34,6 +34,7 @@ const Log = @import("log.zig");
 const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
 const stringify = @import("stringify.zig");
+const parse = @import("parse.zig");
 
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
@@ -1844,7 +1845,8 @@ pub fn Journal(comptime Event: type) type {
             }
             const w = &out.writer;
             var head: [stringify.envelope_head_max]u8 = undefined;
-            w.writeAll(stringify.envelopeHead(&head, seq, at, self.options.schema_version, back_link)) catch return error.OutOfMemory;
+            const envelope = stringify.envelopeHead(&head, seq, at, self.options.schema_version, back_link);
+            w.writeAll(envelope) catch return error.OutOfMemory;
             stringify.value(event, w) catch return error.OutOfMemory;
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
@@ -1868,12 +1870,16 @@ pub fn Journal(comptime Event: type) type {
                 };
             }
 
+            const covered_len = covered.len;
             const stored = out.toOwnedSlice() catch return error.OutOfMemory;
             self.record_hint = stored.len;
-            const parsed = std.json.parseFromSliceLeaky(
-                Line,
+            // The event is read back out of the bytes that will be written,
+            // as a `Line` read with unknown members ignored would read it:
+            // the members around it are the ones just written from numbers.
+            const parsed = parse.fromSlice(
+                Event,
                 arena.?.allocator(),
-                stored,
+                stored[envelope.len..covered_len],
                 .{ .ignore_unknown_fields = true },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1889,7 +1895,7 @@ pub fn Journal(comptime Event: type) type {
                     .seq = seq,
                     .at = at,
                     .version = self.options.schema_version,
-                    .event = parsed.ev,
+                    .event = parsed,
                     .bytes = stored,
                 },
             };
@@ -2164,7 +2170,7 @@ pub fn Journal(comptime Event: type) type {
         ) ReadError!Event {
             if (version == self.options.schema_version) {
                 return switch (ev) {
-                    .span => |at| std.json.parseFromSliceLeaky(Event, arena, line[at.from..at.to], .{}) catch |err| switch (err) {
+                    .span => |at| parse.fromSlice(Event, arena, line[at.from..at.to], .{}) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.CorruptRecord,
                     },
