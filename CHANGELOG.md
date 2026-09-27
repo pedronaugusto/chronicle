@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- An event is written by the package's own encoder instead of
+  `std.json.Stringify`, to the same bytes: a string is scanned sixteen bytes
+  at a time for what JSON escapes rather than one byte at a time, and member
+  and tag names are written as the constants they are. Shapes it does not
+  write itself — floats, `std.json.Value`, tuples, a type with its own
+  `jsonStringify`, a string that is not UTF-8 — go to `std.json` as before.
+  The members in front of the event are written as digits without a format
+  string. A differential property and a fuzz target hold both to
+  `std.json`'s bytes. The benchmark's 200-byte event encodes in 26 ns where
+  it took 142.
+
 - An `append` or `appendAll` on a journal that keeps no record — no tail,
   no sink, no round-trip check — allocates nothing once the journal's line
   buffer has grown to the record's size. The line was a fresh allocation

@@ -33,6 +33,7 @@ const Io = std.Io;
 const Log = @import("log.zig");
 const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
+const stringify = @import("stringify.zig");
 
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
@@ -1823,9 +1824,10 @@ pub fn Journal(comptime Event: type) type {
 
             // The envelope is written by hand, field by field in `Line`'s
             // order, into the one buffer that becomes the stored bytes, and
-            // `std.json` writes only the event into it. The bytes are the
-            // ones `std.json.Stringify` writes for a `Line`; the suite's
-            // golden lines hold it to that.
+            // the event after it by `stringify`, which writes what
+            // `std.json.Stringify` writes for it. The bytes are the ones
+            // `std.json.Stringify` writes for a `Line`; the suite's golden
+            // lines and its differential property hold it to that.
             //
             // A record something keeps is written into its own arena, sized
             // from the last record so a run of records alike is written
@@ -1841,11 +1843,9 @@ pub fn Journal(comptime Event: type) type {
                 out.clearRetainingCapacity();
             }
             const w = &out.writer;
-            w.print(
-                "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":",
-                .{ seq, at, self.options.schema_version, back_link },
-            ) catch return error.OutOfMemory;
-            std.json.Stringify.value(event, .{}, w) catch return error.OutOfMemory;
+            var head: [stringify.envelope_head_max]u8 = undefined;
+            w.writeAll(stringify.envelopeHead(&head, seq, at, self.options.schema_version, back_link)) catch return error.OutOfMemory;
+            stringify.value(event, w) catch return error.OutOfMemory;
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
             // it.

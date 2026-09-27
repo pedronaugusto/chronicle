@@ -6,6 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const chronicle = @import("chronicle.zig");
+const stringify = @import("stringify.zig");
 
 /// The events of a tiny registry: enough shape to fold, and an `unknown` arm
 /// so a record from an older schema has somewhere to land.
@@ -3549,7 +3550,166 @@ test "a record longer than a record may be is refused, and so is a segment of on
 
 //========================================================================
 // The bytes an append writes.
+//
+// An event is written by `stringify`, not by `std.json`, and the members in
+// front of it by hand. What is on the disk is a promise, so both are held
+// to `std.json`'s bytes here: a property over values of every shape an
+// event can take, a fuzz target over strings, and the envelope's integers
+// at their edges.
 //========================================================================
+
+const Hue = enum { red, @"gr\"een", blue };
+
+/// A type with its own `jsonStringify`, which `stringify` hands to
+/// `std.json` rather than writing itself.
+const Custom = struct {
+    n: u8,
+    pub fn jsonStringify(self: Custom, jw: anytype) !void {
+        try jw.write(.{ .custom = self.n });
+    }
+};
+
+const Inner = struct { a: ?u8, b: []const []const u8, c: void, d: Hue };
+
+/// Every shape `stringify` writes itself, and a few it hands on.
+const Shape = union(enum) {
+    empty,
+    flag: bool,
+    small: i8,
+    wide: u64,
+    signed: i64,
+    huge: u128,
+    negative: i128,
+    text: []const u8,
+    maybe: ?[]const u8,
+    hue: Hue,
+    list: []const u32,
+    fixed: [3]u16,
+    nested: Inner,
+    pointer: *const Inner,
+    many: []const ?Hue,
+    // handed to `std.json`
+    real: f64,
+    tuple: struct { u8, bool },
+    custom: Custom,
+    value: std.json.Value,
+    @"odd \"tag\"": u8,
+};
+
+/// A string built to be awkward: runs longer than a vector of clean bytes
+/// with the things JSON escapes at every position, and UTF-8 both whole and
+/// broken.
+fn awkward(random: std.Random, buffer: []u8) []const u8 {
+    const pieces = [_][]const u8{
+        "a", "z", " ", "\"", "\\", "\n", "\t", "\x00", "\x1f", "\x7f", "/",
+        "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80", // whole UTF-8
+        "\xff", "\x80", "\xc3", "\xed\xa0\x80", // not UTF-8
+        "abcdefghijklmnopqrstuvwxyz0123456789", // longer than a vector
+    };
+    var len: usize = 0;
+    const parts = random.uintLessThan(usize, 12);
+    for (0..parts) |_| {
+        // mostly the clean bytes and the escapes, sometimes a byte that is
+        // not UTF-8, which sends the whole string to `std.json`
+        const pick = if (random.uintLessThan(u8, 8) == 0)
+            pieces[random.uintLessThan(usize, pieces.len)]
+        else
+            pieces[random.uintLessThan(usize, 14)];
+        const repeat = 1 + random.uintLessThan(usize, 3);
+        for (0..repeat) |_| {
+            if (len + pick.len > buffer.len) return buffer[0..len];
+            @memcpy(buffer[len..][0..pick.len], pick);
+            len += pick.len;
+        }
+    }
+    return buffer[0..len];
+}
+
+fn expectSameAsStdJson(v: anytype) !void {
+    var ours: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer ours.deinit();
+    var theirs: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer theirs.deinit();
+    try stringify.value(v, &ours.writer);
+    try std.json.Stringify.value(v, .{}, &theirs.writer);
+    try testing.expectEqualStrings(theirs.written(), ours.written());
+}
+
+test "an event is written as std.json writes it, whatever its shape" {
+    var prng: std.Random.DefaultPrng = .init(0x5eed_c4a0);
+    const random = prng.random();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    for (0..20_000) |_| {
+        _ = arena.reset(.retain_capacity);
+        const a = arena.allocator();
+        const text = try a.dupe(u8, awkward(random, try a.alloc(u8, 96)));
+        const inner: Inner = .{
+            .a = if (random.boolean()) random.int(u8) else null,
+            .b = &.{ text, awkward(random, try a.alloc(u8, 48)) },
+            .c = {},
+            .d = random.enumValue(Hue),
+        };
+        const boxed = try a.create(Inner);
+        boxed.* = inner;
+        const shapes = [_]Shape{
+            .empty,
+            .{ .flag = random.boolean() },
+            .{ .small = random.int(i8) },
+            .{ .wide = random.int(u64) },
+            .{ .signed = random.int(i64) },
+            .{ .huge = random.int(u128) },
+            .{ .negative = random.int(i128) },
+            .{ .text = text },
+            .{ .maybe = if (random.boolean()) text else null },
+            .{ .hue = random.enumValue(Hue) },
+            .{ .list = &.{ random.int(u32), 0, std.math.maxInt(u32) } },
+            .{ .fixed = .{ random.int(u16), 0, 7 } },
+            .{ .nested = inner },
+            .{ .pointer = boxed },
+            .{ .many = &.{ null, random.enumValue(Hue) } },
+            .{ .real = @bitCast(random.int(u64)) },
+            .{ .tuple = .{ random.int(u8), random.boolean() } },
+            .{ .custom = .{ .n = random.int(u8) } },
+            .{ .value = .{ .string = text } },
+            .{ .@"odd \"tag\"" = random.int(u8) },
+        };
+        for (shapes) |shape| try expectSameAsStdJson(shape);
+        try expectSameAsStdJson(text);
+        try expectSameAsStdJson(created(random.int(u32), text));
+        try expectSameAsStdJson(Event{ .removed = .{ .id = random.int(u32) } });
+    }
+    // The edges of the integers, which a random draw rarely lands on.
+    inline for (.{ u0, u1, i1, u8, i8, u64, i64, u128, i128 }) |Int| {
+        try expectSameAsStdJson(@as(Int, std.math.minInt(Int)));
+        try expectSameAsStdJson(@as(Int, std.math.maxInt(Int)));
+    }
+    try expectSameAsStdJson(@as([]const u8, ""));
+    try expectSameAsStdJson(@as([]const u32, &.{}));
+    try expectSameAsStdJson(struct {}{});
+    try expectSameAsStdJson(struct { a: void }{ .a = {} });
+}
+
+test "a record's envelope is the digits std.json would write" {
+    var prng: std.Random.DefaultPrng = .init(0xe4e1_09e5);
+    const random = prng.random();
+    const edges_u64 = [_]u64{ 0, 1, 9, 10, 99, 100, 101, 999, 1000, std.math.maxInt(i64), std.math.maxInt(u64) };
+    const edges_i64 = [_]i64{ std.math.minInt(i64), std.math.minInt(i64) + 1, -100, -99, -10, -9, -1, 0, 1, std.math.maxInt(i64) };
+    const edges_u32 = [_]u32{ 0, 1, 10, 100, std.math.maxInt(u32) };
+    for (0..50_000) |i| {
+        const seq = if (i < edges_u64.len) edges_u64[i] else random.int(u64) >> random.int(u6);
+        const at = if (i < edges_i64.len) edges_i64[i] else random.int(i64) >> random.int(u6);
+        const version = if (i < edges_u32.len) edges_u32[i] else random.int(u32) >> random.int(u5);
+        const link = random.int(u32);
+        var head: [stringify.envelope_head_max]u8 = undefined;
+        var want: [stringify.envelope_head_max]u8 = undefined;
+        try testing.expectEqualStrings(
+            try std.fmt.bufPrint(&want, "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":", .{ seq, at, version, link }),
+            stringify.envelopeHead(&head, seq, at, version, link),
+        );
+    }
+}
 
 test "an append that keeps no record allocates nothing" {
     const io = testing.io;
@@ -3757,6 +3917,28 @@ const framing_corpus = [_][]const u8{
     seeded("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{}}\n"),
     seeded("chronicle\n"),
 };
+
+test "fuzz: a string is written as std.json writes it" {
+    try testing.fuzz({}, fuzzStringify, .{ .corpus = &stringify_corpus });
+}
+
+const stringify_corpus = [_][]const u8{
+    seeded(""),
+    seeded("plain"),
+    seeded("a quote \" and a backslash \\ past the first sixteen bytes"),
+    seeded("\x00\x01\x1f\x7f\n\r\t"),
+    seeded("caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80"),
+    seeded("\xff\xfe not UTF-8"),
+    seeded("\xed\xa0\x80 a surrogate half"),
+};
+
+fn fuzzStringify(_: void, smith: *testing.Smith) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    const bytes = buffer[0..smith.slice(&buffer)];
+    try expectSameAsStdJson(bytes);
+    try expectSameAsStdJson(created(7, bytes));
+    try expectSameAsStdJson(Inner{ .a = null, .b = &.{ bytes, bytes }, .c = {}, .d = .blue });
+}
 
 test "fuzz: a segment whose first line is arbitrary" {
     try testing.fuzz({}, fuzzFraming, .{ .corpus = &framing_corpus });
