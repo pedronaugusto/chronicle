@@ -68,6 +68,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   line; a record written by hand with its event before its envelope, and a
   member named `p` in its event, read the event's. It reads the envelope's.
 
+- A sync is strand's (`strand.syncFile`): the same calls — `F_FULLFSYNC` on
+  Darwin, `fsync` or `fdatasync` on Linux as the write needs, the system's
+  flush on Windows — with two differences where the copy here had drifted.
+  An interrupted `F_FULLFSYNC` or `fdatasync` is made again; it used to be
+  answered with a plain `fsync`, a weaker call, and so was any failure the
+  code did not name. Now a failure is reported, and only a filesystem that
+  declines the stronger call gets `fsync`. Which directory a backup is
+  going to is asked of strand's `FileId`, which is this package's directory
+  identity moved there.
+
 - **Breaking:** the `migrate` hook takes an allocator and the record's
   event as its bytes:
   `fn (arena: Allocator, from_version: u32, event: chronicle.Raw)`. `event`

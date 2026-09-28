@@ -24,10 +24,8 @@ const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
 const clone = @import("clone.zig");
-const identity = @import("identity.zig");
 const envelopes = @import("envelope.zig");
 const strand = @import("strand");
 
@@ -137,7 +135,7 @@ pub const OnTruncated = enum {
 /// any of these, because they are what the replacement promise is.
 ///
 /// What "durable" costs is a platform's answer and not this package's:
-/// `durable.flush` names the call, and README.md has the row per platform.
+/// `flush` names the call, and README.md has the row per platform.
 pub const Sync = enum {
     /// Flush before every `appendLine` returns, and once per `commit`.
     always,
@@ -148,6 +146,50 @@ pub const Sync = enum {
     /// system and it writes them back when it chooses.
     never,
 };
+
+/// The call a durable write makes on a platform.
+pub const Flush = enum {
+    /// `fcntl(F_FULLFSYNC)`: the bytes are on the drive's media, not only in
+    /// its write cache. Darwin, where `fsync` promises the weaker thing.
+    full_fsync,
+    /// `fsync(2)`, or `fdatasync(2)` for a write that did not change the
+    /// file's length. What that means past the drive's cache is the drive's
+    /// promise and the operating system's.
+    fsync,
+    /// `NtFlushBuffersFile`, which is what `Io.File.sync` does on Windows.
+    flush_buffers,
+};
+
+/// What `Sync.always` issues here. `chronicle.flush` re-exports it, and
+/// README.md's durability table is written per platform from it.
+pub const flush: Flush = switch (builtin.os.tag) {
+    .macos, .ios, .tvos, .watchos, .visionos => .full_fsync,
+    .windows => .flush_buffers,
+    else => .fsync,
+};
+
+/// How much of a file has to reach the disk.
+const Level = enum {
+    /// The contents and whatever metadata a reader needs to find them. What
+    /// an append that extended the file asks for.
+    whole,
+    /// The contents only. Sufficient — and only sufficient — when the write
+    /// went into space the file already had, which is what preallocation
+    /// arranges.
+    contents,
+};
+
+/// Make `file`'s bytes durable, as far as this platform can be asked: the
+/// call strand makes for a sync (`strand.syncFile`), `F_FULLFSYNC` on Darwin,
+/// and on Linux `fsync` for `.whole` and `fdatasync` for `.contents`. It
+/// blocks the calling thread, as `Io.File.sync` does. An interrupted call is
+/// made again; a failure is reported, never answered with a weaker call.
+fn syncFile(io: Io, file: Io.File, level: Level) Io.File.SyncError!void {
+    _ = try strand.syncFile(file, io, switch (level) {
+        .whole => .all,
+        .contents => .data,
+    });
+}
 
 /// Whether this process may write to the log.
 pub const Access = enum {
@@ -708,7 +750,7 @@ fn describeSealed(log: *Log, io: Io, segment: *Segment) OpenError!void {
             const repair_file = try log.dir.createFile(io, &segmentName(segment.base_seq, segment_extension), .{ .truncate = false });
             defer repair_file.close(io);
             try repair_file.setLength(io, scanned.complete_bytes);
-            if (log.options.sync != .never) try durable.sync(io, repair_file, .whole);
+            if (log.options.sync != .never) try syncFile(io, repair_file, .whole);
             log.dir.deleteFile(io, &segmentName(segment.base_seq, index_extension)) catch {};
             try log.syncDir(io);
         }
@@ -1169,7 +1211,7 @@ fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync) SealError!v
     // Under `.never` the log itself is not asked to reach the drive, and a
     // seal that outlives its segment is one the next open checks against the
     // segment and rebuilds; so the index is held to the log's own level.
-    if (sync != .never) try durable.sync(io, file, .whole);
+    if (sync != .never) try syncFile(io, file, .whole);
 }
 
 /// The active segment's index, reopened for appending, when the one on the
@@ -1901,8 +1943,8 @@ pub fn commitDeferred(log: *Log) AppendError!void {
 fn syncActive(log: *Log, io: Io) Io.File.SyncError!void {
     const active = &log.active.?;
     const segment = log.segments.items[log.segments.items.len - 1];
-    const level: durable.Level = if (segment.bytes <= active.preallocated) .contents else .whole;
-    return durable.sync(io, active.file, level);
+    const level: Level = if (segment.bytes <= active.preallocated) .contents else .whole;
+    return syncFile(io, active.file, level);
 }
 
 /// Seal the active segment and start a new one named after the record that
@@ -1913,7 +1955,7 @@ fn rotate(log: *Log, io: Io) AppendError!void {
         const active = &log.active.?;
         try active.writer.interface.flush();
         try log.trimPreallocation(io);
-        if (log.options.sync != .never) try durable.sync(io, active.file, .whole);
+        if (log.options.sync != .never) try syncFile(io, active.file, .whole);
         try active.index_writer.interface.flush();
         // A seal that cannot be written leaves an index the next open reads
         // as stale and rebuilds, which is a cost and not a wrong answer -- but
@@ -1963,7 +2005,7 @@ fn startSegment(log: *Log, io: Io, base_seq: u64, root: u32) AppendError!Started
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
     if (log.options.sync != .never) {
-        try durable.sync(io, file, .whole);
+        try syncFile(io, file, .whole);
         try log.syncDir(io);
     }
     const header_bytes = writer.pos;
@@ -2252,7 +2294,7 @@ pub fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
 fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
     if (!can_sync_dir) return;
     const as_file: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
-    try durable.sync(io, as_file, .whole);
+    try syncFile(io, as_file, .whole);
 }
 
 fn deleteSegmentFiles(log: *Log, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {
@@ -2324,7 +2366,7 @@ pub fn truncateAfter(log: *Log, io: Io, seq: u64) TruncateError!void {
         const file = try log.dir.createFile(io, &segmentName(holder.base_seq, segment_extension), .{ .truncate = false });
         defer file.close(io);
         try file.setLength(io, offset);
-        if (log.options.sync != .never) try durable.sync(io, file, .whole);
+        if (log.options.sync != .never) try syncFile(io, file, .whole);
         // The index describes bytes that are no longer there. Removing it is
         // cheaper than leaving one the next open has to reject and rebuild.
         log.dir.deleteFile(io, &segmentName(holder.base_seq, index_extension)) catch {};
@@ -2435,7 +2477,7 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
             try writer.interface.writeByte('\n');
         }
         try writer.interface.flush();
-        try durable.sync(io, out, .whole);
+        try syncFile(io, out, .whole);
         out.close(io);
         closed = true;
     }
@@ -2472,7 +2514,7 @@ pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) Write
         var writer = file.writer(io, &buffer);
         try writer.interface.writeAll(bytes);
         try writer.interface.flush();
-        try durable.sync(io, file, .whole);
+        try syncFile(io, file, .whole);
     }
     try log.dir.rename(temporary, log.dir, name, io);
     try log.syncDir(io);
@@ -2490,14 +2532,14 @@ pub fn syncBeforeSnapshot(log: *Log, io: Io) SnapshotError!void {
     if (log.active == null) return error.ReadOnly;
     const active = &log.active.?;
     try active.writer.interface.flush();
-    try durable.sync(io, active.file, .whole);
+    try syncFile(io, active.file, .whole);
 }
 
 //========================================================================
 // Copying a running log.
 //========================================================================
 
-pub const BackupError = OpenError || identity.Error || error{BackupInPlace};
+pub const BackupError = OpenError || strand.FileId.Error || error{BackupInPlace};
 
 /// Copy a consistent view of the log into the directory `dest_path`, creating
 /// it if it is not there, and report the newest sequence number the copy
@@ -2619,7 +2661,7 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) Op
     // -- can still go through the filesystem where the platform takes a
     // length.
     if (clone.range(to, from, length)) {
-        try durable.sync(io, to, .whole);
+        try syncFile(io, to, .whole);
         return true;
     }
 
@@ -2636,7 +2678,7 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) Op
         try to.writePositionalAll(io, chunk[0..read], at);
         at += read;
     }
-    try durable.sync(io, to, .whole);
+    try syncFile(io, to, .whole);
     return true;
 }
 
@@ -2666,9 +2708,9 @@ fn clearBackup(log: *Log, io: Io, dest: Io.Dir) OpenError!void {
 /// caught where a comparison of paths would miss it. Failure to establish
 /// identity stops the copy: treating an unknown destination as different can
 /// open a source segment through the destination handle with truncation.
-fn sameDirectory(log: *Log, dest: Io.Dir) identity.Error!bool {
-    const here = try identity.of(log.dir);
-    const there = try identity.of(dest);
+fn sameDirectory(log: *Log, dest: Io.Dir) strand.FileId.Error!bool {
+    const here = try strand.FileId.of(log.dir.handle);
+    const there = try strand.FileId.of(dest.handle);
     return here.eql(there);
 }
 
@@ -2683,7 +2725,7 @@ pub fn close(log: *Log, io: Io) CloseError!void {
     if (log.active) |*active| {
         try active.writer.interface.flush();
         try log.trimPreallocation(io);
-        if (log.options.sync != .never) try durable.sync(io, active.file, .whole);
+        if (log.options.sync != .never) try syncFile(io, active.file, .whole);
 
         // The index is only a cache. Failure to finish it costs the next open
         // a scan and does not change whether the log itself was closed durably.
@@ -2704,7 +2746,7 @@ pub fn deinit(log: *Log, io: Io) void {
     if (log.active) |*active| {
         active.writer.interface.flush() catch {};
         log.trimPreallocation(io) catch {};
-        if (log.options.sync != .never) durable.sync(io, active.file, .whole) catch {};
+        if (log.options.sync != .never) syncFile(io, active.file, .whole) catch {};
         active.index_writer.interface.flush() catch {};
         // Leave the active index stamped with the length it describes, so that
         // the next open can take it rather than rebuild it.

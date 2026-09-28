@@ -33,7 +33,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Log = @import("log.zig");
-const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
 const strand = @import("strand");
 const envelope = @import("envelope.zig");
@@ -56,12 +55,12 @@ pub const Access = Log.Access;
 pub const Sync = Log.Sync;
 
 /// The call a durable write makes on a platform.
-pub const Flush = durable.Flush;
+pub const Flush = Log.Flush;
 
 /// What `Options.sync = .always` issues here, which is what a returned
 /// sequence number survives here. README.md's durability table is the same
 /// three answers in words.
-pub const flush: Flush = durable.flush;
+pub const flush: Flush = Log.flush;
 
 /// The file inside a journal directory that a writer holds its advisory lock
 /// on. It is never read or written.
