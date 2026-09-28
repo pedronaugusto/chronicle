@@ -3,6 +3,14 @@
     .version = "0.6.0",
     .minimum_zig_version = "0.16.0",
     .fingerprint = 0xdc91dbecd4617a72,
+    .dependencies = .{
+        // Encoding and decoding a line. Pinned to a commit; the hash is what
+        // the build checks.
+        .strand = .{
+            .url = "git+https://github.com/pedronaugusto/strand#4ef8e7a4a45f478151b36ffbd69ba579097a5160",
+            .hash = "strand-0.7.0-8LNWVstNCgDSLlbdbAD0dqwgkaTqFW_6Sci-yrgCJTYQ",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

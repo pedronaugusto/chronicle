@@ -1,3 +1,7 @@
 # Everything this repository holds is LF on every platform, so no diff and no
 # gate ever reads a line ending as a change.
 * text=auto eol=lf
+
+# The journals a previous version wrote, byte for byte.
+src/testdata/**/*.log binary
+src/testdata/**/*.idx binary

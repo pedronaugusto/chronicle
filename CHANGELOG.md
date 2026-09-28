@@ -26,37 +26,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wake with `replay(cursor)`, 13.2 µs with `replayAt` (best of seven,
   interleaved).
 
-- A record holding a whole number that `std.json` (Zig 0.16.0) cannot cast
-  is `error.CorruptRecord` instead of a panic. Read from bytes, `std.json`
-  takes a number with a fraction or an exponent into an integer through
-  `i128`, and panics on one from 2^127 up (`1.8e38` into a `u128`, 2^127
-  into an `i128`); read from a `std.json.Value` — a record in some other
-  shape than the written one — it casts a float equal to the type's largest
-  value rounded up (2^64 into a `u64`). Before either is given a record,
-  the package walks it as `std.json` would and answers where it would
-  panic; everything else is still `std.json`'s answer.
-
-- An event in the shape this package writes is read back by the package's
-  own reader instead of `std.json`, into the same value: its strings are
-  scanned sixteen bytes at a time and handed back as slices of the line, as
-  `std.json` hands them back, and member names are compared as constants.
-  Anything else — whitespace, members out of order, missing or unknown, an
-  escape, a number with a fraction, a type it does not read — goes to
-  `std.json` whole, so every error is `std.json`'s. Replay, `subscribe`,
-  the tail an `open` fills and the read-back of an append that keeps its
-  record all take it. A differential property over written and mutated
-  bytes and a fuzz target hold it to `std.json`.
-
-- An event is written by the package's own encoder instead of
-  `std.json.Stringify`, to the same bytes: a string is scanned sixteen bytes
-  at a time for what JSON escapes rather than one byte at a time, and member
-  and tag names are written as the constants they are. Shapes it does not
-  write itself — floats, `std.json.Value`, tuples, a type with its own
-  `jsonStringify`, a string that is not UTF-8 — go to `std.json` as before.
-  The members in front of the event are written as digits without a format
-  string. A differential property and a fuzz target hold both to
-  `std.json`'s bytes. The benchmark's 200-byte event encodes in 26 ns where
-  it took 142.
+- A record's line is written and read by strand, which is now this
+  package's one dependency, pinned by commit. strand writes the bytes
+  `std.json` writes and reads what `std.json` reads, and the lines are the
+  ones this package wrote before: a journal written by the previous code
+  (in `src/testdata`) reads back as the events appended to it, takes new
+  records on its chain, and the same events appended today are the same
+  lines. Null optionals are still written, as `std.json`'s default has
+  it. What that changes:
+  - An event kept as a `strand.Raw` — a journal of events carried as their
+    bytes — is read back as a slice of its line by strand's own decoder,
+    where it went through `std.json`'s scanner a byte at a time.
+  - A record holding a whole number written with a fraction or an exponent,
+    which `std.json` (Zig 0.16.0) panics on casting, is read as the number
+    it is when it fits the event's type and is `error.CorruptRecord` when it
+    does not, on every path. `1.8e38` into a `u128` is the number.
+  - A line not in the shape this package writes, a record written by hand,
+    has its envelope read as its members' bytes rather than as a
+    `std.json.Value`, and its event parsed from where it lies in the line
+    like any other.
+  - Written and read faster than the codec this package carried until now
+    (`stringify.zig`, `parse.zig`, gone), whose fast paths and guard went
+    to strand.
 
 - An `append` or `appendAll` on a journal that keeps no record — no tail,
   no sink, no round-trip check — allocates nothing once the journal's line

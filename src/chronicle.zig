@@ -23,7 +23,9 @@
 //! Everything here is generic over one `Event` type, which may be any type
 //! `std.json` can both stringify and parse — a tagged union is the expected
 //! shape, because it gives each record a name on disk and an exhaustive
-//! `switch` in the fold.
+//! `switch` in the fold. A record's line is written and read by strand, which
+//! writes the bytes `std.json` writes and reads what `std.json` reads; this
+//! package keeps the lines.
 //!
 //! See `Journal` for the API, and README.md for the durability promises.
 
@@ -33,8 +35,7 @@ const Io = std.Io;
 const Log = @import("log.zig");
 const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
-const stringify = @import("stringify.zig");
-const parse = @import("parse.zig");
+const strand = @import("strand");
 
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
@@ -150,8 +151,10 @@ pub const Position = struct {
 /// best-effort `deinit` where an error cannot be returned.
 ///
 /// `Event` must round-trip through `std.json`: `std.json.Stringify.value` must
-/// accept it and `std.json.parseFromSlice` must read back what was written. A
-/// tagged union of structs is the expected shape.
+/// accept it and `std.json.parseFromSlice` must read back what was written.
+/// strand does both, in `std.json`'s bytes and with its answers. A tagged
+/// union of structs is the expected shape; a `strand.Raw` is an event kept as
+/// its bytes, read back as a slice of the line.
 pub fn Journal(comptime Event: type) type {
     return struct {
         const Self = @This();
@@ -1968,12 +1971,10 @@ pub fn Journal(comptime Event: type) type {
             var arena: ?std.heap.ArenaAllocator = if (needs_record) .init(self.gpa) else null;
             errdefer if (arena) |*a| a.deinit();
 
-            // The envelope is written by hand, field by field in `Line`'s
-            // order, into the one buffer that becomes the stored bytes, and
-            // the event after it by `stringify`, which writes what
-            // `std.json.Stringify` writes for it. The bytes are the ones
-            // `std.json.Stringify` writes for a `Line`; the suite's golden
-            // lines and its differential property hold it to that.
+            // The bytes are the ones `std.json.Stringify` writes for a
+            // `Line`, written into the one buffer that becomes the stored
+            // bytes; the suite's golden lines, its property over every shape
+            // and a log written before strand hold it to that.
             //
             // A record something keeps is written into its own arena, sized
             // from the last record so a run of records alike is written
@@ -1988,11 +1989,19 @@ pub fn Journal(comptime Event: type) type {
             } else {
                 out.clearRetainingCapacity();
             }
+            // The record is `Line` written by strand, which writes what
+            // `std.json` writes (null optionals included, as `std.json`'s
+            // default has it), with its closing brace left off: that is
+            // where the checksum goes.
             const w = &out.writer;
-            var head: [stringify.envelope_head_max]u8 = undefined;
-            const envelope = stringify.envelopeHead(&head, seq, at, self.options.schema_version, back_link);
-            w.writeAll(envelope) catch return error.OutOfMemory;
-            stringify.value(event, w) catch return error.OutOfMemory;
+            strand.writeValue(w, Line{
+                .seq = seq,
+                .at = at,
+                .v = self.options.schema_version,
+                .p = back_link,
+                .ev = event,
+            }, .{ .emit_null_optional_fields = true }) catch return error.OutOfMemory;
+            w.end -= 1;
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
             // it.
@@ -2019,12 +2028,14 @@ pub fn Journal(comptime Event: type) type {
             const stored = out.toOwnedSlice() catch return error.OutOfMemory;
             self.record_hint = stored.len;
             // The event is read back out of the bytes that will be written,
-            // as a `Line` read with unknown members ignored would read it:
-            // the members around it are the ones just written from numbers.
-            const parsed = parse.fromSlice(
+            // found by the envelope reader every replay uses, and read as a
+            // `Line` read with unknown members ignored would read it: the
+            // members around it are the ones just written from numbers.
+            const span = (quickHeader(stored[0..covered_len], sum) orelse return error.NotRoundTrippable).ev;
+            const parsed = strand.parseLine(
                 Event,
                 arena.?.allocator(),
-                stored[envelope.len..covered_len],
+                stored[span.from..span.to],
                 .{ .ignore_unknown_fields = true },
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -2167,32 +2178,18 @@ pub fn Journal(comptime Event: type) type {
             /// This record's own checksum, which the next one carries as its
             /// `p`.
             c: u32,
-            /// The event, still unparsed.
-            ev: Body,
+            /// Where the event sits in the line, still unparsed: a pair of
+            /// offsets rather than a slice, since the line a record is built
+            /// from may be a copy of the one the header was read from.
+            ev: Span,
         };
 
-        /// A record's event as the header reader leaves it.
-        ///
-        /// A line in the shape this package writes gives up its `ev` as a
-        /// slice of itself, and whatever wants the event parses that slice
-        /// once. A line in some other shape has already been through
-        /// `std.json` to be read at all, so its `ev` comes back as the value
-        /// that parse produced.
-        const Body = union(enum) {
-            /// Where the event sits in the line, as a pair of offsets rather
-            /// than as a slice: the line a record is built from may be a copy
-            /// of the one the header was read from.
-            span: struct { from: usize, to: usize },
-            /// The parse that read the line, and the line it read: the value
-            /// lives in the scratch that parse used, so anything that has to
-            /// outlast the call reads the line again into its own arena.
-            parsed: struct { value: std.json.Value, line: []const u8 },
-        };
+        const Span = struct { from: usize, to: usize };
 
         /// Read a line's envelope, checking its checksum.
         ///
         /// `scratch` holds nothing unless the line is not in the shape this
-        /// package writes, in which case it holds the parse that read it.
+        /// package writes, in which case it holds what reading it took.
         fn parseHeader(scratch: Allocator, line: []const u8) ReadError!Header {
             // The checksum is the last member of every record this package
             // writes, so it is found from the end and the rest of the line is
@@ -2245,7 +2242,7 @@ pub fn Journal(comptime Event: type) type {
                 .version = std.math.cast(u32, version) orelse return null,
                 .p = std.math.cast(u32, link) orelse return null,
                 .c = claimed,
-                .ev = .{ .span = .{ .from = at + ev_prefix.len, .to = covered.len } },
+                .ev = .{ .from = at + ev_prefix.len, .to = covered.len },
             };
         }
 
@@ -2267,32 +2264,37 @@ pub fn Journal(comptime Event: type) type {
 
         /// The same envelope out of a line in some other shape: a record
         /// written by hand, or a member in another order.
+        ///
+        /// The members are read as their bytes, so that a number is taken
+        /// only when it is an integer written as one, and the event is found
+        /// where it lies in the line and parsed from there like any other.
         fn slowHeader(scratch: Allocator, line: []const u8, claimed: u32) ReadError!Header {
-            const root = std.json.parseFromSliceLeaky(
-                std.json.Value,
-                scratch,
-                line,
-                .{},
-            ) catch |err| switch (err) {
+            const Members = struct { seq: strand.Raw, at: strand.Raw, v: strand.Raw, p: strand.Raw, ev: strand.Raw };
+            const members = strand.parseLine(Members, scratch, line, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.CorruptRecord,
             };
-            if (root != .object) return error.CorruptRecord;
-            const seq = root.object.get("seq") orelse return error.CorruptRecord;
-            const at = root.object.get("at") orelse return error.CorruptRecord;
-            const v = root.object.get("v") orelse return error.CorruptRecord;
-            const ev = root.object.get("ev") orelse return error.CorruptRecord;
-            const back = root.object.get("p") orelse return error.CorruptRecord;
-            if (seq != .integer or at != .integer or v != .integer) return error.CorruptRecord;
-            if (back != .integer or seq.integer < 1) return error.CorruptRecord;
+            const seq = integerOf(members.seq) orelse return error.CorruptRecord;
+            if (seq < 1) return error.CorruptRecord;
+            const from = @intFromPtr(members.ev.bytes.ptr) - @intFromPtr(line.ptr);
             return .{
-                .seq = @intCast(seq.integer),
-                .at = at.integer,
-                .version = std.math.cast(u32, v.integer) orelse return error.CorruptRecord,
-                .p = std.math.cast(u32, back.integer) orelse return error.CorruptRecord,
+                .seq = @intCast(seq),
+                .at = integerOf(members.at) orelse return error.CorruptRecord,
+                .version = std.math.cast(u32, integerOf(members.v) orelse return error.CorruptRecord) orelse return error.CorruptRecord,
+                .p = std.math.cast(u32, integerOf(members.p) orelse return error.CorruptRecord) orelse return error.CorruptRecord,
                 .c = claimed,
-                .ev = .{ .parsed = .{ .value = ev, .line = line } },
+                .ev = .{ .from = from, .to = from + members.ev.bytes.len },
             };
+        }
+
+        /// A member's value as an integer when it is one written as one — no
+        /// fraction, no exponent, not a string — and within an `i64`. Null
+        /// for anything else.
+        fn integerOf(member_value: strand.Raw) ?i64 {
+            const bytes = member_value.bytes;
+            if (bytes.len == 0 or !(bytes[0] == '-' or std.ascii.isDigit(bytes[0]))) return null;
+            if (!std.json.isNumberFormattedLikeAnInteger(bytes)) return null;
+            return std.fmt.parseInt(i64, bytes, 10) catch null;
         }
 
         /// Finish a header into a record whose every slice comes from `arena`.
@@ -2310,19 +2312,13 @@ pub fn Journal(comptime Event: type) type {
             self: *Self,
             arena: Allocator,
             version: u32,
-            ev: Body,
+            ev: Span,
             line: []const u8,
         ) ReadError!Event {
             if (version == self.options.schema_version) {
-                return switch (ev) {
-                    .span => |at| parse.fromSlice(Event, arena, line[at.from..at.to], .{}) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => return error.CorruptRecord,
-                    },
-                    .parsed => |found| parse.fromValue(Event, arena, found.value, .{}) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => return error.CorruptRecord,
-                    },
+                return strand.parseLine(Event, arena, line[ev.from..ev.to], .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.CorruptRecord,
                 };
             }
             if (version > self.options.schema_version) return error.NewerSchema;
@@ -2334,29 +2330,14 @@ pub fn Journal(comptime Event: type) type {
         /// The record's `ev` member in the record's own arena, so that what a
         /// `migrate` hook or the `unknown` arm keeps lasts as long as the
         /// record does.
-        fn retainedEv(arena: Allocator, ev: Body, line: []const u8) ReadError!std.json.Value {
-            const bytes = switch (ev) {
-                .span => |at| line[at.from..at.to],
-                // The value there belongs to the scratch that read the line.
-                // The line is read again, into the arena that will hold it.
-                .parsed => |found| return objectMember(arena, found.line, "ev"),
-            };
-            return std.json.parseFromSliceLeaky(std.json.Value, arena, bytes, .{}) catch |err| switch (err) {
+        fn retainedEv(arena: Allocator, ev: Span, line: []const u8) ReadError!std.json.Value {
+            return strand.parseLine(std.json.Value, arena, line[ev.from..ev.to], .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.CorruptRecord,
             };
         }
 
-        fn objectMember(arena: Allocator, line: []const u8, name: []const u8) ReadError!std.json.Value {
-            const root = std.json.parseFromSliceLeaky(std.json.Value, arena, line, .{}) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.CorruptRecord,
-            };
-            if (root != .object) return error.CorruptRecord;
-            return root.object.get(name) orelse error.CorruptRecord;
-        }
-
-        fn unknownEvent(arena: Allocator, ev: Body, line: []const u8) ReadError!Event {
+        fn unknownEvent(arena: Allocator, ev: Span, line: []const u8) ReadError!Event {
             switch (comptime unknown_arm.?) {
                 .empty => return @unionInit(Event, "unknown", {}),
                 .json_value => return @unionInit(Event, "unknown", try retainedEv(arena, ev, line)),

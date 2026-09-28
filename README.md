@@ -91,8 +91,9 @@ const chronicle_dep = b.dependency("chronicle", .{ .target = target, .optimize =
 exe.root_module.addImport("chronicle", chronicle_dep.module("chronicle"));
 ```
 
-One module, no dependencies and no build options: the only knobs are the
-`Options` passed to `open`.
+One module and no build options: the only knobs are the `Options` passed to
+`open`. Its one dependency is [strand](https://github.com/pedronaugusto/strand),
+which writes and reads a record's line; this package keeps the lines.
 
 ## The API
 
@@ -146,13 +147,11 @@ public declaration carries a doc comment stating its contract;
 `src/chronicle.zig` is the reference and `src/log.zig` the segment store under
 it. `Event` may be any type `std.json` can write and read back; a tagged union
 is the expected shape, because it gives each record a name on disk and an
-exhaustive `switch` in the fold. The usual shapes of an event — structs,
-tagged unions, enums, optionals, integers, booleans, strings and slices of
-them — are written and read by the package's own code, to the bytes
-`std.json` writes and the values it reads; anything else, and any line not
-in the shape this package writes, goes through `std.json` itself — after a
-check for the whole numbers Zig 0.16.0's `std.json` panics on rather than
-refuses, which are `error.CorruptRecord`.
+exhaustive `switch` in the fold. strand writes and reads it, to the bytes
+`std.json` writes and the values it reads, and a `strand.Raw` is an event
+kept as its bytes, read back as a slice of its line. A whole number that
+Zig 0.16.0's `std.json` panics on casting is read as the number where it fits
+the type and is `error.CorruptRecord` where it does not.
 
 ## Design
 

@@ -6,8 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const chronicle = @import("chronicle.zig");
-const stringify = @import("stringify.zig");
-const parse = @import("parse.zig");
+const strand = @import("strand");
 
 /// The events of a tiny registry: enough shape to fold, and an `unknown` arm
 /// so a record from an older schema has somewhere to land.
@@ -3552,27 +3551,23 @@ test "a record longer than a record may be is refused, and so is a segment of on
 //========================================================================
 // The bytes an append writes.
 //
-// An event is written by `stringify`, not by `std.json`, and the members in
-// front of it by hand. What is on the disk is a promise, so both are held
-// to `std.json`'s bytes here: a property over values of every shape an
-// event can take, a fuzz target over strings, and the envelope's integers
-// at their edges.
+// A record's line is written by strand, which writes what `std.json`
+// writes: its own suite holds it to that over every shape a value can take.
+// What is on this package's disk is a promise, so the records are held to
+// `std.json`'s bytes here too — the envelope and the event, over every
+// shape, at the edges of the envelope's integers — and a log written before
+// strand wrote the lines is read, and its lines written again, byte for
+// byte.
 //========================================================================
 
 const Hue = enum { red, @"gr\"een", blue };
 
-/// A type with its own `jsonStringify`, which `stringify` hands to
-/// `std.json` rather than writing itself.
-const Custom = struct {
-    n: u8,
-    pub fn jsonStringify(self: Custom, jw: anytype) !void {
-        try jw.write(.{ .custom = self.n });
-    }
-};
+const Inner = struct { a: ?u8, b: []const []const u8, d: Hue };
 
-const Inner = struct { a: ?u8, b: []const []const u8, c: void, d: Hue };
-
-/// Every shape `stringify` writes itself, and a few it hands on.
+/// Every shape an event is made of that reads back as itself: what strand
+/// writes itself, and a float, a tuple and a `std.json.Value`, which it
+/// hands to `std.json`. (A type with its own `jsonStringify` and a `void`
+/// member are in strand's own property; neither reads back.)
 const Shape = union(enum) {
     empty,
     flag: bool,
@@ -3592,7 +3587,6 @@ const Shape = union(enum) {
     // handed to `std.json`
     real: f64,
     tuple: struct { u8, bool },
-    custom: Custom,
     value: std.json.Value,
     @"odd \"tag\"": u8,
 };
@@ -3626,30 +3620,58 @@ fn awkward(random: std.Random, buffer: []u8) []const u8 {
     return buffer[0..len];
 }
 
-fn expectSameAsStdJson(v: anytype) !void {
-    var ours: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer ours.deinit();
-    var theirs: std.Io.Writer.Allocating = .init(testing.allocator);
-    defer theirs.deinit();
-    try stringify.value(v, &ours.writer);
-    try std.json.Stringify.value(v, .{}, &theirs.writer);
-    try testing.expectEqualStrings(theirs.written(), ours.written());
+/// The envelope and event of a line as `std.json` writes a `Line` for them,
+/// less the closing brace, then the checksum: what every record a journal
+/// holds must be, byte for byte. `p` is read off the record itself, which
+/// is what the chain says it is and is checked by every read.
+fn expectStdJsonRecord(comptime E: type, record: chronicle.Journal(E).Record, version: u32) !void {
+    const Line = struct { seq: u64, at: i64, v: u32, p: u32, ev: E };
+    const p_at = std.mem.indexOf(u8, record.bytes, ",\"p\":").? + ",\"p\":".len;
+    const p_end = std.mem.indexOfScalarPos(u8, record.bytes, p_at, ',').?;
+    const back_link = try std.fmt.parseInt(u32, record.bytes[p_at..p_end], 10);
+    var want: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer want.deinit();
+    try std.json.Stringify.value(Line{
+        .seq = record.seq,
+        .at = record.at,
+        .v = version,
+        .p = back_link,
+        .ev = record.event,
+    }, .{}, &want.writer);
+    want.writer.end -= 1;
+    const sum = chronicle.checksum(want.written());
+    try want.writer.print(",\"c\":{d}}}", .{sum});
+    try testing.expectEqualStrings(want.written(), record.bytes);
 }
 
-test "an event is written as std.json writes it, whatever its shape" {
+test "a record is the bytes std.json writes for it, whatever its event's shape" {
+    const io = testing.io;
+    const ShapeJournal = chronicle.Journal(Shape);
     var prng: std.Random.DefaultPrng = .init(0x5eed_c4a0);
     const random = prng.random();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
+    var gpa: FixtureAllocator = .{};
+    defer expectNoLeak(&gpa);
 
-    for (0..20_000) |_| {
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    // Every record kept in the tail, as it was written: `Record.bytes` is
+    // the line on the disk.
+    var journal = try ShapeJournal.open(gpa.allocator(), io, ws.path, .{
+        .sync = .never,
+        .tail_records = 64,
+        .max_segment_bytes = 64 * 1024,
+    });
+    defer journal.deinit(io);
+
+    for (0..1_000) |round| {
         _ = arena.reset(.retain_capacity);
         const a = arena.allocator();
         const text = try a.dupe(u8, awkward(random, try a.alloc(u8, 96)));
         const inner: Inner = .{
             .a = if (random.boolean()) random.int(u8) else null,
             .b = &.{ text, awkward(random, try a.alloc(u8, 48)) },
-            .c = {},
             .d = random.enumValue(Hue),
         };
         const boxed = try a.create(Inner);
@@ -3670,54 +3692,45 @@ test "an event is written as std.json writes it, whatever its shape" {
             .{ .nested = inner },
             .{ .pointer = boxed },
             .{ .many = &.{ null, random.enumValue(Hue) } },
-            .{ .real = @bitCast(random.int(u64)) },
+            .{ .real = @bitCast(random.int(u64) & 0x7fef_ffff_ffff_ffff) },
             .{ .tuple = .{ random.int(u8), random.boolean() } },
-            .{ .custom = .{ .n = random.int(u8) } },
             .{ .value = .{ .string = text } },
             .{ .@"odd \"tag\"" = random.int(u8) },
         };
-        for (shapes) |shape| try expectSameAsStdJson(shape);
-        try expectSameAsStdJson(text);
-        try expectSameAsStdJson(created(random.int(u32), text));
-        try expectSameAsStdJson(Event{ .removed = .{ .id = random.int(u32) } });
+        for (shapes, 0..) |shape, i| {
+            const stamp: i64 = if (i == 0) std.math.minInt(i64) + @as(i64, @intCast(round)) else random.int(i64);
+            _ = try journal.append(io, stamp, shape);
+            const window = journal.records();
+            try expectStdJsonRecord(Shape, window.records[window.records.len - 1], 1);
+        }
     }
-    // The edges of the integers, which a random draw rarely lands on.
-    inline for (.{ u0, u1, i1, u8, i8, u64, i64, u128, i128 }) |Int| {
-        try expectSameAsStdJson(@as(Int, std.math.minInt(Int)));
-        try expectSameAsStdJson(@as(Int, std.math.maxInt(Int)));
-    }
-    try expectSameAsStdJson(@as([]const u8, ""));
-    try expectSameAsStdJson(@as([]const u32, &.{}));
-    try expectSameAsStdJson(struct {}{});
-    try expectSameAsStdJson(struct { a: void }{ .a = {} });
 }
 
-/// An event every part of which the fast reader reads itself, so that a
-/// value of it takes that path wherever its bytes are in the written shape.
-const Plain = union(enum) {
-    empty,
-    flag: bool,
-    small: i8,
-    wide: u64,
-    signed: i64,
-    huge: u128,
-    negative: i128,
-    text: []const u8,
-    maybe: ?[]const u8,
-    hue: Hue,
-    list: []const u32,
-    fixed: [3]u16,
-    nested: struct { a: ?u8, b: []const []const u8, d: Hue, e: ?*const Plain },
-    many: []const ?Hue,
-    twice: ??bool,
-    @"odd \"tag\"": u8,
-};
+test "a record's envelope is the digits std.json would write, at their edges" {
+    const io = testing.io;
+    const edges_i64 = [_]i64{ std.math.minInt(i64), std.math.minInt(i64) + 1, -100, -99, -10, -9, -1, 0, 1, 9, 10, 99, 100, std.math.maxInt(i64) };
+    const edges_u32 = [_]u32{ 1, 9, 10, 99, 100, 101, 999, 1000, std.math.maxInt(u32) };
+    for (edges_u32) |version| {
+        var ws = try Workspace.init("log");
+        defer ws.deinit();
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{
+            .sync = .never,
+            .schema_version = version,
+            .tail_records = edges_i64.len,
+        });
+        defer journal.deinit(io);
+        for (edges_i64) |stamp| {
+            _ = try journal.append(io, stamp, created(@intCast(version % 1000), "x"));
+            const window = journal.records();
+            try expectStdJsonRecord(Event, window.records[window.records.len - 1], version);
+        }
+    }
+}
 
 /// The benchmark's event, and the shape of most: a number and a string.
 const Pair = struct { value: u64, padding: []const u8 };
 
-/// A string with nothing in it JSON escapes: what most events carry, and
-/// what the fast reader reads without handing it on.
+/// A string with nothing in it JSON escapes: what most events carry.
 fn clean(random: std.Random, buffer: []u8) []const u8 {
     const pieces = [_][]const u8{ "a", "Z", " ", "0", "/", "~", "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80", "a longer run of clean bytes" };
     var len: usize = 0;
@@ -3730,262 +3743,18 @@ fn clean(random: std.Random, buffer: []u8) []const u8 {
     return buffer[0..len];
 }
 
-/// A `Plain`, its strings clean or awkward as asked.
-fn randomPlain(random: std.Random, a: std.mem.Allocator, depth: u8, clean_strings: bool) !Plain {
-    const text = if (clean_strings)
-        try a.dupe(u8, clean(random, try a.alloc(u8, 200)))
-    else
-        try a.dupe(u8, awkward(random, try a.alloc(u8, 96)));
-    return switch (random.uintLessThan(u8, 18)) {
-        16 => .{ .huge = random.int(u128) >> random.int(u7) },
-        17 => .{ .negative = random.int(i128) >> random.int(u7) },
-        0 => .empty,
-        1 => .{ .flag = random.boolean() },
-        2 => .{ .small = random.int(i8) },
-        3 => .{ .wide = random.int(u64) >> random.int(u6) },
-        4 => .{ .signed = random.int(i64) >> random.int(u6) },
-        5 => .{ .wide = std.math.maxInt(u64) },
-        6 => .{ .signed = std.math.minInt(i64) },
-        7 => .{ .text = text },
-        8 => .{ .maybe = if (random.boolean()) text else null },
-        9 => .{ .hue = random.enumValue(Hue) },
-        10 => .{ .list = try a.dupe(u32, &.{ random.int(u32), 0, std.math.maxInt(u32) }) },
-        11 => .{ .fixed = .{ random.int(u16), 0, 7 } },
-        12 => .{ .nested = .{
-            .a = if (random.boolean()) random.int(u8) else null,
-            .b = try a.dupe([]const u8, &.{ text, "second" }),
-            .d = random.enumValue(Hue),
-            .e = if (depth < 3 and random.boolean()) blk: {
-                const inner = try a.create(Plain);
-                inner.* = try randomPlain(random, a, depth + 1, clean_strings);
-                break :blk inner;
-            } else null,
-        } },
-        13 => .{ .many = try a.dupe(?Hue, &.{ null, random.enumValue(Hue) }) },
-        14 => .{ .twice = switch (random.uintLessThan(u8, 3)) {
-            0 => null,
-            1 => @as(?bool, null),
-            else => random.boolean(),
-        } },
-        else => .{ .@"odd \"tag\"" = random.int(u8) },
-    };
-}
-
-/// Whether `bytes` carry a number `std.json` (Zig 0.16.0) can panic on
-/// reading into a 128-bit integer: written with a fraction or an exponent,
-/// whole, and from 2^127 to 2^128, which its range check lets through and
-/// its cast through `i128` cannot hold. Worked out from the tokens alone,
-/// not from the type, and so not by the guard it is here to check. `null`
-/// when a string carries such a number, which some types read as one and
-/// others as text: no answer is claimed for those bytes.
-fn stdPanicsOn(bytes: []const u8) ?bool {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    var scanner: std.json.Scanner = .initCompleteInput(arena.allocator(), bytes);
-    const low = std.math.ldexp(@as(f128, 1), 127);
-    const high = std.math.ldexp(@as(f128, 1), 128);
-    var found = false;
-    while (true) {
-        const token = scanner.nextAlloc(arena.allocator(), .alloc_if_needed) catch return found;
-        const text, const quoted = switch (token) {
-            .end_of_document => return found,
-            .number, .allocated_number => |text| .{ text, false },
-            .string, .allocated_string => |text| .{ text, true },
-            else => continue,
-        };
-        if (std.json.isNumberFormattedLikeAnInteger(text)) continue;
-        const float = std.fmt.parseFloat(f128, text) catch continue;
-        if (@round(float) != float or float < low or float > high) continue;
-        if (quoted) return null;
-        found = true;
-    }
-}
-
-/// `parse.fromSlice` and `std.json` given the same bytes: the same value,
-/// or the same error -- and an error where `std.json` would panic.
-fn expectSameParse(comptime T: type, bytes: []const u8) !void {
-    var ours_arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer ours_arena.deinit();
-    var theirs_arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer theirs_arena.deinit();
-    const ours = parse.fromSlice(T, ours_arena.allocator(), bytes, .{});
-    // Every integer in the types this is called with is read from such a
-    // number into an error or a panic, never a value.
-    const panics = stdPanicsOn(bytes) orelse return;
-    if (panics) {
-        if (ours) |_| return error.TestExpectedError else |_| return;
-    }
-    const theirs = std.json.parseFromSliceLeaky(T, theirs_arena.allocator(), bytes, .{});
-    if (theirs) |value| {
-        try testing.expectEqualDeep(value, try ours);
-    } else |err| {
-        try testing.expectError(err, ours);
-    }
-}
-
-/// Bytes in the written shape, changed in one of the ways a line in some
-/// other shape differs from it: whitespace, a byte replaced, dropped or
-/// doubled, a string escaped, a number written as a fraction, a member
-/// written that the type does not have.
-fn mutate(random: std.Random, a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    if (bytes.len == 0) return bytes;
-    const at = random.uintLessThan(usize, bytes.len);
-    const replacements = "{}[]\":,\\0-.e1anu\x00\xff";
-    return switch (random.uintLessThan(u8, 9)) {
-        8 => exponent(a, bytes),
-        0 => try std.mem.concat(a, u8, &.{ bytes[0..at], " ", bytes[at..] }),
-        1 => try std.mem.concat(a, u8, &.{ bytes[0..at], "\n\t", bytes[at..] }),
-        2 => try std.mem.concat(a, u8, &.{ bytes[0..at], bytes[at + 1 ..] }),
-        3 => try std.mem.concat(a, u8, &.{ bytes[0 .. at + 1], bytes[at..] }),
-        4 => blk: {
-            const copy = try a.dupe(u8, bytes);
-            copy[at] = replacements[random.uintLessThan(usize, replacements.len)];
-            break :blk copy;
-        },
-        5 => try std.mem.replaceOwned(u8, a, bytes, "a", "\\u0061"),
-        6 => try std.mem.replaceOwned(u8, a, bytes, "0", "0.0"),
-        else => try std.mem.replaceOwned(u8, a, bytes, ",", ",\"wide\":1,"),
-    };
-}
-
-/// The first run of digits in `bytes` written again with an exponent, as the
-/// same number: `123` as `1.23e2`. What a person or another program writing
-/// a large integer may well write, and what `std.json` reads through a float.
-fn exponent(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
-    const from = std.mem.indexOfAny(u8, bytes, "0123456789") orelse return bytes;
-    var to = from;
-    while (to < bytes.len and std.ascii.isDigit(bytes[to])) to += 1;
-    const digits = bytes[from..to];
-    const number = if (digits.len == 1)
-        try std.fmt.allocPrint(a, "{s}e0", .{digits})
-    else
-        try std.fmt.allocPrint(a, "{c}.{s}e{d}", .{ digits[0], digits[1..], digits.len - 1 });
-    return std.mem.concat(a, u8, &.{ bytes[0..from], number, bytes[to..] });
-}
-
-test "an event is read as std.json reads it, in the written shape and out of it" {
-    var prng: std.Random.DefaultPrng = .init(0x9a55_ed17);
-    const random = prng.random();
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-
-    for (0..20_000) |_| {
-        _ = arena.reset(.retain_capacity);
-        const a = arena.allocator();
-        const clean_strings = random.boolean();
-        const value = try randomPlain(random, a, 0, clean_strings);
-        var written: std.Io.Writer.Allocating = .init(a);
-        try stringify.value(value, &written.writer);
-        const bytes = written.written();
-        try expectSameParse(Plain, bytes);
-        // With nothing in its strings to escape, read by the fast reader.
-        // (What it read is `std.json`'s value, checked above; not always
-        // `value`, since `??bool` written as `null` reads back as the outer
-        // null.)
-        if (clean_strings) {
-            _ = (try parse.fast(Plain, a, bytes)) orelse return error.TestUnexpectedResult;
-        }
-        for (0..4) |_| try expectSameParse(Plain, try mutate(random, a, bytes));
-        try expectSameParse(Event, bytes);
-        try expectSameParse(Pair, bytes);
-
-        const pair: Pair = .{ .value = random.int(u64), .padding = awkward(random, try a.alloc(u8, 200)) };
-        written.clearRetainingCapacity();
-        try stringify.value(pair, &written.writer);
-        try expectSameParse(Pair, written.written());
-        try expectSameParse(Pair, try mutate(random, a, written.written()));
-    }
-    // The suite's own event, which the fast reader hands to std.json
-    // whole for its `std.json.Value` arm, and the integers at their edges.
-    try expectSameParse(Event, "{\"created\":{\"id\":1,\"name\":\"x\"}}");
-    inline for (.{ u0, u1, i1, u8, i8, u64, i64, u128, i128 }) |Int| {
-        for ([_]Int{ std.math.minInt(Int), std.math.maxInt(Int) }) |edge| {
-            var buffer: [48]u8 = undefined;
-            try expectSameParse(Int, try std.fmt.bufPrint(&buffer, "{d}", .{edge}));
-        }
-    }
-    for ([_][]const u8{
-        "0",  "-0", "00",                                      "-",     "1e2", "1.0",
-        "-1", "01", "18446744073709551616",                    "\"1\"", " 1",  "1 ",
-        "1x", "",   "340282366920938463463374607431768211456", "-00",
-    }) |text| {
-        try expectSameParse(u64, text);
-        try expectSameParse(i128, text);
-        try expectSameParse(u128, text);
-        try expectSameParse(u1, text);
-    }
-}
-
-test "a whole number past what std.json can cast is an error, not a panic" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
-    // Read from bytes: a float at or past 2^127 goes through an `i128` cast
-    // in `std.json`, and so does 2^127 itself into an `i128`, whose largest
-    // value rounds up to it. Each of these panicked.
-    try testing.expectError(error.Overflow, parse.fromSlice(u128, a, "1.8e38", .{}));
-    try testing.expectError(error.Overflow, parse.fromSlice(u128, a, "3.402823669209384634633746074317682114555e38", .{}));
-    try testing.expectError(error.Overflow, parse.fromSlice(i128, a, "1.7014118346046923173168730371588410572e38", .{}));
-    try testing.expectError(error.Overflow, parse.fromSlice(u128, a, "\"2e38\"", .{}));
-    try testing.expectError(error.Overflow, parse.fromSlice(u120, a, "1.329227995784915872903807060280344576e36", .{}));
-    try testing.expectError(error.Overflow, parse.fromSlice(struct { a: u8, b: ?[]const u128 }, a, "{ \"a\":1, \"b\":[1, 2.0e38] }", .{}));
-    try testing.expectError(error.Overflow, parse.fromSlice(union(enum) { x: [2]i128 }, a, "{\"x\":[0,1.7014118346046923173168730371588410572e38]}", .{}));
-
-    // Around them, std.json's own answers: the values it reads, and the
-    // errors it gives first.
-    const neighbours = [_][]const u8{
-        "1.7e38",                                     "-1.7014118346046923173168730371588410572e38",
-        "1.7014118346046923173168730371588410571e38", "3.5e38",
-        "-1.8e38",                                    "1.5e3",
-        "2.5",                                        "1e999",
-    };
-    for (neighbours) |text| {
-        try expectSameParse(u128, text);
-        try expectSameParse(i128, text);
-        try expectSameParse(u64, text);
-    }
-    // std.json refuses the unknown member before it reaches the number.
-    try expectSameParse(struct { a: u128 }, "{\"b\":1,\"a\":1.8e38}");
-    try testing.expectError(error.UnknownField, parse.fromSlice(struct { a: u128 }, a, "{\"b\":1,\"a\":1.8e38}", .{}));
-
-    // Read from a `std.json.Value`, what a line in some other shape than
-    // the written one is read into first: a float that is the type's
-    // largest value rounded up is let through its check and cast straight
-    // to the type. 2^64 into a `u64` panicked.
-    const cases = [_]struct { float: f64, u: bool }{
-        .{ .float = 0x1p64, .u = true },
-        .{ .float = 0x1p63, .u = false },
-    };
-    for (cases) |case| {
-        const value: std.json.Value = .{ .float = case.float };
-        if (case.u) {
-            try testing.expectError(error.Overflow, parse.fromValue(u64, a, value, .{}));
-        } else {
-            try testing.expectError(error.Overflow, parse.fromValue(i64, a, value, .{}));
-        }
-    }
-    try testing.expectError(error.Overflow, parse.fromValue(u128, a, .{ .float = 0x1p128 }, .{}));
-    try testing.expectError(error.Overflow, parse.fromValue(i128, a, .{ .float = 0x1p127 }, .{}));
-    try testing.expectError(error.Overflow, parse.fromValue(u128, a, .{ .number_string = "1.8e38" }, .{}));
-    // And what it reads: the same as std.json.
-    try testing.expectEqual(@as(u64, 1 << 63), try parse.fromValue(u64, a, .{ .float = 0x1p63 }, .{}));
-    try testing.expectEqual(@as(u128, 1 << 127), try parse.fromValue(u128, a, .{ .float = 0x1p127 }, .{}));
-    try testing.expectEqual(@as(i64, std.math.minInt(i64)), try parse.fromValue(i64, a, .{ .float = -0x1p63 }, .{}));
-    try testing.expectError(error.Overflow, parse.fromValue(u64, a, .{ .float = 0x1p65 }, .{}));
-}
-
-test "a record holding a number std.json cannot cast is a corrupt record" {
+test "a record holding a number std.json cannot cast is read as the number, or is a corrupt record" {
     const io = testing.io;
     const Wide = union(enum) { huge: u128, big: i128, count: u64 };
     const WideJournal = chronicle.Journal(Wide);
 
     // In the written envelope, where the event is read from its bytes, and
-    // in an envelope written by hand with a space in it, where the line is
-    // read into a `std.json.Value` first and the event from that.
+    // in an envelope written by hand with a space in it, which is read as
+    // its members' bytes first and the event from its own. std.json panicked
+    // on each of these on at least one of the two paths. Past the type they
+    // are corrupt records on both, found by the open that reads the tail
+    // or by the replay.
     const bad = [_][]const u8{
-        \\{"huge":1.8e38}
-        ,
         \\{"big":1.7014118346046923173168730371588410572e38}
         ,
         \\{"huge":3.402823669209385e38}
@@ -3995,9 +3764,6 @@ test "a record holding a number std.json cannot cast is a corrupt record" {
     };
     for (bad, 0..) |ev, i| {
         for ([_]bool{ false, true }) |by_hand| {
-            // Read from a value, 1.8e38 is an `f64` below 2^128 and std.json
-            // reads it into a `u128`: a value, and std.json's answer.
-            if (i == 0 and by_hand) continue;
             var ws = try Workspace.init("log");
             defer ws.deinit();
             var written: Handwritten = try .init(1, 1);
@@ -4008,9 +3774,6 @@ test "a record holding a number std.json cannot cast is a corrupt record" {
                 try written.checked(covered);
             } else try written.record(1, 1, 1, ev);
             try ws.write(try ws.segment(1), written.written());
-            // Each panicked on at least one of the two paths; the rest
-            // std.json refuses itself. Found by the open that reads the
-            // tail, or by the replay.
             var journal = WideJournal.open(testing.allocator, io, ws.path, .{}) catch |err| {
                 try testing.expectEqual(error.CorruptRecord, err);
                 continue;
@@ -4025,27 +3788,36 @@ test "a record holding a number std.json cannot cast is a corrupt record" {
         }
     }
 
-    // A whole number written with an exponent that fits is read, on both
-    // paths, as std.json reads it.
-    for ([_]bool{ false, true }) |by_hand| {
-        var ws = try Workspace.init("log");
-        defer ws.deinit();
-        var written: Handwritten = try .init(1, 1);
-        defer written.deinit();
-        if (by_hand) {
-            try written.checked("{\"seq\": 1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{\"count\":1.5e3}");
-        } else try written.record(1, 1, 1, "{\"count\":1.5e3}");
-        try ws.write(try ws.segment(1), written.written());
-        var journal = try WideJournal.open(testing.allocator, io, ws.path, .{});
-        defer journal.deinit(io);
-        var walk = try journal.replay(io, 0);
-        defer walk.deinit(io);
-        try testing.expectEqual(Wide{ .count = 1500 }, (try walk.next(io)).?.event);
-        try testing.expectEqual(null, try walk.next(io));
+    // In range, a whole number written with an exponent is read as the
+    // number it is, on both paths: 1.8e38 into a `u128`, which std.json
+    // cast through an `i128`, and 1.5e3 into a `u64`.
+    const good = [_]struct { ev: []const u8, want: Wide }{
+        .{ .ev = "{\"huge\":1.8e38}", .want = .{ .huge = 180_000_000_000_000_000_000_000_000_000_000_000_000 } },
+        .{ .ev = "{\"count\":1.5e3}", .want = .{ .count = 1500 } },
+    };
+    for (good) |case| {
+        for ([_]bool{ false, true }) |by_hand| {
+            var ws = try Workspace.init("log");
+            defer ws.deinit();
+            var written: Handwritten = try .init(1, 1);
+            defer written.deinit();
+            if (by_hand) {
+                const covered = try std.fmt.allocPrint(testing.allocator, "{{\"seq\": 1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{s}", .{case.ev});
+                defer testing.allocator.free(covered);
+                try written.checked(covered);
+            } else try written.record(1, 1, 1, case.ev);
+            try ws.write(try ws.segment(1), written.written());
+            var journal = try WideJournal.open(testing.allocator, io, ws.path, .{});
+            defer journal.deinit(io);
+            var walk = try journal.replay(io, 0);
+            defer walk.deinit(io);
+            try testing.expectEqual(case.want, (try walk.next(io)).?.event);
+            try testing.expectEqual(null, try walk.next(io));
+        }
     }
 }
 
-test "a journal of events the fast reader reads gives them back as appended" {
+test "a journal of events gives them back as appended, through the tail and a replay" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -4057,9 +3829,8 @@ test "a journal of events the fast reader reads gives them back as appended" {
     defer arena.deinit();
     const a = arena.allocator();
 
-    // Clean strings, which the fast reader reads, and awkward ones, which
-    // it hands to std.json; through the tail, which reads each record back
-    // as it is appended, and through a replay after a reopen.
+    // Clean strings and awkward ones; through the tail, which reads each
+    // record back as it is appended, and through a replay after a reopen.
     var appended: std.ArrayList(Pair) = .empty;
     {
         var journal = try PairJournal.open(testing.allocator, io, ws.path, .{ .sync = .never, .max_segment_bytes = 16 * 1024 });
@@ -4088,24 +3859,208 @@ test "a journal of events the fast reader reads gives them back as appended" {
     try testing.expectEqual(appended.items.len, seen);
 }
 
-test "a record's envelope is the digits std.json would write" {
-    var prng: std.Random.DefaultPrng = .init(0xe4e1_09e5);
-    const random = prng.random();
-    const edges_u64 = [_]u64{ 0, 1, 9, 10, 99, 100, 101, 999, 1000, std.math.maxInt(i64), std.math.maxInt(u64) };
-    const edges_i64 = [_]i64{ std.math.minInt(i64), std.math.minInt(i64) + 1, -100, -99, -10, -9, -1, 0, 1, std.math.maxInt(i64) };
-    const edges_u32 = [_]u32{ 0, 1, 10, 100, std.math.maxInt(u32) };
-    for (0..50_000) |i| {
-        const seq = if (i < edges_u64.len) edges_u64[i] else random.int(u64) >> random.int(u6);
-        const at = if (i < edges_i64.len) edges_i64[i] else random.int(i64) >> random.int(u6);
-        const version = if (i < edges_u32.len) edges_u32[i] else random.int(u32) >> random.int(u5);
-        const link = random.int(u32);
-        var head: [stringify.envelope_head_max]u8 = undefined;
-        var want: [stringify.envelope_head_max]u8 = undefined;
-        try testing.expectEqualStrings(
-            try std.fmt.bufPrint(&want, "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":", .{ seq, at, version, link }),
-            stringify.envelopeHead(&head, seq, at, version, link),
-        );
+//========================================================================
+// A log written before strand wrote the lines.
+//
+// `testdata/bde5a26` holds two journals chronicle bde5a26 wrote with its own
+// writer: one of events of every shape (`values.zig`), across sixteen
+// segments, and one of `strand.Raw` events, which is tycho's journal. Today's
+// chronicle reads them, gives back the events that were appended, carries
+// their chains on, and writes the same events as the same bytes.
+//========================================================================
+
+const old_log = @import("testdata/bde5a26/values.zig");
+
+const Fixture = struct { name: []const u8, bytes: []const u8 };
+
+const old_journal = [_]Fixture{
+    .{ .name = "00000000000000000001.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000001.log") },
+    .{ .name = "00000000000000000001.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000001.idx") },
+    .{ .name = "00000000000000000027.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000027.log") },
+    .{ .name = "00000000000000000027.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000027.idx") },
+    .{ .name = "00000000000000000055.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000055.log") },
+    .{ .name = "00000000000000000055.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000055.idx") },
+    .{ .name = "00000000000000000084.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000084.log") },
+    .{ .name = "00000000000000000084.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000084.idx") },
+    .{ .name = "00000000000000000111.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000111.log") },
+    .{ .name = "00000000000000000111.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000111.idx") },
+    .{ .name = "00000000000000000139.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000139.log") },
+    .{ .name = "00000000000000000139.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000139.idx") },
+    .{ .name = "00000000000000000165.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000165.log") },
+    .{ .name = "00000000000000000165.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000165.idx") },
+    .{ .name = "00000000000000000190.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000190.log") },
+    .{ .name = "00000000000000000190.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000190.idx") },
+    .{ .name = "00000000000000000213.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000213.log") },
+    .{ .name = "00000000000000000213.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000213.idx") },
+    .{ .name = "00000000000000000241.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000241.log") },
+    .{ .name = "00000000000000000241.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000241.idx") },
+    .{ .name = "00000000000000000268.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000268.log") },
+    .{ .name = "00000000000000000268.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000268.idx") },
+    .{ .name = "00000000000000000292.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000292.log") },
+    .{ .name = "00000000000000000292.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000292.idx") },
+    .{ .name = "00000000000000000318.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000318.log") },
+    .{ .name = "00000000000000000318.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000318.idx") },
+    .{ .name = "00000000000000000345.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000345.log") },
+    .{ .name = "00000000000000000345.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000345.idx") },
+    .{ .name = "00000000000000000373.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000373.log") },
+    .{ .name = "00000000000000000373.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000373.idx") },
+    .{ .name = "00000000000000000398.log", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000398.log") },
+    .{ .name = "00000000000000000398.idx", .bytes = @embedFile("testdata/bde5a26/journal/00000000000000000398.idx") },
+};
+
+const old_raw_journal = [_]Fixture{
+    .{ .name = "00000000000000000001.log", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000001.log") },
+    .{ .name = "00000000000000000001.idx", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000001.idx") },
+    .{ .name = "00000000000000000031.log", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000031.log") },
+    .{ .name = "00000000000000000031.idx", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000031.idx") },
+    .{ .name = "00000000000000000061.log", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000061.log") },
+    .{ .name = "00000000000000000061.idx", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000061.idx") },
+    .{ .name = "00000000000000000090.log", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000090.log") },
+    .{ .name = "00000000000000000090.idx", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000090.idx") },
+    .{ .name = "00000000000000000120.log", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000120.log") },
+    .{ .name = "00000000000000000120.idx", .bytes = @embedFile("testdata/bde5a26/raw/00000000000000000120.idx") },
+};
+
+fn copyFixture(ws: *Workspace, files: []const Fixture) !void {
+    for (files) |file| try ws.write(try ws.sub(file.name), file.bytes);
+}
+
+/// Two events the same, compared as `std.json` writes them: a
+/// `std.json.Value` holds a hash map, which `expectEqualDeep` compares by
+/// its pointers.
+fn expectSameEvent(want: anytype, got: @TypeOf(want)) !void {
+    const want_bytes = try std.json.Stringify.valueAlloc(testing.allocator, want, .{});
+    defer testing.allocator.free(want_bytes);
+    const got_bytes = try std.json.Stringify.valueAlloc(testing.allocator, got, .{});
+    defer testing.allocator.free(got_bytes);
+    try testing.expectEqualStrings(want_bytes, got_bytes);
+}
+
+/// A line with the numbers the chain puts in it — `p`, and `c` over it —
+/// taken out: what two journals with different roots write alike for the
+/// same records.
+fn unchained(a: std.mem.Allocator, line: []const u8) ![]const u8 {
+    const p_at = std.mem.indexOf(u8, line, ",\"p\":").? + ",\"p\":".len;
+    const p_end = std.mem.indexOfScalarPos(u8, line, p_at, ',').?;
+    const c_at = std.mem.lastIndexOf(u8, line, ",\"c\":").?;
+    return std.mem.concat(a, u8, &.{ line[0..p_at], line[p_end..c_at] });
+}
+
+test "a log written before strand reads as it was written, and its records are written again byte for byte" {
+    const io = testing.io;
+    const OldJournal = chronicle.Journal(old_log.Event);
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var prng = old_log.generator();
+    var events: [old_log.count]old_log.Event = undefined;
+    for (&events, 0..) |*event, i| event.* = try old_log.event(a, prng.random(), i);
+    var raws: [old_log.raw_count][]const u8 = undefined;
+    for (&raws, 0..) |*raw, i| raw.* = try old_log.raw(a, prng.random(), i);
+
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    try copyFixture(&ws, &old_journal);
+    var fresh = try Workspace.init("again");
+    defer fresh.deinit();
+
+    // Every record checks out -- checksum, chain, sequence -- and is the
+    // event that was appended, where it was appended.
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    {
+        var journal = try OldJournal.open(testing.allocator, io, ws.path, .{ .max_segment_bytes = old_log.max_segment_bytes, .verify = .full });
+        defer journal.deinit(io);
+        var walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        var i: usize = 0;
+        while (try walk.next(io)) |record| : (i += 1) {
+            try testing.expectEqual(@as(u64, i + 1), record.seq);
+            try testing.expectEqual(old_log.at(i), record.at);
+            try expectSameEvent(events[i], record.event);
+            // The line is `std.json`'s bytes for the record, as it was when
+            // bde5a26 wrote it.
+            try expectStdJsonRecord(old_log.Event, record, 1);
+            try old_lines.append(a, try a.dupe(u8, record.bytes));
+        }
+        try testing.expectEqual(@as(usize, old_log.count), i);
     }
+
+    // The same events appended by today's writer are the same lines but for
+    // the chain, whose root a fresh journal draws at random.
+    {
+        var journal = try OldJournal.open(testing.allocator, io, fresh.path, .{ .max_segment_bytes = old_log.max_segment_bytes, .sync = .never });
+        defer journal.deinit(io);
+        for (events, 0..) |event, i| _ = try journal.append(io, old_log.at(i), event);
+        var walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        var i: usize = 0;
+        while (try walk.next(io)) |record| : (i += 1) {
+            try testing.expectEqualStrings(try unchained(a, old_lines.items[i]), try unchained(a, record.bytes));
+        }
+        try testing.expectEqual(@as(usize, old_log.count), i);
+        // The segments rotated where the old ones did.
+        for (old_journal) |file| {
+            if (std.mem.endsWith(u8, file.name, chronicle.segment_extension)) {
+                try testing.expect(fresh.exists(try fresh.sub(file.name)));
+            }
+        }
+    }
+
+    // The old log takes new records on the end of its chain, and the whole
+    // of it reads back.
+    {
+        var journal = try OldJournal.open(testing.allocator, io, ws.path, .{ .max_segment_bytes = old_log.max_segment_bytes, .sync = .never });
+        defer journal.deinit(io);
+        for (events[0..50], 0..) |event, i| _ = try journal.append(io, old_log.at(i), event);
+    }
+    var journal = try OldJournal.open(testing.allocator, io, ws.path, .{ .max_segment_bytes = old_log.max_segment_bytes, .verify = .full });
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, old_log.count + 50), try journal.lastSeq(io));
+    var walk = try journal.replay(io, old_log.count);
+    defer walk.deinit(io);
+    var i: usize = 0;
+    while (try walk.next(io)) |record| : (i += 1) try expectSameEvent(events[i], record.event);
+    try testing.expectEqual(@as(usize, 50), i);
+
+    // tycho's journal: events kept as their bytes, read back as a slice of
+    // the line they are on, and written again as they were.
+    var raw_ws = try Workspace.init("raw");
+    defer raw_ws.deinit();
+    try copyFixture(&raw_ws, &old_raw_journal);
+    var raw_again = try Workspace.init("raw-again");
+    defer raw_again.deinit();
+    const RawJournal = chronicle.Journal(strand.Raw);
+    var raw_lines: std.ArrayList([]const u8) = .empty;
+    {
+        var raw_journal = try RawJournal.open(testing.allocator, io, raw_ws.path, .{ .max_segment_bytes = old_log.max_segment_bytes, .verify = .full });
+        defer raw_journal.deinit(io);
+        var raw_walk = try raw_journal.replay(io, 0);
+        defer raw_walk.deinit(io);
+        var n: usize = 0;
+        while (try raw_walk.next(io)) |record| : (n += 1) {
+            // A line break between tokens is a space on a record's line.
+            const want = try a.dupe(u8, raws[n]);
+            for (want) |*byte| if (byte.* == '\n' or byte.* == '\r') {
+                byte.* = ' ';
+            };
+            try testing.expectEqualStrings(want, record.event.bytes);
+            const from = @intFromPtr(record.event.bytes.ptr);
+            try testing.expect(from > @intFromPtr(record.bytes.ptr) and from + record.event.bytes.len < @intFromPtr(record.bytes.ptr) + record.bytes.len);
+            try raw_lines.append(a, try a.dupe(u8, record.bytes));
+        }
+        try testing.expectEqual(@as(usize, old_log.raw_count), n);
+    }
+    var raw_journal = try RawJournal.open(testing.allocator, io, raw_again.path, .{ .max_segment_bytes = old_log.max_segment_bytes, .sync = .never });
+    defer raw_journal.deinit(io);
+    for (raws, 0..) |raw, n| _ = try raw_journal.append(io, old_log.at(n), .{ .bytes = raw });
+    var raw_walk = try raw_journal.replay(io, 0);
+    defer raw_walk.deinit(io);
+    var n: usize = 0;
+    while (try raw_walk.next(io)) |record| : (n += 1) {
+        try testing.expectEqualStrings(try unchained(a, raw_lines.items[n]), try unchained(a, record.bytes));
+    }
+    try testing.expectEqual(@as(usize, old_log.raw_count), n);
 }
 
 test "an append that keeps no record allocates nothing" {
@@ -4532,53 +4487,6 @@ const framing_corpus = [_][]const u8{
     seeded("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{}}\n"),
     seeded("chronicle\n"),
 };
-
-test "fuzz: a string is written as std.json writes it" {
-    try testing.fuzz({}, fuzzStringify, .{ .corpus = &stringify_corpus });
-}
-
-const stringify_corpus = [_][]const u8{
-    seeded(""),
-    seeded("plain"),
-    seeded("a quote \" and a backslash \\ past the first sixteen bytes"),
-    seeded("\x00\x01\x1f\x7f\n\r\t"),
-    seeded("caf\xc3\xa9 \xe2\x82\xac \xf0\x9f\x98\x80"),
-    seeded("\xff\xfe not UTF-8"),
-    seeded("\xed\xa0\x80 a surrogate half"),
-};
-
-fn fuzzStringify(_: void, smith: *testing.Smith) anyerror!void {
-    var buffer: [512]u8 = undefined;
-    const bytes = buffer[0..smith.slice(&buffer)];
-    try expectSameAsStdJson(bytes);
-    try expectSameAsStdJson(created(7, bytes));
-    try expectSameAsStdJson(Inner{ .a = null, .b = &.{ bytes, bytes }, .c = {}, .d = .blue });
-}
-
-test "fuzz: an event is read as std.json reads it" {
-    try testing.fuzz({}, fuzzParse, .{ .corpus = &parse_corpus });
-}
-
-const parse_corpus = [_][]const u8{
-    seeded("{\"text\":\"plain\"}"),
-    seeded("{\"nested\":{\"a\":null,\"b\":[\"x\",\"y\"],\"d\":\"red\",\"e\":{\"empty\":{}}}}"),
-    seeded("{\"list\":[1,0,4294967295]}"),
-    seeded("{\"twice\":null}"),
-    seeded("{\"hue\":\"gr\\\"een\"}"),
-    seeded("{\"signed\":-9223372036854775808}"),
-    seeded("{\"text\":\"caf\xc3\xa9 \\u0041\"}"),
-    seeded("{ \"flag\" : true }"),
-    seeded("{\"value\":1,\"padding\":\"pppp\"}"),
-    seeded("{\"huge\":1.8e38}"),
-    seeded("{\"negative\":1.7014118346046923173168730371588410572e38}"),
-};
-
-fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {
-    var buffer: [512]u8 = undefined;
-    const bytes = buffer[0..smith.slice(&buffer)];
-    try expectSameParse(Plain, bytes);
-    try expectSameParse(Pair, bytes);
-}
 
 test "fuzz: a segment whose first line is arbitrary" {
     try testing.fuzz({}, fuzzFraming, .{ .corpus = &framing_corpus });

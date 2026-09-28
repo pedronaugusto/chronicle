@@ -5,16 +5,19 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     //=====================================================================
-    // The module. Pure Zig, no dependencies, nothing to configure: the
+    // The module. Pure Zig, one dependency, nothing to configure: the
     // package's only knobs are the `Options` a caller passes to `open`, so
     // there is no build option to forward and no way for a consumer's build
-    // graph to disagree with this one.
+    // graph to disagree with this one. strand reads and writes a record's
+    // line; this package keeps the lines.
     //=====================================================================
 
+    const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const module = b.addModule("chronicle", .{
         .root_source_file = b.path("src/chronicle.zig"),
         .target = target,
         .optimize = optimize,
+        .imports = &.{.{ .name = "strand", .module = strand }},
     });
 
     //=====================================================================
@@ -44,6 +47,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .sanitize_thread = if (thread_sanitizer) true else null,
             .error_tracing = false,
+            .imports = &.{.{ .name = "strand", .module = strand }},
         }),
     });
 
