@@ -12,6 +12,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   million a second, a replay of the last hundred thousand from 38.4 to
   13.8 ms.
 
+- `Journal.replayAt(io, position)` and `Replay.position()`: a walk that
+  starts where an earlier one stopped. A reader that follows a log keeps the
+  `chronicle.Position` its last pass ended at — the last record it read,
+  its segment, its offsets and its checksum — and the next pass opens that
+  file at that offset instead of seeking by its cursor and reading forward
+  to it. The record the position names is read back first; a position into
+  bytes a `compact`, `truncateAfter` or `dropSegmentsBefore` has changed is
+  `error.StalePosition`, never records from the wrong place, and
+  `replay(position.cursor)` is the way on. A walk that stops in front of a
+  record the writer has not finished hands back a position in front of it.
+  A follower waking for one new record in a million-record log: 17.7 µs a
+  wake with `replay(cursor)`, 13.2 µs with `replayAt` (best of seven,
+  interleaved).
+
 - A record holding a whole number that `std.json` (Zig 0.16.0) cannot cast
   is `error.CorruptRecord` instead of a panic. Read from bytes, `std.json`
   takes a number with a fraction or an exponent into an integer through

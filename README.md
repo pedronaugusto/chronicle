@@ -112,6 +112,7 @@ One module, no dependencies and no build options: the only knobs are the
 | `since(cursor)` | The tail after `cursor`, as a `Window`. |
 | `waitPast(io, cursor)` | Block until there is one, then `since(cursor)`. |
 | `replay(io, cursor)` | A walk over every record after `cursor`, from the disk. |
+| `replayAt(io, position)` | The same, from where an earlier walk's `position()` stopped. |
 | `nudge(io)` | Wake the waiters with no record behind it. |
 | `lastSeq(io)` | The newest sequence number, or zero. |
 | `seqAtOrAfter(io, at)` | The lowest sequence number stamped at or after `at`. |
@@ -136,7 +137,7 @@ One module, no dependencies and no build options: the only knobs are the
 
 Plus `chronicle.checksum(covered)`, which is the checksum a record carries,
 and `chronicle.segmentName(base_seq)`, which is the file a sequence number
-lives in; `chronicle.flush`, which names the call a durable write makes here;
+lives in; `chronicle.Position`, where a walk stopped; `chronicle.flush`, which names the call a durable write makes here;
 and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Window`,
 `Replay`, `Tailer`, `Sink`, `Reader`, `Readers`, `Options`, `Snapshot`,
 `Opened`, `Migrate`, `Stats` and one named error set per operation, with
@@ -299,7 +300,7 @@ it is open.**
 |---|---|
 | One writer | A second `open` with the default `Options.access = .write` gets `error.Locked`. The lock is released on close, and by the operating system when the process ends however it ends, including a kill. |
 | Any number of readers | `Options.access = .read` takes no lock and writes nothing to the log: no repair, no index, no compaction. A record the writer is halfway through appending is the end of the log to a reader, not damage. |
-| Tailing | `replay(cursor)` costs a seek and then the records; `refresh` re-reads the directory when the writer may have rotated, which costs a walk of the newest segment. `tailer(name)` keeps the cursor in `<path>/<name>.cursor` — the one file a `.read` journal writes, and its own rather than the log's. |
+| Tailing | `replay(cursor)` costs a seek and then the records; `replayAt(position)` starts at the byte after the last record the previous walk read, and answers `error.StalePosition` when a compaction or a truncation has changed what is there; `refresh` re-reads the directory when the writer may have rotated, which costs a walk of the newest segment. `tailer(name)` keeps the cursor in `<path>/<name>.cursor` — the one file a `.read` journal writes, and its own rather than the log's. |
 | `backup(dest)` beside a live writer | A read-only journal refreshes its segment inventory first, and the newest segment's length is measured and its newlines walked during the call, so the copy ends at a record boundary however far the writer had got. A reader omits the optional snapshot because it cannot freeze that file and the segments together; a writer's backup includes it. A writer unlinking a segment mid-copy comes back as an error rather than as a copy with a hole in it. |
 | Two writers without the lock | Not available: this package gives no way to ask for it. A journal on a filesystem whose locks do not work is refused too — `open` returns `error.FileLocksUnsupported`. |
 | Cross-process wake-up | Not promised. `waitPast` is for tasks inside one process; across processes, poll. |
@@ -336,7 +337,8 @@ latched as a write that failed. So is a close. A `Replay` takes no lock and writ
 whose index is missing is walked from its first record rather than indexed on
 the way; the calls above are what build an index. `records()`, `since()`,
 `segmentCount()`, `oldestSeq()` and a `Replay` do not take it: call them from
-the task that appends, or under coordination of your own. Every file operation
+the task that appends, or under coordination of your own. `replayAt` takes it
+to choose the segments the walk will cross; the walk it returns does not. Every file operation
 and the wait primitive go through `std.Io`, so the package runs under
 `std.testing.io`, a threaded `Io`, or whatever comes next.
 

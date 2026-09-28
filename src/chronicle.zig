@@ -101,6 +101,47 @@ pub fn checksum(covered: []const u8) u32 {
     return crc32c.hash(covered);
 }
 
+/// Where a `Replay` got to, for the next one to start from: what
+/// `Replay.position` hands back and `Journal.replayAt` takes.
+///
+/// A reader that follows a log -- one that wakes at every append and hands
+/// on what is new -- would otherwise start each pass with `replay(cursor)`,
+/// which lands on the index entry at or before the cursor and reads its way
+/// forward to it. A position goes straight to the byte after the last
+/// record read, in the file it was read from.
+///
+/// It is plain data: kept between passes, handed to another task, or used
+/// with another `Journal` on the same directory. It names a record as well as
+/// a place, and `replayAt` reads that record back before it goes on, so a
+/// position into bytes that are not the ones it was taken from -- a
+/// `compact`, a `truncateAfter`, a `dropSegmentsBefore` since -- is
+/// `error.StalePosition`, never records from the wrong place.
+pub const Position = struct {
+    /// The reader has every record up to and including this sequence
+    /// number: what it would pass to `replay`.
+    cursor: u64,
+    /// The last record the walk read, handed on or stepped over; null when
+    /// it read none, in which case `replayAt` is `replay` from `cursor`.
+    last: ?Last = null,
+
+    pub const Last = struct {
+        seq: u64,
+        /// The segment holding it, by the sequence number it is named after.
+        segment: u64,
+        /// Where its line starts in the segment's file, and where the next
+        /// one starts.
+        start: u64,
+        end: u64,
+        /// Its checksum, which the record after it carries as its back-link.
+        checksum: u32,
+    };
+
+    /// A position that is only a cursor: `replayAt` from it is `replay`.
+    pub fn after(cursor: u64) Position {
+        return .{ .cursor = cursor };
+    }
+};
+
 /// An append-only log of `Event` values.
 ///
 /// The returned type owns a directory, the newest segment's files, an advisory
@@ -437,6 +478,10 @@ pub fn Journal(comptime Event: type) type {
 
         /// Errors from `replay`, and from the `Replay` it returns.
         pub const ReplayError = ReadError;
+
+        /// `replayAt`'s errors: `replay`'s, and a position that no longer
+        /// names the record it was taken after.
+        pub const ReplayAtError = ReplayError || error{StalePosition};
 
         /// Errors from `seqAtOrAfter`, which may have to rebuild an index
         /// before it can answer and so can fail at everything `open` can.
@@ -1028,6 +1073,8 @@ pub fn Journal(comptime Event: type) type {
             /// Its own, so that two walks and an `append` never share one.
             scratch: std.heap.ArenaAllocator,
             run: Continuity,
+            /// The last record read whole: handed on, or stepped over.
+            last: ?Position.Last = null,
 
             pub fn deinit(walk: *Replay, io: Io) void {
                 walk.scan.deinit(io);
@@ -1046,11 +1093,36 @@ pub fn Journal(comptime Event: type) type {
                     // Stepping over a record before its event is parsed is
                     // what lets a reader hold a cursor into a log whose
                     // events it does not know.
-                    if (!try walk.run.accept(header)) continue;
+                    if (!try walk.run.accept(header)) {
+                        walk.last = walk.lastRead(header, line);
+                        continue;
+                    }
                     _ = walk.arena.reset(.retain_capacity);
-                    return try walk.journal.recordFrom(walk.arena.allocator(), header, line);
+                    const record = try walk.journal.recordFrom(walk.arena.allocator(), header, line);
+                    walk.last = walk.lastRead(header, line);
+                    return record;
                 }
                 return null;
+            }
+
+            /// Where this walk got to: after the last record `next` returned,
+            /// or the last one it stepped over on the way to the first. A
+            /// walk that ends in an error is at the last record it read
+            /// without one, so a walk from here reads the bad one again.
+            pub fn position(walk: *const Replay) Position {
+                const last = walk.last orelse return .{ .cursor = walk.run.cursor };
+                return .{ .cursor = @max(walk.run.cursor, last.seq), .last = last };
+            }
+
+            /// The record just read, where it lies in its file.
+            fn lastRead(walk: *const Replay, header: Header, line: []const u8) Position.Last {
+                return .{
+                    .seq = header.seq,
+                    .segment = walk.scan.bases[walk.scan.at],
+                    .start = walk.scan.position - line.len - 1,
+                    .end = walk.scan.position,
+                    .checksum = header.c,
+                };
             }
         };
 
@@ -1087,6 +1159,79 @@ pub fn Journal(comptime Event: type) type {
                 .scratch = .init(self.gpa),
                 .run = .{ .cursor = cursor },
             };
+        }
+
+        /// A walk over every record after `position`, starting at the byte
+        /// after the last record the walk that handed it back had read.
+        ///
+        /// This is `replay` for a reader that comes back: a follower that
+        /// wakes at every append keeps the position its last pass ended at
+        /// and starts the next pass there, in the file and at the offset it
+        /// stopped, instead of seeking by its cursor and reading its way
+        /// forward to it. The records are the ones `replay(position.cursor)`
+        /// gives, checked the same way, the chain included: the first one is
+        /// checked against the last one the position names.
+        ///
+        /// That record is read back before anything else, and must be where
+        /// the position says, with the sequence number and checksum it says.
+        /// When it is not -- its segment was rewritten by a `compact` or
+        /// dropped, the log was cut by `truncateAfter` and written again --
+        /// the answer is `error.StalePosition`, and a `replay` from
+        /// `position.cursor` is the way on (compare `oldestSeq` with the cursor
+        /// to learn whether records were dropped before the reader had them).
+        /// A position that names no record is `replay(position.cursor)`.
+        ///
+        /// A record the writer has not finished is not read, and a walk that
+        /// stops in front of one hands back a position in front of it: a
+        /// walk from there reads it once it is whole. Records appended in one
+        /// `appendAll` are read as the walk finds them, all of them once the
+        /// batch is committed.
+        ///
+        /// The segments it will cross are decided under the journal's lock,
+        /// from what is committed then; the walk itself reads without it.
+        /// Safe to call from any task or thread, except from inside a sink.
+        pub fn replayAt(self: *Self, io: Io, position: Position) ReplayAtError!Replay {
+            const last = position.last orelse {
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                return self.replayFrom(io, position.cursor, false);
+            };
+            var walk: Replay = walk: {
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                const scan = (try self.log.scanAt(last.segment, last.start)) orelse
+                    return error.StalePosition;
+                break :walk .{
+                    .journal = self,
+                    .scan = scan,
+                    .arena = .init(self.gpa),
+                    .scratch = .init(self.gpa),
+                    .run = .{ .cursor = position.cursor },
+                };
+            };
+            errdefer walk.deinit(io);
+
+            // The record the position names, read back: the same bytes at the
+            // same place are what make what follows them the log that
+            // followed it.
+            const line = (walk.scan.next(io) catch |err| switch (err) {
+                error.FileNotFound,
+                error.TruncatedRecord,
+                error.RecordTooLarge,
+                error.UnsupportedFormat,
+                => return error.StalePosition,
+                else => |e| return e,
+            }) orelse return error.StalePosition;
+            if (walk.scan.at != 0 or walk.scan.position != last.end) return error.StalePosition;
+            const header = parseHeader(walk.scratch.allocator(), line) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.StalePosition,
+            };
+            if (header.seq != last.seq or header.c != last.checksum) return error.StalePosition;
+            walk.run.expected = last.seq + 1;
+            walk.run.link = last.checksum;
+            walk.last = last;
+            return walk;
         }
 
         /// Read every record of every segment back, through the checks a

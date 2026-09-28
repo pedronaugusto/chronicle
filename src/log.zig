@@ -1743,6 +1743,19 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
     };
 }
 
+/// A `Scan` starting `offset` bytes into the segment whose first record is
+/// `base_seq` and going on through every segment after it, or null when the
+/// log holds no such segment -- or, for a writer, holds fewer bytes of it than
+/// `offset`.
+pub fn scanAt(log: *Log, base_seq: u64, offset: u64) ScanError!?Scan {
+    for (log.segments.items, 0..) |segment, i| {
+        if (segment.base_seq != base_seq) continue;
+        if (log.options.access != .read and offset > segment.bytes) return null;
+        return try log.scanOver(log.segments.items[i..], offset);
+    }
+    return null;
+}
+
 /// A `Scan` positioned at the first record after `cursor`, as close to it as
 /// the indexes allow.
 ///

@@ -4243,6 +4243,224 @@ const open_corpus = [_][]const u8{
     seeded("\x00\xff\xfe\n"),
 };
 
+/// Every record a walk from `position` hands on, by sequence number, each
+/// checked to be the record `fill`-style appends made for it; and where the
+/// walk ended.
+fn resumeFrom(journal: *Journal, io: Io, position: chronicle.Position, seqs: *std.ArrayList(u64)) !chronicle.Position {
+    var walk = try journal.replayAt(io, position);
+    defer walk.deinit(io);
+    while (try walk.next(io)) |record| {
+        try testing.expectEqual(@as(u32, @intCast(record.seq)), record.event.created.id);
+        try seqs.append(testing.allocator, record.seq);
+    }
+    return walk.position();
+}
+
+/// `seqs` is `first` through `last`, in order, and then emptied.
+fn expectRun(seqs: *std.ArrayList(u64), first: u64, last: u64) !void {
+    defer seqs.clearRetainingCapacity();
+    try testing.expectEqual(@as(usize, @intCast(last + 1 - first)), seqs.items.len);
+    for (seqs.items, first..) |seq, want| try testing.expectEqual(want, seq);
+}
+
+test "a replay picks up where the last one stopped, across batches and rotations" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(7, 4));
+    defer journal.deinit(io);
+    var seqs: std.ArrayList(u64) = .empty;
+    defer seqs.deinit(testing.allocator);
+
+    // An empty log: a walk that read nothing hands back its cursor alone.
+    var position = try resumeFrom(&journal, io, .after(0), &seqs);
+    try testing.expectEqual(chronicle.Position.after(0), position);
+
+    for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "one"));
+    position = try resumeFrom(&journal, io, position, &seqs);
+    try expectRun(&seqs, 1, 10);
+    try testing.expectEqual(@as(u64, 10), position.cursor);
+    try testing.expectEqual(@as(u64, 8), position.last.?.segment);
+
+    // Nothing new: nothing, and the same place.
+    try testing.expectEqual(position, try resumeFrom(&journal, io, position, &seqs));
+    try expectRun(&seqs, 1, 0);
+
+    // One at a time, a batch that crosses three rotations, records whose
+    // durability rides with the next flush: each pass is what came since.
+    _ = try journal.append(io, 11, created(11, "one"));
+    position = try resumeFrom(&journal, io, position, &seqs);
+    try expectRun(&seqs, 11, 11);
+    try fill(&journal, io, 12, 40, "batch");
+    position = try resumeFrom(&journal, io, position, &seqs);
+    try expectRun(&seqs, 12, 40);
+    for (41..44) |i| _ = try journal.appendDeferred(io, @intCast(i), created(@intCast(i), "later"));
+    position = try resumeFrom(&journal, io, position, &seqs);
+    try expectRun(&seqs, 41, 43);
+    try testing.expectEqual(@as(u64, 43), position.cursor);
+
+    // A walk stopped part of the way hands back where it stopped.
+    {
+        var walk = try journal.replay(io, 5);
+        defer walk.deinit(io);
+        for (6..9) |_| _ = (try walk.next(io)).?;
+        position = walk.position();
+    }
+    try testing.expectEqual(@as(u64, 8), position.cursor);
+    try testing.expectEqual(@as(u64, 8), position.last.?.seq);
+    _ = try resumeFrom(&journal, io, position, &seqs);
+    try expectRun(&seqs, 9, 43);
+
+    // A replay from a cursor steps over the records at and before it, and
+    // the last one it stepped over is where it stands.
+    {
+        var walk = try journal.replay(io, 43);
+        defer walk.deinit(io);
+        try testing.expectEqual(null, try walk.next(io));
+        position = walk.position();
+    }
+    try testing.expectEqual(@as(u64, 43), position.last.?.seq);
+
+    // The position is data: another journal on the directory takes it.
+    journal.deinit(io);
+    journal = try Journal.open(testing.allocator, io, ws.path, small(7, 4));
+    _ = try journal.append(io, 44, created(44, "reopened"));
+    _ = try resumeFrom(&journal, io, position, &seqs);
+    try expectRun(&seqs, 44, 44);
+}
+
+test "a replay that stopped at an unfinished record reads it once it is whole" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var whole: Handwritten = try .init(1, 1);
+    defer whole.deinit();
+    for (1..5) |i| {
+        var buffer: [64]u8 = undefined;
+        const ev = try std.fmt.bufPrint(&buffer, "{{\"created\":{{\"id\":{d},\"name\":\"n\"}}}}", .{i});
+        try whole.record(i, 1, 1, ev);
+    }
+    const bytes = whole.written();
+    // The fourth record half written, as a writer in another process leaves
+    // it between two of its writes.
+    const fourth = std.mem.lastIndexOfScalar(u8, bytes[0 .. bytes.len - 1], '\n').? + 1;
+    const torn = bytes[0 .. fourth + (bytes.len - fourth) / 2];
+    try ws.write(try ws.segment(1), torn);
+
+    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    defer reader.deinit(io);
+    var seqs: std.ArrayList(u64) = .empty;
+    defer seqs.deinit(testing.allocator);
+    var position = try resumeFrom(&reader, io, .after(0), &seqs);
+    try expectRun(&seqs, 1, 3);
+    try testing.expectEqual(@as(u64, fourth), position.last.?.end);
+
+    // Still half: still nothing, and still in front of it.
+    try testing.expectEqual(position, try resumeFrom(&reader, io, position, &seqs));
+    try expectRun(&seqs, 1, 0);
+
+    try ws.write(try ws.segment(1), bytes);
+    position = try resumeFrom(&reader, io, position, &seqs);
+    try expectRun(&seqs, 4, 4);
+
+    // A writer that crashed mid-record and was opened again drops the half
+    // and writes the next record in its place: the position before it is
+    // good, and the walk reads what was written there.
+    {
+        var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer writer.deinit(io);
+        _ = try writer.append(io, 5, created(5, "after"));
+        _ = try writer.append(io, 6, created(6, "after"));
+    }
+    const segment = try ws.read(try ws.segment(1));
+    const sixth = std.mem.lastIndexOfScalar(u8, segment[0 .. segment.len - 1], '\n').? + 1;
+    try ws.write(try ws.segment(1), segment[0 .. sixth + 10]);
+    {
+        var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer writer.deinit(io);
+        _ = try writer.append(io, 6, created(6, "again"));
+    }
+    _ = try resumeFrom(&reader, io, position, &seqs);
+    try expectRun(&seqs, 5, 6);
+}
+
+test "a position into bytes the log no longer holds is refused, never read" {
+    const io = testing.io;
+    var seqs: std.ArrayList(u64) = .empty;
+    defer seqs.deinit(testing.allocator);
+
+    // Records 1 to 60, ten to a segment; a reader that got to 35, in the
+    // segment named 31.
+    const Setup = struct {
+        fn at35(journal: *Journal, sub_io: Io) !chronicle.Position {
+            try fill(journal, sub_io, 1, 60, "n");
+            var walk = try journal.replay(sub_io, 0);
+            defer walk.deinit(sub_io);
+            for (0..35) |_| _ = (try walk.next(sub_io)).?;
+            return walk.position();
+        }
+    };
+
+    {
+        // A compaction that dropped records the reader had not read.
+        var ws = try Workspace.init("ahead");
+        defer ws.deinit();
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
+        defer journal.deinit(io);
+        const position = try Setup.at35(&journal, io);
+        try testing.expectEqual(@as(u64, 31), position.last.?.segment);
+        try journal.compact(io, 45);
+        try testing.expectError(error.StalePosition, journal.replayAt(io, position));
+        // What the reader missed, said by the numbers.
+        try testing.expect(journal.oldestSeq() > position.cursor + 1);
+    }
+    {
+        // A compaction that rewrote the reader's segment and dropped nothing
+        // it had not read: refused all the same, and a replay from its
+        // cursor is the way on.
+        var ws = try Workspace.init("inside");
+        defer ws.deinit();
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
+        defer journal.deinit(io);
+        const position = try Setup.at35(&journal, io);
+        try journal.compact(io, 33);
+        try testing.expectError(error.StalePosition, journal.replayAt(io, position));
+        _ = try resumeFrom(&journal, io, .after(position.cursor), &seqs);
+        try expectRun(&seqs, 36, 60);
+    }
+    {
+        // A compaction behind the reader's segment leaves its bytes where
+        // they were, and the walk goes on.
+        var ws = try Workspace.init("behind");
+        defer ws.deinit();
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
+        defer journal.deinit(io);
+        const position = try Setup.at35(&journal, io);
+        try journal.compact(io, 25);
+        _ = try resumeFrom(&journal, io, position, &seqs);
+        try expectRun(&seqs, 36, 60);
+        _ = try journal.dropSegmentsBefore(io, 40);
+        try testing.expectError(error.StalePosition, journal.replayAt(io, position));
+    }
+    {
+        // The log cut behind the reader and written again: the same
+        // records at the same places, byte for byte but one letter, which
+        // only the checksum tells apart.
+        var ws = try Workspace.init("cut");
+        defer ws.deinit();
+        var journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
+        defer journal.deinit(io);
+        const position = try Setup.at35(&journal, io);
+        try journal.truncateAfter(io, 32);
+        try fill(&journal, io, 33, 50, "m");
+        try testing.expectError(error.StalePosition, journal.replayAt(io, position));
+        // Cut to shorter than the position and not written again.
+        try journal.truncateAfter(io, 32);
+        try testing.expectError(error.StalePosition, journal.replayAt(io, position));
+    }
+}
+
 test "fuzz: open of arbitrary segment contents, and the repair it promises" {
     try testing.fuzz({}, fuzzOpen, .{ .corpus = &open_corpus });
 }
