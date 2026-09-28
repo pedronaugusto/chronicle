@@ -2174,7 +2174,7 @@ pub fn Journal(comptime Event: type) type {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.CorruptRecord,
                     },
-                    .parsed => |found| std.json.parseFromValueLeaky(Event, arena, found.value, .{}) catch |err| switch (err) {
+                    .parsed => |found| parse.fromValue(Event, arena, found.value, .{}) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.CorruptRecord,
                     },

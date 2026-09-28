@@ -12,6 +12,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   million a second, a replay of the last hundred thousand from 38.4 to
   13.8 ms.
 
+- A record holding a whole number that `std.json` (Zig 0.16.0) cannot cast
+  is `error.CorruptRecord` instead of a panic. Read from bytes, `std.json`
+  takes a number with a fraction or an exponent into an integer through
+  `i128`, and panics on one from 2^127 up (`1.8e38` into a `u128`, 2^127
+  into an `i128`); read from a `std.json.Value` — a record in some other
+  shape than the written one — it casts a float equal to the type's largest
+  value rounded up (2^64 into a `u64`). Before either is given a record,
+  the package walks it as `std.json` would and answers where it would
+  panic; everything else is still `std.json`'s answer.
+
 - An event in the shape this package writes is read back by the package's
   own reader instead of `std.json`, into the same value: its strings are
   scanned sixteen bytes at a time and handed back as slices of the line, as

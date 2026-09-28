@@ -3694,18 +3694,14 @@ test "an event is written as std.json writes it, whatever its shape" {
 
 /// An event every part of which the fast reader reads itself, so that a
 /// value of it takes that path wherever its bytes are in the written shape.
-///
-/// No 128-bit integers here, though the reader reads them: std.json in Zig
-/// 0.16.0 reads a number with a fraction or an exponent into one through an
-/// `i128`, and panics on one near or past `maxInt(i128)` rather than
-/// returning an error, so a mutated or fuzzed input could not be compared.
-/// The fixed edges below cover them.
 const Plain = union(enum) {
     empty,
     flag: bool,
     small: i8,
     wide: u64,
     signed: i64,
+    huge: u128,
+    negative: i128,
     text: []const u8,
     maybe: ?[]const u8,
     hue: Hue,
@@ -3740,7 +3736,9 @@ fn randomPlain(random: std.Random, a: std.mem.Allocator, depth: u8, clean_string
         try a.dupe(u8, clean(random, try a.alloc(u8, 200)))
     else
         try a.dupe(u8, awkward(random, try a.alloc(u8, 96)));
-    return switch (random.uintLessThan(u8, 16)) {
+    return switch (random.uintLessThan(u8, 18)) {
+        16 => .{ .huge = random.int(u128) >> random.int(u7) },
+        17 => .{ .negative = random.int(i128) >> random.int(u7) },
         0 => .empty,
         1 => .{ .flag = random.boolean() },
         2 => .{ .small = random.int(i8) },
@@ -3773,14 +3771,50 @@ fn randomPlain(random: std.Random, a: std.mem.Allocator, depth: u8, clean_string
     };
 }
 
+/// Whether `bytes` carry a number `std.json` (Zig 0.16.0) can panic on
+/// reading into a 128-bit integer: written with a fraction or an exponent,
+/// whole, and from 2^127 to 2^128, which its range check lets through and
+/// its cast through `i128` cannot hold. Worked out from the tokens alone,
+/// not from the type, and so not by the guard it is here to check. `null`
+/// when a string carries such a number, which some types read as one and
+/// others as text: no answer is claimed for those bytes.
+fn stdPanicsOn(bytes: []const u8) ?bool {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var scanner: std.json.Scanner = .initCompleteInput(arena.allocator(), bytes);
+    const low = std.math.ldexp(@as(f128, 1), 127);
+    const high = std.math.ldexp(@as(f128, 1), 128);
+    var found = false;
+    while (true) {
+        const token = scanner.nextAlloc(arena.allocator(), .alloc_if_needed) catch return found;
+        const text, const quoted = switch (token) {
+            .end_of_document => return found,
+            .number, .allocated_number => |text| .{ text, false },
+            .string, .allocated_string => |text| .{ text, true },
+            else => continue,
+        };
+        if (std.json.isNumberFormattedLikeAnInteger(text)) continue;
+        const float = std.fmt.parseFloat(f128, text) catch continue;
+        if (@round(float) != float or float < low or float > high) continue;
+        if (quoted) return null;
+        found = true;
+    }
+}
+
 /// `parse.fromSlice` and `std.json` given the same bytes: the same value,
-/// or the same error.
+/// or the same error -- and an error where `std.json` would panic.
 fn expectSameParse(comptime T: type, bytes: []const u8) !void {
     var ours_arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer ours_arena.deinit();
     var theirs_arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer theirs_arena.deinit();
     const ours = parse.fromSlice(T, ours_arena.allocator(), bytes, .{});
+    // Every integer in the types this is called with is read from such a
+    // number into an error or a panic, never a value.
+    const panics = stdPanicsOn(bytes) orelse return;
+    if (panics) {
+        if (ours) |_| return error.TestExpectedError else |_| return;
+    }
     const theirs = std.json.parseFromSliceLeaky(T, theirs_arena.allocator(), bytes, .{});
     if (theirs) |value| {
         try testing.expectEqualDeep(value, try ours);
@@ -3797,7 +3831,8 @@ fn mutate(random: std.Random, a: std.mem.Allocator, bytes: []const u8) ![]const 
     if (bytes.len == 0) return bytes;
     const at = random.uintLessThan(usize, bytes.len);
     const replacements = "{}[]\":,\\0-.e1anu\x00\xff";
-    return switch (random.uintLessThan(u8, 8)) {
+    return switch (random.uintLessThan(u8, 9)) {
+        8 => exponent(a, bytes),
         0 => try std.mem.concat(a, u8, &.{ bytes[0..at], " ", bytes[at..] }),
         1 => try std.mem.concat(a, u8, &.{ bytes[0..at], "\n\t", bytes[at..] }),
         2 => try std.mem.concat(a, u8, &.{ bytes[0..at], bytes[at + 1 ..] }),
@@ -3811,6 +3846,21 @@ fn mutate(random: std.Random, a: std.mem.Allocator, bytes: []const u8) ![]const 
         6 => try std.mem.replaceOwned(u8, a, bytes, "0", "0.0"),
         else => try std.mem.replaceOwned(u8, a, bytes, ",", ",\"wide\":1,"),
     };
+}
+
+/// The first run of digits in `bytes` written again with an exponent, as the
+/// same number: `123` as `1.23e2`. What a person or another program writing
+/// a large integer may well write, and what `std.json` reads through a float.
+fn exponent(a: std.mem.Allocator, bytes: []const u8) ![]const u8 {
+    const from = std.mem.indexOfAny(u8, bytes, "0123456789") orelse return bytes;
+    var to = from;
+    while (to < bytes.len and std.ascii.isDigit(bytes[to])) to += 1;
+    const digits = bytes[from..to];
+    const number = if (digits.len == 1)
+        try std.fmt.allocPrint(a, "{s}e0", .{digits})
+    else
+        try std.fmt.allocPrint(a, "{c}.{s}e{d}", .{ digits[0], digits[1..], digits.len - 1 });
+    return std.mem.concat(a, u8, &.{ bytes[0..from], number, bytes[to..] });
 }
 
 test "an event is read as std.json reads it, in the written shape and out of it" {
@@ -3863,6 +3913,135 @@ test "an event is read as std.json reads it, in the written shape and out of it"
         try expectSameParse(i128, text);
         try expectSameParse(u128, text);
         try expectSameParse(u1, text);
+    }
+}
+
+test "a whole number past what std.json can cast is an error, not a panic" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Read from bytes: a float at or past 2^127 goes through an `i128` cast
+    // in `std.json`, and so does 2^127 itself into an `i128`, whose largest
+    // value rounds up to it. Each of these panicked.
+    try testing.expectError(error.Overflow, parse.fromSlice(u128, a, "1.8e38", .{}));
+    try testing.expectError(error.Overflow, parse.fromSlice(u128, a, "3.402823669209384634633746074317682114555e38", .{}));
+    try testing.expectError(error.Overflow, parse.fromSlice(i128, a, "1.7014118346046923173168730371588410572e38", .{}));
+    try testing.expectError(error.Overflow, parse.fromSlice(u128, a, "\"2e38\"", .{}));
+    try testing.expectError(error.Overflow, parse.fromSlice(u120, a, "1.329227995784915872903807060280344576e36", .{}));
+    try testing.expectError(error.Overflow, parse.fromSlice(struct { a: u8, b: ?[]const u128 }, a, "{ \"a\":1, \"b\":[1, 2.0e38] }", .{}));
+    try testing.expectError(error.Overflow, parse.fromSlice(union(enum) { x: [2]i128 }, a, "{\"x\":[0,1.7014118346046923173168730371588410572e38]}", .{}));
+
+    // Around them, std.json's own answers: the values it reads, and the
+    // errors it gives first.
+    const neighbours = [_][]const u8{
+        "1.7e38",                                     "-1.7014118346046923173168730371588410572e38",
+        "1.7014118346046923173168730371588410571e38", "3.5e38",
+        "-1.8e38",                                    "1.5e3",
+        "2.5",                                        "1e999",
+    };
+    for (neighbours) |text| {
+        try expectSameParse(u128, text);
+        try expectSameParse(i128, text);
+        try expectSameParse(u64, text);
+    }
+    // std.json refuses the unknown member before it reaches the number.
+    try expectSameParse(struct { a: u128 }, "{\"b\":1,\"a\":1.8e38}");
+    try testing.expectError(error.UnknownField, parse.fromSlice(struct { a: u128 }, a, "{\"b\":1,\"a\":1.8e38}", .{}));
+
+    // Read from a `std.json.Value`, what a line in some other shape than
+    // the written one is read into first: a float that is the type's
+    // largest value rounded up is let through its check and cast straight
+    // to the type. 2^64 into a `u64` panicked.
+    const cases = [_]struct { float: f64, u: bool }{
+        .{ .float = 0x1p64, .u = true },
+        .{ .float = 0x1p63, .u = false },
+    };
+    for (cases) |case| {
+        const value: std.json.Value = .{ .float = case.float };
+        if (case.u) {
+            try testing.expectError(error.Overflow, parse.fromValue(u64, a, value, .{}));
+        } else {
+            try testing.expectError(error.Overflow, parse.fromValue(i64, a, value, .{}));
+        }
+    }
+    try testing.expectError(error.Overflow, parse.fromValue(u128, a, .{ .float = 0x1p128 }, .{}));
+    try testing.expectError(error.Overflow, parse.fromValue(i128, a, .{ .float = 0x1p127 }, .{}));
+    try testing.expectError(error.Overflow, parse.fromValue(u128, a, .{ .number_string = "1.8e38" }, .{}));
+    // And what it reads: the same as std.json.
+    try testing.expectEqual(@as(u64, 1 << 63), try parse.fromValue(u64, a, .{ .float = 0x1p63 }, .{}));
+    try testing.expectEqual(@as(u128, 1 << 127), try parse.fromValue(u128, a, .{ .float = 0x1p127 }, .{}));
+    try testing.expectEqual(@as(i64, std.math.minInt(i64)), try parse.fromValue(i64, a, .{ .float = -0x1p63 }, .{}));
+    try testing.expectError(error.Overflow, parse.fromValue(u64, a, .{ .float = 0x1p65 }, .{}));
+}
+
+test "a record holding a number std.json cannot cast is a corrupt record" {
+    const io = testing.io;
+    const Wide = union(enum) { huge: u128, big: i128, count: u64 };
+    const WideJournal = chronicle.Journal(Wide);
+
+    // In the written envelope, where the event is read from its bytes, and
+    // in an envelope written by hand with a space in it, where the line is
+    // read into a `std.json.Value` first and the event from that.
+    const bad = [_][]const u8{
+        \\{"huge":1.8e38}
+        ,
+        \\{"big":1.7014118346046923173168730371588410572e38}
+        ,
+        \\{"huge":3.402823669209385e38}
+        ,
+        \\{"count":1.8446744073709552e19}
+        ,
+    };
+    for (bad, 0..) |ev, i| {
+        for ([_]bool{ false, true }) |by_hand| {
+            // Read from a value, 1.8e38 is an `f64` below 2^128 and std.json
+            // reads it into a `u128`: a value, and std.json's answer.
+            if (i == 0 and by_hand) continue;
+            var ws = try Workspace.init("log");
+            defer ws.deinit();
+            var written: Handwritten = try .init(1, 1);
+            defer written.deinit();
+            if (by_hand) {
+                const covered = try std.fmt.allocPrint(testing.allocator, "{{\"seq\": 1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{s}", .{ev});
+                defer testing.allocator.free(covered);
+                try written.checked(covered);
+            } else try written.record(1, 1, 1, ev);
+            try ws.write(try ws.segment(1), written.written());
+            // Each panicked on at least one of the two paths; the rest
+            // std.json refuses itself. Found by the open that reads the
+            // tail, or by the replay.
+            var journal = WideJournal.open(testing.allocator, io, ws.path, .{}) catch |err| {
+                try testing.expectEqual(error.CorruptRecord, err);
+                continue;
+            };
+            defer journal.deinit(io);
+            var walk = try journal.replay(io, 0);
+            defer walk.deinit(io);
+            testing.expectError(error.CorruptRecord, walk.next(io)) catch |err| {
+                std.debug.print("case {d}, by hand {}\n", .{ i, by_hand });
+                return err;
+            };
+        }
+    }
+
+    // A whole number written with an exponent that fits is read, on both
+    // paths, as std.json reads it.
+    for ([_]bool{ false, true }) |by_hand| {
+        var ws = try Workspace.init("log");
+        defer ws.deinit();
+        var written: Handwritten = try .init(1, 1);
+        defer written.deinit();
+        if (by_hand) {
+            try written.checked("{\"seq\": 1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{\"count\":1.5e3}");
+        } else try written.record(1, 1, 1, "{\"count\":1.5e3}");
+        try ws.write(try ws.segment(1), written.written());
+        var journal = try WideJournal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        var walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        try testing.expectEqual(Wide{ .count = 1500 }, (try walk.next(io)).?.event);
+        try testing.expectEqual(null, try walk.next(io));
     }
 }
 
@@ -4172,6 +4351,8 @@ const parse_corpus = [_][]const u8{
     seeded("{\"text\":\"caf\xc3\xa9 \\u0041\"}"),
     seeded("{ \"flag\" : true }"),
     seeded("{\"value\":1,\"padding\":\"pppp\"}"),
+    seeded("{\"huge\":1.8e38}"),
+    seeded("{\"negative\":1.7014118346046923173168730371588410572e38}"),
 };
 
 fn fuzzParse(_: void, smith: *testing.Smith) anyerror!void {

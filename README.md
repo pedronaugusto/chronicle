@@ -149,7 +149,9 @@ exhaustive `switch` in the fold. The usual shapes of an event — structs,
 tagged unions, enums, optionals, integers, booleans, strings and slices of
 them — are written and read by the package's own code, to the bytes
 `std.json` writes and the values it reads; anything else, and any line not
-in the shape this package writes, goes through `std.json` itself.
+in the shape this package writes, goes through `std.json` itself — after a
+check for the whole numbers Zig 0.16.0's `std.json` panics on rather than
+refuses, which are `error.CorruptRecord`.
 
 ## Design
 
