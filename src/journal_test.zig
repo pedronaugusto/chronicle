@@ -1041,9 +1041,9 @@ test "a record from an older schema goes through migrate" {
     const migrate = struct {
         const V1 = union(enum) { created: struct { id: u32, title: []const u8 } };
 
-        fn f(arena: std.mem.Allocator, from_version: u32, value: std.json.Value) Journal.MigrateError!Event {
+        fn f(arena: std.mem.Allocator, from_version: u32, event: chronicle.Raw) Journal.MigrateError!Event {
             if (from_version != 1) return error.Unmigratable;
-            const old = std.json.parseFromValueLeaky(V1, arena, value, .{}) catch |err| switch (err) {
+            const old = event.parse(V1, arena, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.Unmigratable,
             };
@@ -1087,6 +1087,62 @@ test "without a migrate hook an older record lands in the unknown arm" {
     try testing.expectEqual(@as(u32, 1), record.version);
     try testing.expect(record.event == .unknown);
     try testing.expect(record.event.unknown.object.get("retired") != null);
+}
+
+test "an older record kept as its bytes is a slice of its line, and checked" {
+    const io = testing.io;
+    const Keeping = union(enum) { created: struct { id: u32, name: []const u8 }, unknown: chronicle.Raw };
+
+    // In the `unknown` arm: the event's bytes as they are in the line.
+    {
+        var ws = try Workspace.init("log");
+        defer ws.deinit();
+        try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev =
+            \\{"retired": {"id":7}}
+        }});
+        var journal = try chronicle.Journal(Keeping).open(testing.allocator, io, ws.path, .{ .schema_version = 2 });
+        defer journal.deinit(io);
+        const record = journal.records().records[0];
+        try testing.expectEqualStrings("{\"retired\": {\"id\":7}}", record.event.unknown.bytes);
+        const at = @intFromPtr(record.event.unknown.bytes.ptr);
+        try testing.expect(at > @intFromPtr(record.bytes.ptr) and at < @intFromPtr(record.bytes.ptr) + record.bytes.len);
+    }
+
+    // Through the hook: what it reads borrows from the line too, where it
+    // needs no unescaping.
+    {
+        var ws = try Workspace.init("log");
+        defer ws.deinit();
+        try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev =
+            \\{"created":{"id":7,"title":"old"}}
+        }});
+        const migrate = struct {
+            fn f(arena: std.mem.Allocator, from_version: u32, event: chronicle.Raw) chronicle.Journal(Keeping).MigrateError!Keeping {
+                if (from_version != 1) return error.Unmigratable;
+                const V1 = union(enum) { created: struct { id: u32, title: []const u8 } };
+                const old = event.parse(V1, arena, .{}) catch return error.Unmigratable;
+                return .{ .created = .{ .id = old.created.id, .name = old.created.title } };
+            }
+        }.f;
+        var journal = try chronicle.Journal(Keeping).open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = migrate });
+        defer journal.deinit(io);
+        const record = journal.records().records[0];
+        try testing.expectEqualStrings("old", record.event.created.name);
+        const at = @intFromPtr(record.event.created.name.ptr);
+        try testing.expect(at > @intFromPtr(record.bytes.ptr) and at < @intFromPtr(record.bytes.ptr) + record.bytes.len);
+    }
+
+    // An older event that is not JSON is a corrupt record, whether a hook
+    // or an arm was to take it: the bytes are checked before either sees
+    // them.
+    {
+        var ws = try Workspace.init("log");
+        defer ws.deinit();
+        try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev =
+            \\{"retired":{"id":7}
+        }});
+        try testing.expectError(error.CorruptRecord, chronicle.Journal(Keeping).open(testing.allocator, io, ws.path, .{ .schema_version = 2 }));
+    }
 }
 
 test "without a migrate hook and without an unknown arm an older record is refused" {

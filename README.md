@@ -138,7 +138,8 @@ which writes and reads a record's line; this package keeps the lines.
 
 Plus `chronicle.checksum(covered)`, which is the checksum a record carries,
 and `chronicle.segmentName(base_seq)`, which is the file a sequence number
-lives in; `chronicle.Position`, where a walk stopped; `chronicle.flush`, which names the call a durable write makes here;
+lives in; `chronicle.Position`, where a walk stopped; `chronicle.Raw`, an
+event kept as its bytes; `chronicle.flush`, which names the call a durable write makes here;
 and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Window`,
 `Replay`, `Tailer`, `Sink`, `Reader`, `Readers`, `Options`, `Snapshot`,
 `Opened`, `Migrate`, `Stats` and one named error set per operation, with
@@ -148,8 +149,8 @@ public declaration carries a doc comment stating its contract;
 it. `Event` may be any type `std.json` can write and read back; a tagged union
 is the expected shape, because it gives each record a name on disk and an
 exhaustive `switch` in the fold. strand writes and reads it, to the bytes
-`std.json` writes and the values it reads, and a `strand.Raw` is an event
-kept as its bytes, read back as a slice of its line. A whole number that
+`std.json` writes and the values it reads, and a `chronicle.Raw` (strand's
+`Raw`) is an event kept as its bytes, read back as a slice of its line. A whole number that
 Zig 0.16.0's `std.json` panics on casting is read as the number where it fits
 the type and is `error.CorruptRecord` where it does not.
 
@@ -309,11 +310,13 @@ against `Options.schema_version`.** Equal is parsed as `Event`. Newer is
 `error.NewerSchema`: this process is the old one, and guessing at a record a
 newer writer wrote is how a fold silently goes wrong. Older goes to
 `Options.migrate` if you gave one, then to the `Event` arm named `unknown` if
-there is one, typed `void` or `std.json.Value`, then to `error.OlderSchema`.
-The hook is `fn (arena, from_version, value) MigrateError!Event`: `value` is
-the record's event as JSON, and `arena` is the record's own, so the old shape
-parsed as a type and whatever the new `Event` needs allocated live as long as
-the record and are never freed by hand.
+there is one, typed `void`, `chronicle.Raw` or `std.json.Value`, then to
+`error.OlderSchema`. The hook is `fn (arena, from_version, event)
+MigrateError!Event`: `event` is the record's event as its bytes, checked as
+JSON, a `chronicle.Raw` that is a slice of the record's line, and
+`event.parse(Old, arena, .{})` reads the old shape as a type. `arena` is the
+record's own, so that parse and whatever the new `Event` needs allocated live
+as long as the record and are never freed by hand.
 [`examples/migrate.zig`](examples/migrate.zig) reads version 1 records back at
 version 2.
 `compact` copies kept records byte for byte, so one read back through

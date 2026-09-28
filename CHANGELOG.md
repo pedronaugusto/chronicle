@@ -60,13 +60,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   readers only when one has; every `append` used to pay for a futex wake
   whether anyone waited or not.
 
-- **Breaking:** the `migrate` hook takes an allocator:
-  `fn (arena: Allocator, from_version: u32, value: std.json.Value)`. It is
-  the arena that owns the record being built, so a hook can parse the old
-  shape as a type and allocate what the new `Event` holds, and it all lives
-  as long as the record. A hook that allocated nothing adds the parameter
-  and ignores it. `examples/migrate.zig` reads version 1 records at
-  version 2.
+- **Breaking:** the `migrate` hook takes an allocator and the record's
+  event as its bytes:
+  `fn (arena: Allocator, from_version: u32, event: chronicle.Raw)`. `event`
+  is checked as JSON and is a slice of the record's line, and
+  `event.parse(Old, arena, .{})` reads the old shape as a type, its strings
+  borrowed from the line where they need no unescaping; the hook used to be
+  handed a `std.json.Value` tree built for it. `arena` is the arena that owns
+  the record being built, so what the hook parses and allocates lives as
+  long as the record. `examples/migrate.zig` reads version 1 records at
+  version 2. An `Event` arm named `unknown` may be a `chronicle.Raw` as well
+  as `void` or a `std.json.Value`, and then holds the older record's event
+  as its bytes.
 
 - `backup` knows its own directory by what the filesystem calls it — device
   and inode on POSIX, volume serial and file id on Windows — and no longer by

@@ -37,6 +37,12 @@ const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
 const strand = @import("strand");
 
+/// An event kept as its bytes: what a `migrate` hook is handed, what an
+/// `unknown` arm of this type holds, and an `Event` of its own for a journal
+/// that carries events it does not read. It is strand's, read back as a
+/// slice of the record's line; `Raw.parse` reads it as a type.
+pub const Raw = strand.Raw;
+
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
 pub const OnTruncated = Log.OnTruncated;
@@ -292,14 +298,17 @@ pub fn Journal(comptime Event: type) type {
         /// Translates a record written at an older schema version into the
         /// current `Event`.
         ///
-        /// `arena` is the arena that owns the record being built, and `value`
-        /// is the record's `ev` member, already parsed into it. What the hook
-        /// allocates from `arena` — the old shape parsed as a type with
-        /// `std.json.parseFromValueLeaky`, a string put together, a slice of
-        /// the new form — lasts exactly as long as the record does, and so
-        /// does anything in `value` the returned `Event` borrows. Nothing
-        /// needs freeing: the arena goes with the record.
-        pub const Migrate = *const fn (arena: Allocator, from_version: u32, value: std.json.Value) MigrateError!Event;
+        /// `arena` is the arena that owns the record being built, and `event`
+        /// is the record's `ev` member as its bytes, checked as JSON: a slice
+        /// of the record's line, which lasts as long as the record does.
+        /// `event.parse(Old, arena, .{})` reads the old shape as a type,
+        /// with its strings borrowed from the line where they need no
+        /// unescaping. What the hook allocates from `arena` — that parse, a
+        /// string put together, a slice of the new form — lasts exactly as
+        /// long as the record does, and so does anything in `event` the
+        /// returned `Event` borrows. Nothing needs freeing: the arena goes
+        /// with the record.
+        pub const Migrate = *const fn (arena: Allocator, from_version: u32, event: Raw) MigrateError!Event;
 
         /// How a journal is opened. Every field has a default; the defaults are
         /// the durable, forgiving ones.
@@ -319,8 +328,8 @@ pub fn Journal(comptime Event: type) type {
             verify: Verify = .quick,
             /// Called for a record written at a version below
             /// `schema_version`. Without it, such a record becomes the `Event`
-            /// arm named `unknown` if there is one, and `error.OlderSchema` if
-            /// there is not.
+            /// arm named `unknown` if there is one — typed `void`, `Raw` or
+            /// `std.json.Value` — and `error.OlderSchema` if there is not.
             migrate: ?Migrate = null,
             /// How often `append` makes the bytes it wrote durable. The
             /// default is the durable one; README.md states what each level
@@ -543,7 +552,7 @@ pub fn Journal(comptime Event: type) type {
             ev: Event,
         };
 
-        const UnknownArm = enum { empty, json_value };
+        const UnknownArm = enum { empty, raw, json_value };
 
         /// Whether `Event` has an arm this package can put an unrecognised
         /// older record into, and what shape it is.
@@ -553,6 +562,7 @@ pub fn Journal(comptime Event: type) type {
             for (info.@"union".fields) |field| {
                 if (!std.mem.eql(u8, field.name, "unknown")) continue;
                 if (field.type == void) break :blk .empty;
+                if (field.type == Raw) break :blk .raw;
                 if (field.type == std.json.Value) break :blk .json_value;
                 break :blk null;
             }
@@ -2327,11 +2337,10 @@ pub fn Journal(comptime Event: type) type {
             return error.OlderSchema;
         }
 
-        /// The record's `ev` member in the record's own arena, so that what a
-        /// `migrate` hook or the `unknown` arm keeps lasts as long as the
-        /// record does.
-        fn retainedEv(arena: Allocator, ev: Span, line: []const u8) ReadError!std.json.Value {
-            return strand.parseLine(std.json.Value, arena, line[ev.from..ev.to], .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
+        /// The record's `ev` member as its bytes, checked as JSON: a slice of
+        /// the record's line, which lasts as long as the record does.
+        fn retainedEv(arena: Allocator, ev: Span, line: []const u8) ReadError!Raw {
+            return strand.parseLine(Raw, arena, line[ev.from..ev.to], .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.CorruptRecord,
             };
@@ -2340,7 +2349,15 @@ pub fn Journal(comptime Event: type) type {
         fn unknownEvent(arena: Allocator, ev: Span, line: []const u8) ReadError!Event {
             switch (comptime unknown_arm.?) {
                 .empty => return @unionInit(Event, "unknown", {}),
-                .json_value => return @unionInit(Event, "unknown", try retainedEv(arena, ev, line)),
+                .raw => return @unionInit(Event, "unknown", try retainedEv(arena, ev, line)),
+                .json_value => return @unionInit(
+                    Event,
+                    "unknown",
+                    strand.parseLine(std.json.Value, arena, line[ev.from..ev.to], .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.CorruptRecord,
+                    },
+                ),
             }
         }
 

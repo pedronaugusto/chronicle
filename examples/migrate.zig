@@ -27,12 +27,13 @@ const V1 = union(enum) {
 const Ledger = chronicle.Journal(Event);
 const LedgerV1 = chronicle.Journal(V1);
 
-/// Called for every record written below version 2. `arena` is the record's:
-/// the old shape is parsed into it, and so are the new strings, so they live
-/// exactly as long as the record and nothing is freed by hand.
-fn migrate(arena: std.mem.Allocator, from_version: u32, value: std.json.Value) Ledger.MigrateError!Event {
+/// Called for every record written below version 2, with its event as the
+/// bytes it was written in. `arena` is the record's: the old shape is parsed
+/// into it, and so are the new strings, so they live exactly as long as the
+/// record and nothing is freed by hand.
+fn migrate(arena: std.mem.Allocator, from_version: u32, event: chronicle.Raw) Ledger.MigrateError!Event {
     if (from_version != 1) return error.Unmigratable;
-    const old = std.json.parseFromValueLeaky(V1, arena, value, .{}) catch |err| switch (err) {
+    const old = event.parse(V1, arena, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Unmigratable,
     };
