@@ -1305,8 +1305,8 @@ fn fileLength(log: *Log, io: Io, name: []const u8) OpenError!u64 {
     return file.length(io);
 }
 
-/// The line beginning at `offset`, read in bounded steps rather than by taking
-/// the segment into memory.
+/// The line beginning at `offset`, read through strand's line layer in
+/// bounded steps rather than by taking the segment into memory.
 fn lineAt(log: *Log, io: Io, segment: Segment, offset: u64) OpenError!Line {
     const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
     defer file.close(io);
@@ -1315,26 +1315,26 @@ fn lineAt(log: *Log, io: Io, segment: Segment, offset: u64) OpenError!Line {
 }
 
 fn lineAtFrom(log: *Log, io: Io, file: Io.File, segment: Segment, offset: u64) OpenError!Line {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(log.gpa);
-    var chunk: [4096]u8 = undefined;
-    var at = offset;
-    while (at < segment.bytes) {
-        const want: usize = @intCast(@min(chunk.len, segment.bytes - at));
-        const read = try file.readPositionalAll(io, chunk[0..want], at);
-        if (read == 0) break;
-        if (std.mem.indexOfScalar(u8, chunk[0..read], '\n')) |newline| {
-            try out.appendSlice(log.gpa, chunk[0..newline]);
-            return .{ .bytes = try out.toOwnedSlice(log.gpa), .terminated = true };
-        }
-        try out.appendSlice(log.gpa, chunk[0..read]);
-        at += read;
-    }
-    return .{ .bytes = try out.toOwnedSlice(log.gpa), .terminated = false };
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &.{});
+    try reader.seekTo(offset);
+    var bounded = reader.interface.limited(.limited64(segment.bytes -| offset), &buffer);
+    // Unbounded, as a line read here always was: what it is for is decided
+    // by whoever asked for it.
+    var lines: strand.LineReader = .resumeAt(log.gpa, &bounded.interface, framing(std.math.maxInt(usize)), .{ .offset = offset });
+    defer lines.deinit();
+    const line = lines.next() catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.LineTooLong, error.ControlByte, error.MissingSeparator => unreachable,
+    } orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = false };
+    return .{ .bytes = try log.gpa.dupe(u8, line.line), .terminated = true };
 }
 
-/// The last line of a segment, found by reading backwards in doubling windows
-/// so that the cost is the size of one record rather than of the segment.
+/// The last line of a segment, read backwards by strand's `Tail` a block at
+/// a time from where the segment's records end, so that the cost is the
+/// size of one record rather than of the segment. `terminated` says whether
+/// the segment ends with the newline that ends a record.
 fn lastLine(log: *Log, io: Io, segment: Segment) OpenError!Line {
     const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
     defer file.close(io);
@@ -1343,22 +1343,28 @@ fn lastLine(log: *Log, io: Io, segment: Segment) OpenError!Line {
 }
 
 fn lastLineFrom(log: *Log, io: Io, file: Io.File, segment: Segment) OpenError!Line {
-    var window: u64 = 4096;
-    while (true) {
-        const from = segment.bytes -| window;
-        const size: usize = @intCast(segment.bytes - from);
-        const buffer = try log.gpa.alloc(u8, size);
-        defer log.gpa.free(buffer);
-        const read = try file.readPositionalAll(io, buffer, from);
-        const bytes = buffer[0..read];
-        const terminated = bytes.len != 0 and bytes[bytes.len - 1] == '\n';
-        const body = if (terminated) bytes[0 .. bytes.len - 1] else bytes;
-        if (std.mem.lastIndexOfScalar(u8, body, '\n')) |newline| {
-            return .{ .bytes = try log.gpa.dupe(u8, body[newline + 1 ..]), .terminated = terminated };
-        }
-        if (from == 0) return .{ .bytes = try log.gpa.dupe(u8, body), .terminated = terminated };
-        window *= 2;
-    }
+    if (segment.bytes == 0) return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = false };
+    var last: [1]u8 = undefined;
+    const terminated = try file.readPositionalAll(io, &last, segment.bytes - 1) == 1 and last[0] == '\n';
+    var reader = file.reader(io, &.{});
+    var tail: strand.Tail(strand.Raw) = try .init(log.gpa, &reader, .{
+        .end = segment.bytes,
+        .max_line_bytes = std.math.maxInt(usize),
+        .skip_blank = false,
+        .reject_control_bytes = false,
+        .skip_bom = false,
+        .crlf = false,
+        .block_bytes = 4096,
+    });
+    defer tail.deinit();
+    const line = tail.prevRaw() catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.SeekFailed => return reader.seek_err.?,
+        error.Truncated => return error.TruncatedRecord,
+        error.OutOfMemory => return error.OutOfMemory,
+        error.MalformedLine, error.ControlByte, error.MissingSeparator, error.LineTooLong => unreachable,
+    } orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = terminated };
+    return .{ .bytes = try log.gpa.dupe(u8, line.line), .terminated = terminated };
 }
 
 /// The two members of a line the segment layer reads — where the record sits
@@ -1407,7 +1413,23 @@ const Scanned = struct {
     header_bytes: u64,
 };
 
-/// Walk a segment's newlines, optionally writing each line's offset and
+/// How a segment's lines are framed by strand's `LineReader`: at a `\n`
+/// alone, every byte before it kept — a `\r`, a control byte, a mark at the
+/// start are bytes of the record the checksum covers, not the line layer's
+/// to judge — nothing skipped, and a final line with no `\n` after it not a
+/// line (`LineReader.unfinished` says there was one).
+fn framing(max_line_bytes: usize) strand.LineReader.Options {
+    return .{
+        .max_line_bytes = max_line_bytes,
+        .skip_blank = false,
+        .reject_control_bytes = false,
+        .require_terminator = true,
+        .skip_bom = false,
+        .crlf = false,
+    };
+}
+
+/// Walk a segment's lines, optionally writing each line's offset and
 /// timestamp to an index being built. Memory is one read buffer and one line:
 /// nothing grows with the segment.
 fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenError!Scanned {
@@ -1426,95 +1448,80 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
     const buffer = try log.gpa.alloc(u8, log.options.read_buffer_size);
     defer log.gpa.free(buffer);
 
-    var line: Io.Writer.Allocating = .init(log.gpa);
-    defer line.deinit();
+    // The segment is what `segment.bytes` says it is, whatever the file
+    // runs on into after it.
+    var reader = file.reader(io, &.{});
+    var bounded = reader.interface.limited(.limited64(segment.bytes), buffer);
+    var lines: strand.LineReader = .init(log.gpa, &bounded.interface, framing(log.options.max_record_bytes));
+    defer lines.deinit();
 
-    var reader = file.reader(io, buffer);
-    var offset: u64 = 0;
     var at_header = true;
     var timed = true;
-    const cap = log.options.max_record_bytes;
-    // How much of the line being read has been seen, and how much of it
-    // somebody wrote -- the bytes up to the last one that is not zero. Both
-    // are counted rather than measured off what was kept, because a line
-    // longer than a record may be is not kept.
-    var line_bytes: u64 = 0;
-    var line_written: u64 = 0;
-    while (offset < segment.bytes) {
-        const chunk = reader.interface.peekGreedy(1) catch |err| switch (err) {
-            error.EndOfStream => break,
+    while (true) {
+        const line = lines.next() catch |err| switch (err) {
+            // Past what a record may be, and the segment ends inside it: the
+            // tail after the last newline, measured below.
+            error.LineTooLong => if (lines.unfinished) break else return error.RecordTooLarge,
             error.ReadFailed => return reader.err.?,
-        };
-        if (std.mem.indexOfScalar(u8, chunk, '\n')) |newline| {
-            const piece = chunk[0..newline];
-            if (writtenLength(piece) != 0) line_written = line_bytes + writtenLength(piece);
-            line_bytes += piece.len;
-            if (line_bytes > cap) return error.RecordTooLarge;
-            line.writer.writeAll(piece) catch return error.OutOfMemory;
-            reader.interface.toss(newline + 1);
-
-            if (at_header) {
-                // The first line says what format the rest of the file is in
-                // and what the first record's back-link has to be. A file
-                // whose first line is not one is refused rather than read.
-                const header = parseSegmentHeader(log.gpa, line.written()) orelse
-                    return error.UnsupportedFormat;
-                if (header.version != log_format or header.base_seq != segment.base_seq) {
-                    return error.UnsupportedFormat;
-                }
-                scanned.chain = header.root;
-                scanned.header_bytes = offset + newline + 1;
-                at_header = false;
-            } else {
-                const envelope = envelopeOf(log.gpa, line.written());
-                const at: ?i64 = if (envelope) |found| found.at else null;
-                if (at) |stamp| scanned.times.widen(stamp) else {
-                    timed = false;
-                }
-                if (envelope) |found| {
-                    if (found.c) |value| scanned.chain = value;
-                }
-                if (index) |sink| try sink.record(scanned.lines, offset, at orelse 0);
-                scanned.lines += 1;
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ControlByte, error.MissingSeparator => unreachable,
+        } orelse break;
+        const end = line.offset + line.line.len + 1;
+        if (at_header) {
+            // The first line says what format the rest of the file is in
+            // and what the first record's back-link has to be. A file
+            // whose first line is not one is refused rather than read.
+            const header = parseSegmentHeader(log.gpa, line.line) orelse
+                return error.UnsupportedFormat;
+            if (header.version != log_format or header.base_seq != segment.base_seq) {
+                return error.UnsupportedFormat;
             }
-
-            line.clearRetainingCapacity();
-            line_bytes = 0;
-            line_written = 0;
-            offset += newline + 1;
-            scanned.complete_bytes = offset;
+            scanned.chain = header.root;
+            scanned.header_bytes = end;
+            at_header = false;
         } else {
-            if (writtenLength(chunk) != 0) line_written = line_bytes + writtenLength(chunk);
-            // Only as far as a record may be. Past that the line is not one,
-            // and the bytes are counted rather than held: a segment ending in
-            // a writer's reserved space is mostly zeros, and reading them
-            // into memory to find that out would be the whole of the
-            // reservation.
-            if (line_bytes <= cap) {
-                const room = @min(chunk.len, cap - line_bytes);
-                line.writer.writeAll(chunk[0..room]) catch return error.OutOfMemory;
+            const found = envelopeOf(log.gpa, line.line);
+            const at: ?i64 = if (found) |envelope| envelope.at else null;
+            if (at) |stamp| scanned.times.widen(stamp) else {
+                timed = false;
             }
-            line_bytes += chunk.len;
-            reader.interface.toss(chunk.len);
-            offset += chunk.len;
+            if (found) |envelope| {
+                if (envelope.c) |value| scanned.chain = value;
+            }
+            if (index) |sink| try sink.record(scanned.lines, line.offset, at orelse 0);
+            scanned.lines += 1;
         }
+        scanned.complete_bytes = end;
     }
-    // What is left after the last newline. A record this package writes can
-    // hold no zero byte -- `std.json` escapes every control character -- so a
-    // run of zeros at the end of a segment is space that was reserved and
-    // never written into, and the writer simply carries on there.
-    scanned.partial_bytes = line_written;
+    // What is left after the last newline: how much of it somebody wrote,
+    // up to the last byte that is not zero. A record this package writes
+    // can hold no zero byte -- `std.json` escapes every control character --
+    // so a run of zeros at the end of a segment is space that was reserved
+    // and never written into, and the writer simply carries on there.
+    scanned.partial_bytes = try writtenBetween(io, file, scanned.complete_bytes, segment.bytes);
     // One record with no readable timestamp and the pair says nothing, because
     // a range that does not cover every record cannot be used to skip one.
     if (!timed) scanned.times = .unknown;
     return scanned;
 }
 
-/// `bytes` up to and including the last one that is not zero.
-fn writtenLength(bytes: []const u8) u64 {
-    var at = bytes.len;
-    while (at > 0 and bytes[at - 1] == 0) at -= 1;
-    return at;
+/// How many of the bytes of `file` from `from` to `to` somebody wrote: up to
+/// and including the last one that is not zero. Read a block at a time,
+/// since what is there may be a reservation of any size.
+fn writtenBetween(io: Io, file: Io.File, from: u64, to: u64) OpenError!u64 {
+    var block: [16 * 1024]u8 = undefined;
+    var written: u64 = 0;
+    var at = from;
+    while (at < to) {
+        const want: usize = @intCast(@min(block.len, to - at));
+        const read = try file.readPositionalAll(io, block[0..want], at);
+        if (read == 0) break;
+        var last = read;
+        while (last > 0 and block[last - 1] == 0) last -= 1;
+        if (last != 0) written = at - from + last;
+        at += read;
+    }
+    return written;
 }
 
 /// A walk over the log's lines from some sequence number onward, holding one
@@ -1538,7 +1545,11 @@ pub const Scan = struct {
     file: ?Io.File,
     reader: Io.File.Reader,
     buffer: []u8,
-    line: Io.Writer.Allocating,
+    /// strand's line layer over `reader`, framing the lines of whichever
+    /// segment is open (`framing`). A line whole in `buffer` is handed back
+    /// where it lies; one that straddles a refill is copied into its line
+    /// buffer.
+    lines: strand.LineReader,
     /// Where in the current segment the next line starts.
     position: u64,
     /// Whether the next line is the one that says what the file is.
@@ -1554,7 +1565,7 @@ pub const Scan = struct {
 
     pub fn deinit(scan: *Scan, io: Io) void {
         if (scan.file) |file| file.close(io);
-        scan.line.deinit();
+        scan.lines.deinit();
         scan.gpa.free(scan.buffer);
         scan.gpa.free(scan.bases);
         scan.gpa.free(scan.limits);
@@ -1567,6 +1578,13 @@ pub const Scan = struct {
         return boundary;
     }
 
+    fn nextSegment(scan: *Scan, io: Io) void {
+        if (scan.file) |file| file.close(io);
+        scan.file = null;
+        scan.at += 1;
+        scan.position = 0;
+    }
+
     /// The next line, or null at the end of the log. The bytes are valid until
     /// the next call to `next` or to `deinit`.
     pub fn next(scan: *Scan, io: Io) ScanError!?[]const u8 {
@@ -1575,10 +1593,7 @@ pub const Scan = struct {
             // Past the records of this segment: what follows them is space a
             // writer reserved and has not filled, not a record.
             if (scan.position >= scan.limits[scan.at]) {
-                if (scan.file) |file| file.close(io);
-                scan.file = null;
-                scan.at += 1;
-                scan.position = 0;
+                scan.nextSegment(io);
                 continue;
             }
             if (scan.file == null) {
@@ -1587,72 +1602,74 @@ pub const Scan = struct {
                 scan.reader = file.reader(io, scan.buffer);
                 if (scan.position != 0) try scan.reader.seekTo(scan.position);
                 scan.at_header = scan.position == 0;
+                scan.lines.reset(.{ .offset = scan.position });
             }
-            scan.line.clearRetainingCapacity();
-            const streamed = scan.reader.interface.streamDelimiterLimit(
-                &scan.line.writer,
-                '\n',
-                .limited(scan.max_record_bytes + 1),
-            ) catch |err| switch (err) {
+            // The walk may have been moved since the last line; the reader
+            // it reads through is the one in it now.
+            scan.lines.input = &scan.reader.interface;
+            const newest = scan.at + 1 == scan.bases.len;
+            const line = scan.lines.next() catch |err| switch (err) {
                 error.ReadFailed => return scan.reader.err.?,
-                error.WriteFailed => return error.OutOfMemory,
-                error.StreamTooLong => {
-                    const newest = scan.at + 1 == scan.bases.len;
+                error.OutOfMemory => return error.OutOfMemory,
+                error.LineTooLong => {
                     // A live writer may have reserved far more than one
                     // record of zero-filled space. JSON emitted here contains
-                    // no zero byte, so the first zero marks unwritten tail,
-                    // not an oversized record.
+                    // no zero byte, so a zero in what a record may be of the
+                    // line marks unwritten tail, not an oversized record.
                     if (newest and scan.tolerate_partial_tail and
-                        std.mem.indexOfScalar(u8, scan.line.written(), 0) != null)
+                        try scan.zeroIn(io, scan.lines.recordStart().offset))
                     {
                         return null;
                     }
                     return error.RecordTooLarge;
                 },
-            };
-            // What follows what was streamed is the newline, or nothing at
-            // all: `streamDelimiterEnding` leaves the delimiter buffered when
-            // it found one and leaves the buffer empty when it ran out of
-            // file. Both have to be told apart by the *byte*, not by whether
-            // there is one. A writer in another process may have appended
-            // since the line ran out, in which case there is a byte and it is
-            // the rest of the record — and taking it for the newline would
-            // hand back half a record and leave the walk one byte out for
-            // every record after it.
-            const ending = scan.reader.interface.peekByte() catch |err| switch (err) {
-                error.EndOfStream => null,
-                error.ReadFailed => return scan.reader.err.?,
-            };
-            const terminated = ending == @as(?u8, '\n');
-            if (terminated) {
-                scan.reader.interface.toss(1);
-                scan.position += streamed + 1;
-                if (scan.at_header) {
-                    // The first line of a file says what the rest of it is.
-                    // A walk that starts there reads it and checks it; one
-                    // that starts at an offset the index gave is already past
-                    // it, and the open that gave it the offset checked it.
-                    scan.at_header = false;
-                    const header = parseSegmentHeader(scan.gpa, scan.line.written()) orelse
-                        return error.UnsupportedFormat;
-                    if (header.version != log_format or header.base_seq != scan.bases[scan.at]) {
-                        return error.UnsupportedFormat;
-                    }
-                    scan.boundary = .{ .base_seq = header.base_seq, .root = header.root };
-                    continue;
+                error.ControlByte, error.MissingSeparator => unreachable,
+            } orelse {
+                // No newline, and bytes before the end of the file: a record
+                // the writer has not finished, which for a reader beside it
+                // is the end of the log, and anywhere else is damage. A
+                // writer in another process may have appended since, which
+                // the line layer tells from a newline by the byte itself.
+                if (scan.lines.unfinished) {
+                    if (newest and scan.tolerate_partial_tail) return null;
+                    return error.TruncatedRecord;
                 }
-                return scan.line.written();
+                scan.nextSegment(io);
+                continue;
+            };
+            scan.position = line.offset + line.line.len + 1;
+            if (scan.at_header) {
+                // The first line of a file says what the rest of it is.
+                // A walk that starts there reads it and checks it; one
+                // that starts at an offset the index gave is already past
+                // it, and the open that gave it the offset checked it.
+                scan.at_header = false;
+                const header = parseSegmentHeader(scan.gpa, line.line) orelse
+                    return error.UnsupportedFormat;
+                if (header.version != log_format or header.base_seq != scan.bases[scan.at]) {
+                    return error.UnsupportedFormat;
+                }
+                scan.boundary = .{ .base_seq = header.base_seq, .root = header.root };
+                continue;
             }
-            if (streamed != 0) {
-                const newest = scan.at + 1 == scan.bases.len;
-                if (newest and scan.tolerate_partial_tail) return null;
-                return error.TruncatedRecord;
-            }
-            scan.file.?.close(io);
-            scan.file = null;
-            scan.at += 1;
-            scan.position = 0;
+            return line.line;
         }
+    }
+
+    /// Whether the bytes of the open segment from `from`, as far as a record
+    /// may run, hold a zero.
+    fn zeroIn(scan: *Scan, io: Io, from: u64) ScanError!bool {
+        var block: [4096]u8 = undefined;
+        var at = from;
+        const to = from + scan.max_record_bytes + 1;
+        while (at < to) {
+            const want: usize = @intCast(@min(block.len, to - at));
+            const read = try scan.file.?.readPositionalAll(io, block[0..want], at);
+            if (std.mem.indexOfScalar(u8, block[0..read], 0) != null) return true;
+            if (read < want) return false;
+            at += read;
+        }
+        return false;
     }
 };
 
@@ -1683,7 +1700,8 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
         .file = null,
         .reader = undefined,
         .buffer = buffer,
-        .line = .init(log.gpa),
+        // Its input is set to the walk's reader when a segment is opened.
+        .lines = .init(log.gpa, undefined, framing(log.options.max_record_bytes)),
         .position = position,
         .at_header = false,
         .boundary = null,

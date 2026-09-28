@@ -78,6 +78,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   going to is asked of strand's `FileId`, which is this package's directory
   identity moved there.
 
+- A segment's lines are framed by strand's `LineReader` and `Tail`, where
+  the segment store had readers of its own: a replay's walk, the scan an
+  open makes of the newest segment, the read of a segment's first line and
+  the search for its last. The store keeps only what is a segment's own —
+  its first line, the space reserved after its records, the bound on a
+  record — and every line keeps every byte before its newline, a `\r`
+  included, since the checksum covers them all. A line whole in the read
+  buffer is handed to the replay where it lies instead of being copied out
+  of it, and the last line of a segment is found reading back a block at a
+  time instead of reading a window twice as large again at each step.
+
 - **Breaking:** the `migrate` hook takes an allocator and the record's
   event as its bytes:
   `fn (arena: Allocator, from_version: u32, event: chronicle.Raw)`. `event`
