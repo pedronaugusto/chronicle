@@ -36,6 +36,7 @@ const Log = @import("log.zig");
 const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
 const strand = @import("strand");
+const envelope = @import("envelope.zig");
 
 /// An event kept as its bytes: what a `migrate` hook is handed, what an
 /// `unknown` arm of this type holds, and an `Event` of its own for a journal
@@ -2041,7 +2042,7 @@ pub fn Journal(comptime Event: type) type {
             // found by the envelope reader every replay uses, and read as a
             // `Line` read with unknown members ignored would read it: the
             // members around it are the ones just written from numbers.
-            const span = (quickHeader(stored[0..covered_len], sum) orelse return error.NotRoundTrippable).ev;
+            const span = (envelope.quick(stored[0..covered_len]) orelse return error.NotRoundTrippable).ev;
             const parsed = strand.parseLine(
                 Event,
                 arena.?.allocator(),
@@ -2188,123 +2189,26 @@ pub fn Journal(comptime Event: type) type {
             /// This record's own checksum, which the next one carries as its
             /// `p`.
             c: u32,
-            /// Where the event sits in the line, still unparsed: a pair of
-            /// offsets rather than a slice, since the line a record is built
-            /// from may be a copy of the one the header was read from.
+            /// Where the event sits in the line, still unparsed.
             ev: Span,
         };
 
-        const Span = struct { from: usize, to: usize };
+        const Span = envelope.Span;
 
         /// Read a line's envelope, checking its checksum.
         ///
         /// `scratch` holds nothing unless the line is not in the shape this
         /// package writes, in which case it holds what reading it took.
         fn parseHeader(scratch: Allocator, line: []const u8) ReadError!Header {
-            // The checksum is the last member of every record this package
-            // writes, so it is found from the end and the rest of the line is
-            // what it covers. A line that does not end in one is not a record
-            // and there is nothing to check it against.
-            const covered = coveredBytes(line) orelse return error.CorruptRecord;
-            const claimed = std.fmt.parseInt(
-                u32,
-                line[covered.len + ",\"c\":".len .. line.len - 1],
-                10,
-            ) catch return error.CorruptRecord;
-            if (checksum(covered) != claimed) return error.ChecksumMismatch;
-
-            if (quickHeader(covered, claimed)) |header| return header;
-            return slowHeader(scratch, line, claimed);
-        }
-
-        /// The bytes a line's checksum covers: everything before the
-        /// `,"c":<digits>}` it ends with. Null when it does not end with one.
-        fn coveredBytes(line: []const u8) ?[]const u8 {
-            const opening = ",\"c\":";
-            if (line.len < opening.len + 2 or line[line.len - 1] != '}') return null;
-            var at = line.len - 1;
-            var digits: usize = 0;
-            while (at > 0 and std.ascii.isDigit(line[at - 1])) : (digits += 1) at -= 1;
-            if (digits == 0 or at < opening.len) return null;
-            if (!std.mem.eql(u8, line[at - opening.len .. at], opening)) return null;
-            return line[0 .. at - opening.len];
-        }
-
-        /// The envelope of a line in exactly the shape this package writes,
-        /// read straight off the bytes. Null to say "ask `std.json`".
-        ///
-        /// This is the path every record of every replay takes, so it parses
-        /// the four numbers itself and hands the event on as the slice it
-        /// already is, rather than building a `std.json.Value` for a line
-        /// that is about to be parsed into an `Event` anyway.
-        fn quickHeader(covered: []const u8, claimed: u32) ?Header {
-            var at: usize = 0;
-            const seq = member(covered, &at, "{\"seq\":") orelse return null;
-            const stamp = member(covered, &at, ",\"at\":") orelse return null;
-            const version = member(covered, &at, ",\"v\":") orelse return null;
-            const link = member(covered, &at, ",\"p\":") orelse return null;
-            const ev_prefix = ",\"ev\":";
-            if (!std.mem.startsWith(u8, covered[at..], ev_prefix)) return null;
-            if (seq < 1) return null;
-            return .{
-                .seq = std.math.cast(u64, seq) orelse return null,
-                .at = stamp,
-                .version = std.math.cast(u32, version) orelse return null,
-                .p = std.math.cast(u32, link) orelse return null,
-                .c = claimed,
-                .ev = .{ .from = at + ev_prefix.len, .to = covered.len },
-            };
-        }
-
-        /// One integer member, read at `at` and stepped over. Null when the
-        /// member is not there, is not an integer, or does not end where a
-        /// member ends.
-        fn member(line: []const u8, at: *usize, comptime opening: []const u8) ?i64 {
-            if (!std.mem.startsWith(u8, line[at.*..], opening)) return null;
-            var end = at.* + opening.len;
-            const from = end;
-            if (end < line.len and line[end] == '-') end += 1;
-            const digits = end;
-            while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
-            if (end == digits) return null;
-            const value = std.fmt.parseInt(i64, line[from..end], 10) catch return null;
-            at.* = end;
-            return value;
-        }
-
-        /// The same envelope out of a line in some other shape: a record
-        /// written by hand, or a member in another order.
-        ///
-        /// The members are read as their bytes, so that a number is taken
-        /// only when it is an integer written as one, and the event is found
-        /// where it lies in the line and parsed from there like any other.
-        fn slowHeader(scratch: Allocator, line: []const u8, claimed: u32) ReadError!Header {
-            const Members = struct { seq: strand.Raw, at: strand.Raw, v: strand.Raw, p: strand.Raw, ev: strand.Raw };
-            const members = strand.parseLine(Members, scratch, line, .{}) catch |err| switch (err) {
+            // A line that does not end in a checksum is not a record and
+            // there is nothing to check it against.
+            const t = envelope.trailer(line) orelse return error.CorruptRecord;
+            if (checksum(t.covered) != t.c) return error.ChecksumMismatch;
+            const head = envelope.quick(t.covered) orelse envelope.members(scratch, line) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return error.CorruptRecord,
+                error.Corrupt => return error.CorruptRecord,
             };
-            const seq = integerOf(members.seq) orelse return error.CorruptRecord;
-            if (seq < 1) return error.CorruptRecord;
-            const from = @intFromPtr(members.ev.bytes.ptr) - @intFromPtr(line.ptr);
-            return .{
-                .seq = @intCast(seq),
-                .at = integerOf(members.at) orelse return error.CorruptRecord,
-                .version = std.math.cast(u32, integerOf(members.v) orelse return error.CorruptRecord) orelse return error.CorruptRecord,
-                .p = std.math.cast(u32, integerOf(members.p) orelse return error.CorruptRecord) orelse return error.CorruptRecord,
-                .c = claimed,
-                .ev = .{ .from = from, .to = from + members.ev.bytes.len },
-            };
-        }
-
-        /// A member's value as an integer when it is one written as one — no
-        /// fraction, no exponent, not a string — and within an `i64`. Null
-        /// for anything else.
-        fn integerOf(member_value: strand.Raw) ?i64 {
-            const bytes = member_value.bytes;
-            if (bytes.len == 0 or !(bytes[0] == '-' or std.ascii.isDigit(bytes[0]))) return null;
-            if (!std.json.isNumberFormattedLikeAnInteger(bytes)) return null;
-            return std.fmt.parseInt(i64, bytes, 10) catch null;
+            return .{ .seq = head.seq, .at = head.at, .version = head.v, .p = head.p, .c = t.c, .ev = head.ev };
         }
 
         /// Finish a header into a record whose every slice comes from `arena`.
@@ -2396,4 +2300,5 @@ pub fn Journal(comptime Event: type) type {
 
 test {
     _ = @import("journal_test.zig");
+    _ = @import("envelope.zig");
 }

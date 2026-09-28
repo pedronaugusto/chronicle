@@ -60,6 +60,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   readers only when one has; every `append` used to pay for a futex wake
   whether anyone waited or not.
 
+- One reader for a record's envelope and a segment's first line, where the
+  journal and the segment store each had their own: the shape this package
+  writes read off the bytes, any other shape read by strand as its members'
+  bytes, an integer only where it is written as one. The segment store's
+  reader of a record's back-link found the first `,"p":` anywhere in the
+  line; a record written by hand with its event before its envelope, and a
+  member named `p` in its event, read the event's. It reads the envelope's.
+
 - **Breaking:** the `migrate` hook takes an allocator and the record's
   event as its bytes:
   `fn (arena: Allocator, from_version: u32, event: chronicle.Raw)`. `event`

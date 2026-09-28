@@ -28,6 +28,8 @@ const durable = @import("durable.zig");
 const crc32c = @import("crc32c.zig");
 const clone = @import("clone.zig");
 const identity = @import("identity.zig");
+const envelopes = @import("envelope.zig");
+const strand = @import("strand");
 
 const Log = @This();
 
@@ -92,45 +94,31 @@ const SegmentHeader = struct {
 const SegmentHead = struct { root: u32, header_bytes: u64 };
 
 /// The header a segment's first line carries, or null when that line is not
-/// one. Nothing here guesses: a line that does not parse as this object is
+/// one. Nothing here guesses: a line that does not read as this object is
 /// not a segment header, and a segment whose first line is not one is not a
-/// segment this package wrote.
+/// segment this package wrote. The shape this package writes is read off the
+/// bytes; another is read as its members.
 fn parseSegmentHeader(gpa: Allocator, line: []const u8) ?SegmentHeader {
     if (quickSegmentHeader(line)) |header| return header;
     if (!std.mem.startsWith(u8, line, "{\"chronicle\":")) return null;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), line, .{}) catch return null;
-    if (root != .object) return null;
-    const version = root.object.get("chronicle") orelse return null;
-    const base = root.object.get("base") orelse return null;
-    const chain = root.object.get("root") orelse return null;
-    if (version != .integer or base != .integer or chain != .integer) return null;
+    const Members = struct { chronicle: strand.Raw, base: strand.Raw, root: strand.Raw };
+    const found = strand.parseLine(Members, arena.allocator(), line, .{}) catch return null;
     return .{
-        .version = std.math.cast(u32, version.integer) orelse return null,
-        .base_seq = std.math.cast(u64, base.integer) orelse return null,
-        .root = std.math.cast(u32, chain.integer) orelse return null,
+        .version = std.math.cast(u32, envelopes.integerOf(found.chronicle) orelse return null) orelse return null,
+        .base_seq = std.math.cast(u64, envelopes.integerOf(found.base) orelse return null) orelse return null,
+        .root = std.math.cast(u32, envelopes.integerOf(found.root) orelse return null) orelse return null,
     };
 }
 
 fn quickSegmentHeader(line: []const u8) ?SegmentHeader {
     var at: usize = 0;
-    const version = unsignedMember(u32, line, &at, "{\"chronicle\":") orelse return null;
-    const base_seq = unsignedMember(u64, line, &at, ",\"base\":") orelse return null;
-    const root = unsignedMember(u32, line, &at, ",\"root\":") orelse return null;
+    const version = envelopes.member(u32, line, &at, "{\"chronicle\":") orelse return null;
+    const base_seq = envelopes.member(u64, line, &at, ",\"base\":") orelse return null;
+    const root = envelopes.member(u32, line, &at, ",\"root\":") orelse return null;
     if (at + 1 != line.len or line[at] != '}') return null;
     return .{ .version = version, .base_seq = base_seq, .root = root };
-}
-
-fn unsignedMember(comptime T: type, line: []const u8, at: *usize, comptime opening: []const u8) ?T {
-    if (!std.mem.startsWith(u8, line[at.*..], opening)) return null;
-    const from = at.* + opening.len;
-    var end = from;
-    while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
-    if (end == from) return null;
-    const value = std.fmt.parseInt(T, line[from..end], 10) catch return null;
-    at.* = end;
-    return value;
 }
 
 /// What `open` does with a final line the previous writer did not finish.
@@ -1331,111 +1319,30 @@ fn lastLineFrom(log: *Log, io: Io, file: Io.File, segment: Segment) OpenError!Li
     }
 }
 
-/// The two members of a line the segment layer reads: where the record sits in
-/// the sequence, and when the caller said it happened.
+/// The two members of a line the segment layer reads — where the record sits
+/// in the sequence, and when the caller said it happened — and the checksum
+/// the line ends with, which the next record carries as its back-link.
 const Envelope = struct {
     seq: u64,
     /// Null when the line carries no `at`, or one that is not an integer. Such
     /// a record is one the journal above will refuse; here it only means there
     /// is no timestamp to index it by.
     at: ?i64,
-    /// The checksum the line ends with, which the next record carries as its
-    /// back-link. Null when the line carries none.
+    /// Null when the line carries none.
     c: ?u32,
 };
 
-/// A line's `seq` and `at`, or null when the line is not an object carrying a
-/// sequence number at all.
-///
-/// A record this package writes begins `{"seq":<digits>,"at":<digits>,`, and
-/// that shape is read straight off the bytes, because this runs over every
-/// line of the active segment at every open. Anything else — a record written
-/// by hand, a member in another order, a line that is not one of ours — goes
-/// through `std.json`.
+/// A line's `seq`, `at` and `c`, or null when the line is not an object
+/// carrying a sequence number at all (`envelope.stamp`).
 fn envelopeOf(gpa: Allocator, line: []const u8) ?Envelope {
-    if (quickEnvelope(line)) |found| return found;
-
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), line, .{}) catch return null;
-    if (root != .object) return null;
-    const seq = root.object.get("seq") orelse return null;
-    if (seq != .integer or seq.integer < 1) return null;
-    const at: ?i64 = if (root.object.get("at")) |value|
-        (if (value == .integer) value.integer else null)
-    else
-        null;
-    return .{ .seq = @intCast(seq.integer), .at = at, .c = trailingChecksum(line) };
-}
-
-/// The `p` a line carries: the checksum of the record before it. Read off
-/// the bytes where the shape is the one this package writes, and through
-/// `std.json` where it is not.
-fn backLinkOf(gpa: Allocator, line: []const u8) ?u32 {
-    const opening = ",\"p\":";
-    if (std.mem.indexOf(u8, line, opening)) |found| {
-        var at = found + opening.len;
-        const from = at;
-        while (at < line.len and std.ascii.isDigit(line[at])) at += 1;
-        if (at != from and at < line.len and (line[at] == ',' or line[at] == '}')) {
-            return std.fmt.parseInt(u32, line[from..at], 10) catch null;
-        }
-    }
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), line, .{}) catch return null;
-    if (root != .object) return null;
-    const value = root.object.get("p") orelse return null;
-    if (value != .integer) return null;
-    return std.math.cast(u32, value.integer);
-}
-
-/// The `c` a line ends with. It is the last member of every record this
-/// package writes, so it is read off the end rather than parsed for.
-fn trailingChecksum(line: []const u8) ?u32 {
-    const opening = ",\"c\":";
-    if (line.len < 2 or line[line.len - 1] != '}') return null;
-    var at = line.len - 1;
-    var digits: usize = 0;
-    while (at > 0 and std.ascii.isDigit(line[at - 1])) : (digits += 1) at -= 1;
-    if (digits == 0 or at < opening.len) return null;
-    if (!std.mem.eql(u8, line[at - opening.len .. at], opening)) return null;
-    return std.fmt.parseInt(u32, line[at .. line.len - 1], 10) catch null;
-}
-
-/// The envelope of a line in exactly the shape this package writes, or null to
-/// say "ask `std.json`".
-fn quickEnvelope(line: []const u8) ?Envelope {
-    const seq_prefix = "{\"seq\":";
-    const at_prefix = ",\"at\":";
-    if (!std.mem.startsWith(u8, line, seq_prefix)) return null;
-
-    var at: usize = seq_prefix.len;
-    const seq_from = at;
-    while (at < line.len and std.ascii.isDigit(line[at])) at += 1;
-    if (at == seq_from) return null;
-    const seq = std.fmt.parseInt(u64, line[seq_from..at], 10) catch return null;
-    if (seq < 1) return null;
-
-    if (!std.mem.startsWith(u8, line[at..], at_prefix)) return null;
-    at += at_prefix.len;
-    const at_from = at;
-    if (at < line.len and line[at] == '-') at += 1;
-    const digits_from = at;
-    while (at < line.len and std.ascii.isDigit(line[at])) at += 1;
-    if (at == digits_from) return null;
-    const stamp = std.fmt.parseInt(i64, line[at_from..at], 10) catch return null;
-
-    // The member has to end where a member ends, or these were the first
-    // digits of something else.
-    if (at >= line.len or line[at] != ',') return null;
-    return .{ .seq = seq, .at = stamp, .c = trailingChecksum(line) };
+    const found = envelopes.stamp(gpa, line) orelse return null;
+    return .{ .seq = found.seq, .at = found.at, .c = if (envelopes.trailer(line)) |t| t.c else null };
 }
 
 /// The `seq` member of a line, or null when the line is not an object carrying
 /// one.
 fn seqOf(gpa: Allocator, line: []const u8) ?u64 {
-    return (envelopeOf(gpa, line) orelse return null).seq;
+    return (envelopes.stamp(gpa, line) orelse return null).seq;
 }
 
 const Scanned = struct {
@@ -2513,7 +2420,7 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
                 // Records are copied byte for byte, so the new file's chain
                 // has to root where the first of them links back to. That
                 // number is in the record itself.
-                const root = backLinkOf(log.gpa, line) orelse return error.CorruptRecord;
+                const root = envelopes.backLink(log.gpa, line) orelse return error.CorruptRecord;
                 var buffer: [96]u8 = undefined;
                 const header: SegmentHeader = .{
                     .version = log_format,
