@@ -1524,16 +1524,14 @@ pub fn Journal(comptime Event: type) type {
                 try self.mutex.lock(io);
                 defer self.mutex.unlock(io);
 
-                const document = try std.json.Stringify.valueAlloc(
-                    self.gpa,
-                    .{ .fmt = document_format, .seq = seq },
-                    .{},
-                );
-                defer self.gpa.free(document);
+                var document: std.Io.Writer.Allocating = .init(self.gpa);
+                defer document.deinit();
+                strand.writeValue(&document.writer, .{ .fmt = document_format, .seq = seq }, .{}) catch
+                    return error.OutOfMemory;
 
                 const file = try cursorName(self.gpa, tail.name);
                 defer self.gpa.free(file);
-                try self.log.writeAtomic(io, file, document);
+                try self.log.writeAtomic(io, file, document.written());
                 tail.cursor = seq;
             }
 
@@ -1694,22 +1692,12 @@ pub fn Journal(comptime Event: type) type {
                 else => return Malformed,
             };
             const Versioned = struct { fmt: u32 };
-            const version = std.json.parseFromSliceLeaky(
-                Versioned,
-                arena,
-                bytes,
-                .{ .ignore_unknown_fields = true },
-            ) catch |err| switch (err) {
+            const version = strand.parseLine(Versioned, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return Malformed,
             };
             if (version.fmt != document_format) return error.UnsupportedFormat;
-            return std.json.parseFromSliceLeaky(
-                Document,
-                arena,
-                bytes,
-                .{ .ignore_unknown_fields = true },
-            ) catch |err| switch (err) {
+            return strand.parseLine(Document, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return Malformed,
             };
@@ -1784,15 +1772,13 @@ pub fn Journal(comptime Event: type) type {
             defer self.gpa.free(b64);
             _ = encoder.encode(b64, state_bytes);
 
-            const document = try std.json.Stringify.valueAlloc(
-                self.gpa,
-                .{ .fmt = document_format, .seq = self.seq, .state = b64 },
-                .{},
-            );
-            defer self.gpa.free(document);
+            var document: std.Io.Writer.Allocating = .init(self.gpa);
+            defer document.deinit();
+            strand.writeValue(&document.writer, .{ .fmt = document_format, .seq = self.seq, .state = b64 }, .{}) catch
+                return error.OutOfMemory;
 
             try self.log.syncBeforeSnapshot(io);
-            try self.log.writeSnapshot(io, document);
+            try self.log.writeSnapshot(io, document.written());
         }
 
         /// Delete every whole segment whose records are all at or before `seq`,
