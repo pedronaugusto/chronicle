@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- `Replay.rearmAt(io, position)` starts another pass on the same walk. A
+  follower keeps one scan buffer, segment storage, line buffer and two record
+  arenas across wakes; after the first pass, following one new record in the
+  same segment allocates nothing. The position is checked again on every pass,
+  with the same `error.StalePosition` contract as `Journal.replayAt`.
+
 - Measured on a million 200-byte events, best of seven runs interleaved
   with the previous release's code: an append without `fsync` from 603,000
   to 745,000 records a second, a replay of all of them from 2.60 to 7.32

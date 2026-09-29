@@ -45,6 +45,12 @@ var last: u64 = 0;
     const now = std.Io.Clock.real.now(io).toMilliseconds();
     _ = try ledger.append(io, now, .{ .account_opened = .{ .id = 1, .owner = "ada" } });
 
+    // A follower keeps its replay across wakes. Each re-arm checks where
+    // the last pass stopped and reuses the scan buffer and record scratch.
+    var follower = try ledger.replayAt(io, .after(0));
+    defer follower.deinit(io);
+    _ = (try follower.next(io)).?;
+
     // A batch goes down under one fsync instead of one each. It is group
     // commit and not a transaction: a crash inside it leaves a prefix of
     // it on the disk, exactly as a crash inside one append leaves a torn
@@ -53,6 +59,10 @@ var last: u64 = 0;
         .{ .at = now, .event = .{ .deposited = .{ .id = 1, .cents = 5_000 } } },
         .{ .at = now, .event = .{ .withdrawn = .{ .id = 1, .cents = 1_250 } } },
     });
+    try follower.rearmAt(io, follower.position());
+    var followed: usize = 0;
+    while (try follower.next(io)) |_| followed += 1;
+    if (followed != 2) return error.ReplayMismatch;
 
     // Write the fold out beside the log and drop the records it covers,
     // so the next start replays three records instead of three million.
@@ -114,6 +124,7 @@ which writes and reads a record's line; this package keeps the lines.
 | `waitPast(io, cursor)` | Block until there is one, then `since(cursor)`. |
 | `replay(io, cursor)` | A walk over every record after `cursor`, from the disk. |
 | `replayAt(io, position)` | The same, from where an earlier walk's `position()` stopped. |
+| `Replay.rearmAt(io, position)` | Start another pass on the same walk, retaining its scan buffer and scratch allocations. |
 | `nudge(io)` | Wake the waiters with no record behind it. |
 | `lastSeq(io)` | The newest sequence number, or zero. |
 | `seqAtOrAfter(io, at)` | The lowest sequence number stamped at or after `at`. |
@@ -300,7 +311,7 @@ it is open.**
 |---|---|
 | One writer | A second `open` with the default `Options.access = .write` gets `error.Locked`. The lock is released on close, and by the operating system when the process ends however it ends, including a kill. |
 | Any number of readers | `Options.access = .read` takes no lock and writes nothing to the log: no repair, no index, no compaction. A record the writer is halfway through appending is the end of the log to a reader, not damage. |
-| Tailing | `replay(cursor)` costs a seek and then the records; `replayAt(position)` starts at the byte after the last record the previous walk read, and answers `error.StalePosition` when a compaction or a truncation has changed what is there; `refresh` re-reads the directory when the writer may have rotated, which costs a walk of the newest segment. `tailer(name)` keeps the cursor in `<path>/<name>.cursor` — the one file a `.read` journal writes, and its own rather than the log's. |
+| Tailing | `replay(cursor)` costs a seek and then the records; `replayAt(position)` starts at the byte after the last record the previous walk read, and answers `error.StalePosition` when a compaction or a truncation has changed what is there. Keep that `Replay` and call `walk.rearmAt(io, walk.position())` on each wake to reuse its scan buffer, segment storage and scratch allocations; `deinit` it when done. A re-arm invalidates the previous record, and after an error the walk can be re-armed or deinitialized. `refresh` re-reads the directory when the writer may have rotated, which costs a walk of the newest segment. `tailer(name)` keeps the cursor in `<path>/<name>.cursor` — the one file a `.read` journal writes, and its own rather than the log's. |
 | `backup(dest)` beside a live writer | A read-only journal refreshes its segment inventory first, and the newest segment's length is measured and its newlines walked during the call, so the copy ends at a record boundary however far the writer had got. A reader omits the optional snapshot because it cannot freeze that file and the segments together; a writer's backup includes it. A writer unlinking a segment mid-copy comes back as an error rather than as a copy with a hole in it. |
 | Two writers without the lock | Not available: this package gives no way to ask for it. A journal on a filesystem whose locks do not work is refused too — `open` returns `error.FileLocksUnsupported`. |
 | Cross-process wake-up | Not promised. `waitPast` is for tasks inside one process; across processes, poll. |

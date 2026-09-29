@@ -76,6 +76,12 @@ pub fn main() !void {
         const now = std.Io.Clock.real.now(io).toMilliseconds();
         _ = try ledger.append(io, now, .{ .account_opened = .{ .id = 1, .owner = "ada" } });
 
+        // A follower keeps its replay across wakes. Each re-arm checks where
+        // the last pass stopped and reuses the scan buffer and record scratch.
+        var follower = try ledger.replayAt(io, .after(0));
+        defer follower.deinit(io);
+        _ = (try follower.next(io)).?;
+
         // A batch goes down under one fsync instead of one each. It is group
         // commit and not a transaction: a crash inside it leaves a prefix of
         // it on the disk, exactly as a crash inside one append leaves a torn
@@ -84,6 +90,10 @@ pub fn main() !void {
             .{ .at = now, .event = .{ .deposited = .{ .id = 1, .cents = 5_000 } } },
             .{ .at = now, .event = .{ .withdrawn = .{ .id = 1, .cents = 1_250 } } },
         });
+        try follower.rearmAt(io, follower.position());
+        var followed: usize = 0;
+        while (try follower.next(io)) |_| followed += 1;
+        if (followed != 2) return error.ReplayMismatch;
 
         // Write the fold out beside the log and drop the records it covers,
         // so the next start replays three records instead of three million.
