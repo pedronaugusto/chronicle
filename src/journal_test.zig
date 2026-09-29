@@ -4798,7 +4798,7 @@ test "opening a log that was closed cleanly costs no scan of it" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    const count = 60_000;
+    const count = 2_000;
     const options: Journal.Options = .{
         .sync = .never,
         .tail_records = 8,
@@ -4813,33 +4813,25 @@ test "opening a log that was closed cleanly costs no scan of it" {
         try testing.expectEqual(@as(usize, 1), journal.segmentCount());
     }
 
-    // The first open after those writes pays for a cold cache over the
-    // segment and the index that no later open pays again, and the scan
-    // below, running second, would never pay it. Both numbers are wanted
-    // warm, so the first open is thrown away.
-    _ = try openMicroseconds(&ws, options);
-    const taken = try openMicroseconds(&ws, options);
+    // Counted, not timed: a runner under load made a ratio of two timings
+    // fail once. A clean open reads the index and scans nothing.
+    try testing.expectEqual(@as(u64, 0), try openScans(&ws, options));
 
-    // The same open with the index deleted, which is the work the open above
-    // does not do. Measured once and not repeated: an open that finds no
-    // index builds one, so the second would not scan.
+    // With the index gone, the open is the scan the index spares it --
+    // one, of the one segment -- and it builds the index again, so the
+    // open after it scans nothing either.
     try ws.root.deleteFile(io, try ws.index(1));
-    const scanned = try openMicroseconds(&ws, options);
-
-    // Three times rather than the twenty the change is worth, because the
-    // fixed cost of opening a directory is in both numbers and a small log
-    // on a fast disk is mostly that. It measured seven here.
-    try testing.expect(scanned >= 3 * taken);
+    try testing.expectEqual(@as(u64, 1), try openScans(&ws, options));
+    try testing.expectEqual(@as(u64, 0), try openScans(&ws, options));
 }
 
-fn openMicroseconds(ws: *Workspace, options: Journal.Options) !u64 {
+/// How many segments one open of the log scanned.
+fn openScans(ws: *Workspace, options: Journal.Options) !u64 {
     const io = testing.io;
-    const started = now();
     var journal = try Journal.open(testing.allocator, io, ws.path, options);
     defer journal.deinit(io);
-    const elapsed = microseconds(started);
     try testing.expect(try journal.lastSeq(io) != 0);
-    return elapsed;
+    return journal.log.segment_scans;
 }
 
 test "five folds over one pass cost what one fold costs" {

@@ -367,6 +367,10 @@ chain: u32,
 /// time halves the entries rather than reading them.
 index_opens: u64,
 index_reads: u64,
+/// How many times a segment's records have been read end to end to learn
+/// what it holds (`scanSegment`). Not part of any promise either: what the
+/// suite counts to prove that a log closed cleanly opens with no scan.
+segment_scans: u64,
 /// How many times the records of the active segment have been made durable
 /// by a commit. Not part of any promise either: what the suite counts to
 /// prove that a deferred record is left to the next one.
@@ -471,6 +475,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenErro
         .chain = 0,
         .index_opens = 0,
         .index_reads = 0,
+        .segment_scans = 0,
         .record_syncs = 0,
         .held_index = null,
     };
@@ -1433,6 +1438,7 @@ fn framing(max_line_bytes: usize) strand.LineReader.Options {
 /// timestamp to an index being built. Memory is one read buffer and one line:
 /// nothing grows with the segment.
 fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenError!Scanned {
+    log.segment_scans += 1;
     var scanned: Scanned = .{
         .lines = 0,
         .complete_bytes = 0,
