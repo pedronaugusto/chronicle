@@ -1537,10 +1537,13 @@ pub const Scan = struct {
     dir: Io.Dir,
     /// The base sequence numbers of the segments still to walk, oldest first.
     bases: []u64,
+    /// Allocated storage retained when a scan is armed again.
+    bases_storage: []u64,
     /// How far into each of them the records go. A writer knows that exactly;
     /// a reader beside one does not, and walks to the end of the file and
     /// stops at the first line the writer has not finished.
     limits: []u64,
+    limits_storage: []u64,
     at: usize,
     file: ?Io.File,
     reader: Io.File.Reader,
@@ -1567,8 +1570,8 @@ pub const Scan = struct {
         if (scan.file) |file| file.close(io);
         scan.lines.deinit();
         scan.gpa.free(scan.buffer);
-        scan.gpa.free(scan.bases);
-        scan.gpa.free(scan.limits);
+        scan.gpa.free(scan.bases_storage);
+        scan.gpa.free(scan.limits_storage);
         scan.* = undefined;
     }
 
@@ -1576,6 +1579,30 @@ pub const Scan = struct {
         const boundary = scan.boundary;
         scan.boundary = null;
         return boundary;
+    }
+
+    /// Point this scan at a new set of segments, retaining its read buffer,
+    /// line buffer and segment storage for the next pass.
+    fn rearmOver(scan: *Scan, io: Io, segments: []const Segment, position: u64, unbounded: bool) ScanError!void {
+        if (segments.len > scan.bases_storage.len) {
+            scan.bases_storage = try scan.gpa.realloc(scan.bases_storage, segments.len);
+        }
+        if (segments.len > scan.limits_storage.len) {
+            scan.limits_storage = try scan.gpa.realloc(scan.limits_storage, segments.len);
+        }
+        if (scan.file) |file| file.close(io);
+        scan.file = null;
+        scan.bases = scan.bases_storage[0..segments.len];
+        scan.limits = scan.limits_storage[0..segments.len];
+        for (segments, scan.bases, scan.limits) |segment, *base, *limit| {
+            base.* = segment.base_seq;
+            limit.* = if (unbounded) std.math.maxInt(u64) else segment.bytes;
+        }
+        scan.at = 0;
+        scan.position = position;
+        scan.at_header = false;
+        scan.boundary = null;
+        scan.lines.reset(.{ .offset = position });
     }
 
     fn nextSegment(scan: *Scan, io: Io) void {
@@ -1675,10 +1702,15 @@ pub const Scan = struct {
 
 /// A `Scan` over `segments`, starting `position` bytes into the first of them.
 fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan {
-    const bases = try log.gpa.alloc(u64, segments.len);
-    errdefer log.gpa.free(bases);
-    const limits = try log.gpa.alloc(u64, segments.len);
-    errdefer log.gpa.free(limits);
+    // A follower may have stopped in the old active segment just as the
+    // writer rotates. Its next pass then spans that segment and the new one.
+    const capacity = @max(segments.len, 2);
+    const bases_storage = try log.gpa.alloc(u64, capacity);
+    errdefer log.gpa.free(bases_storage);
+    const limits_storage = try log.gpa.alloc(u64, capacity);
+    errdefer log.gpa.free(limits_storage);
+    const bases = bases_storage[0..segments.len];
+    const limits = limits_storage[0..segments.len];
     // A reader has no committed length to go on -- the writer is still
     // appending -- so it walks to the end of the file and lets the missing
     // newline end it.
@@ -1695,7 +1727,9 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
         .gpa = log.gpa,
         .dir = log.dir,
         .bases = bases,
+        .bases_storage = bases_storage,
         .limits = limits,
+        .limits_storage = limits_storage,
         .at = 0,
         .file = null,
         .reader = undefined,
@@ -1710,17 +1744,21 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
     };
 }
 
-/// A `Scan` starting `offset` bytes into the segment whose first record is
-/// `base_seq` and going on through every segment after it, or null when the
-/// log holds no such segment -- or, for a writer, holds fewer bytes of it than
-/// `offset`.
-pub fn scanAt(log: *Log, base_seq: u64, offset: u64) ScanError!?Scan {
+/// An idle scan whose buffers can be armed for a replay without replacing it.
+pub fn scanIdle(log: *Log) ScanError!Scan {
+    return log.scanOver(&.{}, 0);
+}
+
+/// Re-arm an existing scan at an offset, or report that the segment is gone
+/// or shorter than the offset. It walks this segment and every one after it.
+pub fn scanAtInto(log: *Log, scan: *Scan, io: Io, base_seq: u64, offset: u64) ScanError!bool {
     for (log.segments.items, 0..) |segment, i| {
         if (segment.base_seq != base_seq) continue;
-        if (log.options.access != .read and offset > segment.bytes) return null;
-        return try log.scanOver(log.segments.items[i..], offset);
+        if (log.options.access != .read and offset > segment.bytes) return false;
+        try scan.rearmOver(io, log.segments.items[i..], offset, log.options.access == .read);
+        return true;
     }
-    return null;
+    return false;
 }
 
 /// A `Scan` positioned at the first record after `cursor`, as close to it as
@@ -1729,7 +1767,20 @@ pub fn scanAt(log: *Log, base_seq: u64, offset: u64) ScanError!?Scan {
 /// The walk may begin a little before it — a caller with a cursor drops what it
 /// has already seen — but never after it.
 pub fn scanFrom(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!Scan {
-    if (log.segments.items.len == 0) return log.scanOver(&.{}, 0);
+    const start = try log.scanStart(io, cursor, may_write);
+    return log.scanOver(start.segments, start.position);
+}
+
+/// Re-arm an existing scan from a cursor, retaining its buffers.
+pub fn scanFromInto(log: *Log, scan: *Scan, io: Io, cursor: u64, may_write: bool) ScanError!void {
+    const start = try log.scanStart(io, cursor, may_write);
+    try scan.rearmOver(io, start.segments, start.position, log.options.access == .read);
+}
+
+const ScanStart = struct { segments: []const Segment, position: u64 };
+
+fn scanStart(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!ScanStart {
+    if (log.segments.items.len == 0) return .{ .segments = &.{}, .position = 0 };
 
     // Saturating: a cursor of every one is a reader past the end of any log
     // this package can write, and it walks nothing rather than wrapping.
@@ -1745,7 +1796,7 @@ pub fn scanFrom(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!Scan 
     // first record to return. Stepping over the cursor seeds that record's
     // predecessor checksum before its successor is accepted.
     const position = (try log.indexedOffset(io, first, cursor, may_write)) orelse 0;
-    return log.scanOver(log.segments.items[first..], position);
+    return .{ .segments = log.segments.items[first..], .position = position };
 }
 
 //========================================================================

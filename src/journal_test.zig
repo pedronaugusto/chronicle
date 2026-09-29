@@ -4268,6 +4268,33 @@ test "a position into bytes the log no longer holds is refused, never read" {
     }
 }
 
+test "a replay can be re-armed across segment rotations" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 4));
+    defer journal.deinit(io);
+    var walk = try journal.replayAt(io, .after(0));
+    defer walk.deinit(io);
+
+    for (1..12) |i| {
+        _ = try journal.append(io, @intCast(i), created(@intCast(i), "rotating"));
+        try walk.rearmAt(io, walk.position());
+        try testing.expectEqual(@as(u64, @intCast(i)), (try walk.next(io)).?.seq);
+        try testing.expectEqual(null, try walk.next(io));
+    }
+    try testing.expect(journal.segmentCount() > 2);
+
+    const old = walk.position();
+    try journal.truncateAfter(io, 8);
+    try testing.expectError(error.StalePosition, walk.rearmAt(io, old));
+    try walk.rearmAt(io, .after(8));
+    try testing.expectEqual(null, try walk.next(io));
+    _ = try journal.append(io, 9, created(9, "after truncation"));
+    try walk.rearmAt(io, walk.position());
+    try testing.expectEqual(@as(u64, 9), (try walk.next(io)).?.seq);
+}
+
 test "fuzz: open of arbitrary segment contents, and the repair it promises" {
     try testing.fuzz({}, fuzzOpen, .{ .corpus = &open_corpus });
 }

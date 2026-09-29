@@ -1096,6 +1096,58 @@ pub fn Journal(comptime Event: type) type {
                 walk.* = undefined;
             }
 
+            /// Start another pass after `position`, keeping this walk's scan
+            /// buffer, line buffer, segment storage and record arenas. Call
+            /// after the previous pass has ended or when its remaining records
+            /// are no longer needed. Any record returned by `next` is invalid
+            /// after this call. On error, re-arm or deinit before calling
+            /// `next` again.
+            ///
+            /// The position is checked against the record it names on every
+            /// pass. A changed or removed record is `error.StalePosition`.
+            pub fn rearmAt(walk: *Replay, io: Io, at: Position) ReplayAtError!void {
+                const self = walk.journal;
+                if (at.last) |last| {
+                    const found = found: {
+                        try self.mutex.lock(io);
+                        defer self.mutex.unlock(io);
+                        break :found try self.log.scanAtInto(&walk.scan, io, last.segment, last.start);
+                    };
+                    if (!found) return error.StalePosition;
+                } else {
+                    {
+                        try self.mutex.lock(io);
+                        defer self.mutex.unlock(io);
+                        try self.log.scanFromInto(&walk.scan, io, at.cursor, false);
+                    }
+                }
+
+                walk.run = .{ .cursor = at.cursor };
+                walk.last = null;
+                _ = walk.arena.reset(.retain_capacity);
+                _ = walk.scratch.reset(.retain_capacity);
+                if (at.last) |last| {
+                    // Read the named record back before reading its successor.
+                    const line = (walk.scan.next(io) catch |err| switch (err) {
+                        error.FileNotFound,
+                        error.TruncatedRecord,
+                        error.RecordTooLarge,
+                        error.UnsupportedFormat,
+                        => return error.StalePosition,
+                        else => |e| return e,
+                    }) orelse return error.StalePosition;
+                    if (walk.scan.at != 0 or walk.scan.position != last.end) return error.StalePosition;
+                    const header = parseHeader(walk.scratch.allocator(), line) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.StalePosition,
+                    };
+                    if (header.seq != last.seq or header.c != last.checksum) return error.StalePosition;
+                    walk.run.expected = last.seq + 1;
+                    walk.run.link = last.checksum;
+                    walk.last = last;
+                }
+            }
+
             /// The next record, or null at the end of the log. It is valid
             /// until the next call to `next` or to `deinit`.
             pub fn next(walk: *Replay, io: Io) ReplayError!?Record {
@@ -1204,46 +1256,15 @@ pub fn Journal(comptime Event: type) type {
         /// from what is committed then; the walk itself reads without it.
         /// Safe to call from any task or thread, except from inside a sink.
         pub fn replayAt(self: *Self, io: Io, position: Position) ReplayAtError!Replay {
-            const last = position.last orelse {
-                try self.mutex.lock(io);
-                defer self.mutex.unlock(io);
-                return self.replayFrom(io, position.cursor, false);
-            };
-            var walk: Replay = walk: {
-                try self.mutex.lock(io);
-                defer self.mutex.unlock(io);
-                const scan = (try self.log.scanAt(last.segment, last.start)) orelse
-                    return error.StalePosition;
-                break :walk .{
-                    .journal = self,
-                    .scan = scan,
-                    .arena = .init(self.gpa),
-                    .scratch = .init(self.gpa),
-                    .run = .{ .cursor = position.cursor },
-                };
+            var walk: Replay = .{
+                .journal = self,
+                .scan = try self.log.scanIdle(),
+                .arena = .init(self.gpa),
+                .scratch = .init(self.gpa),
+                .run = .{ .cursor = position.cursor },
             };
             errdefer walk.deinit(io);
-
-            // The record the position names, read back: the same bytes at the
-            // same place are what make what follows them the log that
-            // followed it.
-            const line = (walk.scan.next(io) catch |err| switch (err) {
-                error.FileNotFound,
-                error.TruncatedRecord,
-                error.RecordTooLarge,
-                error.UnsupportedFormat,
-                => return error.StalePosition,
-                else => |e| return e,
-            }) orelse return error.StalePosition;
-            if (walk.scan.at != 0 or walk.scan.position != last.end) return error.StalePosition;
-            const header = parseHeader(walk.scratch.allocator(), line) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                else => return error.StalePosition,
-            };
-            if (header.seq != last.seq or header.c != last.checksum) return error.StalePosition;
-            walk.run.expected = last.seq + 1;
-            walk.run.link = last.checksum;
-            walk.last = last;
+            try walk.rearmAt(io, position);
             return walk;
         }
 
