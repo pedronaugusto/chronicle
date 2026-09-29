@@ -30,7 +30,7 @@ const Balances = struct {
     }
 
     fn apply(ctx: *anyopaque, record: Ledger.Record) void {
-        const self: *Balances = @ptrCast(@alignCast(ctx));
+        const self: *Balances = @ptrCast(@alignCast(ctx)); // safe: sink hands apply out with a Balances as its ctx
         switch (record.event) {
             .account_opened => self.accounts += 1,
             .deposited => |e| self.cents += e.cents,

@@ -114,7 +114,7 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
     };
     const seq = integerOf(found.seq) orelse return error.Corrupt;
     if (seq < 1) return error.Corrupt;
-    const from = @intFromPtr(found.ev.bytes.ptr) - @intFromPtr(line.ptr);
+    const from = @intFromPtr(found.ev.bytes.ptr) - @intFromPtr(line.ptr); // safe: parseLine without copy_strings hands back a view into line; numbers only
     return .{
         .seq = @intCast(seq),
         .at = integerOf(found.at) orelse return error.Corrupt,
