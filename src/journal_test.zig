@@ -4136,6 +4136,45 @@ test "a replay picks up where the last one stopped, across batches and rotations
     try expectRun(&seqs, 44, 44);
 }
 
+test "a re-armed replay allocates nothing on follow-up passes" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var writer = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .tail_records = 0,
+        .tail_bytes = 0,
+    });
+    defer writer.deinit(io);
+    _ = try writer.append(io, 1, created(1, "a follower record"));
+
+    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var reader = try Journal.open(counting.allocator(), io, ws.path, .{ .access = .read });
+    defer reader.deinit(io);
+    var walk = try reader.replayAt(io, .after(0));
+    defer walk.deinit(io);
+    try testing.expectEqual(@as(u64, 1), (try walk.next(io)).?.seq);
+    try testing.expectEqual(null, try walk.next(io));
+
+    // Warm the same path as every later wake, then count from here.
+    _ = try writer.append(io, 2, created(2, "a follower record"));
+    try walk.rearmAt(io, walk.position());
+    try testing.expectEqual(@as(u64, 2), (try walk.next(io)).?.seq);
+    try testing.expectEqual(null, try walk.next(io));
+    const settled = counting.allocations;
+
+    for (3..67) |i| {
+        _ = try writer.append(io, @intCast(i), created(@intCast(i), "a follower record"));
+        const at = walk.position();
+        try walk.rearmAt(io, at);
+        try testing.expectEqual(@as(u64, @intCast(i)), (try walk.next(io)).?.seq);
+        try testing.expectEqual(null, try walk.next(io));
+        try walk.rearmAt(io, walk.position());
+        try testing.expectEqual(null, try walk.next(io));
+    }
+    try testing.expectEqual(settled, counting.allocations);
+}
+
 test "a replay that stopped at an unfinished record reads it once it is whole" {
     const io = testing.io;
     var ws = try Workspace.init("log");
