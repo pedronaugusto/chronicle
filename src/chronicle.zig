@@ -1179,7 +1179,7 @@ pub fn Journal(comptime Event: type) type {
             decoder: Decoder,
             scan: Log.Scan,
             /// Holds the record `next` last returned, and nothing else.
-            arena: std.heap.ArenaAllocator,
+            arena: *std.heap.ArenaAllocator,
             /// Its own, so that two walks and an `append` never share one.
             scratch: std.heap.ArenaAllocator,
             run: Continuity,
@@ -1188,7 +1188,7 @@ pub fn Journal(comptime Event: type) type {
 
             pub fn deinit(walk: *Replay, io: Io) void {
                 walk.scan.deinit(io);
-                walk.arena.deinit();
+                destroyArena(walk.arena);
                 walk.scratch.deinit();
                 walk.* = undefined;
             }
@@ -1319,11 +1319,14 @@ pub fn Journal(comptime Event: type) type {
         /// missing. The caller holds the journal's lock while choosing the
         /// scan, whether or not it may build an index.
         fn replayFrom(self: *Self, io: Io, cursor: u64, may_write: bool) ReplayError!Replay {
+            var scan = try self.log.scanFrom(io, cursor, .{ .may_write = may_write });
+            errdefer scan.deinit(io);
+            const arena = try createArena(self.gpa);
             return .{
                 .journal = self,
                 .decoder = self.captureDecoder(),
-                .scan = try self.log.scanFrom(io, cursor, .{ .may_write = may_write }),
-                .arena = .init(self.gpa),
+                .scan = scan,
+                .arena = arena,
                 .scratch = .init(self.gpa),
                 .run = .{ .cursor = cursor },
             };
@@ -1362,11 +1365,14 @@ pub fn Journal(comptime Event: type) type {
             var walk = initialized: {
                 try self.mutex.lock(io);
                 defer self.mutex.unlock(io);
+                var scan = try self.log.scanIdle();
+                errdefer scan.deinit(io);
+                const arena = try createArena(self.gpa);
                 break :initialized Replay{
                     .journal = self,
                     .decoder = self.captureDecoder(),
-                    .scan = try self.log.scanIdle(),
-                    .arena = .init(self.gpa),
+                    .scan = scan,
+                    .arena = arena,
                     .scratch = .init(self.gpa),
                     .run = .{ .cursor = position.cursor },
                 };

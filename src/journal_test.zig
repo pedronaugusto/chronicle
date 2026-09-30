@@ -5535,3 +5535,56 @@ test "closing a journal finalizes its owned state under the lock" {
 test "deinitializing a journal finalizes its owned state under the lock" {
     try finalizingUnderLock(true);
 }
+
+test "a moved replay keeps the allocator carried by its last JSON value alive" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const J = chronicle.Journal(std.json.Value);
+    var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
+    defer journal.deinit(io);
+    const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
+    defer testing.allocator.free(values);
+    _ = try journal.append(io, 1, .{ .array = .fromOwnedSlice(testing.allocator, values) });
+    const Reader = struct {
+        fn read(j: *J, inner: Io) !struct { walk: J.Replay, record: J.Record } {
+            var walk = try j.replay(inner, 0);
+            errdefer walk.deinit(inner);
+            const record = (try walk.next(inner)).?;
+            return .{ .walk = walk, .record = record };
+        }
+    };
+    var read = try Reader.read(&journal, io);
+    defer read.walk.deinit(io);
+    const context = read.walk.arena;
+    try testing.expectEqual(@as(*anyopaque, context), read.record.event.array.allocator.ptr);
+    var array = read.record.event.array;
+    try array.ensureTotalCapacity(65536);
+    try array.append(.{ .string = "next" });
+    try testing.expectEqualStrings("first", array.items[0].string);
+    try testing.expectEqualStrings("next", array.items[1].string);
+}
+
+test "replay creation releases its scan and stable arena on every allocation failure" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+    }
+    const Reader = struct {
+        fn read(gpa: std.mem.Allocator, inner: Io, path: []const u8) !void {
+            var journal = try Journal.open(gpa, inner, path, .{ .access = .read });
+            defer journal.deinit(inner);
+            var walk = try journal.replay(inner, 0);
+            defer walk.deinit(inner);
+            _ = try walk.next(inner);
+            var positioned = try journal.replayAt(inner, walk.position());
+            defer positioned.deinit(inner);
+            try testing.expectEqual(@as(?Journal.Record, null), try positioned.next(inner));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Reader.read, .{ io, ws.path });
+}

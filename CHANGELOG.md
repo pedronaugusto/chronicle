@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- A replay keeps its record arena at a stable address, so a returned or moved walk preserves allocator contexts retained by its last event.
+
 - Opening, snapshot restoration and final release observe and change journal state under its lock, including cleanup after an error.
 
 - A positioned replay initializes under the journal lock, and independent readers own the decoding configuration and allocator they need without observing journal fields between calls.
