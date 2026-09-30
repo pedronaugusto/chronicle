@@ -464,7 +464,7 @@ pub fn Journal(comptime Event: type) type {
         /// `state` is the byte string that was passed to `snapshot`, and `seq`
         /// is the journal's newest sequence number at that moment: fold `state`
         /// into your state and then replay only the records after `seq`, which
-        /// is what `subscribeFrom` and `since` take.
+        /// is what `subscribeFrom` and `copySince` take.
         ///
         /// `state` is the caller's, from the allocator `openWithSnapshot` was
         /// given; free it when the fold has been restored from it.
@@ -832,7 +832,7 @@ pub fn Journal(comptime Event: type) type {
 
             // Reserve before writing: after the bytes are durable nothing may
             // fail, or the disk would hold a record memory does not.
-            try self.tail.entries.ensureUnusedCapacity(self.gpa, 1);
+            if (self.keepsRecords()) try self.tail.entries.ensureUnusedCapacity(self.gpa, 1);
 
             {
                 errdefer self.persistence_failed = true;
@@ -903,7 +903,7 @@ pub fn Journal(comptime Event: type) type {
             // Reserved before anything is written: after the bytes are
             // durable nothing may fail, or the disk would hold records
             // memory does not.
-            try self.tail.entries.ensureUnusedCapacity(self.gpa, entries.len);
+            if (self.keepsRecords()) try self.tail.entries.ensureUnusedCapacity(self.gpa, entries.len);
 
             // Only the records something will read are kept: a journal with
             // no tail and no sink holds one line at a time, however long the
@@ -912,7 +912,7 @@ pub fn Journal(comptime Event: type) type {
             defer built.deinit(self.gpa);
             var published = false;
             defer if (!published) for (built.items) |*item| item.release();
-            if (self.needsRecord()) try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
+            if (self.keepsRecords()) try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
 
             const before = self.seq;
             var link = self.log.chainTip();
@@ -929,7 +929,7 @@ pub fn Journal(comptime Event: type) type {
                         return err;
                     };
                 }
-                if (item.record != null) built.appendAssumeCapacity(item) else item.release();
+                if (self.keepsRecords()) built.appendAssumeCapacity(item) else item.release();
             }
 
             {
@@ -2039,8 +2039,9 @@ pub fn Journal(comptime Event: type) type {
         /// A record serialised and waiting to be written.
         ///
         /// `record` is there when something will read it: an arena owns every
-        /// slice of it, and moves with the record into the tail once it is on the
-        /// disk. When nothing will — no tail, no sink, no round-trip check —
+        /// slice of it. A tail or sink takes ownership after the write; a
+        /// round-trip check alone releases it as soon as it has been staged.
+        /// When nothing will — no tail, no sink, no round-trip check —
         /// the line is the only thing built, and it is the journal's `line`:
         /// valid until the next record is encoded, which is after this one
         /// has been handed to the log.
@@ -2058,12 +2059,15 @@ pub fn Journal(comptime Event: type) type {
             }
         };
 
-        /// Whether an appended record has to be readable in memory as well as
-        /// on the disk.
+        /// Whether a record needs an owner after the write, for the cache or
+        /// for callbacks. Verification alone reads it before the write.
+        fn keepsRecords(self: *const Self) bool {
+            return self.options.tail_records != 0 or self.sinks.items.len != 0;
+        }
+
+        /// Whether encoding must parse its result, for a reader or a check.
         fn needsRecord(self: *const Self) bool {
-            return self.options.tail_records != 0 or
-                self.sinks.items.len != 0 or
-                self.options.verify_round_trip;
+            return self.keepsRecords() or self.options.verify_round_trip;
         }
 
         /// Serialise one record.
@@ -2172,7 +2176,8 @@ pub fn Journal(comptime Event: type) type {
         /// because the disk must never hold a record memory does not.
         fn publish(self: *Self, item: Built) bool {
             self.seq = item.seq;
-            const record = item.record orelse return false;
+            if (!self.keepsRecords()) return false;
+            const record = item.record.?;
             self.tail.appendAssumeCapacity(.{ .record = record, .arena = item.arena.? });
             for (self.sinks.items) |sink| sink.f(sink.ctx, record);
             return true;

@@ -353,8 +353,9 @@ with.
 `compact`, `dropSegmentsBefore`, `truncateAfter`, `reconcile`, `stats` and
 `refresh` take it and are safe from any task or thread, several at once; the subscribe calls hold it for
 the whole of their replay, so the hand-over from the disk to the live records
-has no seam in it. A cancel reaches those calls at the lock: waiting for it,
-a call returns `error.Canceled` with nothing done. Once a call that changes
+has no seam in it. A call that can return `error.Canceled` can be canceled
+while waiting for the lock, with nothing done. `nudge` takes the lock without
+cancelation. Calls that read files may also be canceled during their I/O. Once a call that changes
 the files holds it — an append, a batch, a snapshot, a compaction, a
 truncation, a drop, a reconcile, a refresh — it runs to its end with the
 task's cancelation blocked, and the cancel is reported by the task's next

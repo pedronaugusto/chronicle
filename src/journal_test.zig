@@ -5308,3 +5308,39 @@ test "replacing a backup releases its inventory on every allocation failure" {
     };
     try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ io, ws.root, ws.path, dest });
 }
+
+test "a larger batch nobody keeps needs no larger working memory" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var counting: testing.FailingAllocator = .init(testing.allocator, .{});
+    var journal = try Journal.open(counting.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
+    defer journal.deinit(io);
+    var entries: [1024]Journal.Entry = @splat(.{ .at = 0, .event = created(1, "one line") });
+    _ = try journal.appendAll(io, entries[0..1]);
+    const settled = counting.allocations;
+    try testing.expectEqual(@as(u64, 1025), try journal.appendAll(io, &entries));
+    try testing.expectEqual(settled, counting.allocations);
+}
+
+test "checking a batch nobody keeps holds only one parsed record at a time" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true, .stack_trace_frames = 0 }) = .init;
+    defer if (gpa.deinit() == .leak) @panic("a checked batch leaked");
+    var journal = try Journal.open(gpa.allocator(), io, ws.path, .{
+        .sync = .never,
+        .tail_records = 0,
+        .verify_round_trip = true,
+    });
+    defer journal.deinit(io);
+    // A fixed allowance for one record, independent of the batch's length.
+    gpa.requested_memory_limit = gpa.total_requested_bytes + 64 * 1024;
+    const name: [2048]u8 = @splat('n');
+    const entries: [128]Journal.Entry = @splat(.{ .at = 0, .event = created(1, &name) });
+    try testing.expectEqual(@as(u64, 128), try journal.appendAll(io, &entries));
+    // Replaying has its own read buffer; the allowance above is for writes.
+    gpa.requested_memory_limit = std.math.maxInt(usize);
+    try testing.expectEqual(@as(u64, 128), try journal.verify(io));
+}
