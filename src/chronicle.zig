@@ -265,9 +265,7 @@ pub fn Journal(comptime Event: type) type {
 
             /// Release every record and all its referenced data together.
             pub fn deinit(batch: *Batch) void {
-                const gpa = batch.arena.child_allocator;
-                batch.arena.deinit();
-                gpa.destroy(batch.arena);
+                destroyArena(batch.arena);
                 batch.* = undefined;
             }
         };
@@ -275,8 +273,21 @@ pub fn Journal(comptime Event: type) type {
         /// One tail entry owns its record and all the memory it references.
         const OwnedRecord = struct {
             record: Record,
-            arena: std.heap.ArenaAllocator,
+            arena: *std.heap.ArenaAllocator,
         };
+
+        /// Allocator contexts retained by events must survive moving owners.
+        fn createArena(gpa: Allocator) Allocator.Error!*std.heap.ArenaAllocator {
+            const arena = try gpa.create(std.heap.ArenaAllocator);
+            arena.* = .init(gpa);
+            return arena;
+        }
+
+        fn destroyArena(arena: *std.heap.ArenaAllocator) void {
+            const gpa = arena.child_allocator;
+            arena.deinit();
+            gpa.destroy(arena);
+        }
 
         /// The bounded cache owns its entries and their byte count together.
         /// A rebuild is a separate cache until it has read the log whole.
@@ -314,7 +325,7 @@ pub fn Journal(comptime Event: type) type {
                 if (drop == 0) return;
                 for (tail.entries.items[0..drop]) |*owned| {
                     tail.bytes -= owned.record.bytes.len;
-                    owned.arena.deinit();
+                    destroyArena(owned.arena);
                 }
                 const kept = tail.entries.items.len - drop;
                 std.mem.copyForwards(OwnedRecord, tail.entries.items[0..kept], tail.entries.items[drop..]);
@@ -1035,10 +1046,8 @@ pub fn Journal(comptime Event: type) type {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             const window = self.tailSince(cursor);
-            const arena = try gpa.create(std.heap.ArenaAllocator);
-            errdefer gpa.destroy(arena);
-            arena.* = .init(gpa);
-            errdefer arena.deinit();
+            const arena = try createArena(gpa);
+            errdefer destroyArena(arena);
             const a = arena.allocator();
             const copied = try a.alloc(Record, window.records.len);
             for (window.records, copied) |owned, *copy| {
@@ -2072,7 +2081,7 @@ pub fn Journal(comptime Event: type) type {
         /// valid until the next record is encoded, which is after this one
         /// has been handed to the log.
         const Built = struct {
-            arena: ?std.heap.ArenaAllocator,
+            arena: ?*std.heap.ArenaAllocator,
             bytes: []const u8,
             seq: u64,
             at: i64,
@@ -2081,7 +2090,7 @@ pub fn Journal(comptime Event: type) type {
             record: ?Record,
 
             fn release(built: *Built) void {
-                if (built.arena) |*arena| arena.deinit();
+                if (built.arena) |arena| destroyArena(arena);
             }
         };
 
@@ -2106,8 +2115,8 @@ pub fn Journal(comptime Event: type) type {
         /// and drop it unread, so it is not done.
         fn encode(self: *Self, seq: u64, at: i64, back_link: u32, event: Event) AppendError!Built {
             const needs_record = self.needsRecord();
-            var arena: ?std.heap.ArenaAllocator = if (needs_record) .init(self.gpa) else null;
-            errdefer if (arena) |*a| a.deinit();
+            const arena: ?*std.heap.ArenaAllocator = if (needs_record) try createArena(self.gpa) else null;
+            errdefer if (arena) |a| destroyArena(a);
 
             // The bytes are the ones `std.json.Stringify` writes for a
             // `Line`, written into the one buffer that becomes the stored
@@ -2118,7 +2127,7 @@ pub fn Journal(comptime Event: type) type {
             // from the last record so a run of records alike is written
             // without growing the buffer. One nothing keeps is written into
             // the journal's `line`, which it hands back grown or not.
-            var out: std.Io.Writer.Allocating = if (arena) |*a| .init(a.allocator()) else .fromArrayList(self.gpa, &self.line);
+            var out: std.Io.Writer.Allocating = if (arena) |a| .init(a.allocator()) else .fromArrayList(self.gpa, &self.line);
             defer if (!needs_record) {
                 self.line = out.toArrayList();
             };
@@ -2228,8 +2237,8 @@ pub fn Journal(comptime Event: type) type {
                 const header = try parseHeader(self.scratch.allocator(), line);
                 if (!try run.accept(header)) continue;
 
-                var arena: std.heap.ArenaAllocator = .init(self.gpa);
-                errdefer arena.deinit();
+                const arena = try createArena(self.gpa);
+                errdefer destroyArena(arena);
                 const stored = try arena.allocator().dupe(u8, line);
                 const record = try self.recordFrom(arena.allocator(), header, stored);
                 try rebuilt.entries.ensureUnusedCapacity(self.gpa, 1);

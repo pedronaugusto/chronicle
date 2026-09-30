@@ -5429,3 +5429,29 @@ test "observing persistence status waits for the journal lock" {
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
+
+test "a tail keeps the allocator carried by a JSON value at its owner" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const J = chronicle.Journal(std.json.Value);
+    var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 2 });
+    defer journal.deinit(io);
+    const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
+    defer testing.allocator.free(values);
+    for (1..9) |seq| {
+        _ = try journal.append(io, @intCast(seq), .{ .array = .fromOwnedSlice(testing.allocator, values) });
+    }
+    // Appending moves owners both when the tail grows and when it evicts.
+    // Read the internal owner under its lock before exercising the allocator.
+    journal.mutex.lockUncancelable(io);
+    defer journal.mutex.unlock(io);
+    const owned = &journal.tail.entries.items[0];
+    const context = owned.arena;
+    try testing.expectEqual(@as(*anyopaque, context), owned.record.event.array.allocator.ptr);
+    var array = owned.record.event.array;
+    try array.ensureTotalCapacity(65536);
+    try array.append(.{ .string = "next" });
+    try testing.expectEqualStrings("first", array.items[0].string);
+    try testing.expectEqualStrings("next", array.items[1].string);
+}
