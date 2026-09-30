@@ -662,7 +662,7 @@ pub fn Journal(comptime Event: type) type {
         /// `path` may be relative to the current directory or absolute. Release
         /// with `deinit`.
         pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!Self {
-            var log = try Log.open(gpa, io, path, .{
+            const log = try Log.open(gpa, io, path, .{
                 .access = options.access,
                 .on_truncated = options.on_truncated,
                 .sync = options.sync,
@@ -674,7 +674,6 @@ pub fn Journal(comptime Event: type) type {
                 .index_interval_bytes = options.index_interval_bytes,
                 .max_record_bytes = options.max_record_bytes,
             });
-            errdefer log.deinit(io);
 
             var self: Self = .{
                 .gpa = gpa,
@@ -693,13 +692,12 @@ pub fn Journal(comptime Event: type) type {
                 .seq = 0,
                 .write_failed = false,
             };
-            errdefer {
-                self.clearTail();
-                self.tail.deinit(gpa);
-                self.line.deinit(gpa);
-                self.scratch.deinit();
+            errdefer self.deinit(io);
+            {
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                try self.fillTail(io);
             }
-            try self.fillTail(io);
             if (options.verify == .full) _ = try self.verify(io);
             return self;
         }
@@ -721,7 +719,11 @@ pub fn Journal(comptime Event: type) type {
             // Read before the journal is copied into the result: a field
             // initializer that mutated `self` after `.journal = self` would
             // leave the bookkeeping behind in the original.
-            const found = try self.readSnapshot(io);
+            const found = snapshot_read: {
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                break :snapshot_read try self.readSnapshot(io);
+            };
             return .{ .journal = self, .snapshot = found };
         }
 
@@ -734,6 +736,11 @@ pub fn Journal(comptime Event: type) type {
             // a cancel asks of the task meanwhile.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
+            self.mutex.lockUncancelable(io);
+            defer {
+                self.mutex.unlock(io);
+                self.* = undefined;
+            }
             defer self.release();
             try self.log.close(io);
         }
@@ -745,6 +752,11 @@ pub fn Journal(comptime Event: type) type {
         pub fn deinit(self: *Self, io: Io) void {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
+            self.mutex.lockUncancelable(io);
+            defer {
+                self.mutex.unlock(io);
+                self.* = undefined;
+            }
             self.log.deinit(io);
             self.release();
         }
@@ -755,7 +767,6 @@ pub fn Journal(comptime Event: type) type {
             self.line.deinit(self.gpa);
             self.sinks.deinit(self.gpa);
             self.scratch.deinit();
-            self.* = undefined;
         }
 
         //====================================================================

@@ -5491,3 +5491,47 @@ test "starting a positioned replay observes its journal only under the lock" {
     try testing.expect(!Probe.unlocked);
     try testing.expectEqualStrings("one", (try walk.next(io)).?.event.created.name);
 }
+
+fn finalizingUnderLock(comptime best_effort: bool) !void {
+    var vtable = testing.io.vtable.*;
+    const Probe = struct {
+        var journal: ?*Journal = null;
+        var unlocked: bool = false;
+        var calls: usize = 0;
+        fn setLength(ctx: ?*anyopaque, file: Io.File, length: u64) Io.File.SetLengthError!void {
+            if (journal) |j| {
+                calls += 1;
+                if (j.mutex.tryLock()) {
+                    j.mutex.unlock(testing.io);
+                    unlocked = true;
+                }
+            }
+            return testing.io.vtable.fileSetLength(ctx, file, length);
+        }
+    };
+    vtable.fileSetLength = Probe.setLength;
+    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .preallocate_bytes = 4096 });
+    _ = journal.append(io, 1, created(1, "one")) catch |err| {
+        journal.deinit(io);
+        return err;
+    };
+    Probe.unlocked = false;
+    Probe.calls = 0;
+    Probe.journal = &journal;
+    defer Probe.journal = null;
+    if (best_effort) journal.deinit(io) else try journal.close(io);
+    Probe.journal = null;
+    try testing.expect(Probe.calls > 0);
+    try testing.expect(!Probe.unlocked);
+}
+
+test "closing a journal finalizes its owned state under the lock" {
+    try finalizingUnderLock(false);
+}
+
+test "deinitializing a journal finalizes its owned state under the lock" {
+    try finalizingUnderLock(true);
+}

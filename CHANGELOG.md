@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Opening, snapshot restoration and final release observe and change journal state under its lock, including cleanup after an error.
+
 - A positioned replay initializes under the journal lock, and independent readers own the decoding configuration and allocator they need without observing journal fields between calls.
 
 - Tail records and staged writes keep their arenas at stable addresses, so allocator contexts retained by events survive publication, growth and eviction.
