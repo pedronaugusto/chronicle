@@ -165,18 +165,9 @@ pub fn Journal(comptime Event: type) type {
     return struct {
         const Self = @This();
 
-        // Three fields are part of the API and are documented as such. The
-        // rest, below the divider, are the journal's own bookkeeping: reading
-        // them is reading an implementation, and writing them is undefined.
+        // Only options are part of the field API. The bookkeeping below is
+        // owned by the journal; observe it through the calls that take its lock.
 
-        /// How many unterminated bytes `open` dropped from the end of the
-        /// newest segment. Zero unless a previous writer died mid-record, and
-        /// zero when `Options.on_truncated` is `.fail`, which fails instead.
-        dropped_bytes: usize,
-        /// Whether an `append` has failed to reach the disk. Once true it stays
-        /// true until `reconcile`, and every `append` and `compact` is refused;
-        /// see `AppendError.PersistenceFailed`.
-        persistence_failed: bool,
         /// The options `open` was given, unchanged.
         options: Options,
 
@@ -185,6 +176,9 @@ pub fn Journal(comptime Event: type) type {
         /// The allocator every allocation comes from. Owned by the caller; the
         /// journal never outlives it.
         gpa: Allocator,
+        /// A failed persistence operation refuses writes until reconciliation.
+        /// Read only through `status`, under the journal's lock.
+        write_failed: bool,
         /// The segments, the indexes, the lock and the directory.
         log: Log,
         /// The newest records, oldest first. A record and the arena owning
@@ -645,7 +639,7 @@ pub fn Journal(comptime Event: type) type {
         /// never reuses a number. A final line the previous writer did not
         /// finish is handled per `Options.on_truncated`; with the default it is
         /// dropped, the segment is shortened to the last complete record, and
-        /// the byte count lands in `dropped_bytes`, so the next `append` writes
+        /// the byte count is reported by `status(io).dropped_bytes`, so the next `append` writes
         /// a well-formed line.
         ///
         /// What this reads is the newest segment — bounded by
@@ -686,8 +680,7 @@ pub fn Journal(comptime Event: type) type {
                 .waiters = 0,
                 .futex_wakes = 0,
                 .seq = 0,
-                .persistence_failed = false,
-                .dropped_bytes = log.dropped_bytes,
+                .write_failed = false,
             };
             errdefer {
                 self.clearTail();
@@ -824,7 +817,7 @@ pub fn Journal(comptime Event: type) type {
             // is not a journal that has failed, and it must not be latched as
             // one.
             if (self.options.access == .read) return error.ReadOnly;
-            if (self.persistence_failed) return error.PersistenceFailed;
+            if (self.write_failed) return error.PersistenceFailed;
             if (self.seq >= std.math.maxInt(i64)) return error.SequenceExhausted;
 
             const next = self.seq + 1;
@@ -839,7 +832,7 @@ pub fn Journal(comptime Event: type) type {
             if (self.keepsRecords()) try self.tail.entries.ensureUnusedCapacity(self.gpa, 1);
 
             {
-                errdefer self.persistence_failed = true;
+                errdefer self.write_failed = true;
                 switch (durability) {
                     .now => try self.log.appendLine(io, built.bytes, built.at, built.checksum),
                     .deferred => {
@@ -900,7 +893,7 @@ pub fn Journal(comptime Event: type) type {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
             if (self.options.access == .read) return error.ReadOnly;
-            if (self.persistence_failed) return error.PersistenceFailed;
+            if (self.write_failed) return error.PersistenceFailed;
             if (entries.len == 0) return self.seq;
             if (entries.len > std.math.maxInt(i64) - self.seq) return error.SequenceExhausted;
 
@@ -927,7 +920,7 @@ pub fn Journal(comptime Event: type) type {
                 };
                 link = item.checksum;
                 {
-                    errdefer self.persistence_failed = true;
+                    errdefer self.write_failed = true;
                     self.log.stageLine(io, item.bytes, item.at, item.checksum) catch |err| {
                         item.release();
                         return err;
@@ -937,7 +930,7 @@ pub fn Journal(comptime Event: type) type {
             }
 
             {
-                errdefer self.persistence_failed = true;
+                errdefer self.write_failed = true;
                 try self.log.commit(io);
             }
             published = true;
@@ -971,13 +964,12 @@ pub fn Journal(comptime Event: type) type {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
             if (self.options.access == .read) return error.ReadOnly;
-            if (!self.persistence_failed) return self.seq;
+            if (!self.write_failed) return self.seq;
 
             try self.log.reload(io);
             self.clearTail();
             try self.fillTail(io);
-            self.dropped_bytes = self.log.dropped_bytes;
-            self.persistence_failed = false;
+            self.write_failed = false;
             return self.seq;
         }
 
@@ -995,7 +987,7 @@ pub fn Journal(comptime Event: type) type {
                 // The log could not be put back. What is on the disk is
                 // still whole records in order, and a reopen reads them, but
                 // this process must not hand any of them out as appended.
-                self.persistence_failed = true;
+                self.write_failed = true;
             };
         }
 
@@ -1459,6 +1451,28 @@ pub fn Journal(comptime Event: type) type {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             return self.log.baseSeq() + 1;
+        }
+
+        /// The journal's recovery and persistence state at one instant.
+        pub const Status = struct {
+            /// Whether a persistence operation failed. Writes stay refused
+            /// until `reconcile` succeeds; see `AppendError.PersistenceFailed`.
+            persistence_failed: bool,
+            /// How many unterminated bytes were dropped from the newest
+            /// segment during opening or recovery. Zero when none were dropped.
+            dropped_bytes: usize,
+        };
+
+        /// Copy the recovery and persistence state under the journal's lock.
+        /// A later write or reconciliation may change it.
+        /// Safe to call from any task or thread, except from inside a sink.
+        pub fn status(self: *Self, io: Io) Io.Cancelable!Status {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            return .{
+                .persistence_failed = self.write_failed,
+                .dropped_bytes = self.log.dropped_bytes,
+            };
         }
 
         /// What the log is made of, in numbers.
@@ -1967,7 +1981,7 @@ pub fn Journal(comptime Event: type) type {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
             if (self.options.access == .read) return error.ReadOnly;
-            if (self.persistence_failed) return error.PersistenceFailed;
+            if (self.write_failed) return error.PersistenceFailed;
             try self.log.truncateAfter(io, seq);
             self.clearTail();
             try self.fillTail(io);
@@ -2001,7 +2015,7 @@ pub fn Journal(comptime Event: type) type {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
             if (self.options.access == .read) return error.ReadOnly;
-            if (self.persistence_failed) return error.PersistenceFailed;
+            if (self.write_failed) return error.PersistenceFailed;
             try self.log.compact(io, keep_after_seq);
             self.clearTail();
             try self.fillTail(io);

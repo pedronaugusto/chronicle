@@ -563,7 +563,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
         // What survived is a prefix of the batch, byte for byte -- not a
         // rewritten one, and never a record the batch did not write.
         try testing.expectEqualStrings(kept, try ws.read(name));
-        try testing.expectEqual(@as(usize, stopped.len - kept.len), journal.dropped_bytes);
+        try testing.expectEqual(@as(usize, stopped.len - kept.len), (try journal.status(io)).dropped_bytes);
         try testing.expectEqual(@as(u64, records), try journal.lastSeq(io));
         try testing.expectEqual(@as(u64, records), try journal.verify(io));
 
@@ -583,7 +583,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
     var journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
     try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
-    try testing.expectEqual(@as(usize, head - 3), journal.dropped_bytes);
+    try testing.expectEqual(@as(usize, head - 3), (try journal.status(io)).dropped_bytes);
     try testing.expectEqual(@as(u64, 1), try journal.append(io, 99, created(9, "the first")));
 }
 
@@ -609,7 +609,7 @@ test "a final line the writer did not finish is dropped and the segment repaired
         var journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
 
-        try testing.expectEqual(@as(usize, partial.len), journal.dropped_bytes);
+        try testing.expectEqual(@as(usize, partial.len), (try journal.status(io)).dropped_bytes);
         var copied_tail_8 = try journal.copySince(testing.allocator, io, 0);
         defer copied_tail_8.deinit();
         try testing.expectEqual(@as(usize, 1), copied_tail_8.records.len);
@@ -628,7 +628,7 @@ test "a final line the writer did not finish is dropped and the segment repaired
     var copied_tail_9 = try reopened.copySince(testing.allocator, io, 0);
     defer copied_tail_9.deinit();
     try testing.expectEqual(@as(usize, 2), copied_tail_9.records.len);
-    try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
+    try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
 }
 
 test "on_truncated .fail refuses the journal and leaves the segment as found" {
@@ -738,26 +738,21 @@ test "a gap between two segments is refused" {
 }
 
 test "a write that does not reach the disk publishes nothing and latches" {
-    const io = testing.io;
+    var vtable: Io.VTable = undefined;
+    const io = failingIo(&vtable);
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .write_buffer_size = 0 });
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "durable"));
 
-    // Take the segment's write access away underneath the journal. A reader
-    // must never see a record the disk does not have, so the failed append
-    // adds nothing and every later one is refused.
-    const active = &journal.log.active.?;
-    const length = try active.file.length(io);
-    active.file.close(io);
-    active.file = try journal.log.dir.openFile(io, &chronicle.segmentName(1), .{});
-    active.writer = active.file.writer(io, journal.log.write_buf);
-    active.writer.pos = length;
-
+    // Refuse an unbuffered write before any bytes reach disk. No staged
+    // bytes remain for the reopen to flush after the seam is restored.
+    fail_writes.store(true, .release);
+    defer fail_writes.store(false, .release);
     try testing.expectError(error.WriteFailed, journal.append(io, 2, created(2, "lost")));
-    try testing.expect(journal.persistence_failed);
+    try testing.expect((try journal.status(io)).persistence_failed);
     try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
     var copied_tail_10 = try journal.copySince(testing.allocator, io, 0);
     defer copied_tail_10.deinit();
@@ -767,9 +762,24 @@ test "a write that does not reach the disk publishes nothing and latches" {
 
     // Reconciliation reopens the authoritative bytes, clears the latch and
     // tells the caller whether the attempted sequence actually survived.
+    fail_writes.store(false, .release);
     try testing.expectEqual(@as(u64, 1), try journal.reconcile(io));
-    try testing.expect(!journal.persistence_failed);
+    try testing.expect(!(try journal.status(io)).persistence_failed);
     try testing.expectEqual(@as(u64, 2), try journal.append(io, 2, created(2, "retried")));
+}
+
+/// Inject a failed write through the same seam every real file write uses.
+var fail_writes: std.atomic.Value(bool) = .init(false);
+
+fn failingIo(vtable: *Io.VTable) Io {
+    vtable.* = testing.io.vtable.*;
+    vtable.fileWritePositional = struct {
+        fn write(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
+            if (fail_writes.load(.acquire)) return error.InputOutput;
+            return testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+        }
+    }.write;
+    return .{ .userdata = testing.io.userdata, .vtable = vtable };
 }
 
 /// Whether a file write made with cancelation not blocked is to be the
@@ -803,7 +813,7 @@ fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
         .{ .at = 2, .event = created(2, "two") },
         .{ .at = 3, .event = created(3, "three") },
     }));
-    try testing.expect(!journal.persistence_failed);
+    try testing.expect(!(try journal.status(io)).persistence_failed);
     try testing.expectEqual(@as(u32, 3), fold.events);
     try journal.snapshot(io, "state");
     try journal.truncateAfter(io, 2);
@@ -942,7 +952,7 @@ test "a reserved segment is written into rather than extended, and reserves noth
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .preallocate_bytes = reserve });
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 50), try reopened.lastSeq(io));
-    try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
+    try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
 }
 
 test "space a writer reserved and never filled is not a record it did not finish" {
@@ -970,14 +980,14 @@ test "space a writer reserved and never filled is not a record it did not finish
         var journal = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
         defer journal.deinit(io);
         try testing.expectEqual(@as(u64, 3), try journal.lastSeq(io));
-        try testing.expectEqual(@as(usize, 0), journal.dropped_bytes);
+        try testing.expectEqual(@as(usize, 0), (try journal.status(io)).dropped_bytes);
         _ = try journal.append(io, 4, created(4, "into the space"));
     }
 
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 4), try reopened.lastSeq(io));
-    try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
+    try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
 }
 
 test "a reader stops at a live writer's oversized zero reservation" {
@@ -1027,7 +1037,7 @@ test "a half-written record before the reserved zeros is dropped, and only it" {
     defer journal.deinit(io);
     try testing.expectEqual(@as(u64, 3), try journal.lastSeq(io));
     // The count is the bytes somebody wrote, not the zeros nobody did.
-    try testing.expectEqual(torn.len, journal.dropped_bytes);
+    try testing.expectEqual(torn.len, (try journal.status(io)).dropped_bytes);
 }
 
 test "a record from a newer schema is refused rather than guessed at" {
@@ -3356,7 +3366,7 @@ test "a reader beside a writer mid-record sees the records, not the fragment" {
     var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
     defer reader.deinit(io);
     try testing.expectEqual(@as(u64, 1), try reader.lastSeq(io));
-    try testing.expectEqual(@as(usize, 0), reader.dropped_bytes);
+    try testing.expectEqual(@as(usize, 0), (try reader.status(io)).dropped_bytes);
     try testing.expectEqualStrings(before, try ws.read(try ws.segment(1)));
     try testing.expect(!ws.exists(try ws.sub(chronicle.lock_name)));
 }
@@ -3659,7 +3669,7 @@ test "a record longer than a record may be is refused, and so is a segment of on
 
     var journal = try Journal.open(testing.allocator, io, torn.path, .{ .max_record_bytes = cap });
     defer journal.deinit(io);
-    try testing.expectEqual(@as(usize, cap * 8), journal.dropped_bytes);
+    try testing.expectEqual(@as(usize, cap * 8), (try journal.status(io)).dropped_bytes);
     try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
 }
 
@@ -4453,7 +4463,7 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
     defer reopened.deinit(io);
     try testing.expectEqual(held, try reopened.lastSeq(io));
-    try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
+    try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
 }
 
 /// Arbitrary bytes where the line that says what the file is should be.
@@ -4644,7 +4654,7 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
     var reopened = try PingJournal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
     defer reopened.deinit(io);
     try testing.expectEqual(held + 1, try reopened.lastSeq(io));
-    try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
+    try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
     try testing.expectEqual(held + 2 - (try reopened.oldestSeq(io)), try reopened.verify(io));
 }
 
@@ -5398,4 +5408,24 @@ test "observing the oldest sequence waits for the inventory lock" {
 
 test "observing the segment count waits for the inventory lock" {
     try canceledInventoryObservation(.segments);
+}
+
+test "observing persistence status waits for the journal lock" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    journal.mutex.lockUncancelable(io);
+    defer journal.mutex.unlock(io);
+    var started: std.atomic.Value(bool) = .init(false);
+    const Reader = struct {
+        fn read(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
+            ready.store(true, .release);
+            _ = try j.status(inner);
+        }
+    };
+    var future = try io.concurrent(Reader.read, .{ &journal, io, &started });
+    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    try testing.expectError(error.Canceled, future.cancel(io));
 }

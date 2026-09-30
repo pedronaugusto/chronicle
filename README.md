@@ -144,6 +144,7 @@ which writes and reads a record's line; this package keeps the lines.
 | `dropSegmentsBefore(io, seq)` | Unlink the whole segments a snapshot covers. |
 | `truncateAfter(io, seq)` | Drop every record after `seq`, handing the numbers back. |
 | `verify(io)` | Read every record of every segment through every check. |
+| `status(io)` | Persistence failure and dropped bytes, copied under the lock. |
 | `stats(io)` | Segments, records, and the bytes they take. |
 
 Plus `chronicle.checksum(covered)`, which is the checksum a record carries,
@@ -152,7 +153,7 @@ lives in; `chronicle.Position`, where a walk stopped; `chronicle.Raw`, an
 event kept as its bytes; `chronicle.flush`, which names the call a durable write makes here;
 and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Batch`,
 `Replay`, `Tailer`, `Sink`, `Reader`, `Readers`, `Options`, `Snapshot`,
-`Opened`, `Migrate`, `Stats` and one named error set per operation, with
+`Opened`, `Migrate`, `Status`, `Stats` and one named error set per operation, with
 `Sync`, `Flush` and `Verify` at the module root. Every
 public declaration carries a doc comment stating its contract;
 `src/chronicle.zig` is the reference and `src/log.zig` the segment store under
@@ -350,7 +351,7 @@ with.
 `waitPast`, `nudge`, `subscribe`,
 `subscribeFrom`, `subscribeAll`, `subscribeAllFrom`, `unsubscribe`, `lastSeq`,
 `oldestSeq`, `segmentCount`, `seqAtOrAfter`, `tailer`, `readers`, `minCursor`, `snapshot`, `backup`,
-`compact`, `dropSegmentsBefore`, `truncateAfter`, `reconcile`, `stats` and
+`compact`, `dropSegmentsBefore`, `truncateAfter`, `reconcile`, `status`, `stats` and
 `refresh` take it and are safe from any task or thread, several at once; the subscribe calls hold it for
 the whole of their replay, so the hand-over from the disk to the live records
 has no seam in it. A call that can return `error.Canceled` can be canceled
@@ -372,8 +373,8 @@ reads without it and writes nothing. A missing index is walked from the first re
 `Replay` belongs to one reader at a time, and its records borrow only that
 walk's memory. Retention beside a walk may remove files it needs, which is
 reported as an error. `close` and `deinit` require every caller and walk to
-have stopped. The mutable public fields require the caller's coordination;
-use `lastSeq` and `stats` for locked observations. The allocator passed to
+have stopped. Observe recovery and persistence state with `status(io)`. The public
+`options` field is the configuration passed to `open`; leave it unchanged. The allocator passed to
 `open` must support concurrent use when walks or tailers allocate alongside
 journal calls. Every file operation and
 the wait primitive go through `std.Io`, so the package runs under

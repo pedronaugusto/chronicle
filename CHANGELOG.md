@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Breaking:** `status(io)` returns a locked `Status` observation in place of the mutable `persistence_failed` and `dropped_bytes` fields.
+
 - **Breaking:** `oldestSeq(io)` and `segmentCount(io)` take the journal lock and return a cancelable observation of its inventory.
 
 - An owned batch keeps its arena at a stable address, so allocator contexts retained by managed JSON containers survive returning and moving the batch.
