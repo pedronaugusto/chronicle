@@ -127,8 +127,8 @@ which writes and reads a record's line; this package keeps the lines.
 | `nudge(io)` | Wake the waiters with no record behind it. |
 | `lastSeq(io)` | The newest sequence number, or zero. |
 | `seqAtOrAfter(io, at)` | The lowest sequence number stamped at or after `at`. |
-| `oldestSeq()` | The oldest one still held. |
-| `segmentCount()` | How many files the log is spread over. |
+| `oldestSeq(io)` | The oldest one still held. |
+| `segmentCount(io)` | How many files the log is spread over. |
 | `refresh(io)` | Read the directory again — how a reader tails a writer. |
 | `tailer(io, name)` | A named reader, with the cursor it last committed. |
 | `subscribe(io, sink)` | Fold every record, from the disk and then live. |
@@ -349,7 +349,7 @@ with.
 **One mutex inside.** `append`, `appendDeferred`, `appendAll`, `copySince`,
 `waitPast`, `nudge`, `subscribe`,
 `subscribeFrom`, `subscribeAll`, `subscribeAllFrom`, `unsubscribe`, `lastSeq`,
-`seqAtOrAfter`, `tailer`, `readers`, `minCursor`, `snapshot`, `backup`,
+`oldestSeq`, `segmentCount`, `seqAtOrAfter`, `tailer`, `readers`, `minCursor`, `snapshot`, `backup`,
 `compact`, `dropSegmentsBefore`, `truncateAfter`, `reconcile`, `stats` and
 `refresh` take it and are safe from any task or thread, several at once; the subscribe calls hold it for
 the whole of their replay, so the hand-over from the disk to the live records
@@ -366,8 +366,7 @@ own, with an allocator suitable for the threads that use it. Sink callbacks
 run under the lock; they must neither call back into the journal nor retain
 a record or its referenced data after the call.
 
-`segmentCount()` and `oldestSeq()` require coordination with changes to the
-journal. `replay`, `replayAt`, `verify`, `Tailer.replay` and `Replay.rearmAt`
+`replay`, `replayAt`, `verify`, `Tailer.replay` and `Replay.rearmAt`
 take the lock to choose the segments the walk will cross; the walk itself
 reads without it and writes nothing. A missing index is walked from the first record. Each
 `Replay` belongs to one reader at a time, and its records borrow only that

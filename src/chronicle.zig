@@ -1443,7 +1443,10 @@ pub fn Journal(comptime Event: type) type {
 
         /// How many segments the log is spread over. One for a young journal;
         /// it grows by one every `Options.max_segment_bytes`.
-        pub fn segmentCount(self: *const Self) usize {
+        /// Safe to call from any task or thread, except from inside a sink.
+        pub fn segmentCount(self: *Self, io: Io) Io.Cancelable!usize {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
             return self.log.segments.items.len;
         }
 
@@ -1451,7 +1454,10 @@ pub fn Journal(comptime Event: type) type {
         /// or a `dropSegmentsBefore` drops a prefix, and one past `lastSeq` on
         /// a log with no records in it. Compare it against a cursor to see what
         /// a reader has missed for good.
-        pub fn oldestSeq(self: *const Self) u64 {
+        /// Safe to call from any task or thread, except from inside a sink.
+        pub fn oldestSeq(self: *Self, io: Io) Io.Cancelable!u64 {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
             return self.log.baseSeq() + 1;
         }
 
