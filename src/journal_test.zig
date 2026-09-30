@@ -5282,3 +5282,29 @@ test "independent replays read committed records beside a rotating writer" {
     try second.await(io);
     try writer.await(io);
 }
+
+test "replacing a backup releases its inventory on every allocation failure" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const dest = try ws.beside("backup");
+    try ws.root.createDirPath(io, "backup");
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "source"));
+    }
+    const Copy = struct {
+        fn f(a: std.mem.Allocator, inner: Io, root: Io.Dir, source: []const u8, target: []const u8) !void {
+            // Every attempt inventories old managed files, even when an
+            // earlier attempt got as far as deleting or replacing them.
+            try root.writeFile(inner, .{ .sub_path = "backup/00000000000000000001.log", .data = "old" });
+            try root.writeFile(inner, .{ .sub_path = "backup/00000000000000000002.log", .data = "old" });
+            try root.writeFile(inner, .{ .sub_path = "backup/00000000000000000002.idx", .data = "old" });
+            var journal = try Journal.open(a, inner, source, .{ .sync = .never, .tail_records = 0 });
+            defer journal.deinit(inner);
+            try testing.expectEqual(@as(u64, 1), try journal.backup(inner, target));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ io, ws.root, ws.path, dest });
+}

@@ -2760,11 +2760,12 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) Op
 /// Remove the previous backup's log-owned files before writing a new view.
 /// Locks and reader cursors belong to users of the destination and remain.
 fn clearBackup(log: *Log, io: Io, dest: Io.Dir) OpenError!void {
-    var names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (names.items) |name| log.gpa.free(name);
-        names.deinit(log.gpa);
-    }
+    // The inventory is one temporary value: its list and every copied name
+    // are released together, including a name whose insertion fails.
+    var arena: std.heap.ArenaAllocator = .init(log.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var names: std.ArrayList([]const u8) = .empty;
 
     var iterator = dest.iterate();
     while (try iterator.next(io)) |entry| {
@@ -2772,7 +2773,7 @@ fn clearBackup(log: *Log, io: Io, dest: Io.Dir) OpenError!void {
         const managed = std.mem.eql(u8, entry.name, snapshot_name) or
             parseNumberedName(entry.name, segment_extension) != null or
             parseNumberedName(entry.name, index_extension) != null;
-        if (managed) try names.append(log.gpa, try log.gpa.dupe(u8, entry.name));
+        if (managed) try names.append(a, try a.dupe(u8, entry.name));
     }
     for (names.items) |name| try dest.deleteFile(io, name);
 }

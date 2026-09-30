@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Replacing a backup owns its old-file inventory in one temporary arena, so a failed insertion cannot leak a copied filename.
+
 - `replay`, `verify` and `Tailer.replay` choose their scans under the journal lock, so writers and other readers cannot race the segment inventory or shared index state.
 
 - Opening or refreshing a journal works when the tail byte limit keeps no record; sequence continuity is checked by the walk, independent of cache eviction.
