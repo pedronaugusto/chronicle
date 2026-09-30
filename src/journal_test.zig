@@ -6,8 +6,6 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const chronicle = @import("chronicle.zig");
-const strand = @import("strand");
-
 /// The events of a tiny registry: enough shape to fold, and an `unknown` arm
 /// so a record from an older schema has somewhere to land.
 const Event = union(enum) {
