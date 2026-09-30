@@ -5455,3 +5455,39 @@ test "a tail keeps the allocator carried by a JSON value at its owner" {
     try testing.expectEqualStrings("first", array.items[0].string);
     try testing.expectEqualStrings("next", array.items[1].string);
 }
+
+test "starting a positioned replay observes its journal only under the lock" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const Probe = struct {
+        var journal: ?*Journal = null;
+        var unlocked: bool = false;
+        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+            if (journal) |j| {
+                if (j.mutex.tryLock()) {
+                    j.mutex.unlock(testing.io);
+                    unlocked = true;
+                }
+            }
+            return testing.allocator.vtable.alloc(ctx, len, alignment, ret_addr);
+        }
+    };
+    var vtable = testing.allocator.vtable.*;
+    vtable.alloc = Probe.alloc;
+    const gpa: std.mem.Allocator = .{ .ptr = testing.allocator.ptr, .vtable = &vtable };
+    var journal = try Journal.open(gpa, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    _ = try journal.append(io, 1, created(1, "one"));
+    Probe.unlocked = false;
+    Probe.journal = &journal;
+    var walk = journal.replayAt(io, .after(0)) catch |err| {
+        Probe.journal = null;
+        return err;
+    };
+    Probe.journal = null;
+    defer walk.deinit(io);
+    // Even an idle scan reads the journal's allocator and read limits.
+    try testing.expect(!Probe.unlocked);
+    try testing.expectEqualStrings("one", (try walk.next(io)).?.event.created.name);
+}

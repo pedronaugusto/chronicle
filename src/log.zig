@@ -1100,8 +1100,8 @@ fn holdIndex(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?Io.File {
 /// while this log holds the write lock and the segment is sealed, so it is
 /// taken once and the answer kept on the segment.
 ///
-/// `may_write` is false for a walk that does not hold the journal's lock: it
-/// reads an index that is already there and never builds one.
+/// Every scan is chosen under the journal's lock. `may_write` is false for
+/// an independent walk: it uses an index already there and never builds one.
 fn provenIndex(log: *Log, io: Io, at: usize, may_write: bool) Io.Cancelable!?Indexed {
     const segment = &log.segments.items[at];
     switch (segment.index) {

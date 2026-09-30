@@ -1163,6 +1163,9 @@ pub fn Journal(comptime Event: type) type {
         /// What `replay` returns: a walk over the log from the disk.
         pub const Replay = struct {
             journal: *Self,
+            /// Copied under the journal lock; reading records observes no
+            /// journal state and invokes migration without holding its lock.
+            decoder: Decoder,
             scan: Log.Scan,
             /// Holds the record `next` last returned, and nothing else.
             arena: std.heap.ArenaAllocator,
@@ -1246,7 +1249,7 @@ pub fn Journal(comptime Event: type) type {
                         continue;
                     }
                     _ = walk.arena.reset(.retain_capacity);
-                    const record = try walk.journal.recordFrom(walk.arena.allocator(), header, line);
+                    const record = try recordFrom(walk.decoder, walk.arena.allocator(), header, line);
                     walk.last = walk.lastRead(header, line);
                     return record;
                 }
@@ -1307,6 +1310,7 @@ pub fn Journal(comptime Event: type) type {
         fn replayFrom(self: *Self, io: Io, cursor: u64, may_write: bool) ReplayError!Replay {
             return .{
                 .journal = self,
+                .decoder = self.captureDecoder(),
                 .scan = try self.log.scanFrom(io, cursor, .{ .may_write = may_write }),
                 .arena = .init(self.gpa),
                 .scratch = .init(self.gpa),
@@ -1344,12 +1348,17 @@ pub fn Journal(comptime Event: type) type {
         /// from what is committed then; the walk itself reads without it.
         /// Safe to call from any task or thread, except from inside a sink.
         pub fn replayAt(self: *Self, io: Io, position: Position) ReplayAtError!Replay {
-            var walk: Replay = .{
-                .journal = self,
-                .scan = try self.log.scanIdle(),
-                .arena = .init(self.gpa),
-                .scratch = .init(self.gpa),
-                .run = .{ .cursor = position.cursor },
+            var walk = initialized: {
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                break :initialized Replay{
+                    .journal = self,
+                    .decoder = self.captureDecoder(),
+                    .scan = try self.log.scanIdle(),
+                    .arena = .init(self.gpa),
+                    .scratch = .init(self.gpa),
+                    .run = .{ .cursor = position.cursor },
+                };
             };
             errdefer walk.deinit(io);
             try walk.rearmAt(io, position);
@@ -1635,6 +1644,7 @@ pub fn Journal(comptime Event: type) type {
         /// to do a stretch of history over.
         pub const Tailer = struct {
             journal: *Self,
+            gpa: Allocator,
             /// This reader's name, owned by the tailer.
             name: []const u8,
             /// Where it has got to. Zero for a name that has never committed
@@ -1645,7 +1655,7 @@ pub fn Journal(comptime Event: type) type {
             /// Release the name. The cursor file stays on the disk; that is
             /// the point of it.
             pub fn deinit(tail: *Tailer) void {
-                tail.journal.gpa.free(tail.name);
+                tail.gpa.free(tail.name);
                 tail.* = undefined;
             }
 
@@ -1793,7 +1803,7 @@ pub fn Journal(comptime Event: type) type {
             if (!validTailerName(name)) return error.InvalidName;
             const owned = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(owned);
-            return .{ .journal = self, .name = owned, .cursor = try self.readCursor(io, owned) };
+            return .{ .journal = self, .gpa = self.gpa, .name = owned, .cursor = try self.readCursor(io, owned) };
         }
 
         /// One path component of letters, digits, `-` and `_`: the characters
@@ -2240,7 +2250,7 @@ pub fn Journal(comptime Event: type) type {
                 const arena = try createArena(self.gpa);
                 errdefer destroyArena(arena);
                 const stored = try arena.allocator().dupe(u8, line);
-                const record = try self.recordFrom(arena.allocator(), header, stored);
+                const record = try recordFrom(self.captureDecoder(), arena.allocator(), header, stored);
                 try rebuilt.entries.ensureUnusedCapacity(self.gpa, 1);
                 rebuilt.appendAssumeCapacity(.{ .record = record, .arena = arena });
                 rebuilt.trim(self.options);
@@ -2308,32 +2318,44 @@ pub fn Journal(comptime Event: type) type {
             return .{ .seq = head.seq, .at = head.at, .version = head.v, .p = head.p, .c = t.c, .ev = head.ev };
         }
 
+        /// Only the schema and migration hook determine how an event is read.
+        /// A walk owns this value rather than observing the journal as it goes.
+        const Decoder = struct {
+            schema_version: u32,
+            migrate: ?Migrate,
+        };
+
+        /// Called under the journal's lock.
+        fn captureDecoder(self: *const Self) Decoder {
+            return .{ .schema_version = self.options.schema_version, .migrate = self.options.migrate };
+        }
+
         /// Finish a header into a record whose every slice comes from `arena`.
-        fn recordFrom(self: *Self, arena: Allocator, header: Header, line: []const u8) ReadError!Record {
+        fn recordFrom(decoding: Decoder, arena: Allocator, header: Header, line: []const u8) ReadError!Record {
             return .{
                 .seq = header.seq,
                 .at = header.at,
                 .version = header.version,
-                .event = try self.eventFrom(arena, header.version, header.ev, line),
+                .event = try eventFrom(decoding, arena, header.version, header.ev, line),
                 .bytes = line,
             };
         }
 
         fn eventFrom(
-            self: *Self,
+            decoding: Decoder,
             arena: Allocator,
             version: u32,
             ev: Span,
             line: []const u8,
         ) ReadError!Event {
-            if (version == self.options.schema_version) {
+            if (version == decoding.schema_version) {
                 return strand.parseLine(Event, arena, line[ev.from..ev.to], .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.CorruptRecord,
                 };
             }
-            if (version > self.options.schema_version) return error.NewerSchema;
-            if (self.options.migrate) |migrate| return migrate(arena, version, try retainedEv(arena, ev, line));
+            if (version > decoding.schema_version) return error.NewerSchema;
+            if (decoding.migrate) |migrate| return migrate(arena, version, try retainedEv(arena, ev, line));
             if (comptime unknown_arm != null) return unknownEvent(arena, ev, line);
             return error.OlderSchema;
         }

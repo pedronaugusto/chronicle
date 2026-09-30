@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- A positioned replay initializes under the journal lock, and independent readers own the decoding configuration and allocator they need without observing journal fields between calls.
+
 - Tail records and staged writes keep their arenas at stable addresses, so allocator contexts retained by events survive publication, growth and eviction.
 
 - **Breaking:** `status(io)` returns a locked `Status` observation in place of the mutable `persistence_failed` and `dropped_bytes` fields.
