@@ -1194,7 +1194,7 @@ pub fn Journal(comptime Event: type) type {
                     {
                         try self.mutex.lock(io);
                         defer self.mutex.unlock(io);
-                        try self.log.scanFromInto(&walk.scan, io, at.cursor, false);
+                        try self.log.scanFromInto(&walk.scan, io, at.cursor, .{});
                     }
                 }
 
@@ -1300,7 +1300,7 @@ pub fn Journal(comptime Event: type) type {
         fn replayFrom(self: *Self, io: Io, cursor: u64, may_write: bool) ReplayError!Replay {
             return .{
                 .journal = self,
-                .scan = try self.log.scanFrom(io, cursor, may_write),
+                .scan = try self.log.scanFrom(io, cursor, .{ .may_write = may_write }),
                 .arena = .init(self.gpa),
                 .scratch = .init(self.gpa),
                 .run = .{ .cursor = cursor },
@@ -2187,7 +2187,7 @@ pub fn Journal(comptime Event: type) type {
             const want = self.options.tail_records;
             const from = if (self.seq > want) self.seq - want else self.log.baseSeq();
 
-            var scan = try self.log.scanFrom(io, from, true);
+            var scan = try self.log.scanFrom(io, from, .{ .may_write = true, .extent = .known });
             defer scan.deinit(io);
 
             var run: Continuity = .{ .cursor = from };

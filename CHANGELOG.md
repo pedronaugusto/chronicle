@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- A read-only tail rebuild reads only the complete boundaries its inventory measured, so an external append cannot make a healthy journal look discontinuous.
+
 - Replacing a backup owns its old-file inventory in one temporary arena, so a failed insertion cannot leak a copied filename.
 
 - `replay`, `verify` and `Tailer.replay` choose their scans under the journal lock, so writers and other readers cannot race the segment inventory or shared index state.

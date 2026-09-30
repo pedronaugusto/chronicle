@@ -1707,7 +1707,7 @@ pub const Scan = struct {
 };
 
 /// A `Scan` over `segments`, starting `position` bytes into the first of them.
-fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan {
+fn scanOver(log: *Log, segments: []const Segment, position: u64, extent: ScanOptions.Extent) ScanError!Scan {
     // A follower may have stopped in the old active segment just as the
     // writer rotates. Its next pass then spans that segment and the new one.
     const capacity = @max(segments.len, 2);
@@ -1717,10 +1717,9 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
     errdefer log.gpa.free(limits_storage);
     const bases = bases_storage[0..segments.len];
     const limits = limits_storage[0..segments.len];
-    // A reader has no committed length to go on -- the writer is still
-    // appending -- so it walks to the end of the file and lets the missing
-    // newline end it.
-    const unbounded = log.options.access == .read;
+    // A live reader walks beyond the inventory and lets a missing newline
+    // end it. A rebuild stays inside the complete boundaries already known.
+    const unbounded = log.options.access == .read and extent == .live;
     for (segments, bases, limits) |segment, *base, *limit| {
         base.* = segment.base_seq;
         limit.* = if (unbounded) std.math.maxInt(u64) else segment.bytes;
@@ -1746,13 +1745,13 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64) ScanError!Scan 
         .at_header = false,
         .boundary = null,
         .max_record_bytes = log.options.max_record_bytes,
-        .tolerate_partial_tail = log.options.access == .read,
+        .tolerate_partial_tail = unbounded,
     };
 }
 
 /// An idle scan whose buffers can be armed for a replay without replacing it.
 pub fn scanIdle(log: *Log) ScanError!Scan {
-    return log.scanOver(&.{}, 0);
+    return log.scanOver(&.{}, 0, .live);
 }
 
 /// Re-arm an existing scan at an offset, or report that the segment is gone
@@ -1767,20 +1766,30 @@ pub fn scanAtInto(log: *Log, scan: *Scan, io: Io, base_seq: u64, offset: u64) Sc
     return false;
 }
 
+/// What a scan may do while it is chosen, and how far it reads afterwards.
+/// A tail rebuild reads the inventory's known record boundaries; a follower
+/// on a read-only journal reads a live file beyond that inventory.
+pub const ScanOptions = struct {
+    pub const Extent = enum { known, live };
+    extent: Extent = .live,
+    /// Only a caller holding the journal's lock may build an index.
+    may_write: bool = false,
+};
+
 /// A `Scan` positioned at the first record after `cursor`, as close to it as
 /// the indexes allow.
 ///
 /// The walk may begin a little before it — a caller with a cursor drops what it
 /// has already seen — but never after it.
-pub fn scanFrom(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!Scan {
-    const start = try log.scanStart(io, cursor, may_write);
-    return log.scanOver(start.segments, start.position);
+pub fn scanFrom(log: *Log, io: Io, cursor: u64, options: ScanOptions) ScanError!Scan {
+    const start = try log.scanStart(io, cursor, options.may_write);
+    return log.scanOver(start.segments, start.position, options.extent);
 }
 
 /// Re-arm an existing scan from a cursor, retaining its buffers.
-pub fn scanFromInto(log: *Log, scan: *Scan, io: Io, cursor: u64, may_write: bool) ScanError!void {
-    const start = try log.scanStart(io, cursor, may_write);
-    try scan.rearmOver(io, start.segments, start.position, log.options.access == .read);
+pub fn scanFromInto(log: *Log, scan: *Scan, io: Io, cursor: u64, options: ScanOptions) ScanError!void {
+    const start = try log.scanStart(io, cursor, options.may_write);
+    try scan.rearmOver(io, start.segments, start.position, log.options.access == .read and options.extent == .live);
 }
 
 const ScanStart = struct { segments: []const Segment, position: u64 };
@@ -1903,7 +1912,7 @@ fn scannedSeqAtOrAfter(
     from_offset: u64,
     from_seq: u64,
 ) OpenError!?u64 {
-    var scan = try log.scanOver(&.{segment}, from_offset);
+    var scan = try log.scanOver(&.{segment}, from_offset, .live);
     defer scan.deinit(io);
     var seq = from_seq;
     while (try scan.next(io)) |line| : (seq += 1) {
@@ -2453,7 +2462,7 @@ pub fn truncateAfter(log: *Log, io: Io, seq: u64) TruncateError!void {
 /// The byte offset inside `segment` at which the record after `seq` begins,
 /// and `segment.bytes` when `seq` is the last record it holds.
 fn offsetAfter(log: *Log, io: Io, segment: Segment, seq: u64) OpenError!u64 {
-    var scan = try log.scanOver(&.{segment}, 0);
+    var scan = try log.scanOver(&.{segment}, 0, .live);
     defer scan.deinit(io);
     var offset = segment.header_bytes;
     var at = segment.base_seq;
@@ -2527,7 +2536,7 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
 
         // From the start of the segment, so that the copy never depends on an
         // index: compaction is rare and one segment is bounded.
-        var scan = try log.scanOver(&.{segment}, 0);
+        var scan = try log.scanOver(&.{segment}, 0, .live);
         defer scan.deinit(io);
         var seq = segment.base_seq;
         var wrote_header = false;
