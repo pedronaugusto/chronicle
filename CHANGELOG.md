@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Opening or refreshing a journal works when the tail byte limit keeps no record; sequence continuity is checked by the walk, independent of cache eviction.
+
 - A rebuilt tail is published only after the whole pass succeeds; a failed refresh leaves no partial batch claiming to be complete.
 
 - A tail entry owns its record and arena together, so a refresh that runs out of memory cannot leave an unowned record behind.

@@ -2189,13 +2189,11 @@ pub fn Journal(comptime Event: type) type {
                 rebuilt.trim(self.options);
             }
 
-            // The segment names and the records inside them have to agree, or a
-            // cursor would point at a record that is not there. An empty tail
-            // is right only for a log with no records in it -- which still has
-            // a sequence number, because the newest segment's name carries it.
-            if (rebuilt.entries.items.len != 0) {
-                if (rebuilt.entries.items[rebuilt.entries.items.len - 1].record.seq != self.seq) return error.DiscontinuousSeq;
-            } else if (want != 0 and self.log.baseSeq() != self.seq) {
+            // Continuity belongs to the walk, not the cache: either tail
+            // ceiling may evict even the newest record while it is read.
+            if (run.expected) |next| {
+                if (next != self.seq + 1) return error.DiscontinuousSeq;
+            } else if (self.log.baseSeq() != self.seq) {
                 return error.DiscontinuousSeq;
             }
             self.tail.deinit(self.gpa);

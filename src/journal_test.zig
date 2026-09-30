@@ -5196,3 +5196,28 @@ test "a failed refresh never calls a partial tail complete" {
     }
     try testing.expect(reached_end);
 }
+
+test "a tail too small for one record still reopens and refreshes" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer writer.deinit(io);
+        _ = try writer.append(io, 1, created(1, "on disk"));
+    }
+    for ([_]usize{ 0, 1 }) |limit| {
+        var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_bytes = limit });
+        defer reader.deinit(io);
+        try testing.expectEqual(@as(u64, 1), try reader.waitPast(io, 0));
+        var batch = try reader.copySince(testing.allocator, io, 0);
+        defer batch.deinit();
+        try testing.expectEqual(@as(usize, 0), batch.records.len);
+        try testing.expect(!batch.complete);
+        var walk = try reader.replay(io, 0);
+        defer walk.deinit(io);
+        try testing.expectEqualStrings("on disk", (try walk.next(io)).?.event.created.name);
+        try testing.expectEqual(@as(?Journal.Record, null), try walk.next(io));
+        try reader.refresh(io);
+    }
+}
