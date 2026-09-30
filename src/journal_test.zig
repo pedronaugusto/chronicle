@@ -1662,7 +1662,7 @@ test "the tail is bounded and a cursor older than it is an incomplete window" {
     for (1..41) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
     // At most four records in memory for forty on the disk.
-    try testing.expect(journal.tail.items.len <= 4);
+    try testing.expect(journal.tail.entries.items.len <= 4);
     var stale = try journal.copySince(testing.allocator, io, 1);
     defer stale.deinit();
     try testing.expect(!stale.complete);
@@ -1703,8 +1703,8 @@ test "a reopened journal fills its tail from the newest records only" {
     var reopened = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 40), try reopened.lastSeq(io));
-    try testing.expect(reopened.tail.items.len <= 4);
-    try testing.expect(reopened.tail.items.len >= 1);
+    try testing.expect(reopened.tail.entries.items.len <= 4);
+    try testing.expect(reopened.tail.entries.items.len >= 1);
     var window = try reopened.copySince(testing.allocator, io, 0);
     defer window.deinit();
     try testing.expect(!window.complete);
@@ -2735,8 +2735,8 @@ test "the tail gives way by bytes as well as by count" {
     const long = "a name long enough that a handful of these is already more than the tail may hold";
     for (1..41) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), long));
 
-    try testing.expect(journal.tail_bytes <= 512);
-    try testing.expect(journal.tail.items.len < 40);
+    try testing.expect(journal.tail.bytes <= 512);
+    try testing.expect(journal.tail.entries.items.len < 40);
     var copied_tail_28 = try journal.copySince(testing.allocator, io, 0);
     defer copied_tail_28.deinit();
     try testing.expect(!copied_tail_28.complete);
@@ -4037,9 +4037,9 @@ test "two hundred thousand records open within a bounded time and memory" {
     // Loose on purpose: record-sized working memory is the newest segment and
     // the tail. Fixed-size segment metadata is accounted separately.
     try testing.expect(elapsed_ms < 30_000);
-    try testing.expect(journal.tail.items.len <= journal.options.tail_records);
+    try testing.expect(journal.tail.entries.items.len <= journal.options.tail_records);
     var held: usize = journal.scratch.queryCapacity();
-    for (journal.tail.items) |*owned| held += owned.arena.queryCapacity();
+    for (journal.tail.entries.items) |*owned| held += owned.arena.queryCapacity();
     try testing.expect(held < 4 * 1024 * 1024);
 
     // And a fold over the whole of it still holds one record at a time.
@@ -5146,8 +5146,8 @@ test "a refresh that runs out of memory leaves every tail record owned and count
             // Record metadata itself is in the tail array: count it without
             // dereferencing its event or bytes, which must still be owned.
             var held: usize = 0;
-            for (reader.tail.items) |owned| held += owned.record.bytes.len;
-            try testing.expectEqual(reader.tail_bytes, held);
+            for (reader.tail.entries.items) |owned| held += owned.record.bytes.len;
+            try testing.expectEqual(reader.tail.bytes, held);
             var partial = try reader.copySince(testing.allocator, io, 0);
             defer partial.deinit();
             for (partial.records) |record| {
@@ -5159,6 +5159,36 @@ test "a refresh that runs out of memory leaves every tail record owned and count
             defer recovered.deinit();
             try testing.expect(recovered.complete);
             try testing.expectEqual(@as(usize, 21), recovered.records.len);
+            continue;
+        };
+        reached_end = true;
+        break;
+    }
+    try testing.expect(reached_end);
+}
+
+test "a failed refresh never calls a partial tail complete" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer writer.deinit(io);
+    _ = try writer.append(io, 1, created(1, "initial"));
+    var reached_end = false;
+    for (0..100) |offset| {
+        try writer.truncateAfter(io, 1);
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        var reader = try Journal.open(failing.allocator(), io, ws.path, .{ .access = .read });
+        defer reader.deinit(io);
+        try fill(&writer, io, 1, 20, "external");
+        failing.fail_index = failing.alloc_index + offset;
+        reader.refresh(io) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            var partial = try reader.copySince(testing.allocator, io, 0);
+            defer partial.deinit();
+            if (partial.complete) {
+                try testing.expectEqual(try reader.lastSeq(io), partial.records[partial.records.len - 1].seq);
+            }
             continue;
         };
         reached_end = true;

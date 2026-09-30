@@ -312,7 +312,8 @@ forward with no re-encoding.
 owned copy under the lock. A writer may have moved the tail between the two
 calls: check `batch.complete`, and use `replay` or `subscribeFrom` for records
 that memory no longer holds. Advance the cursor to the last record handled,
-not to the number returned by the wait. An empty batch is complete only when
+not to the number returned by the wait. A failed rebuild leaves the tail
+empty until it is rebuilt successfully. An empty batch is complete only when
 its cursor has caught up; a nudge can wake a reader with no new record.
 
 **The writer holds an exclusive advisory lock on `<path>/lock` for as long as
