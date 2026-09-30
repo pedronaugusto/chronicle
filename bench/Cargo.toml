@@ -1,0 +1,18 @@
+[package]
+name = "chronicle-rival-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "okaywal-bench"
+path = "src/okaywal_bench.rs"
+
+[dependencies]
+okaywal = "=0.3.1"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

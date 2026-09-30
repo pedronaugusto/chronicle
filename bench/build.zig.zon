@@ -1,0 +1,10 @@
+.{
+    .name = .chronicle_benchmark,
+    .version = "0.0.0",
+    .fingerprint = 0xce5506a6654fe761,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .chronicle = .{ .path = ".." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
