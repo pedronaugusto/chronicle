@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- An owned batch keeps its arena at a stable address, so allocator contexts retained by managed JSON containers survive returning and moving the batch.
+
 - A batch with no tail or sink reserves no record storage and holds only one parsed record at a time when round-trip checks are enabled.
 
 - A read-only tail rebuild reads only the complete boundaries its inventory measured, so an external append cannot make a healthy journal look discontinuous.

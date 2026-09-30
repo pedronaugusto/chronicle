@@ -265,11 +265,15 @@ pub fn Journal(comptime Event: type) type {
             /// tail no longer reaches back that far: use `replay` or
             /// `subscribeFrom` to read the disk.
             complete: bool,
-            arena: std.heap.ArenaAllocator,
+            // Managed JSON containers retain this allocator's context. The
+            // arena stays at one address even when its owning batch moves.
+            arena: *std.heap.ArenaAllocator,
 
             /// Release every record and all its referenced data together.
             pub fn deinit(batch: *Batch) void {
+                const gpa = batch.arena.child_allocator;
                 batch.arena.deinit();
+                gpa.destroy(batch.arena);
                 batch.* = undefined;
             }
         };
@@ -1039,7 +1043,9 @@ pub fn Journal(comptime Event: type) type {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             const window = self.tailSince(cursor);
-            var arena: std.heap.ArenaAllocator = .init(gpa);
+            const arena = try gpa.create(std.heap.ArenaAllocator);
+            errdefer gpa.destroy(arena);
+            arena.* = .init(gpa);
             errdefer arena.deinit();
             const a = arena.allocator();
             const copied = try a.alloc(Record, window.records.len);

@@ -5344,3 +5344,27 @@ test "checking a batch nobody keeps holds only one parsed record at a time" {
     gpa.requested_memory_limit = std.math.maxInt(usize);
     try testing.expectEqual(@as(u64, 128), try journal.verify(io));
 }
+
+test "a batch keeps the allocator carried by a JSON value alive" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const J = chronicle.Journal(std.json.Value);
+    var batch: J.Batch = undefined;
+    {
+        var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
+        defer testing.allocator.free(values);
+        _ = try journal.append(io, 1, .{ .array = .fromOwnedSlice(testing.allocator, values) });
+        batch = try journal.copySince(testing.allocator, io, 0);
+    }
+    defer batch.deinit();
+    // Managed JSON containers carry their allocator. Its context must stay
+    // alive after returning and moving the batch, even for a fresh block.
+    var array = batch.records[0].event.array;
+    try array.ensureTotalCapacity(65536);
+    try array.append(.{ .string = "next" });
+    try testing.expectEqualStrings("first", array.items[0].string);
+    try testing.expectEqualStrings("next", array.items[1].string);
+}
