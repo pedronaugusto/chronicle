@@ -4039,7 +4039,7 @@ test "two hundred thousand records open within a bounded time and memory" {
     try testing.expect(elapsed_ms < 30_000);
     try testing.expect(journal.tail.items.len <= journal.options.tail_records);
     var held: usize = journal.scratch.queryCapacity();
-    for (journal.tail_arenas.items) |*arena| held += arena.queryCapacity();
+    for (journal.tail.items) |*owned| held += owned.arena.queryCapacity();
     try testing.expect(held < 4 * 1024 * 1024);
 
     // And a fold over the whole of it still holds one record at a time.
@@ -5124,4 +5124,45 @@ test "copySince releases partial copies on every allocation failure" {
     };
     try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ &journal, io });
     try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "after")));
+}
+
+test "a refresh that runs out of memory leaves every tail record owned and counted" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer writer.deinit(io);
+    _ = try writer.append(io, 1, created(1, "initial"));
+    var reached_end = false;
+    for (0..100) |offset| {
+        try writer.truncateAfter(io, 1);
+        var failing: testing.FailingAllocator = .init(testing.allocator, .{});
+        var reader = try Journal.open(failing.allocator(), io, ws.path, .{ .access = .read });
+        defer reader.deinit(io);
+        try fill(&writer, io, 1, 20, "external");
+        failing.fail_index = failing.alloc_index + offset;
+        reader.refresh(io) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            // Record metadata itself is in the tail array: count it without
+            // dereferencing its event or bytes, which must still be owned.
+            var held: usize = 0;
+            for (reader.tail.items) |owned| held += owned.record.bytes.len;
+            try testing.expectEqual(reader.tail_bytes, held);
+            var partial = try reader.copySince(testing.allocator, io, 0);
+            defer partial.deinit();
+            for (partial.records) |record| {
+                try testing.expectEqualStrings(if (record.seq == 1) "initial" else "external", record.event.created.name);
+            }
+            failing.fail_index = std.math.maxInt(usize);
+            try reader.refresh(io);
+            var recovered = try reader.copySince(testing.allocator, io, 0);
+            defer recovered.deinit();
+            try testing.expect(recovered.complete);
+            try testing.expectEqual(@as(usize, 21), recovered.records.len);
+            continue;
+        };
+        reached_end = true;
+        break;
+    }
+    try testing.expect(reached_end);
 }

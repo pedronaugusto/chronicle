@@ -187,11 +187,9 @@ pub fn Journal(comptime Event: type) type {
         gpa: Allocator,
         /// The segments, the indexes, the lock and the directory.
         log: Log,
-        /// The newest records, oldest first. Each owns its memory through the
-        /// arena at the same position in `tail_arenas`, which is released when
-        /// the record falls out of the tail.
-        tail: std.ArrayList(Record),
-        tail_arenas: std.ArrayList(std.heap.ArenaAllocator),
+        /// The newest records, oldest first. A record and the arena owning
+        /// every slice in it enter and leave the tail together.
+        tail: std.ArrayList(OwnedRecord),
         /// What the tail's records add up to, for `Options.tail_bytes`.
         tail_bytes: usize,
         /// The length of the last record encoded, which sizes the next one's
@@ -278,9 +276,15 @@ pub fn Journal(comptime Event: type) type {
             }
         };
 
+        /// One tail entry owns its record and all the memory it references.
+        const OwnedRecord = struct {
+            record: Record,
+            arena: std.heap.ArenaAllocator,
+        };
+
         /// A borrow used only while holding the journal's lock.
         const TailWindow = struct {
-            records: []const Record,
+            records: []const OwnedRecord,
             complete: bool,
         };
 
@@ -626,7 +630,6 @@ pub fn Journal(comptime Event: type) type {
                 .log = log,
                 .options = options,
                 .tail = .empty,
-                .tail_arenas = .empty,
                 .tail_bytes = 0,
                 .record_hint = 256,
                 .line = .empty,
@@ -644,7 +647,6 @@ pub fn Journal(comptime Event: type) type {
             errdefer {
                 self.clearTail();
                 self.tail.deinit(gpa);
-                self.tail_arenas.deinit(gpa);
                 self.line.deinit(gpa);
                 self.scratch.deinit();
             }
@@ -701,7 +703,6 @@ pub fn Journal(comptime Event: type) type {
         fn release(self: *Self) void {
             self.clearTail();
             self.tail.deinit(self.gpa);
-            self.tail_arenas.deinit(self.gpa);
             self.line.deinit(self.gpa);
             self.sinks.deinit(self.gpa);
             self.scratch.deinit();
@@ -791,7 +792,6 @@ pub fn Journal(comptime Event: type) type {
             // Reserve before writing: after the bytes are durable nothing may
             // fail, or the disk would hold a record memory does not.
             try self.tail.ensureUnusedCapacity(self.gpa, 1);
-            try self.tail_arenas.ensureUnusedCapacity(self.gpa, 1);
 
             {
                 errdefer self.persistence_failed = true;
@@ -863,7 +863,6 @@ pub fn Journal(comptime Event: type) type {
             // durable nothing may fail, or the disk would hold records
             // memory does not.
             try self.tail.ensureUnusedCapacity(self.gpa, entries.len);
-            try self.tail_arenas.ensureUnusedCapacity(self.gpa, entries.len);
 
             // Only the records something will read are kept: a journal with
             // no tail and no sink holds one line at a time, however long the
@@ -1003,7 +1002,8 @@ pub fn Journal(comptime Event: type) type {
             errdefer arena.deinit();
             const a = arena.allocator();
             const copied = try a.alloc(Record, window.records.len);
-            for (window.records, copied) |record, *copy| {
+            for (window.records, copied) |owned, *copy| {
+                const record = owned.record;
                 copy.* = record;
                 copy.bytes = try a.dupe(u8, record.bytes);
                 // Decode the current event, not the stored version: a migrated
@@ -1023,7 +1023,7 @@ pub fn Journal(comptime Event: type) type {
         fn tailSince(self: *const Self, cursor: u64) TailWindow {
             const items = self.tail.items;
             if (items.len == 0) return .{ .records = items, .complete = cursor >= self.seq };
-            const tail_base = items[0].seq - 1;
+            const tail_base = items[0].record.seq - 1;
             if (cursor < tail_base) return .{ .records = items, .complete = false };
             const skip: usize = @intCast(@min(cursor - tail_base, items.len));
             return .{ .records = items[skip..], .complete = true };
@@ -1497,8 +1497,8 @@ pub fn Journal(comptime Event: type) type {
                     delivered = record.seq;
                 }
             }
-            for (self.tailSince(delivered).records) |record| {
-                for (registered) |sink| sink.f(sink.ctx, record);
+            for (self.tailSince(delivered).records) |owned| {
+                for (registered) |sink| sink.f(sink.ctx, owned.record);
             }
         }
 
@@ -1981,7 +1981,7 @@ pub fn Journal(comptime Event: type) type {
         /// A record serialised and waiting to be written.
         ///
         /// `record` is there when something will read it: an arena owns every
-        /// slice of it, and moves into `tail_arenas` once the record is on the
+        /// slice of it, and moves with the record into the tail once it is on the
         /// disk. When nothing will — no tail, no sink, no round-trip check —
         /// the line is the only thing built, and it is the journal's `line`:
         /// valid until the next record is encoded, which is after this one
@@ -2115,8 +2115,7 @@ pub fn Journal(comptime Event: type) type {
         fn publish(self: *Self, item: Built) bool {
             self.seq = item.seq;
             const record = item.record orelse return false;
-            self.tail.appendAssumeCapacity(record);
-            self.tail_arenas.appendAssumeCapacity(item.arena.?);
+            self.tail.appendAssumeCapacity(.{ .record = record, .arena = item.arena.? });
             self.tail_bytes += record.bytes.len;
             for (self.sinks.items) |sink| sink.f(sink.ctx, record);
             return true;
@@ -2143,8 +2142,7 @@ pub fn Journal(comptime Event: type) type {
                 errdefer arena.deinit();
                 const stored = try arena.allocator().dupe(u8, line);
                 const record = try self.recordFrom(arena.allocator(), header, stored);
-                try self.tail.append(self.gpa, record);
-                try self.tail_arenas.append(self.gpa, arena);
+                try self.tail.append(self.gpa, .{ .record = record, .arena = arena });
                 self.tail_bytes += stored.len;
                 self.trimTail();
             }
@@ -2154,7 +2152,7 @@ pub fn Journal(comptime Event: type) type {
             // is right only for a log with no records in it -- which still has
             // a sequence number, because the newest segment's name carries it.
             if (self.tail.items.len != 0) {
-                if (self.tail.items[self.tail.items.len - 1].seq != self.seq) return error.DiscontinuousSeq;
+                if (self.tail.items[self.tail.items.len - 1].record.seq != self.seq) return error.DiscontinuousSeq;
             } else if (want != 0 and self.log.baseSeq() != self.seq) {
                 return error.DiscontinuousSeq;
             }
@@ -2169,52 +2167,37 @@ pub fn Journal(comptime Event: type) type {
             while (self.tail.items.len - drop > self.options.tail_records or
                 (held > self.options.tail_bytes and drop < self.tail.items.len))
             {
-                held -= self.tail.items[drop].bytes.len;
+                held -= self.tail.items[drop].record.bytes.len;
                 drop += 1;
             }
             if (drop == 0) return;
             drop = @min(@max(drop, self.tail.items.len / 2), self.tail.items.len);
 
-            for (self.tail_arenas.items[0..drop]) |*arena| arena.deinit();
-            const kept = self.tail.items.len - drop;
-            std.mem.copyForwards(Record, self.tail.items[0..kept], self.tail.items[drop..]);
-            std.mem.copyForwards(
-                std.heap.ArenaAllocator,
-                self.tail_arenas.items[0..kept],
-                self.tail_arenas.items[drop..],
-            );
-            self.tail.shrinkRetainingCapacity(kept);
-            self.tail_arenas.shrinkRetainingCapacity(kept);
-
-            self.tail_bytes = 0;
-            for (self.tail.items) |record| self.tail_bytes += record.bytes.len;
+            self.removeTailPrefix(drop);
         }
 
         fn clearTail(self: *Self) void {
-            for (self.tail_arenas.items) |*arena| arena.deinit();
-            self.tail.clearRetainingCapacity();
-            self.tail_arenas.clearRetainingCapacity();
-            self.tail_bytes = 0;
+            self.removeTailPrefix(self.tail.items.len);
         }
 
         /// Evict records whose segment retention just removed from the log.
         fn dropTailBefore(self: *Self, first_seq: u64) void {
             var drop: usize = 0;
-            while (drop < self.tail.items.len and self.tail.items[drop].seq < first_seq) : (drop += 1) {
-                self.tail_bytes -= self.tail.items[drop].bytes.len;
-                self.tail_arenas.items[drop].deinit();
-            }
-            if (drop == 0) return;
+            while (drop < self.tail.items.len and self.tail.items[drop].record.seq < first_seq) : (drop += 1) {}
+            self.removeTailPrefix(drop);
+        }
 
+        /// Release each record with its arena, account for its bytes, then
+        /// move the surviving owners together. All eviction paths use this.
+        fn removeTailPrefix(self: *Self, drop: usize) void {
+            if (drop == 0) return;
+            for (self.tail.items[0..drop]) |*owned| {
+                self.tail_bytes -= owned.record.bytes.len;
+                owned.arena.deinit();
+            }
             const kept = self.tail.items.len - drop;
-            std.mem.copyForwards(Record, self.tail.items[0..kept], self.tail.items[drop..]);
-            std.mem.copyForwards(
-                std.heap.ArenaAllocator,
-                self.tail_arenas.items[0..kept],
-                self.tail_arenas.items[drop..],
-            );
+            std.mem.copyForwards(OwnedRecord, self.tail.items[0..kept], self.tail.items[drop..]);
             self.tail.shrinkRetainingCapacity(kept);
-            self.tail_arenas.shrinkRetainingCapacity(kept);
         }
 
         /// Everything in a line except the event: what a reader needs to decide
