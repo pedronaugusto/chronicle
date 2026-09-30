@@ -39,7 +39,9 @@ pub fn build(b: *std.Build) void {
     // binary `zig build test --fuzz` builds goes through Zig 0.16.0's test
     // runner without them. The suite reports the same failures either way;
     // what is lost is the chain of returns behind an unexpected error.
+    const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const tests = b.addTest(.{
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
         .name = "chronicle-tests",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/chronicle.zig"),
@@ -111,7 +113,7 @@ pub fn build(b: *std.Build) void {
         run.setCwd(b.path("zig-out"));
         examples_step.dependOn(&run.step);
     }
-    test_step.dependOn(examples_step);
+    if (test_filter == null) test_step.dependOn(examples_step);
 }
 
 /// Every example, listed rather than globbed: a build graph that scans a

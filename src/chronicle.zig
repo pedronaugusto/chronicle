@@ -233,8 +233,8 @@ pub fn Journal(comptime Event: type) type {
         /// One entry of the log, as held in memory.
         ///
         /// Every slice in a record — `bytes`, and anything `event` points at —
-        /// belongs either to the journal's tail or to the `Replay` that
-        /// produced it. See `Window` and `Replay.next` for how long each lasts.
+        /// belongs to the `Batch` or `Replay` that produced it, or lasts for
+        /// the call to a `Sink`. See `Batch.deinit` and `Replay.next`.
         pub const Record = struct {
             /// Position in the log. The first record of a journal that has
             /// never been compacted is 1, and it rises by one per record. It is
@@ -257,19 +257,30 @@ pub fn Journal(comptime Event: type) type {
             bytes: []const u8,
         };
 
-        /// The records after a cursor that memory still holds.
-        ///
-        /// `records` is valid until the tail evicts them, which the next
-        /// `append` may do: treat it as a borrow that ends at the next call
-        /// into the journal by anyone. Copy what you need, or take the records
-        /// through a `Sink`, which is called before anything is evicted.
-        pub const Window = struct {
+        /// An owned copy of the records after a cursor that memory still holds.
+        /// Every record, its bytes and everything its event points at belongs
+        /// to this batch, independent of the journal and its lifetime.
+        /// Release it with `deinit`; do not release copies of the same batch.
+        pub const Batch = struct {
             /// The records, oldest first. Empty when the cursor is caught up.
             records: []const Record,
-            /// Whether `records` begins at the record straight after the
-            /// cursor. False means the tail no longer reaches back that far and
-            /// the records in between are on the disk only: `replay` reads
-            /// them, and `subscribeFrom` folds them for you.
+            /// Whether no records between the cursor and the newest sequence
+            /// known at the time of the copy are missing. False means the
+            /// tail no longer reaches back that far: use `replay` or
+            /// `subscribeFrom` to read the disk.
+            complete: bool,
+            arena: std.heap.ArenaAllocator,
+
+            /// Release every record and all its referenced data together.
+            pub fn deinit(batch: *Batch) void {
+                batch.arena.deinit();
+                batch.* = undefined;
+            }
+        };
+
+        /// A borrow used only while holding the journal's lock.
+        const TailWindow = struct {
+            records: []const Record,
             complete: bool,
         };
 
@@ -335,9 +346,9 @@ pub fn Journal(comptime Event: type) type {
             /// default is the durable one; README.md states what each level
             /// promises and what it gives up.
             sync: Sync = .always,
-            /// How many of the newest records to keep in memory for `records`,
-            /// `since` and `waitPast`. Older ones come from the disk. Zero is
-            /// allowed: then `replay` and `subscribe` are the ways to read.
+            /// How many of the newest records to keep in memory for
+            /// `copySince` and subscriptions. Older ones come from the disk.
+            /// Zero is allowed: then `replay` and `subscribe` are the ways to read.
             tail_records: usize = 1024,
             /// A second ceiling on the tail, over the records' bytes, for a
             /// journal whose records are large. Whichever bites first wins.
@@ -490,6 +501,10 @@ pub fn Journal(comptime Event: type) type {
 
         /// Errors from `replay`, and from the `Replay` it returns.
         pub const ReplayError = ReadError;
+
+        /// Copying the tail may be canceled at the lock, run out of memory,
+        /// or find a current event that no longer round-trips through JSON.
+        pub const CopyError = Allocator.Error || Io.Cancelable || error{NotRoundTrippable};
 
         /// `replayAt`'s errors: `replay`'s, and a position that no longer
         /// names the record it was taken after.
@@ -661,7 +676,8 @@ pub fn Journal(comptime Event: type) type {
 
         /// Flush and durably close the active segment, then release the lock
         /// and every allocation. The journal is consumed even when an error
-        /// is returned, and every slice it handed out is invalid afterwards.
+        /// is returned. Call only after every caller and replay has stopped;
+        /// owned batches and snapshot state remain valid.
         pub fn close(self: *Self, io: Io) CloseError!void {
             // A close that has begun flushes and seals to its end, whatever
             // a cancel asks of the task meanwhile.
@@ -673,7 +689,8 @@ pub fn Journal(comptime Event: type) type {
 
         /// Best-effort fallback for scopes that cannot return a close error.
         /// Prefer `close` when `.on_segment` relies on shutdown for its final
-        /// durable write. Every slice the journal handed out is invalid.
+        /// durable write. Call only after every caller and replay has stopped;
+        /// owned batches and snapshot state remain valid.
         pub fn deinit(self: *Self, io: Io) void {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
@@ -964,27 +981,46 @@ pub fn Journal(comptime Event: type) type {
         // Reading.
         //====================================================================
 
-        /// The records the tail holds, oldest first — `since(0)`, named.
+        /// Copy the records after `cursor` that are in the tail, under the
+        /// journal's lock. Pass zero to copy the whole tail.
         ///
-        /// A journal that has been running for a year holds a bounded tail and
-        /// not its history, so this is a window and says so: read
-        /// `Window.complete` before treating it as everything.
+        /// A cursor at or beyond the newest sequence yields an empty, complete
+        /// batch. A cursor older than the tail yields the whole tail with
+        /// `Batch.complete` false: use `replay` or `subscribeFrom` for the gap.
+        /// Waiting and reading are separate: `waitPast` returns a sequence,
+        /// then this call copies what is still held when it takes the lock.
         ///
-        /// Call it from the task that appends, or under coordination of your
-        /// own; `waitPast` is the equivalent that takes the journal's lock.
-        pub fn records(self: *const Self) Window {
-            return self.since(0);
+        /// The batch owns everything it returns through `gpa`; release it
+        /// with `Batch.deinit`. The current events are copied by their JSON
+        /// round-trip, without invoking the migration hook again. The exact
+        /// stored bytes and original schema versions are preserved separately.
+        /// Safe to call from any task or thread, except from inside a sink.
+        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: u64) CopyError!Batch {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            const window = self.tailSince(cursor);
+            var arena: std.heap.ArenaAllocator = .init(gpa);
+            errdefer arena.deinit();
+            const a = arena.allocator();
+            const copied = try a.alloc(Record, window.records.len);
+            for (window.records, copied) |record, *copy| {
+                copy.* = record;
+                copy.bytes = try a.dupe(u8, record.bytes);
+                // Decode the current event, not the stored version: a migrated
+                // record already has its event, and a hook is not a copier.
+                var out: Io.Writer.Allocating = .init(a);
+                strand.writeValue(&out.writer, record.event, .{ .emit_null_optional_fields = true }) catch return error.OutOfMemory;
+                copy.event = strand.parseLine(Event, a, out.written(), .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    else => return error.NotRoundTrippable,
+                };
+            }
+            return .{ .records = copied, .complete = window.complete, .arena = arena };
         }
 
-        /// The records after `cursor` that are in the tail.
-        ///
-        /// A cursor is where a reader got to, so a cursor at the newest
-        /// sequence number yields nothing. A cursor older than the tail yields
-        /// the whole tail with `Window.complete` false: the records in between
-        /// are on the disk, and `replay` or `subscribeFrom` is how to get them.
-        ///
-        /// Same validity and same threading rule as `records`.
-        pub fn since(self: *const Self, cursor: u64) Window {
+        /// The tail after a cursor. The caller holds the journal's lock for
+        /// the whole lifetime of this borrow.
+        fn tailSince(self: *const Self, cursor: u64) TailWindow {
             const items = self.tail.items;
             if (items.len == 0) return .{ .records = items, .complete = cursor >= self.seq };
             const tail_base = items[0].seq - 1;
@@ -994,15 +1030,14 @@ pub fn Journal(comptime Event: type) type {
         }
 
         /// Block until there is a record after `cursor`, or until `nudge`, then
-        /// return `since(cursor)`.
+        /// return the newest sequence number known to the journal.
         ///
-        /// The window is taken under the lock, so it does not grow under the
-        /// reader — but a later `append` can still evict it, so handle it
-        /// before waiting again. A reader that waits again passes the sequence
-        /// number of the last record it handled.
-        ///
+        /// A nudge may return a number at or below the cursor. No records are
+        /// returned: use `copySince`, `replay` or a subscription to read them.
+        /// The tail may move between waiting and reading; `Batch.complete`
+        /// tells a reader whether it needs the disk to cover the gap.
         /// Safe to call from any task or thread, including several at once.
-        pub fn waitPast(self: *Self, io: Io, cursor: u64) Io.Cancelable!Window {
+        pub fn waitPast(self: *Self, io: Io, cursor: u64) Io.Cancelable!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             const nudged = self.nudges;
@@ -1019,7 +1054,7 @@ pub fn Journal(comptime Event: type) type {
                 self.waiters -= 1;
                 try waited;
             }
-            return self.since(cursor);
+            return self.seq;
         }
 
         /// Every `waitPast` woken to look again. Called under the lock.
@@ -1454,7 +1489,7 @@ pub fn Journal(comptime Event: type) type {
             const registered = self.sinks.items[before..];
 
             var delivered = cursor;
-            if (!self.since(cursor).complete) {
+            if (!self.tailSince(cursor).complete) {
                 var walk = try self.replayFrom(io, cursor, true);
                 defer walk.deinit(io);
                 while (try walk.next(io)) |record| {
@@ -1462,7 +1497,7 @@ pub fn Journal(comptime Event: type) type {
                     delivered = record.seq;
                 }
             }
-            for (self.since(delivered).records) |record| {
+            for (self.tailSince(delivered).records) |record| {
                 for (registered) |sink| sink.f(sink.ctx, record);
             }
         }
@@ -1811,7 +1846,7 @@ pub fn Journal(comptime Event: type) type {
         /// goes when you say so and not before.
         ///
         /// The records that survive keep their sequence numbers. A cursor from
-        /// before the cut yields what is left, and `Window.complete` is how a
+        /// before the cut yields what is left, and `Batch.complete` is how a
         /// reader notices.
         ///
         /// Safe to call from any task or thread.
@@ -1849,8 +1884,7 @@ pub fn Journal(comptime Event: type) type {
         /// `seq` may be one below the oldest record, which empties the log and
         /// leaves the sequence at `seq`. Below that it is `error.SeqTooOld`.
         ///
-        /// Every slice the journal handed out before this call is invalid
-        /// afterwards; subscribed sinks are not called again.
+        /// Owned batches remain valid; subscribed sinks are not called again.
         ///
         /// Safe to call from any task or thread.
         pub fn truncateAfter(self: *Self, io: Io, seq: u64) TruncateError!void {
@@ -1884,8 +1918,7 @@ pub fn Journal(comptime Event: type) type {
         /// journal of five records asked to keep nothing leaves an empty log
         /// whose next `append` is six.
         ///
-        /// Every slice the journal handed out before this call is invalid
-        /// afterwards; subscribed sinks are not called again.
+        /// Owned batches remain valid; subscribed sinks are not called again.
         ///
         /// Safe to call from any task or thread.
         pub fn compact(self: *Self, io: Io, keep_after_seq: u64) CompactError!void {

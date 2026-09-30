@@ -119,9 +119,8 @@ which writes and reads a record's line; this package keeps the lines.
 | `appendAll(io, entries)` | Write a batch under one `fsync`; returns the last sequence number. |
 | `appendDeferred(io, at, event)` | Write and publish one record now, durable with the next flush. |
 | `reconcile(io)` | After a persistence error, read back what survived and clear the latch. |
-| `records()` | The tail, oldest first, as a `Window`. |
-| `since(cursor)` | The tail after `cursor`, as a `Window`. |
-| `waitPast(io, cursor)` | Block until there is one, then `since(cursor)`. |
+| `copySince(gpa, io, cursor)` | An owned `Batch` of the tail after `cursor`; zero copies the whole tail. Release it with `deinit()`. |
+| `waitPast(io, cursor)` | Block until there is a record after the cursor or a nudge; return the newest sequence number. |
 | `replay(io, cursor)` | A walk over every record after `cursor`, from the disk. |
 | `replayAt(io, position)` | The same, from where an earlier walk's `position()` stopped. |
 | `Replay.rearmAt(io, position)` | Start another pass on the same walk, retaining its scan buffer and scratch allocations. |
@@ -151,7 +150,7 @@ Plus `chronicle.checksum(covered)`, which is the checksum a record carries,
 and `chronicle.segmentName(base_seq)`, which is the file a sequence number
 lives in; `chronicle.Position`, where a walk stopped; `chronicle.Raw`, an
 event kept as its bytes; `chronicle.flush`, which names the call a durable write makes here;
-and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Window`,
+and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Batch`,
 `Replay`, `Tailer`, `Sink`, `Reader`, `Readers`, `Options`, `Snapshot`,
 `Opened`, `Migrate`, `Stats` and one named error set per operation, with
 `Sync`, `Flush` and `Verify` at the module root. Every
@@ -288,7 +287,7 @@ so losing one costs a scan.
 
 **Record-sized working memory is bounded.** The tail is
 `Options.tail_records` records and `Options.tail_bytes` bytes of them,
-whichever bites first, kept parsed for `records`, `since` and `waitPast`; the
+whichever bites first, kept parsed for `copySince` and subscriptions; the
 oldest half goes when either ceiling is reached, so a tail costs a constant
 amount per append. A `Replay`, and so a `subscribe`, holds the record it is on
 and one read buffer, `Options.read_buffer_size`; a line longer than
@@ -297,12 +296,24 @@ newest segment's newlines, and the records in it land in the tail under its
 ceilings. The journal also keeps fixed-size metadata for every segment, and a
 replay snapshots two numbers per segment it will visit, so that memory grows
 with the segment count even though it does not grow with the records inside a
-segment. Every allocation comes from the allocator passed to `open`.
+segment. Journal and replay allocations come from the allocator passed to
+`open`; batches come from the allocator passed to `copySince`. Their memory
+is held until the caller releases them.
 
-A `Record` from a `Window` lasts until the tail releases it, which the next
-`append` may do; one from a `Replay` until the next `next`; one handed to a
-`Sink` for the call. Copy what you need — `record.bytes` is the durable form,
-ready to forward with no re-encoding.
+A `Record` from a `Batch`, including its bytes and every reference in its
+event, belongs to the batch until `batch.deinit()`, even after the journal
+closes. The batch preserves the stored bytes and schema version and copies
+the current event without running a migration hook again. A record from a
+`Replay` lasts until its next `next`, `rearmAt` or `deinit`; one handed to a
+`Sink` lasts for the call. `record.bytes` is the durable form, ready to
+forward with no re-encoding.
+
+`waitPast` only waits. After it returns, `copySince(gpa, io, cursor)` takes an
+owned copy under the lock. A writer may have moved the tail between the two
+calls: check `batch.complete`, and use `replay` or `subscribeFrom` for records
+that memory no longer holds. Advance the cursor to the last record handled,
+not to the number returned by the wait. An empty batch is complete only when
+its cursor has caught up; a nudge can wake a reader with no new record.
 
 **The writer holds an exclusive advisory lock on `<path>/lock` for as long as
 it is open.**
@@ -334,11 +345,12 @@ version 2.
 `migrate` or the `unknown` arm keeps the version and payload it was written
 with.
 
-**One mutex inside.** `append`, `appendAll`, `waitPast`, `nudge`, `subscribe`,
+**One mutex inside.** `append`, `appendDeferred`, `appendAll`, `copySince`,
+`waitPast`, `nudge`, `subscribe`,
 `subscribeFrom`, `subscribeAll`, `subscribeAllFrom`, `unsubscribe`, `lastSeq`,
 `seqAtOrAfter`, `tailer`, `readers`, `minCursor`, `snapshot`, `backup`,
-`compact`, `dropSegmentsBefore`, `truncateAfter` and `refresh` take it and are
-safe from any task or thread, several at once; the subscribe calls hold it for
+`compact`, `dropSegmentsBefore`, `truncateAfter`, `reconcile`, `stats` and
+`refresh` take it and are safe from any task or thread, several at once; the subscribe calls hold it for
 the whole of their replay, so the hand-over from the disk to the live records
 has no seam in it. A cancel reaches those calls at the lock: waiting for it,
 a call returns `error.Canceled` with nothing done. Once a call that changes
@@ -346,13 +358,22 @@ the files holds it — an append, a batch, a snapshot, a compaction, a
 truncation, a drop, a reconcile, a refresh — it runs to its end with the
 task's cancelation blocked, and the cancel is reported by the task's next
 cancelation point: a record a cancel landed on is written whole, never
-latched as a write that failed. So is a close. A `Replay` takes no lock and writes nothing, so a segment
-whose index is missing is walked from its first record rather than indexed on
-the way; the calls above are what build an index. `records()`, `since()`,
-`segmentCount()`, `oldestSeq()` and a `Replay` do not take it: call them from
-the task that appends, or under coordination of your own. `replayAt` takes it
-to choose the segments the walk will cross; the walk it returns does not. Every file operation
-and the wait primitive go through `std.Io`, so the package runs under
+latched as a write that failed. So is a close. `copySince` returns no borrow
+from the journal: its batch can be read beside writers and released on its
+own, with an allocator suitable for the threads that use it. Sink callbacks
+run under the lock; they must neither call back into the journal nor retain
+a record or its referenced data after the call.
+
+`segmentCount()`, `oldestSeq()`, `replay()` and `verify()` require coordination
+with changes to the journal. `replayAt` and `Replay.rearmAt` take the lock to
+choose the segments the walk will cross; the walk itself reads without it
+and writes nothing. A missing index is walked from the first record. Each
+`Replay` belongs to one reader at a time, and its records borrow only that
+walk's memory. Retention beside a walk may remove files it needs, which is
+reported as an error. `close` and `deinit` require every caller and walk to
+have stopped. The mutable public fields require the caller's coordination;
+use `lastSeq` and `stats` for locked observations. Every file operation and
+the wait primitive go through `std.Io`, so the package runs under
 `std.testing.io`, a threaded `Io`, or whatever comes next.
 
 **A segment file begins with one line saying what it is, and then holds one

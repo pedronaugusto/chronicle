@@ -78,7 +78,9 @@ pub fn main() !void {
     _ = try ledger.append(io, 0, .{ .deposited = .{ .id = 1, .cents = 700 } });
 
     var cents: i64 = 0;
-    for (ledger.records().records) |record| {
+    var batch = try ledger.copySince(gpa, io, 0);
+    defer batch.deinit();
+    for (batch.records) |record| {
         switch (record.event) {
             .account_opened => |opened| {
                 std.debug.print("v{d}: {s}, family {s}\n", .{ record.version, opened.given, opened.family });

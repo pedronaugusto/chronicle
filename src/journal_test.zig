@@ -371,19 +371,28 @@ test "an append returns the sequence number and puts one line in the first segme
     try testing.expectEqualStrings(expected.written(), on_disk);
 
     // The record in memory is the line on the disk, parsed.
-    const all = journal.records();
+    var all = try journal.copySince(testing.allocator, io, 0);
+    defer all.deinit();
     try testing.expect(all.complete);
     try testing.expectEqual(@as(usize, 2), all.records.len);
     try testing.expectEqualStrings("two", all.records[1].event.created.name);
     try testing.expectEqual(@as(i64, 2_000), all.records[1].at);
 
-    // A cursor is where a reader got to, so `since` is the rest of the log --
+    // A cursor is where a reader got to, so `copySince` is the rest of the tail --
     // and a cursor past the end is a reader ahead of this process, not an
     // error.
-    try testing.expectEqual(@as(usize, 1), journal.since(1).records.len);
-    try testing.expectEqual(@as(usize, 0), journal.since(2).records.len);
-    try testing.expectEqual(@as(usize, 0), journal.since(99).records.len);
-    try testing.expect(journal.since(99).complete);
+    var copied_tail_2 = try journal.copySince(testing.allocator, io, 1);
+    defer copied_tail_2.deinit();
+    try testing.expectEqual(@as(usize, 1), copied_tail_2.records.len);
+    var copied_tail_3 = try journal.copySince(testing.allocator, io, 2);
+    defer copied_tail_3.deinit();
+    try testing.expectEqual(@as(usize, 0), copied_tail_3.records.len);
+    var copied_tail_4 = try journal.copySince(testing.allocator, io, 99);
+    defer copied_tail_4.deinit();
+    try testing.expectEqual(@as(usize, 0), copied_tail_4.records.len);
+    var copied_tail_5 = try journal.copySince(testing.allocator, io, 99);
+    defer copied_tail_5.deinit();
+    try testing.expect(copied_tail_5.complete);
 
     // The directory is meant to be read by a person: one lock, one segment,
     // one index.
@@ -407,8 +416,12 @@ test "a reopened journal continues the sequence and appends after the last line"
     var second = try Journal.open(testing.allocator, io, ws.path, .{});
     defer second.deinit(io);
     try testing.expectEqual(@as(u64, 2), try second.lastSeq(io));
-    try testing.expectEqual(@as(usize, 2), second.records().records.len);
-    try testing.expectEqualStrings("before", second.records().records[0].event.created.name);
+    var copied_tail_6 = try second.copySince(testing.allocator, io, 0);
+    defer copied_tail_6.deinit();
+    try testing.expectEqual(@as(usize, 2), copied_tail_6.records.len);
+    var copied_tail_7 = try second.copySince(testing.allocator, io, 0);
+    defer copied_tail_7.deinit();
+    try testing.expectEqualStrings("before", copied_tail_7.records[0].event.created.name);
 
     // Two records sharing a number would make a cursor ambiguous, so the seq
     // continues rather than starting again -- and the line lands after the
@@ -597,7 +610,9 @@ test "a final line the writer did not finish is dropped and the segment repaired
         defer journal.deinit(io);
 
         try testing.expectEqual(@as(usize, partial.len), journal.dropped_bytes);
-        try testing.expectEqual(@as(usize, 1), journal.records().records.len);
+        var copied_tail_8 = try journal.copySince(testing.allocator, io, 0);
+        defer copied_tail_8.deinit();
+        try testing.expectEqual(@as(usize, 1), copied_tail_8.records.len);
         try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
 
         // Repaired means the next append is well formed, not merely that this
@@ -610,7 +625,9 @@ test "a final line the writer did not finish is dropped and the segment repaired
 
     var reopened = try Journal.open(testing.allocator, io, ws.path, .{});
     defer reopened.deinit(io);
-    try testing.expectEqual(@as(usize, 2), reopened.records().records.len);
+    var copied_tail_9 = try reopened.copySince(testing.allocator, io, 0);
+    defer copied_tail_9.deinit();
+    try testing.expectEqual(@as(usize, 2), copied_tail_9.records.len);
     try testing.expectEqual(@as(usize, 0), reopened.dropped_bytes);
 }
 
@@ -742,7 +759,9 @@ test "a write that does not reach the disk publishes nothing and latches" {
     try testing.expectError(error.WriteFailed, journal.append(io, 2, created(2, "lost")));
     try testing.expect(journal.persistence_failed);
     try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
-    try testing.expectEqual(@as(usize, 1), journal.records().records.len);
+    var copied_tail_10 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_10.deinit();
+    try testing.expectEqual(@as(usize, 1), copied_tail_10.records.len);
     try testing.expectError(error.PersistenceFailed, journal.append(io, 3, created(3, "also refused")));
     try testing.expectError(error.PersistenceFailed, journal.compact(io, 0));
 
@@ -1058,7 +1077,9 @@ test "a record from an older schema goes through migrate" {
     });
     defer journal.deinit(io);
 
-    const record = journal.records().records[0];
+    var copied_tail_11 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_11.deinit();
+    const record = copied_tail_11.records[0];
     try testing.expectEqual(@as(u32, 1), record.version);
     try testing.expectEqual(@as(u32, 7), record.event.created.id);
     try testing.expectEqualStrings("old (v1)", record.event.created.name);
@@ -1067,7 +1088,9 @@ test "a record from an older schema goes through migrate" {
     // after the bytes it was read from would have gone, and nothing leaks
     // under the testing allocator when the record goes.
     _ = try journal.append(io, 2, created(8, "new"));
-    try testing.expectEqualStrings("old (v1)", journal.records().records[0].event.created.name);
+    var copied_tail_12 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_12.deinit();
+    try testing.expectEqualStrings("old (v1)", copied_tail_12.records[0].event.created.name);
 }
 
 test "without a migrate hook an older record lands in the unknown arm" {
@@ -1081,7 +1104,9 @@ test "without a migrate hook an older record lands in the unknown arm" {
     var journal = try Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2 });
     defer journal.deinit(io);
 
-    const record = journal.records().records[0];
+    var copied_tail_13 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_13.deinit();
+    const record = copied_tail_13.records[0];
     try testing.expectEqual(@as(u32, 1), record.version);
     try testing.expect(record.event == .unknown);
     try testing.expect(record.event.unknown.object.get("retired") != null);
@@ -1100,7 +1125,9 @@ test "an older record kept as its bytes is a slice of its line, and checked" {
         }});
         var journal = try chronicle.Journal(Keeping).open(testing.allocator, io, ws.path, .{ .schema_version = 2 });
         defer journal.deinit(io);
-        const record = journal.records().records[0];
+        var walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        const record = (try walk.next(io)).?;
         try testing.expectEqualStrings("{\"retired\": {\"id\":7}}", record.event.unknown.bytes);
         const at = @intFromPtr(record.event.unknown.bytes.ptr);
         try testing.expect(at > @intFromPtr(record.bytes.ptr) and at < @intFromPtr(record.bytes.ptr) + record.bytes.len);
@@ -1124,7 +1151,9 @@ test "an older record kept as its bytes is a slice of its line, and checked" {
         }.f;
         var journal = try chronicle.Journal(Keeping).open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = migrate });
         defer journal.deinit(io);
-        const record = journal.records().records[0];
+        var walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        const record = (try walk.next(io)).?;
         try testing.expectEqualStrings("old", record.event.created.name);
         const at = @intFromPtr(record.event.created.name.ptr);
         try testing.expect(at > @intFromPtr(record.bytes.ptr) and at < @intFromPtr(record.bytes.ptr) + record.bytes.len);
@@ -1355,8 +1384,10 @@ test "waitPast blocks until an append arrives" {
     try group.concurrent(io, appender, .{ &journal, io });
 
     const arrived = try journal.waitPast(io, 0);
-    try testing.expect(arrived.records.len >= 1);
-    try testing.expectEqualStrings("awaited", arrived.records[0].event.created.name);
+    try testing.expectEqual(@as(u64, 1), arrived);
+    var batch = try journal.copySince(testing.allocator, io, 0);
+    defer batch.deinit();
+    try testing.expectEqualStrings("awaited", batch.records[0].event.created.name);
     try group.await(io);
 }
 
@@ -1374,8 +1405,8 @@ test "an append nobody waits on wakes nobody, and one somebody waits on wakes th
     try testing.expectEqual(@as(u64, 0), journal.futex_wakes);
 
     const reader = struct {
-        fn f(j: *Journal, inner: Io, cursor: u64) Io.Cancelable!usize {
-            return (try j.waitPast(inner, cursor)).records.len;
+        fn f(j: *Journal, inner: Io, cursor: u64) Io.Cancelable!u64 {
+            return try j.waitPast(inner, cursor);
         }
     }.f;
     var future = try io.concurrent(reader, .{ &journal, io, @as(u64, 3) });
@@ -1391,7 +1422,7 @@ test "an append nobody waits on wakes nobody, and one somebody waits on wakes th
         try io.sleep(.fromMilliseconds(1), .awake);
     }
     _ = try journal.append(io, 4, created(4, "awaited"));
-    try testing.expectEqual(@as(usize, 1), try future.await(io));
+    try testing.expectEqual(@as(u64, 4), try future.await(io));
     try testing.expectEqual(@as(u64, 1), journal.futex_wakes);
 }
 
@@ -1422,7 +1453,7 @@ test "waitPast is woken by a nudge with no record behind it" {
 
     const nothing = try journal.waitPast(io, 0);
     woken.store(true, .release);
-    try testing.expectEqual(@as(usize, 0), nothing.records.len);
+    try testing.expectEqual(@as(u64, 0), nothing);
     try group.await(io);
 }
 
@@ -1436,7 +1467,7 @@ test "a reader stopped as a record arrives is stopped" {
 
     // A reader waiting past the newest record, canceled while a nudge lands
     // on it: the two race, and whichever wins the reader must return
-    // `error.Canceled` or a window, never wait on. `Io.Condition` in Zig
+    // `error.Canceled` or a sequence number, never wait on. `Io.Condition` in Zig
     // 0.16.0 let the broadcast swallow the cancel and hung here within a
     // few hundred rounds; a watchdog turns a hang into a failure.
     const reader = struct {
@@ -1573,7 +1604,8 @@ test "the log rotates into segments named after their first record" {
     var reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 10), try reopened.lastSeq(io));
-    const all = reopened.records();
+    var all = try reopened.copySince(testing.allocator, io, 0);
+    defer all.deinit();
     try testing.expect(all.complete);
     try testing.expectEqual(@as(usize, 10), all.records.len);
     try testing.expectEqual(@as(u64, 1), all.records[0].seq);
@@ -1631,9 +1663,11 @@ test "the tail is bounded and a cursor older than it is an incomplete window" {
 
     // At most four records in memory for forty on the disk.
     try testing.expect(journal.tail.items.len <= 4);
-    const stale = journal.since(1);
+    var stale = try journal.copySince(testing.allocator, io, 1);
+    defer stale.deinit();
     try testing.expect(!stale.complete);
-    const fresh = journal.since(39);
+    var fresh = try journal.copySince(testing.allocator, io, 39);
+    defer fresh.deinit();
     try testing.expect(fresh.complete);
     try testing.expectEqual(@as(usize, 1), fresh.records.len);
     try testing.expectEqual(@as(u64, 40), fresh.records[0].seq);
@@ -1671,7 +1705,8 @@ test "a reopened journal fills its tail from the newest records only" {
     try testing.expectEqual(@as(u64, 40), try reopened.lastSeq(io));
     try testing.expect(reopened.tail.items.len <= 4);
     try testing.expect(reopened.tail.items.len >= 1);
-    const window = reopened.records();
+    var window = try reopened.copySince(testing.allocator, io, 0);
+    defer window.deinit();
     try testing.expect(!window.complete);
     try testing.expectEqual(@as(u64, 40), window.records[window.records.len - 1].seq);
     try testing.expectEqual(@as(u64, 41), try reopened.append(io, 41, created(41, "n")));
@@ -1776,7 +1811,9 @@ test "a journal with no tail still appends, and a sink still gets every record" 
     defer journal.deinit(io);
 
     for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
-    try testing.expectEqual(@as(usize, 0), journal.records().records.len);
+    var copied_tail_20 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_20.deinit();
+    try testing.expectEqual(@as(usize, 0), copied_tail_20.records.len);
 
     // Subscribing makes the records needed again, from the disk and then
     // live, and an event whose slices point at a stack buffer is still safe
@@ -2599,7 +2636,9 @@ test "compact empties the log and the sequence still continues" {
         // A segment's name is the record that will go into it, so a log with
         // nothing in it still knows where it got to.
         try journal.compact(io, 999);
-        try testing.expectEqual(@as(usize, 0), journal.records().records.len);
+        var copied_tail_21 = try journal.copySince(testing.allocator, io, 0);
+        defer copied_tail_21.deinit();
+        try testing.expectEqual(@as(usize, 0), copied_tail_21.records.len);
         try testing.expectEqual(@as(usize, 1), journal.segmentCount());
         try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
         const empty = try journal.stats(io);
@@ -2624,12 +2663,15 @@ test "compact keeps the records after the cut, byte for byte" {
         var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
-        const kept = try ws.arena.allocator().dupe(u8, journal.records().records[6].bytes);
+        var copied_tail_22 = try journal.copySince(testing.allocator, io, 0);
+        defer copied_tail_22.deinit();
+        const kept = try ws.arena.allocator().dupe(u8, copied_tail_22.records[6].bytes);
 
         try journal.compact(io, 6);
         try testing.expectEqual(@as(u64, 7), journal.oldestSeq());
         try testing.expectEqual(@as(u64, 10), try journal.lastSeq(io));
-        const window = journal.records();
+        var window = try journal.copySince(testing.allocator, io, 0);
+        defer window.deinit();
         try testing.expectEqual(@as(usize, 4), window.records.len);
         try testing.expectEqualStrings(kept, window.records[0].bytes);
         try testing.expect(!ws.exists(try ws.segment(1)));
@@ -2637,13 +2679,19 @@ test "compact keeps the records after the cut, byte for byte" {
 
         // A cursor from before the cut gets what is left and says it is
         // partial.
-        try testing.expect(!journal.since(1).complete);
-        try testing.expect(journal.since(7).complete);
+        var copied_tail_24 = try journal.copySince(testing.allocator, io, 1);
+        defer copied_tail_24.deinit();
+        try testing.expect(!copied_tail_24.complete);
+        var copied_tail_25 = try journal.copySince(testing.allocator, io, 7);
+        defer copied_tail_25.deinit();
+        try testing.expect(copied_tail_25.complete);
     }
 
     var reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer reopened.deinit(io);
-    try testing.expectEqual(@as(usize, 4), reopened.records().records.len);
+    var copied_tail_26 = try reopened.copySince(testing.allocator, io, 0);
+    defer copied_tail_26.deinit();
+    try testing.expectEqual(@as(usize, 4), copied_tail_26.records.len);
     try testing.expectEqual(@as(u64, 11), try reopened.append(io, 11, created(11, "n")));
 }
 
@@ -2663,7 +2711,9 @@ test "compact can cut inside the segment being written to" {
     try journal.compact(io, 4);
     try testing.expectEqual(@as(usize, 1), journal.segmentCount());
     try testing.expectEqual(@as(u64, 5), journal.oldestSeq());
-    try testing.expectEqual(@as(usize, 1), journal.records().records.len);
+    var copied_tail_27 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_27.deinit();
+    try testing.expectEqual(@as(usize, 1), copied_tail_27.records.len);
     try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "n")));
     try testing.expect(ws.exists(try ws.segment(5)));
     try testing.expect(!ws.exists(try ws.segment(1)));
@@ -2687,8 +2737,14 @@ test "the tail gives way by bytes as well as by count" {
 
     try testing.expect(journal.tail_bytes <= 512);
     try testing.expect(journal.tail.items.len < 40);
-    try testing.expect(!journal.since(0).complete);
-    try testing.expectEqual(@as(u64, 40), journal.records().records[journal.records().records.len - 1].seq);
+    var copied_tail_28 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_28.deinit();
+    try testing.expect(!copied_tail_28.complete);
+    var copied_tail_29 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_29.deinit();
+    var copied_tail_30 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_30.deinit();
+    try testing.expectEqual(@as(u64, 40), copied_tail_29.records[copied_tail_30.records.len - 1].seq);
 
     // Everything the tail let go of is still on the disk, in order.
     var walk = try journal.replay(io, 0);
@@ -2734,7 +2790,9 @@ test "truncateAfter drops the records past the cut and hands the numbers back" {
     // To nothing, which leaves the sequence exactly where it was told to.
     try journal.truncateAfter(io, 0);
     try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
-    try testing.expectEqual(@as(usize, 0), journal.records().records.len);
+    var copied_tail_31 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_31.deinit();
+    try testing.expectEqual(@as(usize, 0), copied_tail_31.records.len);
     try testing.expectEqual(@as(u64, 1), try journal.append(io, 1, created(1, "from the top")));
 
     // And below the oldest record the log still holds there is nothing to
@@ -2770,7 +2828,9 @@ test "a compaction interrupted after its rename leaves a segment the next open r
     try testing.expect(!ws.exists(try ws.segment(1)));
     try testing.expectEqual(@as(u64, 3), journal.oldestSeq());
     try testing.expectEqual(@as(u64, 8), try journal.lastSeq(io));
-    try testing.expectEqual(@as(usize, 6), journal.records().records.len);
+    var copied_tail_32 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_32.deinit();
+    try testing.expectEqual(@as(usize, 6), copied_tail_32.records.len);
 }
 
 test "a compaction interrupted after its rename takes the older segments with it" {
@@ -2888,7 +2948,8 @@ test "dropSegmentsBefore unlinks whole segments and never the newest one" {
         try testing.expectEqual(@as(u64, 5), journal.oldestSeq());
         try testing.expect(!ws.exists(try ws.segment(1)));
         try testing.expect(!ws.exists(try ws.index(1)));
-        const retained = journal.records();
+        var retained = try journal.copySince(testing.allocator, io, 0);
+        defer retained.deinit();
         try testing.expect(!retained.complete);
         try testing.expectEqual(@as(u64, 5), retained.records[0].seq);
 
@@ -3754,7 +3815,8 @@ test "a record is the bytes std.json writes for it, whatever its event's shape" 
         for (shapes, 0..) |shape, i| {
             const stamp: i64 = if (i == 0) std.math.minInt(i64) + @as(i64, @intCast(round)) else random.int(i64);
             _ = try journal.append(io, stamp, shape);
-            const window = journal.records();
+            var window = try journal.copySince(testing.allocator, io, 0);
+            defer window.deinit();
             try expectStdJsonRecord(Shape, window.records[window.records.len - 1], 1);
         }
     }
@@ -3775,7 +3837,8 @@ test "a record's envelope is the digits std.json would write, at their edges" {
         defer journal.deinit(io);
         for (edges_i64) |stamp| {
             _ = try journal.append(io, stamp, created(@intCast(version % 1000), "x"));
-            const window = journal.records();
+            var window = try journal.copySince(testing.allocator, io, 0);
+            defer window.deinit();
             try expectStdJsonRecord(Event, window.records[window.records.len - 1], version);
         }
     }
@@ -3897,7 +3960,8 @@ test "a journal of events gives them back as appended, through the tail and a re
             const pair: Pair = .{ .value = random.int(u64), .padding = padding };
             try appended.append(a, pair);
             _ = try journal.append(io, @intCast(i), pair);
-            const window = journal.records();
+            var window = try journal.copySince(testing.allocator, io, 0);
+            defer window.deinit();
             try testing.expectEqualDeep(pair, window.records[window.records.len - 1].event);
         }
     }
@@ -4716,12 +4780,18 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
     };
     var journal = opened.journal;
     defer journal.deinit(io);
-    try testing.expectEqual(@as(usize, 1), journal.records().records.len);
+    var copied_tail_37 = try journal.copySince(testing.allocator, io, 0);
+    defer copied_tail_37.deinit();
+    try testing.expectEqual(@as(usize, 1), copied_tail_37.records.len);
     if (opened.snapshot) |snapshot| {
         defer testing.allocator.free(snapshot.state);
         // Whatever sequence number the file claimed, a cursor is clamped to
         // what the journal holds rather than indexing past it.
-        try testing.expect(journal.since(snapshot.seq).records.len <= journal.records().records.len);
+        var copied_tail_38 = try journal.copySince(testing.allocator, io, snapshot.seq);
+        defer copied_tail_38.deinit();
+        var copied_tail_39 = try journal.copySince(testing.allocator, io, 0);
+        defer copied_tail_39.deinit();
+        try testing.expect(copied_tail_38.records.len <= copied_tail_39.records.len);
     }
 }
 
@@ -4932,4 +5002,126 @@ test "a batch under one flush is worth what it costs to form" {
     // budget: the gain is the flush, and a batch that stopped sharing one
     // would not make it.
     try testing.expect(batched * 2 <= singly);
+}
+
+test "waiting and reading keep no storage owned by the journal" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 1 });
+    defer journal.deinit(io);
+    _ = try journal.append(io, 1, created(1, "first"));
+    try testing.expectEqual(@as(u64, 1), try journal.waitPast(io, 0));
+    var batch = try journal.copySince(testing.allocator, io, 0);
+    defer batch.deinit();
+    const writer = struct {
+        fn f(j: *Journal, inner: Io) !void {
+            _ = try j.append(inner, 2, created(2, "second"));
+        }
+    }.f;
+    var future = try io.concurrent(writer, .{ &journal, io });
+    try future.await(io);
+    // A writer has trimmed the tail; the batch still has its own first record.
+    try testing.expectEqual(@as(u64, 1), batch.records[0].seq);
+    try testing.expectEqualStrings("first", batch.records[0].event.created.name);
+}
+
+test "waitPast reports the newest sequence even with no tail" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
+    defer journal.deinit(io);
+    _ = try journal.append(io, 1, created(1, "on disk"));
+    const arrived = try journal.waitPast(io, 0);
+    try testing.expectEqual(@as(u64, 1), arrived);
+}
+
+test "copySince owns nested events and bytes after the journal closes" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const E = struct {
+        label: [:0]const u8,
+        nested: []const *const struct { text: []const u8, numbers: []const ?u32 },
+        value: std.json.Value,
+        raw: chronicle.Raw,
+    };
+    const J = chronicle.Journal(E);
+    var batch: J.Batch = undefined;
+    {
+        var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "value" }});
+        defer testing.allocator.free(values);
+        _ = try journal.append(io, 12, .{
+            .label = "escaped\nlabel",
+            .nested = &.{&.{ .text = "inside", .numbers = &.{ 7, null, 9 } }},
+            .value = .{ .array = .fromOwnedSlice(testing.allocator, values) },
+            .raw = .{ .bytes = "{ \"raw\": [1, 2] }" },
+        });
+        // The input value is independent too; the append parsed its own copy.
+        batch = try journal.copySince(testing.allocator, io, 0);
+    }
+    defer batch.deinit();
+    try testing.expect(batch.complete);
+    const record = batch.records[0];
+    try testing.expectEqual(@as(u64, 1), record.seq);
+    try testing.expectEqual(@as(i64, 12), record.at);
+    try testing.expectEqualStrings("escaped\nlabel", record.event.label);
+    try testing.expectEqual(@as(u8, 0), record.event.label[record.event.label.len]);
+    try testing.expectEqualStrings("inside", record.event.nested[0].text);
+    try testing.expectEqualSlices(?u32, &.{ 7, null, 9 }, record.event.nested[0].numbers);
+    try testing.expectEqualStrings("value", record.event.value.array.items[0].string);
+    try testing.expectEqualStrings("{ \"raw\": [1, 2] }", record.event.raw.bytes);
+    try testing.expect(std.mem.indexOf(u8, record.bytes, "inside") != null);
+}
+
+test "copySince preserves migrated events without calling the hook again" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev =
+        \\{"created":{"id":7,"title":"old"}}
+    }});
+    const Migration = struct {
+        var calls: usize = 0;
+        fn f(arena: std.mem.Allocator, _: u32, _: chronicle.Raw) Journal.MigrateError!Event {
+            calls += 1;
+            return created(7, try std.fmt.allocPrint(arena, "migration {d}", .{calls}));
+        }
+    };
+    Migration.calls = 0;
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.f });
+    defer journal.deinit(io);
+    var batch = try journal.copySince(testing.allocator, io, 0);
+    defer batch.deinit();
+    try testing.expectEqual(@as(usize, 1), Migration.calls);
+    try testing.expectEqual(@as(u32, 1), batch.records[0].version);
+    try testing.expectEqualStrings("migration 1", batch.records[0].event.created.name);
+    try testing.expect(std.mem.indexOf(u8, batch.records[0].bytes, "title") != null);
+    try journal.compact(io, 1);
+    try testing.expectEqualStrings("migration 1", batch.records[0].event.created.name);
+}
+
+test "copySince releases partial copies on every allocation failure" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    var name: [2048]u8 = @splat('n');
+    name[1] = '\n';
+    _ = try journal.append(io, 1, created(1, &name));
+    _ = try journal.append(io, 2, created(2, &name));
+    const Copy = struct {
+        fn f(a: std.mem.Allocator, j: *Journal, inner: Io) !void {
+            var batch = try j.copySince(a, inner, 0);
+            defer batch.deinit();
+            try testing.expectEqual(@as(usize, 2), batch.records.len);
+            try testing.expectEqual(@as(u64, 2), batch.records[1].seq);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ &journal, io });
+    try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "after")));
 }
