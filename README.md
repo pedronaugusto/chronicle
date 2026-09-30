@@ -365,15 +365,17 @@ own, with an allocator suitable for the threads that use it. Sink callbacks
 run under the lock; they must neither call back into the journal nor retain
 a record or its referenced data after the call.
 
-`segmentCount()`, `oldestSeq()`, `replay()` and `verify()` require coordination
-with changes to the journal. `replayAt` and `Replay.rearmAt` take the lock to
-choose the segments the walk will cross; the walk itself reads without it
-and writes nothing. A missing index is walked from the first record. Each
+`segmentCount()` and `oldestSeq()` require coordination with changes to the
+journal. `replay`, `replayAt`, `verify`, `Tailer.replay` and `Replay.rearmAt`
+take the lock to choose the segments the walk will cross; the walk itself
+reads without it and writes nothing. A missing index is walked from the first record. Each
 `Replay` belongs to one reader at a time, and its records borrow only that
 walk's memory. Retention beside a walk may remove files it needs, which is
 reported as an error. `close` and `deinit` require every caller and walk to
 have stopped. The mutable public fields require the caller's coordination;
-use `lastSeq` and `stats` for locked observations. Every file operation and
+use `lastSeq` and `stats` for locked observations. The allocator passed to
+`open` must support concurrent use when walks or tailers allocate alongside
+journal calls. Every file operation and
 the wait primitive go through `std.Io`, so the package runs under
 `std.testing.io`, a threaded `Io`, or whatever comes next.
 

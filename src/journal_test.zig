@@ -5221,3 +5221,64 @@ test "a tail too small for one record still reopens and refreshes" {
         try reader.refresh(io);
     }
 }
+
+test "starting a replay waits for the writer and can be canceled there" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    journal.mutex.lockUncancelable(io);
+    defer journal.mutex.unlock(io);
+    var started: std.atomic.Value(bool) = .init(false);
+    const Reader = struct {
+        fn f(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
+            ready.store(true, .release);
+            // An empty journal needs no file operation to choose its scan:
+            // cancellation must reach the lock protecting that choice.
+            var walk = try j.replay(inner, 0);
+            defer walk.deinit(inner);
+        }
+    };
+    var future = try io.concurrent(Reader.f, .{ &journal, io, &started });
+    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    try testing.expectError(error.Canceled, future.cancel(io));
+}
+
+test "independent replays read committed records beside a rotating writer" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var options = small(4, 0);
+    options.index_interval_bytes = 0;
+    var journal = try Journal.open(testing.allocator, io, ws.path, options);
+    defer journal.deinit(io);
+    try fill(&journal, io, 1, 20, "committed");
+    const Worker = struct {
+        fn write(j: *Journal, inner: Io) !void {
+            try fill(j, inner, 21, 200, "committed");
+        }
+        fn read(j: *Journal, inner: Io) !void {
+            for (0..30) |_| {
+                var walk = try j.replay(inner, 5);
+                defer walk.deinit(inner);
+                var expected: u64 = 6;
+                while (try walk.next(inner)) |record| : (expected += 1) {
+                    try testing.expectEqual(expected, record.seq);
+                    try testing.expectEqual(@as(u32, @intCast(expected)), record.event.created.id);
+                    try testing.expectEqualStrings("committed", record.event.created.name);
+                }
+                try testing.expect(expected > 20);
+            }
+        }
+    };
+    var writer = try io.concurrent(Worker.write, .{ &journal, io });
+    defer writer.cancel(io) catch {};
+    var first = try io.concurrent(Worker.read, .{ &journal, io });
+    defer first.cancel(io) catch {};
+    var second = try io.concurrent(Worker.read, .{ &journal, io });
+    defer second.cancel(io) catch {};
+    try first.await(io);
+    try second.await(io);
+    try writer.await(io);
+}

@@ -1283,15 +1283,20 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// It writes nothing. A segment whose index is missing or stale is
         /// walked from its start rather than indexed on the way, because
-        /// building an index beside an `append` that is writing one is not
-        /// something a call that takes no lock may do. `open`, `refresh` and
-        /// `seqAtOrAfter` hold the lock and are what build indexes.
+        /// building an index is left to `open`, `refresh` and `seqAtOrAfter`.
+        /// Choosing the scan holds the lock: the segment inventory, cached
+        /// index handle and live index buffer belong to the journal. The
+        /// returned walk owns its scan metadata and reads without that lock.
+        /// Safe to call from any task or thread, except from inside a sink.
         pub fn replay(self: *Self, io: Io, cursor: u64) ReplayError!Replay {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
             return self.replayFrom(io, cursor, false);
         }
 
         /// `replay`, saying whether the walk may build an index it finds
-        /// missing. Only a caller holding the journal's lock may say yes.
+        /// missing. The caller holds the journal's lock while choosing the
+        /// scan, whether or not it may build an index.
         fn replayFrom(self: *Self, io: Io, cursor: u64, may_write: bool) ReplayError!Replay {
             return .{
                 .journal = self,
@@ -1350,9 +1355,16 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// This is what `Options.verify = .full` runs at `open`, and it is
         /// what a caller runs on a journal it has reason to doubt. It costs
-        /// the log rather than one segment.
+        /// the log rather than one segment. The scan is chosen under the
+        /// lock and read without it; retention beside it may remove a file
+        /// it needs, which is reported as an error.
+        /// Safe to call from any task or thread, except from inside a sink.
         pub fn verify(self: *Self, io: Io) ReplayError!u64 {
-            var walk = try self.replay(io, self.log.baseSeq());
+            var walk = chosen: {
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                break :chosen try self.replayFrom(io, self.log.baseSeq(), false);
+            };
             defer walk.deinit(io);
             var seen: u64 = 0;
             while (try walk.next(io)) |_| seen += 1;
@@ -1604,8 +1616,13 @@ pub fn Journal(comptime Event: type) type {
 
             /// A walk over every record after the committed cursor, read from
             /// the disk. `Journal.replay(io, tailer.cursor)`, named.
+            /// The cursor and scan are taken under the journal's lock, so
+            /// a concurrent `commit` cannot move the cursor during the choice.
             pub fn replay(tail: *Tailer, io: Io) ReplayError!Replay {
-                return tail.journal.replay(io, tail.cursor);
+                const self = tail.journal;
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                return self.replayFrom(io, tail.cursor, false);
             }
 
             /// Record `seq` as where this reader has got to, durably, and move
