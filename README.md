@@ -131,6 +131,7 @@ which writes and reads a record's line; this package keeps the lines.
 | `oldestSeq(io)` | The oldest one still held. |
 | `segmentCount(io)` | How many files the log is spread over. |
 | `refresh(io)` | Read the directory again — how a reader tails a writer. |
+| `Tailer.cursor(io)` | The committed cursor, copied under the journal lock. |
 | `tailer(io, name)` | A named reader, with the cursor it last committed. |
 | `subscribe(io, sink)` | Fold every record, from the disk and then live. |
 | `subscribeFrom(io, sink, cursor)` | The same, starting after a snapshot. |

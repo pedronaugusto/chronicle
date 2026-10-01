@@ -1879,7 +1879,7 @@ test "a tailer remembers where it got to, in a file of its own" {
     // A name that has never committed a cursor starts at the beginning.
     var reports = try journal.tailer(io, "reports");
     defer reports.deinit();
-    try testing.expectEqual(@as(u64, 0), reports.cursor);
+    try testing.expectEqual(@as(u64, 0), (try reports.cursor(io)));
     try testing.expect(!ws.exists(try ws.sub("reports.cursor")));
 
     // Read some records, then say so.
@@ -1893,7 +1893,7 @@ test "a tailer remembers where it got to, in a file of its own" {
         }
         try reports.commit(io, seen);
     }
-    try testing.expectEqual(@as(u64, 4), reports.cursor);
+    try testing.expectEqual(@as(u64, 4), (try reports.cursor(io)));
     try testing.expectEqualStrings("{\"fmt\":1,\"seq\":4}", try ws.read(try ws.sub("reports.cursor")));
     try testing.expect(!ws.exists(try ws.sub("reports.cursor.tmp")));
 
@@ -1901,7 +1901,7 @@ test "a tailer remembers where it got to, in a file of its own" {
     // reads on from where it stopped.
     var again = try journal.tailer(io, "reports");
     defer again.deinit();
-    try testing.expectEqual(@as(u64, 4), again.cursor);
+    try testing.expectEqual(@as(u64, 4), (try again.cursor(io)));
     var walk = try again.replay(io);
     defer walk.deinit(io);
     const next = (try walk.next(io)) orelse return error.TestExpectedRecord;
@@ -1910,23 +1910,23 @@ test "a tailer remembers where it got to, in a file of its own" {
     // Two names are two readers, and neither moves the other.
     var audit = try journal.tailer(io, "audit");
     defer audit.deinit();
-    try testing.expectEqual(@as(u64, 0), audit.cursor);
+    try testing.expectEqual(@as(u64, 0), (try audit.cursor(io)));
     try audit.commit(io, 9);
     var unmoved = try journal.tailer(io, "reports");
     defer unmoved.deinit();
-    try testing.expectEqual(@as(u64, 4), unmoved.cursor);
+    try testing.expectEqual(@as(u64, 4), (try unmoved.cursor(io)));
 
     // A cursor may go backwards, which is how a reader is asked to do a
     // stretch of history over.
     try audit.commit(io, 2);
-    try testing.expectEqual(@as(u64, 2), audit.cursor);
+    try testing.expectEqual(@as(u64, 2), (try audit.cursor(io)));
 
     // And forgetting a name puts it back where it started.
     try audit.forget(io);
     try testing.expect(!ws.exists(try ws.sub("audit.cursor")));
     var fresh = try journal.tailer(io, "audit");
     defer fresh.deinit();
-    try testing.expectEqual(@as(u64, 0), fresh.cursor);
+    try testing.expectEqual(@as(u64, 0), (try fresh.cursor(io)));
 
     // The cursor files sit beside the log and are not part of it.
     try testing.expectEqual(@as(usize, 3), (try journal.segmentCount(io)));
@@ -2046,7 +2046,7 @@ test "a tailer's name has to be one that can be a file" {
     }
     var fine = try journal.tailer(io, "a_fine-Name9");
     defer fine.deinit();
-    try testing.expectEqual(@as(u64, 0), fine.cursor);
+    try testing.expectEqual(@as(u64, 0), (try fine.cursor(io)));
 
     // A cursor file that is not the object `commit` writes is named, never
     // read as a number that was never reached.
@@ -4745,16 +4745,16 @@ fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
     defer walk.deinit(io);
     var seen: u64 = 0;
     while (try walk.next(io)) |record| {
-        try testing.expect(record.seq > reader.cursor);
+        try testing.expect(record.seq > (try reader.cursor(io)));
         seen += 1;
     }
-    try testing.expectEqual(@as(u64, 5) -| reader.cursor, seen);
+    try testing.expectEqual(@as(u64, 5) -| (try reader.cursor(io)), seen);
 
     // And committing over it leaves a file the next open reads back.
     try reader.commit(io, 3);
     var again = try journal.tailer(io, "reports");
     defer again.deinit();
-    try testing.expectEqual(@as(u64, 3), again.cursor);
+    try testing.expectEqual(@as(u64, 3), (try again.cursor(io)));
 }
 
 const snapshot_corpus = [_][]const u8{
@@ -5608,6 +5608,32 @@ test "observing configuration waits for the journal lock" {
         }
     };
     var future = try io.concurrent(Reader.read, .{ &journal, io, &started });
+    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    try testing.expectError(error.Canceled, future.cancel(io));
+}
+
+test "observing a tailer cursor waits for the journal lock" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    var tailer = try journal.tailer(io, "reports");
+    defer tailer.deinit();
+    try tailer.commit(io, 7);
+    const observed = try tailer.cursor(io);
+    try testing.expectEqual(@as(u64, 7), observed);
+    journal.mutex.lockUncancelable(io);
+    defer journal.mutex.unlock(io);
+    var started: std.atomic.Value(bool) = .init(false);
+    const Reader = struct {
+        fn read(tail: *Journal.Tailer, inner: Io, ready: *std.atomic.Value(bool)) !void {
+            ready.store(true, .release);
+            const seq = try tail.cursor(inner);
+            try testing.expectEqual(@as(u64, 7), seq);
+        }
+    };
+    var future = try io.concurrent(Reader.read, .{ &tailer, io, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }

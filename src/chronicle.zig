@@ -1675,7 +1675,16 @@ pub fn Journal(comptime Event: type) type {
             /// Where it has got to. Zero for a name that has never committed
             /// one, and left where it was by a `compact` that dropped past
             /// it — compare it against `oldestSeq` to see what has gone.
-            cursor: u64,
+            committed: u64,
+
+            /// Where this reader has got to, copied under the journal lock.
+            /// Safe to call from any task or thread, except from inside a sink.
+            pub fn cursor(tail: *Tailer, io: Io) Io.Cancelable!u64 {
+                const self = tail.journal;
+                try self.mutex.lock(io);
+                defer self.mutex.unlock(io);
+                return tail.committed;
+            }
 
             /// Release the name. The cursor file stays on the disk; that is
             /// the point of it.
@@ -1685,14 +1694,14 @@ pub fn Journal(comptime Event: type) type {
             }
 
             /// A walk over every record after the committed cursor, read from
-            /// the disk. `Journal.replay(io, tailer.cursor)`, named.
+            /// the disk. `Journal.replay(io, try tailer.cursor(io))`, named.
             /// The cursor and scan are taken under the journal's lock, so
             /// a concurrent `commit` cannot move the cursor during the choice.
             pub fn replay(tail: *Tailer, io: Io) ReplayError!Replay {
                 const self = tail.journal;
                 try self.mutex.lock(io);
                 defer self.mutex.unlock(io);
-                return self.replayFrom(io, tail.cursor, false);
+                return self.replayFrom(io, tail.committed, false);
             }
 
             /// Record `seq` as where this reader has got to, durably, and move
@@ -1716,7 +1725,7 @@ pub fn Journal(comptime Event: type) type {
                 const file = try cursorName(self.gpa, tail.name);
                 defer self.gpa.free(file);
                 try self.log.writeAtomic(io, file, document.written());
-                tail.cursor = seq;
+                tail.committed = seq;
             }
 
             /// Remove this reader's cursor file, so that the next `tailer`
@@ -1828,7 +1837,7 @@ pub fn Journal(comptime Event: type) type {
             if (!validTailerName(name)) return error.InvalidName;
             const owned = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(owned);
-            return .{ .journal = self, .gpa = self.gpa, .name = owned, .cursor = try self.readCursor(io, owned) };
+            return .{ .journal = self, .gpa = self.gpa, .name = owned, .committed = try self.readCursor(io, owned) };
         }
 
         /// One path component of letters, digits, `-` and `_`: the characters

@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Breaking:** `Tailer.cursor(io)` observes the committed cursor under the journal lock, replacing the mutable `Tailer.cursor` field.
+
 - **Breaking:** `options(io)` returns the configuration supplied at open under the journal lock, replacing the public `options` field.
 
 - A replay keeps its record arena at a stable address, so a returned or moved walk preserves allocator contexts retained by its last event.
