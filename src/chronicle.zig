@@ -2197,10 +2197,16 @@ pub fn Journal(comptime Event: type) type {
             // it.
             const covered = out.written();
             const sum = checksum(covered);
-            // Checked before anything is written: a record longer than a
-            // read will accept is one the log must not be given.
-            if (covered.len + 32 > self.config.max_record_bytes) return error.RecordTooLarge;
-            w.print(",\"c\":{d}}}", .{sum}) catch return error.OutOfMemory;
+            // Form the trailer once: the bound counts the exact stored line,
+            // including the checksum's decimal digits, before any file write.
+            var trailer_buffer: [16]u8 = undefined;
+            const trailer = std.fmt.bufPrint(&trailer_buffer, ",\"c\":{d}}}", .{sum}) catch unreachable;
+            if (covered.len > self.config.max_record_bytes or
+                trailer.len > self.config.max_record_bytes - covered.len)
+            {
+                return error.RecordTooLarge;
+            }
+            w.writeAll(trailer) catch return error.OutOfMemory;
 
             if (!needs_record) {
                 const stored = out.written();

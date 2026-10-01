@@ -3588,6 +3588,50 @@ test "the two documents beside the log say which shape they are in" {
     try testing.expectError(error.UnsupportedFormat, journal.tailer(io, "reports"));
 }
 
+test "the record byte ceiling counts the line actually written" {
+    const io = testing.io;
+    var expected: Handwritten = try .init(1, 1);
+    defer expected.deinit();
+    const header_bytes = expected.written().len;
+    try expected.record(1, 1, 1,
+        \\{"created":{"id":1,"name":"n"}}
+    );
+    const cap = expected.written().len - header_bytes - 1;
+
+    // Both the owned-record path and the reusable-line path have the same
+    // bound. A trailing newline frames the record and is not part of it.
+    for ([_]usize{ 0, 4 }) |tail_records| {
+        for ([_]usize{ cap - 1, cap, cap + 1 }) |limit| {
+            var ws = try Workspace.init("log");
+            defer ws.deinit();
+            try ws.write(try ws.segment(1), expected.written()[0..header_bytes]);
+            {
+                var journal = try Journal.open(testing.allocator, io, ws.path, .{
+                    .sync = .never,
+                    .tail_records = tail_records,
+                    .max_record_bytes = limit,
+                });
+                defer journal.deinit(io);
+                if (limit < cap) {
+                    try testing.expectError(error.RecordTooLarge, journal.append(io, 1, created(1, "n")));
+                    try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
+                    try testing.expect(!(try journal.status(io)).persistence_failed);
+                    try testing.expectEqualStrings(expected.written()[0..header_bytes], try ws.read(try ws.segment(1)));
+                } else {
+                    try testing.expectEqual(@as(u64, 1), try journal.append(io, 1, created(1, "n")));
+                    try testing.expectEqualStrings(expected.written(), try ws.read(try ws.segment(1)));
+                }
+            }
+            var reader = try Journal.open(testing.allocator, io, ws.path, .{
+                .access = .read,
+                .max_record_bytes = limit,
+            });
+            defer reader.deinit(io);
+            try testing.expectEqual(@as(u64, if (limit < cap) 0 else 1), try reader.verify(io));
+        }
+    }
+}
+
 test "a record longer than a record may be is refused, and so is a segment of one" {
     const io = testing.io;
     var ws = try Workspace.init("log");

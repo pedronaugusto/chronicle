@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- The record byte limit counts the exact encoded line and checksum, so a record at the ceiling is accepted and one above it is refused before any file write.
+
 - Encoding keeps its allocation-failure cause with its writer, so a custom stringify refusal returns `WriteFailed` rather than `OutOfMemory` without latching persistence failure.
 
 - A rotation reserves segment inventory before changing files, so allocation failure cannot publish an active file with no matching segment owner.
