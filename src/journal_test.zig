@@ -5713,3 +5713,46 @@ test "the shared document bound leaves an oversized cursor a corrupt cursor" {
     try ws.write(try ws.sub("reports.cursor"), " " ** 4097);
     try testing.expectError(error.CorruptCursor, journal.tailer(io, "reports"));
 }
+
+test "a failed restart releases each file only once after a torn header" {
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    try ws.write(try ws.segment(1), "{\"chronicle\":");
+    const Probe = struct {
+        var live: std.ArrayList(Io.File.Handle) = .empty;
+        var duplicate: usize = 0;
+        fn opened(file: Io.File) Io.File {
+            live.append(testing.allocator, file.handle) catch unreachable;
+            return file;
+        }
+        fn create(ctx: ?*anyopaque, dir: Io.Dir, path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
+            return opened(try testing.io.vtable.dirCreateFile(ctx, dir, path, opts));
+        }
+        fn open(ctx: ?*anyopaque, dir: Io.Dir, path: []const u8, opts: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
+            return opened(try testing.io.vtable.dirOpenFile(ctx, dir, path, opts));
+        }
+        fn close(ctx: ?*anyopaque, files: []const Io.File) void {
+            for (files) |file| {
+                const slot = std.mem.indexOfScalar(Io.File.Handle, live.items, file.handle) orelse {
+                    duplicate += 1;
+                    continue;
+                };
+                _ = live.swapRemove(slot);
+                testing.io.vtable.fileClose(ctx, &.{file});
+            }
+        }
+    };
+    Probe.live = .empty;
+    Probe.duplicate = 0;
+    defer Probe.live.deinit(testing.allocator);
+    var vtable: Io.VTable = undefined;
+    const failing = failingIo(&vtable);
+    vtable.dirCreateFile = Probe.create;
+    vtable.dirOpenFile = Probe.open;
+    vtable.fileClose = Probe.close;
+    fail_writes.store(true, .release);
+    defer fail_writes.store(false, .release);
+    try testing.expectError(error.WriteFailed, Journal.open(testing.allocator, failing, ws.path, .{ .sync = .never }));
+    try testing.expectEqual(@as(usize, 0), Probe.live.items.len);
+    try testing.expectEqual(@as(usize, 0), Probe.duplicate);
+}

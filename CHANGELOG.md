@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- A torn-header recovery closes the files of its first attempt before restarting, so a failed replacement releases each file only once.
+
 - The shared document reader preserves read-bound failures, so an oversized stored snapshot returns `SnapshotTooLarge` while an oversized cursor remains `CorruptCursor`.
 
 - Unit tests count indexed work, event encodings, parses and durable syncs; speed measurements live only in the bench branch harness.

@@ -2160,21 +2160,30 @@ fn openActive(log: *Log, io: Io) OpenError!void {
         return;
     }
 
-    // A file with nothing in it is a segment whose creation did not finish:
-    // the name is on the disk and the line that says what it is is not. It is
-    // written again rather than read.
-    if (try log.fileLength(io, &name) == 0) {
-        const started = try log.startSegment(io, segment.base_seq, freshRoot(io));
-        segment.bytes = started.header_bytes;
-        segment.header_bytes = started.header_bytes;
-        segment.last_seq = segment.base_seq - 1;
-        segment.times = .unknown;
-        log.active = started.active;
-        return;
+    // A file with no complete header is a creation that did not finish.
+    // The attempt owns and closes its files before a fresh creation begins.
+    if (try log.fileLength(io, &name) != 0) {
+        if (try log.resumeActive(io, segment)) |active| {
+            log.active = active;
+            return;
+        }
     }
+    const started = try log.startSegment(io, segment.base_seq, freshRoot(io));
+    segment.bytes = started.header_bytes;
+    segment.header_bytes = started.header_bytes;
+    segment.last_seq = segment.base_seq - 1;
+    segment.times = .unknown;
+    log.active = started.active;
+}
 
+/// Return a fully opened active segment, or null when its torn header needs
+/// replacing. Until success this scope alone owns both files, so a failed
+/// replacement can never release the files of the previous attempt again.
+fn resumeActive(log: *Log, io: Io, segment: *Segment) OpenError!?Active {
+    const name = segmentName(segment.base_seq, segment_extension);
+    var transferred = false;
     const file = try log.dir.createFile(io, &name, .{ .read = true, .truncate = false });
-    errdefer file.close(io);
+    defer if (!transferred) file.close(io);
     segment.bytes = try file.length(io);
 
     // A close seals the active segment's index with the exact length it
@@ -2184,7 +2193,7 @@ fn openActive(log: *Log, io: Io) OpenError!void {
     // get. So a clean restart takes it and the scan is skipped altogether.
     if (try log.resumeIndex(io, segment.*)) |taken| {
         var resumed = taken;
-        errdefer resumed.file.close(io);
+        defer if (!transferred) resumed.file.close(io);
         // The header line and the chain still have to be read, but that is
         // one line and not the segment.
         const head = try log.readSegmentHeader(io, segment.*);
@@ -2194,7 +2203,8 @@ fn openActive(log: *Log, io: Io) OpenError!void {
         log.chain = try log.lastChecksum(io, segment.*, head.root);
         var writer = file.writer(io, log.write_buf);
         writer.pos = segment.bytes;
-        log.active = .{
+        transferred = true;
+        return .{
             .file = file,
             .writer = writer,
             .index_file = resumed.file,
@@ -2202,7 +2212,6 @@ fn openActive(log: *Log, io: Io) OpenError!void {
             .preallocated = segment.bytes,
             .builder = resumed.builder,
         };
-        return;
     }
 
     // The index has no durability of its own, so the active segment's is
@@ -2210,7 +2219,7 @@ fn openActive(log: *Log, io: Io) OpenError!void {
     // readable too: `indexedOffset` reads the live index back through this
     // handle rather than scanning the segment.
     const index_file = try log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{ .read = true, .truncate = true });
-    errdefer index_file.close(io);
+    defer if (!transferred) index_file.close(io);
     var index_writer = index_file.writer(io, log.index_buf);
     try index_writer.interface.writeAll(&placeholderHeader(segment.base_seq, log.options.index_interval_bytes));
     var builder: Builder = .init(segment.base_seq, log.options.index_interval_bytes);
@@ -2223,15 +2232,7 @@ fn openActive(log: *Log, io: Io) OpenError!void {
         // whatever fragment was there is what was dropped.
         if (log.options.on_truncated == .fail) return error.TruncatedRecord;
         log.dropped_bytes = @intCast(scanned.partial_bytes);
-        index_file.close(io);
-        file.close(io);
-        const started = try log.startSegment(io, segment.base_seq, freshRoot(io));
-        segment.bytes = started.header_bytes;
-        segment.header_bytes = started.header_bytes;
-        segment.last_seq = segment.base_seq - 1;
-        segment.times = .unknown;
-        log.active = started.active;
-        return;
+        return null;
     }
 
     // Space reserved and never written into is not a record the writer did
@@ -2254,7 +2255,8 @@ fn openActive(log: *Log, io: Io) OpenError!void {
 
     var writer = file.writer(io, log.write_buf);
     writer.pos = segment.bytes;
-    log.active = .{
+    transferred = true;
+    return .{
         .file = file,
         .writer = writer,
         .index_file = index_file,
