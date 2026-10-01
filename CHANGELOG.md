@@ -20,7 +20,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Breaking:** `copySince` copies events through `strand.copyOwned`, preserving Raw bytes and dynamic values without hooks; events must meet its finite-data-tree contract and `CopyError` no longer includes `NotRoundTrippable`.
 
-- Pin strand at `3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0`, including its checked decoding and payload-byte framing bounds.
+- **Breaking:** pin strand at `3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0`; `Raw.encode` adds `WriteFailed`, byte vectors accept strings and arrays, and framing bounds count payload bytes.
 
 - **Breaking:** `Tailer.cursor(io)` observes the committed cursor under the journal lock, replacing the mutable `Tailer.cursor` field.
 
