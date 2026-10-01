@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- The bench harness measures indexed seeks, shared folds, append and replay rates and group commit in place of unit-suite speed budgets.
+
 - `Replay.rearmAt(io, position)` starts another pass on the same walk. A
   follower keeps one scan buffer, segment storage, line buffer and two record
   arenas across wakes; after the first pass, following one new record in the

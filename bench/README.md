@@ -17,3 +17,13 @@ their versions. `BENCH_BUILD_DIR`/`BENCH_RESULTS` select generated output,
 defaulting to `build/`; `ZIG`, `GO`, `CARGO`, `PYTHON` select tools.
 Snapshot scripts take commits and `BENCH_REPO` (this repository by default).
 Raw inputs default to generated data or `BENCH_CORPUS`. Generated files are ignored.
+
+
+`zig build -Doptimize=ReleaseFast` also builds `work-bench`. Run
+`zig-out/bin/work-bench build/new-scratch` with a directory that does not
+exist, beneath this checkout. It measures the four claims formerly in the
+unit suite: active against sealed seeks, five shared folds against one,
+append and replay time per record, and group commit against single durable
+appends. It prints measurements and ratios, with no speed thresholds. The
+scratch directory is owned and removed by that invocation. `-Dsmoke=true`
+uses tiny fixtures to check the harness; smoke timings are not measurements.

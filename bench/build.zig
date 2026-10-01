@@ -24,6 +24,18 @@ pub fn build(b: *std.Build) void {
     chronicle_bench.root_module.addOptions("bench_options", options);
     b.installArtifact(chronicle_bench);
 
+    const work_bench = b.addExecutable(.{
+        .name = "work-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/work_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "chronicle", .module = chronicle }},
+        }),
+    });
+    work_bench.root_module.addOptions("bench_options", options);
+    b.installArtifact(work_bench);
+
     const file_bench = b.addExecutable(.{
         .name = "plain-zig-bench",
         .root_module = b.createModule(.{
