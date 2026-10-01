@@ -2037,6 +2037,9 @@ fn syncActive(log: *Log, io: Io) Io.File.SyncError!void {
 /// Seal the active segment and start a new one named after the record that
 /// will go into it.
 fn rotate(log: *Log, io: Io) AppendError!void {
+    // Reserve the owner before sealing or naming files. Once a new active
+    // file exists, publishing its inventory must have no failure left.
+    try log.segments.ensureUnusedCapacity(log.gpa, 1);
     const segment = log.segments.items[log.segments.items.len - 1];
     {
         const active = &log.active.?;
@@ -2067,7 +2070,7 @@ fn rotate(log: *Log, io: Io) AppendError!void {
     var fresh: Segment = .named(base_seq);
     fresh.header_bytes = started.header_bytes;
     fresh.bytes = started.header_bytes;
-    try log.segments.append(log.gpa, fresh);
+    log.segments.appendAssumeCapacity(fresh);
 }
 
 /// A segment file just created, and where its records begin.

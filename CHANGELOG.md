@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- A rotation reserves segment inventory before changing files, so allocation failure cannot publish an active file with no matching segment owner.
+
 - Segment-header, timestamp and back-link probes propagate allocation failure instead of treating valid bytes as missing or corrupt metadata.
 
 - A torn-header recovery closes the files of its first attempt before restarting, so a failed replacement releases each file only once.

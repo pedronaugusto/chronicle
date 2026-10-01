@@ -5780,3 +5780,31 @@ test "reading escaped metadata propagates every allocation failure" {
     };
     try testing.checkAllAllocationFailures(testing.allocator, Reader.read, .{ io, ws.path });
 }
+
+test "a rotation reserves its inventory before publishing a new active file" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    var journal = try Journal.open(failing.allocator(), io, ws.path, .{
+        .sync = .never,
+        .tail_records = 0,
+        .verify_round_trip = false,
+        .max_segment_records = 1,
+    });
+    defer journal.deinit(io);
+    _ = try journal.append(io, 1, created(1, "n"));
+    while (journal.log.segments.items.len < journal.log.segments.capacity) {
+        _ = try journal.append(io, 1, created(1, "n"));
+    }
+    const previous = try journal.lastSeq(io);
+    const base = journal.log.segments.items[journal.log.segments.items.len - 1].base_seq;
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, journal.append(io, 1, created(1, "n")));
+    failing.fail_index = std.math.maxInt(usize);
+    // Even a failed write leaves each live file paired with its inventory.
+    try testing.expectEqual(base, journal.log.active.?.builder.base_seq);
+    try testing.expectEqual(previous, try journal.lastSeq(io));
+    _ = try journal.reconcile(io);
+    try testing.expectEqual(previous + 1, try journal.append(io, 1, created(1, "n")));
+}
