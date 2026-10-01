@@ -5756,3 +5756,27 @@ test "a failed restart releases each file only once after a torn header" {
     try testing.expectEqual(@as(usize, 0), Probe.live.items.len);
     try testing.expectEqual(@as(usize, 0), Probe.duplicate);
 }
+
+test "reading escaped metadata propagates every allocation failure" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var written = try Handwritten.init(1, 1);
+    defer written.deinit();
+    written.bytes.clearRetainingCapacity();
+    try written.raw("{\"chronicle\":1,\"ba\\u0073e\":1,\"root\":1}\n");
+    try written.checked("{\"s\\u0065q\":1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{\"created\":{\"id\":1,\"name\":\"one\"}}");
+    try ws.write(try ws.segment(1), written.written());
+    const Reader = struct {
+        fn read(a: std.mem.Allocator, inner: Io, path: []const u8) !void {
+            var journal = try Journal.open(a, inner, path, .{ .access = .read, .tail_records = 0 });
+            defer journal.deinit(inner);
+            try testing.expectEqual(@as(u64, 1), try journal.lastSeq(inner));
+            try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(inner, 1));
+            var walk = try journal.replay(inner, 0);
+            defer walk.deinit(inner);
+            try testing.expectEqualStrings("one", (try walk.next(inner)).?.event.created.name);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Reader.read, .{ io, ws.path });
+}
