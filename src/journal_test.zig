@@ -4047,7 +4047,7 @@ test "two hundred thousand records open within a bounded time and memory" {
     // Loose on purpose: record-sized working memory is the newest segment and
     // the tail. Fixed-size segment metadata is accounted separately.
     try testing.expect(elapsed_ms < 30_000);
-    try testing.expect(journal.tail.entries.items.len <= journal.options.tail_records);
+    try testing.expect(journal.tail.entries.items.len <= (try journal.options(io)).tail_records);
     var held: usize = journal.scratch.queryCapacity();
     for (journal.tail.entries.items) |*owned| held += owned.arena.queryCapacity();
     try testing.expect(held < 4 * 1024 * 1024);
@@ -5587,4 +5587,27 @@ test "replay creation releases its scan and stable arena on every allocation fai
         }
     };
     try testing.checkAllAllocationFailures(testing.allocator, Reader.read, .{ io, ws.path });
+}
+
+test "observing configuration waits for the journal lock" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 7 });
+    defer journal.deinit(io);
+    const observed = try journal.options(io);
+    try testing.expectEqual(@as(usize, 7), observed.tail_records);
+    journal.mutex.lockUncancelable(io);
+    defer journal.mutex.unlock(io);
+    var started: std.atomic.Value(bool) = .init(false);
+    const Reader = struct {
+        fn read(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
+            ready.store(true, .release);
+            const config = try j.options(inner);
+            try testing.expectEqual(@as(usize, 7), config.tail_records);
+        }
+    };
+    var future = try io.concurrent(Reader.read, .{ &journal, io, &started });
+    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    try testing.expectError(error.Canceled, future.cancel(io));
 }

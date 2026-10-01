@@ -111,6 +111,7 @@ which writes and reads a record's line; this package keeps the lines.
 
 | | |
 |---|---|
+| `options(io)` | The configuration supplied at open, copied under the lock. |
 | `open(gpa, io, path, options)` | Create or read back a journal directory. |
 | `openWithSnapshot(gpa, io, path, options)` | The same, plus the snapshot beside it. |
 | `close(io)` | Durably flush, close, unlock and release; returns a shutdown failure. |
@@ -374,7 +375,7 @@ configuration; the walk itself reads without it and writes nothing. A missing in
 walk's memory. Retention beside a walk may remove files it needs, which is
 reported as an error. `close` and `deinit` require every caller and walk to
 have stopped. Observe recovery and persistence state with `status(io)`. The
-public `options` field is the configuration passed to `open`; leave it unchanged.
+`options(io)` call copies the configuration passed to `open` under the lock.
 The allocator passed to `open` must support concurrent use when walks or tailers allocate alongside
 journal calls. Every file operation and
 the wait primitive go through `std.Io`, so the package runs under

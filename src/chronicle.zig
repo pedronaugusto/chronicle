@@ -165,11 +165,11 @@ pub fn Journal(comptime Event: type) type {
     return struct {
         const Self = @This();
 
-        // Only options are part of the field API. The bookkeeping below is
-        // owned by the journal; observe it through the calls that take its lock.
+        // State belongs to the journal; observe it through calls that take
+        // its lock.
 
-        /// The options `open` was given, unchanged.
-        options: Options,
+        /// The configuration supplied at open. Read through `options`.
+        config: Options,
 
         //-------------------------------------------------------------- internals
 
@@ -306,11 +306,11 @@ pub fn Journal(comptime Event: type) type {
                 tail.bytes += owned.record.bytes.len;
             }
 
-            fn trim(tail: *Tail, options: Options) void {
+            fn trim(tail: *Tail, settings: Options) void {
                 var drop: usize = 0;
                 var held = tail.bytes;
-                while (tail.entries.items.len - drop > options.tail_records or
-                    (held > options.tail_bytes and drop < tail.entries.items.len))
+                while (tail.entries.items.len - drop > settings.tail_records or
+                    (held > settings.tail_bytes and drop < tail.entries.items.len))
                 {
                     held -= tail.entries.items[drop].record.bytes.len;
                     drop += 1;
@@ -661,24 +661,24 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// `path` may be relative to the current directory or absolute. Release
         /// with `deinit`.
-        pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!Self {
+        pub fn open(gpa: Allocator, io: Io, path: []const u8, settings: Options) OpenError!Self {
             const log = try Log.open(gpa, io, path, .{
-                .access = options.access,
-                .on_truncated = options.on_truncated,
-                .sync = options.sync,
-                .write_buffer_size = options.write_buffer_size,
-                .read_buffer_size = options.read_buffer_size,
-                .max_segment_bytes = options.max_segment_bytes,
-                .max_segment_records = options.max_segment_records,
-                .preallocate_bytes = options.preallocate_bytes,
-                .index_interval_bytes = options.index_interval_bytes,
-                .max_record_bytes = options.max_record_bytes,
+                .access = settings.access,
+                .on_truncated = settings.on_truncated,
+                .sync = settings.sync,
+                .write_buffer_size = settings.write_buffer_size,
+                .read_buffer_size = settings.read_buffer_size,
+                .max_segment_bytes = settings.max_segment_bytes,
+                .max_segment_records = settings.max_segment_records,
+                .preallocate_bytes = settings.preallocate_bytes,
+                .index_interval_bytes = settings.index_interval_bytes,
+                .max_record_bytes = settings.max_record_bytes,
             });
 
             var self: Self = .{
                 .gpa = gpa,
                 .log = log,
-                .options = options,
+                .config = settings,
                 .tail = .{},
                 .record_hint = 256,
                 .line = .empty,
@@ -698,7 +698,7 @@ pub fn Journal(comptime Event: type) type {
                 defer self.mutex.unlock(io);
                 try self.fillTail(io);
             }
-            if (options.verify == .full) _ = try self.verify(io);
+            if (settings.verify == .full) _ = try self.verify(io);
             return self;
         }
 
@@ -712,9 +712,9 @@ pub fn Journal(comptime Event: type) type {
             gpa: Allocator,
             io: Io,
             path: []const u8,
-            options: Options,
+            settings: Options,
         ) OpenWithSnapshotError!Opened {
-            var self = try open(gpa, io, path, options);
+            var self = try open(gpa, io, path, settings);
             errdefer self.deinit(io);
             // Read before the journal is copied into the result: a field
             // initializer that mutated `self` after `.journal = self` would
@@ -838,7 +838,7 @@ pub fn Journal(comptime Event: type) type {
             // A journal opened for reading is refused before anything else: it
             // is not a journal that has failed, and it must not be latched as
             // one.
-            if (self.options.access == .read) return error.ReadOnly;
+            if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
             if (self.seq >= std.math.maxInt(i64)) return error.SequenceExhausted;
 
@@ -914,7 +914,7 @@ pub fn Journal(comptime Event: type) type {
             // bytes of a record and its flush.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
-            if (self.options.access == .read) return error.ReadOnly;
+            if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
             if (entries.len == 0) return self.seq;
             if (entries.len > std.math.maxInt(i64) - self.seq) return error.SequenceExhausted;
@@ -985,7 +985,7 @@ pub fn Journal(comptime Event: type) type {
             // bytes of a record and its flush.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
-            if (self.options.access == .read) return error.ReadOnly;
+            if (self.config.access == .read) return error.ReadOnly;
             if (!self.write_failed) return self.seq;
 
             try self.log.reload(io);
@@ -1488,6 +1488,14 @@ pub fn Journal(comptime Event: type) type {
             return self.log.baseSeq() + 1;
         }
 
+        /// Copy the configuration supplied at open under the journal's lock.
+        /// Safe to call from any task or thread, except from inside a sink.
+        pub fn options(self: *Self, io: Io) Io.Cancelable!Options {
+            try self.mutex.lock(io);
+            defer self.mutex.unlock(io);
+            return self.config;
+        }
+
         /// The journal's recovery and persistence state at one instant.
         pub const Status = struct {
             /// Whether a persistence operation failed. Writes stay refused
@@ -1939,8 +1947,8 @@ pub fn Journal(comptime Event: type) type {
                 "{{\"fmt\":{d},\"seq\":{d},\"state\":\"\"}}",
                 .{ document_format, self.seq },
             );
-            if (encoded_size > self.options.max_snapshot_bytes or
-                framing_size > self.options.max_snapshot_bytes - encoded_size)
+            if (encoded_size > self.config.max_snapshot_bytes or
+                framing_size > self.config.max_snapshot_bytes - encoded_size)
             {
                 return error.SnapshotTooLarge;
             }
@@ -2016,7 +2024,7 @@ pub fn Journal(comptime Event: type) type {
             // bytes of a record and its flush.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
-            if (self.options.access == .read) return error.ReadOnly;
+            if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
             try self.log.truncateAfter(io, seq);
             self.clearTail();
@@ -2050,7 +2058,7 @@ pub fn Journal(comptime Event: type) type {
             // bytes of a record and its flush.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
-            if (self.options.access == .read) return error.ReadOnly;
+            if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
             try self.log.compact(io, keep_after_seq);
             self.clearTail();
@@ -2083,7 +2091,7 @@ pub fn Journal(comptime Event: type) type {
         pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
-            if (self.options.access == .read) {
+            if (self.config.access == .read) {
                 // A reader's segment inventory is a snapshot from its last
                 // open or refresh. Backup begins with a current directory
                 // view so rotations completed before this call are included.
@@ -2124,12 +2132,12 @@ pub fn Journal(comptime Event: type) type {
         /// Whether a record needs an owner after the write, for the cache or
         /// for callbacks. Verification alone reads it before the write.
         fn keepsRecords(self: *const Self) bool {
-            return self.options.tail_records != 0 or self.sinks.items.len != 0;
+            return self.config.tail_records != 0 or self.sinks.items.len != 0;
         }
 
         /// Whether encoding must parse its result, for a reader or a check.
         fn needsRecord(self: *const Self) bool {
-            return self.keepsRecords() or self.options.verify_round_trip;
+            return self.keepsRecords() or self.config.verify_round_trip;
         }
 
         /// Serialise one record.
@@ -2171,7 +2179,7 @@ pub fn Journal(comptime Event: type) type {
             strand.writeValue(w, Line{
                 .seq = seq,
                 .at = at,
-                .v = self.options.schema_version,
+                .v = self.config.schema_version,
                 .p = back_link,
                 .ev = event,
             }, .{ .emit_null_optional_fields = true }) catch return error.OutOfMemory;
@@ -2183,7 +2191,7 @@ pub fn Journal(comptime Event: type) type {
             const sum = checksum(covered);
             // Checked before anything is written: a record longer than a
             // read will accept is one the log must not be given.
-            if (covered.len + 32 > self.options.max_record_bytes) return error.RecordTooLarge;
+            if (covered.len + 32 > self.config.max_record_bytes) return error.RecordTooLarge;
             w.print(",\"c\":{d}}}", .{sum}) catch return error.OutOfMemory;
 
             if (!needs_record) {
@@ -2224,7 +2232,7 @@ pub fn Journal(comptime Event: type) type {
                 .record = .{
                     .seq = seq,
                     .at = at,
-                    .version = self.options.schema_version,
+                    .version = self.config.schema_version,
                     .event = parsed,
                     .bytes = stored,
                 },
@@ -2251,7 +2259,7 @@ pub fn Journal(comptime Event: type) type {
             self.seq = self.log.lastSeq();
             var rebuilt: Tail = .{};
             errdefer rebuilt.deinit(self.gpa);
-            const want = self.options.tail_records;
+            const want = self.config.tail_records;
             const from = if (self.seq > want) self.seq - want else self.log.baseSeq();
 
             var scan = try self.log.scanFrom(io, from, .{ .may_write = true, .extent = .known });
@@ -2270,7 +2278,7 @@ pub fn Journal(comptime Event: type) type {
                 const record = try recordFrom(self.captureDecoder(), arena.allocator(), header, stored);
                 try rebuilt.entries.ensureUnusedCapacity(self.gpa, 1);
                 rebuilt.appendAssumeCapacity(.{ .record = record, .arena = arena });
-                rebuilt.trim(self.options);
+                rebuilt.trim(self.config);
             }
 
             // Continuity belongs to the walk, not the cache: either tail
@@ -2288,7 +2296,7 @@ pub fn Journal(comptime Event: type) type {
         /// ceilings — at least half of it at a time, so that keeping a tail
         /// costs a constant amount per append rather than a growing one.
         fn trimTail(self: *Self) void {
-            self.tail.trim(self.options);
+            self.tail.trim(self.config);
         }
 
         fn clearTail(self: *Self) void {
@@ -2344,7 +2352,7 @@ pub fn Journal(comptime Event: type) type {
 
         /// Called under the journal's lock.
         fn captureDecoder(self: *const Self) Decoder {
-            return .{ .schema_version = self.options.schema_version, .migrate = self.options.migrate };
+            return .{ .schema_version = self.config.schema_version, .migrate = self.config.migrate };
         }
 
         /// Finish a header into a record whose every slice comes from `arena`.
@@ -2411,7 +2419,7 @@ pub fn Journal(comptime Event: type) type {
                 arena.allocator(),
                 Document,
                 Log.snapshot_name,
-                self.options.max_snapshot_bytes,
+                self.config.max_snapshot_bytes,
                 error.CorruptSnapshot,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
