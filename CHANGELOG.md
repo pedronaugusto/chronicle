@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- The benchmark context cast carries its safety reason on the line the cast occurs.
+
 - The bench harness measures indexed seeks, shared folds, append and replay rates and group commit in place of unit-suite speed budgets.
 
 - `Replay.rearmAt(io, position)` starts another pass on the same walk. A

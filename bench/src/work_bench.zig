@@ -10,8 +10,7 @@ const Fold = struct {
         return .{ .ctx = fold, .f = accept };
     }
     fn accept(ctx: *anyopaque, record: J.Record) void {
-        // safe: sink passes the live Fold pointer supplied as its context.
-        const fold: *Fold = @ptrCast(@alignCast(ctx));
+        const fold: *Fold = @ptrCast(@alignCast(ctx)); // safe: sink passes the live Fold pointer supplied as its context.
         std.debug.assert(record.seq == fold.seen + 1);
         fold.seen = record.seq;
     }
