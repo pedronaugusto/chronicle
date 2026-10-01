@@ -5690,3 +5690,26 @@ test "copySince owns dynamic Value keys strings containers and number spelling" 
     try array.append(.{ .string = "next" });
     try testing.expectEqualStrings("next", array.items[2].string);
 }
+
+test "an oversized stored snapshot is reported by its read bound" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+        try journal.snapshot(io, "state" ** 20);
+    }
+    try testing.expectError(error.SnapshotTooLarge, Journal.openWithSnapshot(testing.allocator, io, ws.path, .{ .max_snapshot_bytes = 64 }));
+}
+
+test "the shared document bound leaves an oversized cursor a corrupt cursor" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    try ws.write(try ws.sub("reports.cursor"), " " ** 4097);
+    try testing.expectError(error.CorruptCursor, journal.tailer(io, "reports"));
+}

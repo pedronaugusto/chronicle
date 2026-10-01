@@ -557,8 +557,7 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `replay`, and from the `Replay` it returns.
         pub const ReplayError = ReadError;
 
-        /// Copying the tail may be canceled at the lock, run out of memory,
-        /// or find a current event that no longer round-trips through JSON.
+        /// Copying the tail may be canceled at the lock or run out of memory.
         pub const CopyError = Allocator.Error || Io.Cancelable;
 
         /// `replayAt`'s errors: `replay`'s, and a position that no longer
@@ -1855,8 +1854,11 @@ pub fn Journal(comptime Event: type) type {
         /// is in. Null when there is no such file, which is not an error for
         /// either of them.
         ///
-        /// `Malformed` is what a file that is not the document becomes, so
-        /// that the two callers keep their own names for it.
+        /// Framing and read bounds have their own errors here; each caller
+        /// translates them into its snapshot or cursor contract.
+        const DocumentError = Allocator.Error || Io.Cancelable ||
+            error{ MalformedDocument, UnsupportedFormat, StreamTooLong };
+
         fn readDocument(
             self: *Self,
             io: Io,
@@ -1864,8 +1866,7 @@ pub fn Journal(comptime Event: type) type {
             Document: type,
             name: []const u8,
             limit: usize,
-            Malformed: anyerror,
-        ) (Allocator.Error || Io.Cancelable || anyerror)!?Document {
+        ) DocumentError!?Document {
             const bytes = self.log.dir.readFileAlloc(
                 io,
                 name,
@@ -1875,17 +1876,18 @@ pub fn Journal(comptime Event: type) type {
                 error.FileNotFound => return null,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
-                else => return Malformed,
+                error.StreamTooLong => return error.StreamTooLong,
+                else => return error.MalformedDocument,
             };
             const Versioned = struct { fmt: u32 };
             const version = strand.parseLine(Versioned, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return Malformed,
+                else => return error.MalformedDocument,
             };
             if (version.fmt != document_format) return error.UnsupportedFormat;
             return strand.parseLine(Document, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
-                else => return Malformed,
+                else => return error.MalformedDocument,
             };
         }
 
@@ -1904,7 +1906,6 @@ pub fn Journal(comptime Event: type) type {
                 Document,
                 file,
                 4096,
-                error.CorruptCursor,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
@@ -2422,7 +2423,6 @@ pub fn Journal(comptime Event: type) type {
                 Document,
                 Log.snapshot_name,
                 self.config.max_snapshot_bytes,
-                error.CorruptSnapshot,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
