@@ -509,12 +509,11 @@ taken beside it, and one to be killed while it mutates the journal — and one
 builds a journal of two hundred thousand records and asserts that opening it
 is proportionate and that record-sized working memory is bounded.
 
-The measurements this package is judged on are tests with budgets: a seek into
-the segment being written to against one into a sealed segment, an open of a
-log that was closed cleanly against the same open with the index deleted, five
-folds over one pass against one fold, and — in ReleaseFast — the rates an
-append and a replayed record run at. Ratios wherever a ratio will do, because
-an absolute number says more about the machine than about the package.
+The unit suite counts work: index probes and skipped prefixes for active and
+sealed seeks, scans avoided by a clean close, one parse per record for shared
+folds, one encoding per uncached append, and one durable record sync per batch.
+Speed measurements live in the `bench` branch harness. The large-log test keeps
+its watchdog and memory bound; unit tests make no claim about a runner's speed.
 
 Six fuzz tests. Five run over the contents of a file — arbitrary segment bytes,
 an arbitrary first line of a segment, an arbitrary index, an arbitrary snapshot

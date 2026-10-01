@@ -1584,8 +1584,7 @@ pub fn Journal(comptime Event: type) type {
         /// Subscribing five folds one at a time reads the log five times: each
         /// call opens its own walk, verifies every checksum again and parses
         /// every event again. This does that work once and calls each sink per
-        /// record, which costs the same as one subscriber — the callbacks are
-        /// free beside the decode.
+        /// record; the callbacks add only their own work.
         ///
         /// It is one call under one lock, so it is also the way to start
         /// several folds at the same record: a record appended beside it lands

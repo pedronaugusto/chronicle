@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Unit tests count indexed work, event encodings, parses and durable syncs; speed measurements live only in the bench branch harness.
+
 - **Breaking:** `copySince` copies events through `strand.copyOwned`, preserving Raw bytes and dynamic values without hooks; events must meet its finite-data-tree contract and `CopyError` no longer includes `NotRoundTrippable`.
 
 - Pin strand at `3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0`, including its checked decoding and payload-byte framing bounds.

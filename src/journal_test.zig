@@ -4806,37 +4806,13 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
 }
 
 //========================================================================
-// Numbers.
-//
-// The measurements a release is judged on, as tests with budgets. They are
-// ratios wherever a ratio will do, because an absolute number is a claim
-// about a machine and these run on whatever CI was given; where an absolute
-// number is the only way to say it, the budget is loose enough to pass on a
-// slow shared runner and tight enough to fail if the thing it measures goes
-// back to what it replaced.
-//
-// The point is not to know how fast this is. It is that the four numbers
-// this release moved cannot quietly move back.
+// Work counted by the implementation, independent of the runner's speed.
 //========================================================================
 
-/// How long `body` takes, in microseconds.
-fn microseconds(started: Io.Timestamp) u64 {
-    return @intCast(started.durationTo(Io.Clock.awake.now(testing.io)).toMicroseconds());
-}
-
-fn now() Io.Timestamp {
-    return Io.Clock.awake.now(testing.io);
-}
-
-test "a seek into the newest segment costs what a seek into a sealed one costs" {
+test "sealed and active seeks both read an index and skip the segment prefix" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-
-    // Two segments of the same size: one sealed, one being appended to. A
-    // seek near the end of each. Before the index of the newest segment
-    // could be read back, the second was a scan of the whole segment and
-    // measured nine hundred times the first.
     const per_segment = 20_000;
     var gpa: FixtureAllocator = .init;
     defer expectNoLeak(&gpa);
@@ -4848,27 +4824,17 @@ test "a seek into the newest segment costs what a seek into a sealed one costs" 
     });
     defer journal.deinit(io);
     try fill(&journal, io, 1, 2 * per_segment - 1, "a name");
-    try testing.expectEqual(@as(usize, 2), (try journal.segmentCount(io)));
-
-    const sealed = try seekMicroseconds(&journal, per_segment - 2, 20);
-    const active = try seekMicroseconds(&journal, 2 * per_segment - 3, 20);
-    // Ten times the sealed seek plus a millisecond: room for a runner that
-    // is busy, none for a scan of twenty thousand records.
-    try testing.expect(active <= 10 * sealed + 1_000);
-}
-
-/// How long it takes, on average over `rounds`, to replay from `cursor` and
-/// take the first record.
-fn seekMicroseconds(journal: *Journal, cursor: u64, rounds: usize) !u64 {
-    const io = testing.io;
-    const started = now();
-    for (0..rounds) |_| {
+    try testing.expectEqual(@as(usize, 2), try journal.segmentCount(io));
+    for ([_]u64{ per_segment - 2, 2 * per_segment - 3 }, 0..) |cursor, segment| {
+        const reads = journal.log.index_reads;
         var walk = try journal.replay(io, cursor);
         defer walk.deinit(io);
-        const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
-        try testing.expectEqual(cursor + 1, record.seq);
+        // The larger sequence fields put one more entry range in the live index.
+        try testing.expectEqual(reads + 9 + segment, journal.log.index_reads);
+        const bytes = journal.log.segments.items[segment].bytes;
+        try testing.expect(walk.scan.position > bytes - bytes / 100);
+        try testing.expectEqual(cursor + 1, (try walk.next(io)).?.seq);
     }
-    return microseconds(started) / rounds;
 }
 
 test "opening a log that was closed cleanly costs no scan of it" {
@@ -4912,78 +4878,83 @@ fn openScans(ws: *Workspace, options: Journal.Options) !u64 {
     return journal.log.segment_scans;
 }
 
-test "five folds over one pass cost what one fold costs" {
+const CountedEvent = struct {
+    id: u32,
+    name: []const u8,
+    var parses: usize = 0;
+    var writes: usize = 0;
+    pub fn jsonParse(a: std.mem.Allocator, source: anytype, opts: std.json.ParseOptions) !CountedEvent {
+        parses += 1;
+        const value = try std.json.innerParse(struct { id: u32, name: []const u8 }, a, source, opts);
+        return .{ .id = value.id, .name = value.name };
+    }
+    pub fn jsonStringify(value: CountedEvent, writer: anytype) !void {
+        writes += 1;
+        try writer.write(.{ .id = value.id, .name = value.name });
+    }
+    const J = chronicle.Journal(CountedEvent);
+    const Fold = struct {
+        seen: u64 = 0,
+        fn sink(fold: *Fold) J.Sink {
+            return .{ .ctx = fold, .f = struct {
+                fn accept(ctx: *anyopaque, record: J.Record) void {
+                    const f: *Fold = @ptrCast(@alignCast(ctx));
+                    std.debug.assert(record.seq == f.seen + 1);
+                    f.seen = record.seq;
+                }
+            }.accept };
+        }
+    };
+};
+
+test "five folds over one pass parse each event once" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-
     const count = 20_000;
-    var gpa: FixtureAllocator = .init;
-    defer expectNoLeak(&gpa);
-    var journal = try Journal.open(gpa.allocator(), io, ws.path, .{
-        .sync = .never,
-        .tail_records = 4,
-    });
+    const J = CountedEvent.J;
+    var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
     defer journal.deinit(io);
-    try fill(&journal, io, 1, count, "a name");
-
-    var one: Registry = .{};
-    const single = single: {
-        const started = now();
-        try journal.subscribe(io, one.sink());
-        break :single microseconds(started);
-    };
-
-    var five: [5]Registry = @splat(.{});
-    var sinks: [5]Journal.Sink = undefined;
+    const entries: [100]J.Entry = @splat(.{ .at = 1, .event = .{ .id = 1, .name = "a name" } });
+    for (0..count / entries.len) |_| _ = try journal.appendAll(io, &entries);
+    var one: CountedEvent.Fold = .{};
+    const before = CountedEvent.parses;
+    try journal.subscribe(io, one.sink());
+    try testing.expectEqual(before + count, CountedEvent.parses);
+    try testing.expectEqual(@as(u64, count), one.seen);
+    var five: [5]CountedEvent.Fold = @splat(.{});
+    var sinks: [5]J.Sink = undefined;
     for (&five, &sinks) |*fold, *sink| sink.* = fold.sink();
-    const shared = shared: {
-        const started = now();
-        try journal.subscribeAll(io, &sinks);
-        break :shared microseconds(started);
-    };
-
-    for (&five) |fold| try testing.expectEqual(@as(u32, count), fold.events);
-    // Five folds fed one at a time would be five passes. The extra callbacks
-    // per record are free beside the decode, so this is one.
-    try testing.expect(shared <= 2 * single + 1_000);
+    const parsed = CountedEvent.parses;
+    try journal.subscribeAll(io, &sinks);
+    try testing.expectEqual(parsed + count, CountedEvent.parses);
+    for (five) |fold| try testing.expectEqual(@as(u64, count), fold.seen);
 }
 
-test "a replay reads the log at a rate a fold can live with" {
+test "an append nobody keeps encodes once and a replay parses once" {
     const io = testing.io;
-    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
-
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const count = 50_000;
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    var journal = try CountedEvent.J.open(testing.allocator, io, ws.path, .{
         .sync = .never,
-        .tail_records = 4,
+        .tail_records = 0,
+        .verify_round_trip = false,
     });
     defer journal.deinit(io);
-
-    const writing = now();
-    for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
-    const per_append = microseconds(writing) * 1000 / count;
-
-    var counted: Registry = .{};
-    const reading = now();
+    const parses = CountedEvent.parses;
+    const writes = CountedEvent.writes;
+    for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), .{ .id = @intCast(i), .name = "a name" });
+    try testing.expectEqual(parses, CountedEvent.parses);
+    try testing.expectEqual(writes + count, CountedEvent.writes);
+    var counted: CountedEvent.Fold = .{};
     try journal.subscribe(io, counted.sink());
-    const per_record = microseconds(reading) * 1000 / count;
-    try testing.expectEqual(@as(u32, count), counted.events);
-
-    // Nanoseconds per record, measured here at about 29 000 for an append
-    // through the testing `Io` and 250 for a record read back. Three times
-    // each is a budget a shared runner meets and a write path that started
-    // parsing every record again does not.
-    try testing.expect(per_append < 90_000);
-    try testing.expect(per_record < 1_000);
+    try testing.expectEqual(parses + count, CountedEvent.parses);
+    try testing.expectEqual(@as(u64, count), counted.seen);
 }
 
-test "a batch under one flush is worth what it costs to form" {
+test "a batch shares one durable record sync" {
     const io = testing.io;
-    if (builtin.mode != .ReleaseFast) return error.SkipZigTest;
-
     var ws = try Workspace.init("log");
     defer ws.deinit();
     var journal = try Journal.open(testing.allocator, io, ws.path, .{
@@ -4991,27 +4962,16 @@ test "a batch under one flush is worth what it costs to form" {
         .tail_records = 4,
     });
     defer journal.deinit(io);
-
     const count = 300;
-    const singly = singly: {
-        const started = now();
-        for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
-        break :singly microseconds(started);
-    };
-
+    const before = journal.log.record_syncs;
+    for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
+    try testing.expectEqual(before + count, journal.log.record_syncs);
     var batch: [100]Journal.Entry = undefined;
     for (&batch, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "a name") };
-    const batched = batched: {
-        const started = now();
-        for (0..count / batch.len) |_| _ = try journal.appendAll(io, &batch);
-        break :batched microseconds(started);
-    };
-
-    // A batch of a hundred measured sixty times a record at a time here,
-    // where a durable write asks the drive to flush its cache. Twice is the
-    // budget: the gain is the flush, and a batch that stopped sharing one
-    // would not make it.
-    try testing.expect(batched * 2 <= singly);
+    const singly = journal.log.record_syncs;
+    for (0..count / batch.len) |_| _ = try journal.appendAll(io, &batch);
+    try testing.expectEqual(singly + count / batch.len, journal.log.record_syncs);
+    try testing.expectEqual(@as(u64, 2 * count), try journal.verify(io));
 }
 
 test "waiting and reading keep no storage owned by the journal" {
