@@ -222,7 +222,7 @@ pub fn Journal(comptime Event: type) type {
         /// An owned copy of the records after a cursor that memory still holds.
         /// Every record, its bytes and everything its event points at belongs
         /// to this batch, independent of the journal and its lifetime.
-        /// Release it with `deinit`; do not release copies of the same batch.
+        /// Only the opaque batch facade hands out access to this state.
         pub const Batch = struct {
             /// The records, oldest first. Empty when the cursor is caught up.
             records: []const Record,
@@ -232,13 +232,14 @@ pub fn Journal(comptime Event: type) type {
             /// `subscribeFrom` to read the disk.
             complete: bool,
             // Managed JSON containers retain this allocator's context. The
-            // arena stays at one address even when its owning batch moves.
-            arena: *std.heap.ArenaAllocator,
+            // batch is allocated before its arena hands out any storage.
+            arena: std.heap.ArenaAllocator,
 
             /// Release every record and all its referenced data together.
             pub fn deinit(batch: *Batch) void {
-                destroyArena(batch.arena);
-                batch.* = undefined;
+                const gpa = batch.arena.child_allocator;
+                batch.arena.deinit();
+                gpa.destroy(batch);
             }
         };
 
@@ -888,13 +889,14 @@ pub fn Journal(comptime Event: type) type {
         // Reading.
         //====================================================================
 
-        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: u64) CopyError!Batch {
+        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: u64) CopyError!*Batch {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             const window = self.tailSince(cursor);
-            const arena = try createArena(gpa);
-            errdefer destroyArena(arena);
-            const a = arena.allocator();
+            const batch = try gpa.create(Batch);
+            batch.* = .{ .records = &.{}, .complete = window.complete, .arena = .init(gpa) };
+            errdefer batch.deinit();
+            const a = batch.arena.allocator();
             const copied = try a.alloc(Record, window.records.len);
             for (window.records, copied) |owned, *copy| {
                 const record = owned.record;
@@ -902,7 +904,8 @@ pub fn Journal(comptime Event: type) type {
                 copy.bytes = try a.dupe(u8, record.bytes);
                 copy.event = try strand.copyOwned(a, record.event);
             }
-            return .{ .records = copied, .complete = window.complete, .arena = arena };
+            batch.records = copied;
+            return batch;
         }
 
         /// The tail after a cursor. The caller holds the journal's lock for
@@ -1388,27 +1391,27 @@ pub fn Journal(comptime Event: type) type {
             cursor: u64,
         };
 
-        /// What `readers` returns. Release it with `deinit`.
+        /// Only the opaque readers facade hands out access to this state.
         pub const Readers = struct {
             items: []const Reader,
-            gpa: Allocator,
+            arena: std.heap.ArenaAllocator,
 
             pub fn deinit(list: *Readers) void {
-                for (list.items) |reader| list.gpa.free(reader.name);
-                list.gpa.free(list.items);
-                list.* = undefined;
+                const gpa = list.arena.child_allocator;
+                list.arena.deinit();
+                gpa.destroy(list);
             }
         };
 
-        pub fn readers(self: *Self, io: Io) TailerError!Readers {
+        pub fn readers(self: *Self, io: Io) TailerError!*Readers {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
 
+            const list = try self.gpa.create(Readers);
+            list.* = .{ .items = &.{}, .arena = .init(self.gpa) };
+            errdefer list.deinit();
+            const a = list.arena.allocator();
             var found: std.ArrayList(Reader) = .empty;
-            errdefer {
-                for (found.items) |reader| self.gpa.free(reader.name);
-                found.deinit(self.gpa);
-            }
 
             var iterator = self.log.dir.iterate();
             while (try iterator.next(io)) |entry| {
@@ -1416,18 +1419,18 @@ pub fn Journal(comptime Event: type) type {
                 if (!std.mem.endsWith(u8, entry.name, cursor_extension)) continue;
                 const name = entry.name[0 .. entry.name.len - cursor_extension.len];
                 if (!validTailerName(name)) continue;
-                const owned = try self.gpa.dupe(u8, name);
-                errdefer self.gpa.free(owned);
-                try found.append(self.gpa, .{
+                const owned = try a.dupe(u8, name);
+                try found.append(a, .{
                     .name = owned,
                     .cursor = try self.readCursor(io, owned),
                 });
             }
-            return .{ .items = try found.toOwnedSlice(self.gpa), .gpa = self.gpa };
+            list.items = try found.toOwnedSlice(a);
+            return list;
         }
 
         pub fn minCursor(self: *Self, io: Io) TailerError!?u64 {
-            var list = try self.readers(io);
+            const list = try self.readers(io);
             defer list.deinit();
             var lowest: ?u64 = null;
             for (list.items) |reader| {

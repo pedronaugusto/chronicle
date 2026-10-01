@@ -129,7 +129,7 @@ The journal has:
 | `appendAll(io, entries)` | Write a batch under one `fsync`; returns the last sequence number. |
 | `appendDeferred(io, at, event)` | Write and publish one record now, durable with the next flush. |
 | `reconcile(io)` | After a persistence error, read back what survived and clear the latch. |
-| `copySince(gpa, io, cursor)` | An owned `Batch` of the tail after `cursor`; zero copies the whole tail. Release it with `deinit()`. |
+| `copySince(gpa, io, cursor)` | An owned `*Batch` of the tail after `cursor`; read `records()` and `complete()`, then release it with `deinit()`. |
 | `waitPast(io, cursor)` | Block until there is a record after the cursor or a nudge; return the newest sequence number. |
 | `replay(io, cursor)` | A walk over every record after `cursor`, from the disk. |
 | `replayAt(io, position)` | The same, from where an earlier walk's `position()` stopped. |
@@ -148,7 +148,7 @@ The journal has:
 | `subscribeAll(io, sinks)` | Fold every record into several folds, over one pass. |
 | `subscribeAllFrom(io, sinks, cursor)` | The same, starting after a snapshot. |
 | `unsubscribe(io, sink)` | Drop a fold. |
-| `readers(io)` | Every named reader and the cursor it committed. |
+| `readers(io)` | An owned `*Readers` listing every named reader and the cursor it committed; read `items()`, then release it with `deinit()`. |
 | `minCursor(io)` | The lowest of those, which is what retention may drop to. |
 | `snapshot(io, state_bytes)` | Write the fold out beside the log. |
 | `backup(io, dest)` | Copy the journal into another directory while it runs. |
@@ -313,6 +313,15 @@ segment. Journal and replay allocations come from the allocator passed to
 `open`; batches come from the allocator passed to `copySince`. Their memory
 is held until the caller releases them.
 
+`Batch` and `Readers` are opaque owners returned by pointer. Store `*Batch`
+and `*Readers`, read `batch.records()`, `batch.complete()` and `list.items()`,
+and release each owner exactly once with `deinit()`, after every user of it
+has finished and before its allocator. Copying a pointer makes an alias to
+the same owner. It does not give that alias another release. A reader list,
+including its names, remains valid after the journal closes; it uses the
+allocator passed to `open`. Both result types hold observations of the time
+they were created; later journal operations do not change them.
+
 A `Record` from a `Batch`, including its bytes and every reference in its
 event, belongs to the batch until `batch.deinit()`, even after the journal
 closes. The batch preserves the stored bytes and schema version and copies
@@ -323,7 +332,7 @@ forward with no re-encoding.
 
 `waitPast` only waits. After it returns, `copySince(gpa, io, cursor)` takes an
 owned copy under the lock. A writer may have moved the tail between the two
-calls: check `batch.complete`, and use `replay` or `subscribeFrom` for records
+calls: check `batch.complete()`, and use `replay` or `subscribeFrom` for records
 that memory no longer holds. Advance the cursor to the last record handled,
 not to the number returned by the wait. A failed rebuild leaves the tail
 empty until it is rebuilt successfully. An empty batch is complete only when

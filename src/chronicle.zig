@@ -153,8 +153,37 @@ pub fn Journal(comptime Event: type) type {
         /// An owned copy of the records after a cursor that memory still holds.
         /// Every record, its bytes and everything its event points at belongs
         /// to this batch, independent of the journal and its lifetime.
-        /// Release it with `deinit`; do not release copies of the same batch.
-        pub const Batch = State.Batch;
+        /// Keep its pointer and release the owner exactly once with `deinit`,
+        /// before the allocator passed to `copySince`. Every pointer alias and
+        /// record borrow becomes invalid on release.
+        pub const Batch = opaque {
+            fn inner(batch: *const Batch) *const State.Batch {
+                return @ptrCast(@alignCast(batch)); // safe: copySince returns this allocated State.Batch, retained until deinit.
+            }
+            fn from(batch: *State.Batch) *Batch {
+                return @ptrCast(batch); // safe: hides the same stable State.Batch allocation without copying it.
+            }
+
+            /// The records, oldest first. Empty when the cursor is caught up.
+            /// The slice and every record's referenced data last until `deinit`.
+            pub fn records(batch: *const Batch) []const Record {
+                return batch.inner().records;
+            }
+
+            /// Whether no records between the cursor and the newest sequence
+            /// known at the time of the copy are missing. False means the tail
+            /// no longer reaches back that far: use `replay` or `subscribeFrom`.
+            pub fn complete(batch: *const Batch) bool {
+                return batch.inner().complete;
+            }
+
+            /// Release the owner, every record and all its referenced data.
+            /// Call only after every user of this batch has finished.
+            pub fn deinit(batch: *Batch) void {
+                const state: *State.Batch = @ptrCast(@alignCast(batch)); // safe: this is the live allocation returned by copySince, released exactly once here.
+                state.deinit();
+            }
+        };
 
         /// One record for `appendAll`: what `append` takes as two arguments.
         pub const Entry = State.Entry;
@@ -331,8 +360,32 @@ pub fn Journal(comptime Event: type) type {
         /// it: the pair `readers` lists, without opening a `Tailer`.
         pub const Reader = State.Reader;
 
-        /// What `readers` returns. Release it with `deinit`.
-        pub const Readers = State.Readers;
+        /// An owned list of named readers and their committed cursors.
+        /// Independent of the journal and its lifetime. Keep its pointer and
+        /// release the owner exactly once with `deinit`, before the allocator
+        /// passed to `open`. Every pointer alias and item borrow becomes
+        /// invalid on release.
+        pub const Readers = opaque {
+            fn inner(list: *const Readers) *const State.Readers {
+                return @ptrCast(@alignCast(list)); // safe: readers returns this allocated State.Readers, retained until deinit.
+            }
+            fn from(list: *State.Readers) *Readers {
+                return @ptrCast(list); // safe: hides the same stable State.Readers allocation without copying it.
+            }
+
+            /// The readers at the time of the listing, in directory order.
+            /// The slice and names last until `deinit`.
+            pub fn items(list: *const Readers) []const Reader {
+                return list.inner().items;
+            }
+
+            /// Release the owner, the list and every reader name together.
+            /// Call only after every user of this list has finished.
+            pub fn deinit(list: *Readers) void {
+                const state: *State.Readers = @ptrCast(@alignCast(list)); // safe: this is the live allocation returned by readers, released exactly once here.
+                state.deinit();
+            }
+        };
 
         /// The journal and the caller-owned snapshot beside it, if any.
         pub const Opened = struct {
@@ -375,7 +428,7 @@ pub fn Journal(comptime Event: type) type {
         /// Flush and durably close the active segment, then release the lock
         /// and every allocation. The journal is consumed even when an error
         /// is returned. Call only after every caller and replay has stopped;
-        /// owned batches and snapshot state remain valid.
+        /// owned batches, reader lists and snapshot state remain valid.
         pub fn close(self: *Self, io: Io) CloseError!void {
             return State.close(self.inner(), io);
         }
@@ -383,7 +436,7 @@ pub fn Journal(comptime Event: type) type {
         /// Best-effort fallback for scopes that cannot return a close error.
         /// Prefer `close` when `.on_segment` relies on shutdown for its final
         /// durable write. Call only after every caller and replay has stopped;
-        /// owned batches and snapshot state remain valid.
+        /// owned batches, reader lists and snapshot state remain valid.
         pub fn deinit(self: *Self, io: Io) void {
             return State.deinit(self.inner(), io);
         }
@@ -509,7 +562,7 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// A cursor at or beyond the newest sequence yields an empty, complete
         /// batch. A cursor older than the tail yields the whole tail with
-        /// `Batch.complete` false: use `replay` or `subscribeFrom` for the gap.
+        /// `Batch.complete()` false: use `replay` or `subscribeFrom` for the gap.
         /// Waiting and reading are separate: `waitPast` returns a sequence,
         /// then this call copies what is still held when it takes the lock.
         ///
@@ -519,8 +572,8 @@ pub fn Journal(comptime Event: type) type {
         /// must be finite trees of data accepted by `strand.copyOwned`. The exact
         /// stored bytes and original schema versions are preserved separately.
         /// Safe to call from any task or thread, except from inside a sink.
-        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: u64) CopyError!Batch {
-            return State.copySince(self.inner(), gpa, io, cursor);
+        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: u64) CopyError!*Batch {
+            return Batch.from(try State.copySince(self.inner(), gpa, io, cursor));
         }
 
         /// Block until there is a record after `cursor`, or until `nudge`, then
@@ -528,7 +581,7 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// A nudge may return a number at or below the cursor. No records are
         /// returned: use `copySince`, `replay` or a subscription to read them.
-        /// The tail may move between waiting and reading; `Batch.complete`
+        /// The tail may move between waiting and reading; `Batch.complete()`
         /// tells a reader whether it needs the disk to cover the gap.
         /// Safe to call from any task or thread, including several at once.
         pub fn waitPast(self: *Self, io: Io, cursor: u64) Io.Cancelable!u64 {
@@ -765,9 +818,13 @@ pub fn Journal(comptime Event: type) type {
         /// process; this reads the directory rather than any register this
         /// journal keeps, so a reader in another process is in the list.
         ///
+        /// The list owns its items and names through the allocator passed to
+        /// `open`; release it with `Readers.deinit`. It remains valid after
+        /// the journal closes.
+        ///
         /// Safe to call from any task or thread.
-        pub fn readers(self: *Self, io: Io) TailerError!Readers {
-            return State.readers(self.inner(), io);
+        pub fn readers(self: *Self, io: Io) TailerError!*Readers {
+            return Readers.from(try State.readers(self.inner(), io));
         }
 
         /// The lowest cursor any named reader has committed, or null when no
@@ -825,7 +882,7 @@ pub fn Journal(comptime Event: type) type {
         /// goes when you say so and not before.
         ///
         /// The records that survive keep their sequence numbers. A cursor from
-        /// before the cut yields what is left, and `Batch.complete` is how a
+        /// before the cut yields what is left, and `Batch.complete()` is how a
         /// reader notices.
         ///
         /// Safe to call from any task or thread.

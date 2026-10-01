@@ -122,9 +122,13 @@ pub fn main() !void {
 
     std.debug.print("snapshot: seq {}, {} cents\n", .{ from, balances.cents });
     std.debug.print("restored: {} accounts, {} cents, seq {}\n", .{ restored.accounts, restored.cents, try reopened.lastSeq(io) });
-    var batch = try reopened.copySince(gpa, io, from);
+    const batch = try reopened.copySince(gpa, io, from);
     defer batch.deinit();
-    std.debug.print("replayed: {} record(s) after the snapshot\n", .{batch.records.len});
+    if (!batch.complete()) return error.IncompleteTail;
+    std.debug.print("replayed: {} record(s) after the snapshot\n", .{batch.records().len});
+    const readers = try reopened.readers(io);
+    defer readers.deinit();
+    if (readers.items().len != 0) return error.UnexpectedReader;
     if (restored.cents != balances.cents) return error.FoldMismatch;
     if (last != 3) return error.UnexpectedSequence;
 }
