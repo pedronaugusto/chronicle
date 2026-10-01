@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Benchmark snapshots copy the harness sources together and keep both benchmark executables for each library commit.
+
 - The benchmark context cast carries its safety reason on the line the cast occurs.
 
 - The bench harness measures indexed seeks, shared folds, append and replay rates and group commit in place of unit-suite speed budgets.

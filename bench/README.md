@@ -27,3 +27,12 @@ append and replay time per record, and group commit against single durable
 appends. It prints measurements and ratios, with no speed thresholds. The
 scratch directory is owned and removed by that invocation. `-Dsmoke=true`
 uses tiny fixtures to check the harness; smoke timings are not measurements.
+
+`./per-commit.sh <commit>` also retains `build/work-bench-<commit>`, so these
+measurements can run against the library commit being reviewed. Snapshot
+builds copy the harness source directory as one unit. Prefer full commit
+identifiers: the resulting executables are cached under the supplied name.
+
+`./test-snapshot.sh <commit>` checks both snapshot executables and rebuilding
+when only the older journal executable is cached. Its scratch and dependency
+cache stay in a temporary directory under `bench/build` and are removed.
