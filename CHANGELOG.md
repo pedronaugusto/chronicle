@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Encoding keeps its allocation-failure cause with its writer, so a custom stringify refusal returns `WriteFailed` rather than `OutOfMemory` without latching persistence failure.
+
 - A rotation reserves segment inventory before changing files, so allocation failure cannot publish an active file with no matching segment owner.
 
 - Segment-header, timestamp and back-link probes propagate allocation failure instead of treating valid bytes as missing or corrupt metadata.

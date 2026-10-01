@@ -36,6 +36,7 @@ const Log = @import("log.zig");
 const crc32c = @import("crc32c.zig");
 const strand = @import("strand");
 const envelope = @import("envelope.zig");
+const Encoding = @import("encoding.zig");
 
 /// An event kept as its bytes: what a `migrate` hook is handed, what an
 /// `unknown` arm of this type holds, and an `Event` of its own for a journal
@@ -545,6 +546,9 @@ pub fn Journal(comptime Event: type) type {
         /// * `SequenceExhausted` — the newest sequence number is
         ///   `maxInt(i64)`, and one more could not be read back, because a
         ///   sequence number is a JSON integer.
+        /// * `WriteFailed` — a custom stringify hook refused the event, or
+        ///   writing or flushing the file failed. A hook refusal changes no
+        ///   file and does not latch persistence failure.
         /// * `RecordTooLarge` — the line the record would be written as is
         ///   longer than `Options.max_record_bytes`. Nothing was written.
         /// * `ReadOnly` — the journal was opened with `Access.read`.
@@ -2165,7 +2169,8 @@ pub fn Journal(comptime Event: type) type {
             // from the last record so a run of records alike is written
             // without growing the buffer. One nothing keeps is written into
             // the journal's `line`, which it hands back grown or not.
-            var out: std.Io.Writer.Allocating = if (arena) |a| .init(a.allocator()) else .fromArrayList(self.gpa, &self.line);
+            var encoding: Encoding = .init(if (arena) |a| .init(a.allocator()) else .fromArrayList(self.gpa, &self.line));
+            const out = &encoding.output;
             defer if (!needs_record) {
                 self.line = out.toArrayList();
             };
@@ -2185,7 +2190,7 @@ pub fn Journal(comptime Event: type) type {
                 .v = self.config.schema_version,
                 .p = back_link,
                 .ev = event,
-            }, .{ .emit_null_optional_fields = true }) catch return error.OutOfMemory;
+            }, .{ .emit_null_optional_fields = true }) catch |err| return encoding.diagnose(err);
             w.end -= 1;
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes

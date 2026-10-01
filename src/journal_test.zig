@@ -5808,3 +5808,56 @@ test "a rotation reserves its inventory before publishing a new active file" {
     _ = try journal.reconcile(io);
     try testing.expectEqual(previous + 1, try journal.append(io, 1, created(1, "n")));
 }
+
+const RefusingEvent = struct {
+    text: []const u8,
+    refuse: bool = false,
+    partial: bool = false,
+    pub fn jsonStringify(value: RefusingEvent, writer: anytype) !void {
+        if (!value.refuse or value.partial) try writer.write(.{ .text = value.text });
+        if (value.refuse) return error.WriteFailed;
+    }
+};
+
+test "a stringify refusal is distinct from an encoding allocation failure" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const J = chronicle.Journal(RefusingEvent);
+    for ([_]usize{ 0, 2 }) |tail_records| {
+        var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = tail_records, .verify_round_trip = tail_records != 0 });
+        defer journal.deinit(io);
+        const previous = try journal.lastSeq(io);
+        for ([_]bool{ false, true }) |partial| {
+            try testing.expectError(error.WriteFailed, journal.append(io, 1, .{
+                .text = "x" ** 4096,
+                .refuse = true,
+                .partial = partial,
+            }));
+            try testing.expectEqual(previous, try journal.lastSeq(io));
+            try testing.expect(!(try journal.status(io)).persistence_failed);
+        }
+        try testing.expectEqual(previous + 1, try journal.append(io, 1, .{ .text = "next" }));
+    }
+}
+
+test "encoding owns the cause of every allocation failure with and without a tail" {
+    const Case = struct {
+        fn append(a: std.mem.Allocator, io: Io, tail_records: usize) !void {
+            var ws = try Workspace.init("log");
+            defer ws.deinit();
+            const J = chronicle.Journal(RefusingEvent);
+            var journal = try J.open(a, io, ws.path, .{
+                .sync = .never,
+                .tail_records = tail_records,
+                .verify_round_trip = tail_records != 0,
+            });
+            defer journal.deinit(io);
+            _ = try journal.append(io, 1, .{ .text = "x" ** 4096 });
+            try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+        }
+    };
+    for ([_]usize{ 0, 2 }) |tail_records| {
+        try testing.checkAllAllocationFailures(testing.allocator, Case.append, .{ testing.io, tail_records });
+    }
+}
