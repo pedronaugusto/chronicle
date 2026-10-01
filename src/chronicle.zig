@@ -559,7 +559,7 @@ pub fn Journal(comptime Event: type) type {
 
         /// Copying the tail may be canceled at the lock, run out of memory,
         /// or find a current event that no longer round-trips through JSON.
-        pub const CopyError = Allocator.Error || Io.Cancelable || error{NotRoundTrippable};
+        pub const CopyError = Allocator.Error || Io.Cancelable;
 
         /// `replayAt`'s errors: `replay`'s, and a position that no longer
         /// names the record it was taken after.
@@ -1049,8 +1049,9 @@ pub fn Journal(comptime Event: type) type {
         /// then this call copies what is still held when it takes the lock.
         ///
         /// The batch owns everything it returns through `gpa`; release it
-        /// with `Batch.deinit`. The current events are copied by their JSON
-        /// round-trip, without invoking the migration hook again. The exact
+        /// with `Batch.deinit`. Events and all their storage are copied through
+        /// strand without calling parse, stringify or migration hooks. Events
+        /// must be finite trees of data accepted by `strand.copyOwned`. The exact
         /// stored bytes and original schema versions are preserved separately.
         /// Safe to call from any task or thread, except from inside a sink.
         pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: u64) CopyError!Batch {
@@ -1065,14 +1066,7 @@ pub fn Journal(comptime Event: type) type {
                 const record = owned.record;
                 copy.* = record;
                 copy.bytes = try a.dupe(u8, record.bytes);
-                // Decode the current event, not the stored version: a migrated
-                // record already has its event, and a hook is not a copier.
-                var out: Io.Writer.Allocating = .init(a);
-                strand.writeValue(&out.writer, record.event, .{ .emit_null_optional_fields = true }) catch return error.OutOfMemory;
-                copy.event = strand.parseLine(Event, a, out.written(), .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    else => return error.NotRoundTrippable,
-                };
+                copy.event = try strand.copyOwned(a, record.event);
             }
             return .{ .records = copied, .complete = window.complete, .arena = arena };
         }

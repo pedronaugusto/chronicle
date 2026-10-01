@@ -354,7 +354,7 @@ with.
 `subscribeFrom`, `subscribeAll`, `subscribeAllFrom`, `unsubscribe`, `lastSeq`,
 `oldestSeq`, `segmentCount`, `seqAtOrAfter`, `tailer`, `readers`, `minCursor`,
 `snapshot`, `backup`, `compact`, `dropSegmentsBefore`, `truncateAfter`,
-`reconcile`, `status`, `stats` and `refresh` take it and are safe from any task or thread, several at once; the subscribe calls hold it for
+`reconcile`, `options`, `status`, `stats` and `refresh` take it and are safe from any task or thread, several at once; the subscribe calls hold it for
 the whole of their replay, so the hand-over from the disk to the live records
 has no seam in it. A call that can return `error.Canceled` can be canceled
 while waiting for the lock, with nothing done. `nudge` takes the lock without
@@ -365,7 +365,10 @@ task's cancelation blocked, and the cancel is reported by the task's next
 cancelation point: a record a cancel landed on is written whole, never
 latched as a write that failed. So is a close. `copySince` returns no borrow
 from the journal: its batch can be read beside writers and released on its
-own, with an allocator suitable for the threads that use it. Sink callbacks
+own, with an allocator suitable for the threads that use it. Events copied into
+a batch must meet `strand.copyOwned`'s finite-data-tree contract; copies
+preserve Raw bytes and dynamic values and call no parse, stringify or migration hooks.
+Sink callbacks
 run under the lock; they must neither call back into the journal nor retain
 a record or its referenced data after the call.
 
@@ -377,6 +380,7 @@ walk's memory. Retention beside a walk may remove files it needs, which is
 reported as an error. `close` and `deinit` require every caller and walk to
 have stopped. Observe recovery and persistence state with `status(io)`. The
 `options(io)` call copies the configuration passed to `open` under the lock.
+`Tailer.cursor(io)` observes the committed cursor under that same lock.
 The allocator passed to `open` must support concurrent use when walks or tailers allocate alongside
 journal calls. Every file operation and
 the wait primitive go through `std.Io`, so the package runs under

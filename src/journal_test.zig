@@ -5637,3 +5637,96 @@ test "observing a tailer cursor waits for the journal lock" {
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
+
+test "copySince copies hook values without parsing or stringifying again" {
+    const Hook = struct {
+        text: []const u8,
+        var parses: usize = 0;
+        var writes: usize = 0;
+        pub fn jsonParse(a: std.mem.Allocator, source: anytype, opts: std.json.ParseOptions) !@This() {
+            parses += 1;
+            const value = try std.json.innerParse(struct { text: []const u8 }, a, source, opts);
+            return .{ .text = value.text };
+        }
+        pub fn jsonStringify(value: @This(), writer: anytype) !void {
+            writes += 1;
+            try writer.write(.{ .text = value.text });
+        }
+    };
+    const J = chronicle.Journal(Hook);
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var batch: J.Batch = undefined;
+    {
+        var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, .{ .text = "hook value" });
+        const parses = Hook.parses;
+        const writes = Hook.writes;
+        batch = try journal.copySince(testing.allocator, io, 0);
+        errdefer batch.deinit();
+        try testing.expectEqual(parses, Hook.parses);
+        try testing.expectEqual(writes, Hook.writes);
+    }
+    defer batch.deinit();
+    try testing.expectEqualStrings("hook value", batch.records[0].event.text);
+}
+
+test "copySince preserves exact migrated Raw bytes" {
+    const J = chronicle.Journal(chronicle.Raw);
+    const Migration = struct {
+        const bytes = "{\n  \"raw\": [1, 2]\n}";
+        fn migrate(a: std.mem.Allocator, _: u32, _: chronicle.Raw) J.MigrateError!chronicle.Raw {
+            return .{ .bytes = try a.dupe(u8, bytes) };
+        }
+    };
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev = "{}" }});
+    var batch: J.Batch = undefined;
+    {
+        var journal = try J.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.migrate });
+        defer journal.deinit(io);
+        batch = try journal.copySince(testing.allocator, io, 0);
+    }
+    defer batch.deinit();
+    try testing.expectEqualStrings(Migration.bytes, batch.records[0].event.bytes);
+    try testing.expectEqual(@as(u32, 1), batch.records[0].version);
+    try testing.expect(std.mem.indexOf(u8, batch.records[0].bytes, "\"ev\":{}") != null);
+}
+
+test "copySince owns dynamic Value keys strings containers and number spelling" {
+    const J = chronicle.Journal(std.json.Value);
+    const Migration = struct {
+        fn migrate(a: std.mem.Allocator, _: u32, _: chronicle.Raw) J.MigrateError!std.json.Value {
+            return std.json.parseFromSliceLeaky(std.json.Value, a, "{\"key\":[\"text\",1e2]}", .{
+                .allocate = .alloc_always,
+                .parse_numbers = false,
+            }) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return error.Unmigratable,
+            };
+        }
+    };
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev = "{}" }});
+    var batch: J.Batch = undefined;
+    {
+        var journal = try J.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.migrate });
+        defer journal.deinit(io);
+        batch = try journal.copySince(testing.allocator, io, 0);
+    }
+    defer batch.deinit();
+    try testing.expectEqualStrings("key", batch.records[0].event.object.keys()[0]);
+    var array = batch.records[0].event.object.get("key").?.array;
+    try testing.expectEqualStrings("text", array.items[0].string);
+    try testing.expectEqual(std.json.Value.number_string, std.meta.activeTag(array.items[1]));
+    try testing.expectEqualStrings("1e2", array.items[1].number_string);
+    try array.ensureTotalCapacity(65536);
+    try array.append(.{ .string = "next" });
+    try testing.expectEqualStrings("next", array.items[2].string);
+}
