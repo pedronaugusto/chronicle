@@ -112,6 +112,42 @@ fn batches(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     try metric(io, "single_over_batch", single / batched, "ratio");
 }
 
+// The former unit-suite ceiling belongs beside the other speed measurements.
+// Fixture creation is untimed; opening keeps the default verification and tail.
+fn largeOpen(io: Io, a: std.mem.Allocator, path: []const u8) !void {
+    const LargeEvent = union(enum) { created: struct { id: u32, name: []const u8 } };
+    const LargeJournal = chronicle.Journal(LargeEvent);
+    const count: usize = if (smoke) 20 else 200_000;
+    {
+        var journal = try LargeJournal.open(a, io, path, .{ .sync = .never, .tail_records = 0 });
+        defer journal.deinit(io);
+        var entries: [500]LargeJournal.Entry = undefined;
+        var offset: usize = 0;
+        while (offset < count) {
+            const n = @min(count - offset, entries.len);
+            for (entries[0..n], 0..) |*entry, i| entry.* = .{
+                .at = @intCast(offset + i),
+                .event = .{ .created = .{ .id = @intCast(offset + i), .name = "a name of some length" } },
+            };
+            _ = try journal.appendAll(io, entries[0..n]);
+            offset += n;
+        }
+        // Snapshot builds also cover the earlier, infallible observation.
+        const segments = if (comptime @typeInfo(@TypeOf(LargeJournal.segmentCount)).@"fn".params.len == 1)
+            journal.segmentCount()
+        else
+            try journal.segmentCount(io);
+        if (!smoke and segments <= 1) return error.ExpectedMultipleSegments;
+    }
+    const started = Io.Clock.awake.now(io);
+    var journal = try LargeJournal.open(a, io, path, .{});
+    defer journal.deinit(io);
+    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    if (try journal.lastSeq(io) != count) return error.WrongCount;
+    try metric(io, "large_open", @floatFromInt(elapsed_ms), "ms");
+    if (!smoke and elapsed_ms >= 30_000) return error.OpenTooSlow;
+}
+
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len != 2) return error.ExpectedNewScratchDirectory;
@@ -120,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
     // Exclusive creation makes each invocation own all of its scratch.
     try Io.Dir.cwd().createDir(io, args[1], .default_dir);
     defer Io.Dir.cwd().deleteTree(io, args[1]) catch {};
-    inline for (.{ .{ "seek", seeks }, .{ "fold", folds }, .{ "rates", rates }, .{ "batch", batches } }) |work| {
+    inline for (.{ .{ "seek", seeks }, .{ "fold", folds }, .{ "rates", rates }, .{ "batch", batches }, .{ "large", largeOpen } }) |work| {
         const path = try std.fs.path.join(a, &.{ args[1], work[0] });
         defer a.free(path);
         try work[1](io, a, path);

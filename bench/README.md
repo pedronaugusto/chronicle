@@ -21,12 +21,16 @@ Raw inputs default to generated data or `BENCH_CORPUS`. Generated files are igno
 
 `zig build -Doptimize=ReleaseFast` also builds `work-bench`. Run
 `zig-out/bin/work-bench build/new-scratch` with a directory that does not
-exist, beneath this checkout. It measures the four claims formerly in the
+exist, beneath this checkout. It measures the claims formerly in the
 unit suite: active against sealed seeks, five shared folds against one,
 append and replay time per record, and group commit against single durable
-appends. It prints measurements and ratios, with no speed thresholds. The
+appends, and opening 200,000 records with the default tail. The large-open
+workload retains the former 30,000 ms ceiling; the others print measurements
+and ratios without speed thresholds. The
 scratch directory is owned and removed by that invocation. `-Dsmoke=true`
-uses tiny fixtures to check the harness; smoke timings are not measurements.
+uses tiny fixtures to check the harness; smoke timings are not measurements. The cancellation tests retained on this
+branch also keep their five-second progress watchdogs; the release unit suite
+checks cancellation without those wall-clock progress ceilings.
 
 `./per-commit.sh <commit>` also retains `build/work-bench-<commit>`, so these
 measurements can run against the library commit being reviewed. Snapshot
