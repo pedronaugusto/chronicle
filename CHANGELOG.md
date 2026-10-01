@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Pin strand at `3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0`, including its checked decoding and payload-byte framing bounds.
+
 - **Breaking:** `Tailer.cursor(io)` observes the committed cursor under the journal lock, replacing the mutable `Tailer.cursor` field.
 
 - **Breaking:** `options(io)` returns the configuration supplied at open under the journal lock, replacing the public `options` field.

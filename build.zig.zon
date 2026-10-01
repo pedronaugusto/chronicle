@@ -7,8 +7,8 @@
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#5fb576f145aad1a3e033222e7408770bdbcc4b66",
-            .hash = "strand-0.7.0-8LNWVupxCgCvSFIvrau3YIkPSE-JGTGs4XeX2eustGWA",
+            .url = "git+https://github.com/pedronaugusto/strand#3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0",
+            .hash = "strand-0.7.0-8LNWVvntCwAhZFFzI4P3OUiXFzvUEX84NQUDk4Ehayc7",
         },
     },
     .paths = .{
