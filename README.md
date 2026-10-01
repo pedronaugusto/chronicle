@@ -507,13 +507,13 @@ compaction leaves when it dies between its rename and its unlink. Three tests
 spawn a second process — one to hold the lock, one to append while a backup is
 taken beside it, and one to be killed while it mutates the journal — and one
 builds a journal of two hundred thousand records and asserts that opening it
-is proportionate and that record-sized working memory is bounded.
+preserves the record count and keeps record-sized working memory bounded.
 
 The unit suite counts work: index probes and skipped prefixes for active and
 sealed seeks, scans avoided by a clean close, one parse per record for shared
 folds, one encoding per uncached append, and one durable record sync per batch.
 Speed measurements live in the `bench` branch harness. The large-log test keeps
-its watchdog and memory bound; unit tests make no claim about a runner's speed.
+its record counts and memory bound; unit tests make no claim about a runner's speed.
 
 Six fuzz tests. Five run over the contents of a file — arbitrary segment bytes,
 an arbitrary first line of a segment, an arbitrary index, an arbitrary snapshot
