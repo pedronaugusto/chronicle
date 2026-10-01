@@ -61,7 +61,7 @@ pub fn main() !void {
         // newest records are read back, and the sequence number continues
         // from the last one, so a restart never reuses a number. A second
         // writer would get error.Locked instead of this journal.
-        var ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
+        const ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
         defer ledger.deinit(io);
 
         // A sink is a fold. Subscribing streams it every record already on
@@ -78,7 +78,7 @@ pub fn main() !void {
 
         // A follower keeps its replay across wakes. Each re-arm checks where
         // the last pass stopped and reuses the scan buffer and record scratch.
-        var follower = try ledger.replayAt(io, .after(0));
+        const follower = try ledger.replayAt(io, .after(0));
         defer follower.deinit(io);
         _ = (try follower.next(io)).?;
 
@@ -107,7 +107,7 @@ pub fn main() !void {
     // Starting again: restore the snapshot, then fold only what came after
     // it. Without a snapshot `from` stays 0 and the whole log is replayed.
     const opened = try Ledger.openWithSnapshot(gpa, io, path, .{ .schema_version = 1 });
-    var reopened = opened.journal;
+    const reopened = opened.journal;
     defer reopened.deinit(io);
 
     var restored: Balances = .{};

@@ -16,6 +16,15 @@ const Event = union(enum) {
 };
 
 const Journal = chronicle.Journal(Event);
+const implementation = @import("journal.zig");
+
+fn journalState(owner: anytype) *implementation.Journal(@FieldType(@typeInfo(@TypeOf(owner)).pointer.child.Record, "event")) {
+    return @ptrCast(@alignCast(owner));
+}
+
+fn replayState(comptime E: type, walk: *chronicle.Journal(E).Replay) *implementation.Journal(E).Replay {
+    return @ptrCast(@alignCast(walk));
+}
 
 /// A fold: the state the log adds up to. Two folds of the same records are
 /// equal whether the records came off the disk or arrived live, which is what
@@ -337,7 +346,7 @@ test "an append returns the sequence number and puts one line in the first segme
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
 
     try testing.expectEqual(@as(u64, 1), try journal.append(io, 1_000, created(1, "one")));
@@ -407,13 +416,13 @@ test "a reopened journal continues the sequence and appends after the last line"
     defer ws.deinit();
 
     {
-        var first = try Journal.open(testing.allocator, io, ws.path, .{});
+        const first = try Journal.open(testing.allocator, io, ws.path, .{});
         defer first.deinit(io);
         _ = try first.append(io, 1, created(1, "before"));
         _ = try first.append(io, 2, created(2, "also before"));
     }
 
-    var second = try Journal.open(testing.allocator, io, ws.path, .{});
+    const second = try Journal.open(testing.allocator, io, ws.path, .{});
     defer second.deinit(io);
     try testing.expectEqual(@as(u64, 2), try second.lastSeq(io));
     var copied_tail_6 = try second.copySince(testing.allocator, io, 0);
@@ -442,7 +451,7 @@ test "appendAll writes every entry and numbers them in order" {
     defer ws.deinit();
 
     var folded: Registry = .{};
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
     try journal.subscribe(io, folded.sink());
 
@@ -475,7 +484,7 @@ test "appendAll writes every entry and numbers them in order" {
     // A batch crossing a rotation is still one batch.
     var rolled = try Workspace.init("rolled");
     defer rolled.deinit();
-    var rolling = try Journal.open(testing.allocator, io, rolled.path, small(2, 1024));
+    const rolling = try Journal.open(testing.allocator, io, rolled.path, small(2, 1024));
     defer rolling.deinit(io);
     var many: [7]Journal.Entry = undefined;
     for (&many, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "n") };
@@ -490,7 +499,7 @@ test "a batch this journal cannot form leaves the log exactly as it was" {
     defer ws.deinit();
 
     const cap = 256;
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .never,
         .max_record_bytes = cap,
         .max_segment_records = 2,
@@ -537,7 +546,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
         .{ .at = 40, .event = created(4, "four") },
     };
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
         try testing.expectEqual(@as(u64, 4), try journal.appendAll(io, &batch));
     }
@@ -557,7 +566,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
         const records = std.mem.count(u8, kept, "\n") - 1;
 
         try ws.write(name, stopped);
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
 
         // What survived is a prefix of the batch, byte for byte -- not a
@@ -580,7 +589,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
     // with a record in it. The next open writes that line again and starts.
     const head = std.mem.indexOfScalar(u8, whole, '\n').?;
     try ws.write(name, whole[0 .. head - 3]);
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
     try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
     try testing.expectEqual(@as(usize, head - 3), (try journal.status(io)).dropped_bytes);
@@ -606,7 +615,7 @@ test "a final line the writer did not finish is dropped and the segment repaired
     try ws.write(try ws.segment(1), crashed.written());
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
 
         try testing.expectEqual(@as(usize, partial.len), (try journal.status(io)).dropped_bytes);
@@ -623,7 +632,7 @@ test "a final line the writer did not finish is dropped and the segment repaired
         try testing.expectEqual(@as(usize, 3), std.mem.count(u8, on_disk, "\n"));
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{});
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{});
     defer reopened.deinit(io);
     var copied_tail_9 = try reopened.copySince(testing.allocator, io, 0);
     defer copied_tail_9.deinit();
@@ -743,7 +752,7 @@ test "a write that does not reach the disk publishes nothing and latches" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .write_buffer_size = 0 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .write_buffer_size = 0 });
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "durable"));
 
@@ -822,7 +831,7 @@ fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
     try testing.expectEqual(@as(u64, 4), try journal.appendDeferred(io, 4, created(4, "deferred")));
     // and nothing swallowed the cancel: a write outside the journal's is
     // still where it lands
-    try testing.expectError(error.Canceled, io.vtable.fileWritePositional(io.userdata, journal.log.active.?.file, "", &.{""}, 1, 0));
+    try testing.expectError(error.Canceled, io.vtable.fileWritePositional(io.userdata, journalState(journal).log.active.?.file, "", &.{""}, 1, 0));
 }
 
 test "a cancel that lands on a write is not a failed write" {
@@ -832,7 +841,7 @@ test "a cancel that lands on a write is not a failed write" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
         var fold: Registry = .{};
         try journal.subscribe(io, fold.sink());
@@ -842,11 +851,11 @@ test "a cancel that lands on a write is not a failed write" {
         // sees each once: a write that has begun runs to its end.
         cancel_writes.store(true, .release);
         defer cancel_writes.store(false, .release);
-        var task = try io.concurrent(writeThroughCancels, .{ io, &journal, &fold });
+        var task = try io.concurrent(writeThroughCancels, .{ io, journal, &fold });
         try task.await(io);
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 4), try reopened.lastSeq(io));
 }
@@ -859,12 +868,12 @@ test "a deferred record is published at once and made durable with the next flus
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
     var fold: Registry = .{};
     try journal.subscribe(io, fold.sink());
 
-    const syncs = journal.log.record_syncs;
+    const syncs = journalState(journal).log.record_syncs;
     try testing.expectEqual(@as(u64, 1), try journal.appendDeferred(io, 1, created(1, "one")));
     try testing.expectEqual(@as(u64, 2), try journal.appendDeferred(io, 2, created(2, "two")));
     // Published at once: the fold has both, and a reader of the files
@@ -872,15 +881,15 @@ test "a deferred record is published at once and made durable with the next flus
     try testing.expectEqual(@as(u32, 2), fold.events);
     try testing.expectEqual(@as(u64, 2), try journal.lastSeq(io));
     {
-        var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+        const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
         defer reader.deinit(io);
         try testing.expectEqual(@as(u64, 2), try reader.lastSeq(io));
     }
     // Nothing was made durable for them, and the next record that asks
     // for it makes all three durable with one flush.
-    try testing.expectEqual(syncs, journal.log.record_syncs);
+    try testing.expectEqual(syncs, journalState(journal).log.record_syncs);
     try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "three")));
-    try testing.expectEqual(syncs + 1, journal.log.record_syncs);
+    try testing.expectEqual(syncs + 1, journalState(journal).log.record_syncs);
     try testing.expectEqual(@as(u32, 3), fold.events);
 }
 
@@ -894,14 +903,14 @@ test "every fsync policy writes a log that opens with the same records" {
         var ws = try Workspace.init("log");
         defer ws.deinit();
         {
-            var journal = try Journal.open(testing.allocator, io, ws.path, .{
+            const journal = try Journal.open(testing.allocator, io, ws.path, .{
                 .sync = policy,
                 .max_segment_records = 3,
             });
             defer journal.deinit(io);
             for (1..8) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
         }
-        var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
+        const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
         defer reopened.deinit(io);
         try testing.expectEqual(@as(u64, 7), try reopened.lastSeq(io));
         try testing.expectEqual(@as(usize, 3), (try reopened.segmentCount(io)));
@@ -929,7 +938,7 @@ test "a reserved segment is written into rather than extended, and reserves noth
 
     const reserve = 64 * 1024;
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{
             .sync = .always,
             .preallocate_bytes = reserve,
         });
@@ -949,7 +958,7 @@ test "a reserved segment is written into rather than extended, and reserves noth
     try testing.expect(closed.len < reserve);
     try testing.expectEqual(@as(u8, '\n'), closed[closed.len - 1]);
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .preallocate_bytes = reserve });
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .preallocate_bytes = reserve });
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 50), try reopened.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
@@ -963,7 +972,7 @@ test "space a writer reserved and never filled is not a record it did not finish
     // What a crash leaves behind with a reservation outstanding: whole
     // records, then the zeros nothing was written into.
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
@@ -977,14 +986,14 @@ test "space a writer reserved and never filled is not a record it did not finish
     // Nothing was dropped, nothing was rewritten, and `.fail` -- which
     // refuses a record the writer did not finish -- has nothing to refuse.
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
         defer journal.deinit(io);
         try testing.expectEqual(@as(u64, 3), try journal.lastSeq(io));
         try testing.expectEqual(@as(usize, 0), (try journal.status(io)).dropped_bytes);
         _ = try journal.append(io, 4, created(4, "into the space"));
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 4), try reopened.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
@@ -995,7 +1004,7 @@ test "a reader stops at a live writer's oversized zero reservation" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var writer = try Journal.open(testing.allocator, io, ws.path, .{
+    const writer = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .never,
         .preallocate_bytes = 4096,
         .max_record_bytes = 512,
@@ -1003,12 +1012,12 @@ test "a reader stops at a live writer's oversized zero reservation" {
     defer writer.deinit(io);
     _ = try writer.append(io, 1, created(1, "one"));
 
-    var reader = try Journal.open(testing.allocator, io, ws.path, .{
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{
         .access = .read,
         .max_record_bytes = 512,
     });
     defer reader.deinit(io);
-    var replay = try reader.replay(io, 0);
+    const replay = try reader.replay(io, 0);
     defer replay.deinit(io);
     try testing.expectEqual(@as(u64, 1), (try replay.next(io)).?.seq);
     try testing.expect((try replay.next(io)) == null);
@@ -1020,7 +1029,7 @@ test "a half-written record before the reserved zeros is dropped, and only it" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
@@ -1033,7 +1042,7 @@ test "a half-written record before the reserved zeros is dropped, and only it" {
     @memset(crashed[records.len + torn.len ..], 0);
     try ws.write(try ws.segment(1), crashed);
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
     try testing.expectEqual(@as(u64, 3), try journal.lastSeq(io));
     // The count is the bytes somebody wrote, not the zeros nobody did.
@@ -1081,7 +1090,7 @@ test "a record from an older schema goes through migrate" {
         }
     }.f;
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
         .schema_version = 2,
         .migrate = migrate,
     });
@@ -1111,7 +1120,7 @@ test "without a migrate hook an older record lands in the unknown arm" {
         \\{"retired":{"id":7}}
     }});
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2 });
     defer journal.deinit(io);
 
     var copied_tail_13 = try journal.copySince(testing.allocator, io, 0);
@@ -1135,7 +1144,7 @@ test "an older record kept as its bytes is a slice of its line, and checked" {
         }});
         var journal = try chronicle.Journal(Keeping).open(testing.allocator, io, ws.path, .{ .schema_version = 2 });
         defer journal.deinit(io);
-        var walk = try journal.replay(io, 0);
+        const walk = try journal.replay(io, 0);
         defer walk.deinit(io);
         const record = (try walk.next(io)).?;
         try testing.expectEqualStrings("{\"retired\": {\"id\":7}}", record.event.unknown.bytes);
@@ -1161,7 +1170,7 @@ test "an older record kept as its bytes is a slice of its line, and checked" {
         }.f;
         var journal = try chronicle.Journal(Keeping).open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = migrate });
         defer journal.deinit(io);
-        var walk = try journal.replay(io, 0);
+        const walk = try journal.replay(io, 0);
         defer walk.deinit(io);
         const record = (try walk.next(io)).?;
         try testing.expectEqualStrings("old", record.event.created.name);
@@ -1202,7 +1211,7 @@ test "close reports a failure while finalizing the active segment" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .on_segment,
         .preallocate_bytes = 4096,
     });
@@ -1211,11 +1220,11 @@ test "close reports a failure while finalizing the active segment" {
     // Leave close a read-only handle to the still-preallocated segment. Its
     // mandatory trim cannot succeed, and the error must reach the caller even
     // though close still releases the journal and its lock.
-    const active = &journal.log.active.?;
+    const active = &journalState(journal).log.active.?;
     const position = active.writer.pos;
     active.file.close(io);
-    active.file = try journal.log.dir.openFile(io, &chronicle.segmentName(1), .{});
-    active.writer = active.file.writer(io, journal.log.write_buf);
+    active.file = try journalState(journal).log.dir.openFile(io, &chronicle.segmentName(1), .{});
+    active.writer = active.file.writer(io, journalState(journal).log.write_buf);
     active.writer.pos = position;
     // Which error names the refusal is the platform's: POSIX says the file
     // cannot be resized, Windows that the handle may not do it.
@@ -1224,7 +1233,7 @@ test "close reports a failure while finalizing the active segment" {
         else => return err,
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 1), try reopened.lastSeq(io));
 }
@@ -1240,7 +1249,7 @@ test "a fold built from the disk equals the fold built live" {
 
     var live: Registry = .{};
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
         try journal.subscribe(io, live.sink());
         _ = try journal.append(io, 1, created(1, "alpha"));
@@ -1250,7 +1259,7 @@ test "a fold built from the disk equals the fold built live" {
     }
 
     var replayed: Registry = .{};
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{});
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{});
     defer reopened.deinit(io);
     try reopened.subscribe(io, replayed.sink());
 
@@ -1268,7 +1277,7 @@ test "one pass feeds every fold, and equals the folds fed one at a time" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 4 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 4 });
     defer journal.deinit(io);
     for (1..301) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
@@ -1299,7 +1308,7 @@ test "a fold can be dropped, and stops being called" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
 
     var leaving: Registry = .{};
@@ -1322,7 +1331,7 @@ test "a record appended beside a shared subscribe lands in every fold exactly on
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 2 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 2 });
     defer journal.deinit(io);
     for (1..2_001) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
@@ -1341,7 +1350,7 @@ test "a record appended beside a shared subscribe lands in every fold exactly on
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, appender, .{ &journal, io });
+    try group.concurrent(io, appender, .{ journal, io });
     try journal.subscribeAll(io, &sinks);
     try group.await(io);
 
@@ -1380,7 +1389,7 @@ test "waitPast blocks until an append arrives" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
 
     const appender = struct {
@@ -1391,7 +1400,7 @@ test "waitPast blocks until an append arrives" {
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, appender, .{ &journal, io });
+    try group.concurrent(io, appender, .{ journal, io });
 
     const arrived = try journal.waitPast(io, 0);
     try testing.expectEqual(@as(u64, 1), arrived);
@@ -1406,34 +1415,34 @@ test "an append nobody waits on wakes nobody, and one somebody waits on wakes th
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
 
     // No reader: the word moves and no system call is made for it.
     for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "alone"));
     journal.nudge(io);
-    try testing.expectEqual(@as(u64, 0), journal.futex_wakes);
+    try testing.expectEqual(@as(u64, 0), journalState(journal).futex_wakes);
 
     const reader = struct {
         fn f(j: *Journal, inner: Io, cursor: u64) Io.Cancelable!u64 {
             return try j.waitPast(inner, cursor);
         }
     }.f;
-    var future = try io.concurrent(reader, .{ &journal, io, @as(u64, 3) });
+    var future = try io.concurrent(reader, .{ journal, io, @as(u64, 3) });
     defer _ = future.cancel(io) catch {};
 
     // Once the reader has counted itself in — read under the lock it counts
     // itself in under — the next append has somebody to wake, and does.
     while (true) {
-        journal.mutex.lockUncancelable(io);
-        const counted = journal.waiters;
-        journal.mutex.unlock(io);
+        journalState(journal).mutex.lockUncancelable(io);
+        const counted = journalState(journal).waiters;
+        journalState(journal).mutex.unlock(io);
         if (counted == 1) break;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
     _ = try journal.append(io, 4, created(4, "awaited"));
     try testing.expectEqual(@as(u64, 4), try future.await(io));
-    try testing.expectEqual(@as(u64, 1), journal.futex_wakes);
+    try testing.expectEqual(@as(u64, 1), journalState(journal).futex_wakes);
 }
 
 test "waitPast is woken by a nudge with no record behind it" {
@@ -1441,7 +1450,7 @@ test "waitPast is woken by a nudge with no record behind it" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
 
     // A nudge wakes whoever is waiting when it happens and is not remembered
@@ -1459,7 +1468,7 @@ test "waitPast is woken by a nudge with no record behind it" {
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, nudger, .{ &journal, io, &woken });
+    try group.concurrent(io, nudger, .{ journal, io, &woken });
 
     const nothing = try journal.waitPast(io, 0);
     woken.store(true, .release);
@@ -1472,7 +1481,7 @@ test "a reader stopped as a record arrives is stopped" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
 
     // A reader waiting past the newest record, canceled while a nudge lands
@@ -1499,9 +1508,9 @@ test "a reader stopped as a record arrives is stopped" {
     for (0..3000) |round| {
         var waiting: std.atomic.Value(bool) = .init(false);
         var go: std.atomic.Value(bool) = .init(false);
-        var future = try io.concurrent(reader, .{ &journal, io, &waiting });
+        var future = try io.concurrent(reader, .{ journal, io, &waiting });
         while (!waiting.load(.acquire)) std.atomic.spinLoopHint();
-        const other = try std.Thread.spawn(.{}, nudger, .{ &journal, io, &go, @as(u32, @intCast(round % 64)) * 50 });
+        const other = try std.Thread.spawn(.{}, nudger, .{ journal, io, &go, @as(u32, @intCast(round % 64)) * 50 });
         go.store(true, .release);
         future.cancel(io) catch {};
         other.join();
@@ -1517,7 +1526,7 @@ test "a walk canceled as it reads an index is canceled" {
     // hold them: a walk from the middle looks its start up in an index.
     var options = small(20, 4);
     options.index_interval_bytes = 0;
-    var journal = try Journal.open(testing.allocator, io, ws.path, options);
+    const journal = try Journal.open(testing.allocator, io, ws.path, options);
     defer journal.deinit(io);
     for (0..200) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "indexed"));
 
@@ -1529,7 +1538,7 @@ test "a walk canceled as it reads an index is canceled" {
         fn f(j: *Journal, inner: Io, started: *std.atomic.Value(bool)) Journal.ReplayError!void {
             while (true) {
                 started.store(true, .release);
-                var walk = try j.replay(inner, 150);
+                const walk = try j.replay(inner, 150);
                 defer walk.deinit(inner);
                 while (try walk.next(inner)) |_| {}
             }
@@ -1538,7 +1547,7 @@ test "a walk canceled as it reads an index is canceled" {
 
     for (0..500) |round| {
         var started: std.atomic.Value(bool) = .init(false);
-        var future = try io.concurrent(reader, .{ &journal, io, &started });
+        var future = try io.concurrent(reader, .{ journal, io, &started });
         while (!started.load(.acquire)) std.atomic.spinLoopHint();
         for (0..(round % 32) * 20) |_| std.atomic.spinLoopHint();
         if (future.cancel(io)) |_| {} else |err| try testing.expectEqual(error.Canceled, err);
@@ -1566,7 +1575,7 @@ test "the log rotates into segments named after their first record" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
@@ -1580,7 +1589,7 @@ test "the log rotates into segments named after their first record" {
     }
 
     // And a reopen walks them in order.
-    var reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 10), try reopened.lastSeq(io));
     var all = try reopened.copySince(testing.allocator, io, 0);
@@ -1596,7 +1605,7 @@ test "stats counts the segments, the records and the bytes they take" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer journal.deinit(io);
     // An empty log has one segment and no records, and says so in numbers
     // rather than in a zero that could mean either.
@@ -1636,12 +1645,12 @@ test "the tail is bounded and a cursor older than it is an incomplete window" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
     defer journal.deinit(io);
     for (1..41) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
     // At most four records in memory for forty on the disk.
-    try testing.expect(journal.tail.entries.items.len <= 4);
+    try testing.expect(journalState(journal).tail.entries.items.len <= 4);
     var stale = try journal.copySince(testing.allocator, io, 1);
     defer stale.deinit();
     try testing.expect(!stale.complete);
@@ -1652,7 +1661,7 @@ test "the tail is bounded and a cursor older than it is an incomplete window" {
     try testing.expectEqual(@as(u64, 40), fresh.records[0].seq);
 
     // What the window does not reach is on the disk, in order, entire.
-    var walk = try journal.replay(io, 0);
+    const walk = try journal.replay(io, 0);
     defer walk.deinit(io);
     var seen: u64 = 0;
     while (try walk.next(io)) |record| {
@@ -1662,7 +1671,7 @@ test "the tail is bounded and a cursor older than it is an incomplete window" {
     try testing.expectEqual(@as(u64, 40), seen);
 
     // And a replay from a cursor starts at the record straight after it.
-    var from_thirty = try journal.replay(io, 30);
+    const from_thirty = try journal.replay(io, 30);
     defer from_thirty.deinit(io);
     const first = (try from_thirty.next(io)) orelse return error.TestExpectedRecord;
     try testing.expectEqual(@as(u64, 31), first.seq);
@@ -1674,16 +1683,16 @@ test "a reopened journal fills its tail from the newest records only" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
         defer journal.deinit(io);
         for (1..41) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
+    const reopened = try Journal.open(testing.allocator, io, ws.path, small(8, 4));
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 40), try reopened.lastSeq(io));
-    try testing.expect(reopened.tail.entries.items.len <= 4);
-    try testing.expect(reopened.tail.entries.items.len >= 1);
+    try testing.expect(journalState(reopened).tail.entries.items.len <= 4);
+    try testing.expect(journalState(reopened).tail.entries.items.len >= 1);
     var window = try reopened.copySince(testing.allocator, io, 0);
     defer window.deinit();
     try testing.expect(!window.complete);
@@ -1698,14 +1707,14 @@ test "subscribe folds a history longer than the tail, streaming from the disk" {
 
     var live: Registry = .{};
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(7, 3));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(7, 3));
         defer journal.deinit(io);
         try journal.subscribe(io, live.sink());
         for (1..51) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
 
     var replayed: Registry = .{};
-    var reopened = try Journal.open(testing.allocator, io, ws.path, small(7, 3));
+    const reopened = try Journal.open(testing.allocator, io, ws.path, small(7, 3));
     defer reopened.deinit(io);
     try reopened.subscribe(io, replayed.sink());
 
@@ -1740,7 +1749,7 @@ test "a record nothing will read is not parsed back, and one something will read
         // A tail means the record is read back in memory, so it is built from
         // the bytes that are about to be written -- and an event that does
         // not survive that is refused before anything reaches the disk.
-        var journal = try Fragile.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Fragile.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         try testing.expectError(error.NotRoundTrippable, journal.append(io, 1, fragile()));
         try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
@@ -1750,7 +1759,7 @@ test "a record nothing will read is not parsed back, and one something will read
         var ws = try Workspace.init("asked");
         defer ws.deinit();
         // No tail and no sink, but the check asked for: same answer.
-        var journal = try Fragile.open(testing.allocator, io, ws.path, .{
+        const journal = try Fragile.open(testing.allocator, io, ws.path, .{
             .sync = .never,
             .tail_records = 0,
             .verify_round_trip = true,
@@ -1765,14 +1774,14 @@ test "a record nothing will read is not parsed back, and one something will read
         // Nothing will read the record, so nothing parses it back: the line
         // goes to the disk, and the fold that has to read it is the one that
         // finds out. That is the trade `verify_round_trip` names.
-        var journal = try Fragile.open(testing.allocator, io, ws.path, .{
+        const journal = try Fragile.open(testing.allocator, io, ws.path, .{
             .sync = .never,
             .tail_records = 0,
         });
         defer journal.deinit(io);
         try testing.expectEqual(@as(u64, 1), try journal.append(io, 1, fragile()));
 
-        var walk = try journal.replay(io, 0);
+        const walk = try journal.replay(io, 0);
         defer walk.deinit(io);
         try testing.expectError(error.CorruptRecord, walk.next(io));
     }
@@ -1783,7 +1792,7 @@ test "a journal with no tail still appends, and a sink still gets every record" 
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .never,
         .tail_records = 0,
     });
@@ -1841,19 +1850,19 @@ test "a tailer remembers where it got to, in a file of its own" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer journal.deinit(io);
     for (1..10) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
     // A name that has never committed a cursor starts at the beginning.
-    var reports = try journal.tailer(io, "reports");
+    const reports = try journal.tailer(io, "reports");
     defer reports.deinit();
     try testing.expectEqual(@as(u64, 0), (try reports.cursor(io)));
     try testing.expect(!ws.exists(try ws.sub("reports.cursor")));
 
     // Read some records, then say so.
     {
-        var walk = try reports.replay(io);
+        const walk = try reports.replay(io);
         defer walk.deinit(io);
         var seen: u64 = 0;
         while (try walk.next(io)) |record| {
@@ -1868,20 +1877,20 @@ test "a tailer remembers where it got to, in a file of its own" {
 
     // A tailer opened again under the same name is that reader again, and it
     // reads on from where it stopped.
-    var again = try journal.tailer(io, "reports");
+    const again = try journal.tailer(io, "reports");
     defer again.deinit();
     try testing.expectEqual(@as(u64, 4), (try again.cursor(io)));
-    var walk = try again.replay(io);
+    const walk = try again.replay(io);
     defer walk.deinit(io);
     const next = (try walk.next(io)) orelse return error.TestExpectedRecord;
     try testing.expectEqual(@as(u64, 5), next.seq);
 
     // Two names are two readers, and neither moves the other.
-    var audit = try journal.tailer(io, "audit");
+    const audit = try journal.tailer(io, "audit");
     defer audit.deinit();
     try testing.expectEqual(@as(u64, 0), (try audit.cursor(io)));
     try audit.commit(io, 9);
-    var unmoved = try journal.tailer(io, "reports");
+    const unmoved = try journal.tailer(io, "reports");
     defer unmoved.deinit();
     try testing.expectEqual(@as(u64, 4), (try unmoved.cursor(io)));
 
@@ -1893,7 +1902,7 @@ test "a tailer remembers where it got to, in a file of its own" {
     // And forgetting a name puts it back where it started.
     try audit.forget(io);
     try testing.expect(!ws.exists(try ws.sub("audit.cursor")));
-    var fresh = try journal.tailer(io, "audit");
+    const fresh = try journal.tailer(io, "audit");
     defer fresh.deinit();
     try testing.expectEqual(@as(u64, 0), (try fresh.cursor(io)));
 
@@ -1907,13 +1916,13 @@ test "a reader's tailer writes its cursor and nothing else" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var writer = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    const writer = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer writer.deinit(io);
     for (1..7) |i| _ = try writer.append(io, @intCast(i), created(@intCast(i), "n"));
 
     // A `.read` journal takes no lock and writes nothing to the log. Its
     // tailer's cursor is the one file it may create.
-    var reader = try Journal.open(testing.allocator, io, ws.path, .{
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{
         .access = .read,
         .tail_records = 1024,
     });
@@ -1930,7 +1939,7 @@ test "a reader's tailer writes its cursor and nothing else" {
         }
     }
 
-    var follower = try reader.tailer(io, "follower");
+    const follower = try reader.tailer(io, "follower");
     defer follower.deinit();
     try follower.commit(io, 6);
     try testing.expectEqualStrings("{\"fmt\":1,\"seq\":6}", try ws.read(try ws.sub("follower.cursor")));
@@ -1962,7 +1971,7 @@ test "retention can see what its readers have consumed" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer journal.deinit(io);
     for (1..13) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
@@ -1975,10 +1984,10 @@ test "retention can see what its readers have consumed" {
     }
 
     {
-        var reports = try journal.tailer(io, "reports");
+        const reports = try journal.tailer(io, "reports");
         defer reports.deinit();
         try reports.commit(io, 9);
-        var billing = try journal.tailer(io, "billing");
+        const billing = try journal.tailer(io, "billing");
         defer billing.deinit();
         try billing.commit(io, 5);
     }
@@ -2006,14 +2015,14 @@ test "a tailer's name has to be one that can be a file" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "n"));
 
     for ([_][]const u8{ "", "..", "a/b", "a\\b", ".hidden", "with space", "sub/dir", "a" ** 65 }) |name| {
         try testing.expectError(error.InvalidName, journal.tailer(io, name));
     }
-    var fine = try journal.tailer(io, "a_fine-Name9");
+    const fine = try journal.tailer(io, "a_fine-Name9");
     defer fine.deinit();
     try testing.expectEqual(@as(u64, 0), (try fine.cursor(io)));
 
@@ -2033,7 +2042,7 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
         defer journal.deinit(io);
         for (1..21) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
@@ -2044,14 +2053,14 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     try ws.root.deleteFile(io, try ws.index(1));
     try ws.write(try ws.index(6), "chridx\x02\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 2));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 2));
     defer journal.deinit(io);
     try testing.expectEqual(@as(u64, 20), try journal.lastSeq(io));
 
     // A seek into either of those segments still lands on the right record,
     // index or no index.
     for ([_]u64{ 0, 2, 5, 7, 12, 19 }) |cursor| {
-        var walk = try journal.replay(io, cursor);
+        const walk = try journal.replay(io, cursor);
         defer walk.deinit(io);
         const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
         try testing.expectEqual(cursor + 1, record.seq);
@@ -2133,13 +2142,13 @@ test "an indexed replay checks the record before its cursor" {
     defer testing.allocator.free(index);
     try ws.write(try ws.index(1), index);
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .never,
         .tail_records = 1,
         .index_interval_bytes = 0,
     });
     defer journal.deinit(io);
-    var walk = try journal.replay(io, 2);
+    const walk = try journal.replay(io, 2);
     defer walk.deinit(io);
     try testing.expectError(error.BrokenChain, walk.next(io));
 }
@@ -2150,7 +2159,7 @@ test "a clean close leaves an index the next open takes rather than rebuilds" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         for (1..2_001) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
         try testing.expectEqual(@as(usize, 1), (try journal.segmentCount(io)));
@@ -2169,7 +2178,7 @@ test "a clean close leaves an index the next open takes rather than rebuilds" {
     try ws.write(try ws.index(1), marked);
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         try testing.expectEqual(@as(u64, 2_000), try journal.lastSeq(io));
         _ = try journal.append(io, 2_001, created(2_001, "n"));
@@ -2189,12 +2198,12 @@ test "the index of a sealed segment is checked once, not once a seek" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
         defer journal.deinit(io);
         for (1..21) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1));
     defer journal.deinit(io);
 
     // The first seek into a segment is what checks its index. Every seek
@@ -2202,18 +2211,18 @@ test "the index of a sealed segment is checked once, not once a seek" {
     // open: the index was proved good once and the proof does not expire,
     // because nothing but this process writes the segment.
     {
-        var warm = try journal.replay(io, 2);
+        const warm = try journal.replay(io, 2);
         defer warm.deinit(io);
         _ = try warm.next(io);
     }
-    const before = journal.log.index_opens;
+    const before = journalState(journal).log.index_opens;
     for (0..10) |_| {
-        var walk = try journal.replay(io, 2);
+        const walk = try journal.replay(io, 2);
         defer walk.deinit(io);
         const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
         try testing.expectEqual(@as(u64, 3), record.seq);
     }
-    try testing.expectEqual(before, journal.log.index_opens);
+    try testing.expectEqual(before, journalState(journal).log.index_opens);
 }
 
 test "a seek into the segment being written to reads its index, not the segment" {
@@ -2225,21 +2234,21 @@ test "a seek into the segment being written to reads its index, not the segment"
     // the segment being appended to is the only thing that can turn that into
     // a seek; without it the walk starts at the first record and steps over
     // every one of them.
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 4 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 4 });
     defer journal.deinit(io);
     const count = 5_000;
     for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     try testing.expectEqual(@as(usize, 1), (try journal.segmentCount(io)));
 
-    var walk = try journal.replay(io, count - 2);
+    const walk = try journal.replay(io, count - 2);
     defer walk.deinit(io);
-    const landed = walk.scan.position;
+    const landed = replayState(Event, walk).scan.position;
     const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
     try testing.expectEqual(@as(u64, count - 1), record.seq);
 
     // Where the walk began: inside the last percent of the segment, which is
     // where the record it was asked for is.
-    const bytes = journal.log.segments.items[0].bytes;
+    const bytes = journalState(journal).log.segments.items[0].bytes;
     try testing.expect(landed > bytes - bytes / 100);
 }
 
@@ -2249,7 +2258,7 @@ test "an index for the wrong segment length is refused and rebuilt" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
         defer journal.deinit(io);
         for (1..16) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
@@ -2262,10 +2271,10 @@ test "an index for the wrong segment length is refused and rebuilt" {
     std.mem.writeInt(u64, bad[8..16], 999_999, .little);
     try ws.write(try ws.index(1), bad);
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1));
     defer journal.deinit(io);
     {
-        var walk = try journal.replay(io, 2);
+        const walk = try journal.replay(io, 2);
         defer walk.deinit(io);
         const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
         try testing.expectEqual(@as(u64, 3), record.seq);
@@ -2284,7 +2293,7 @@ test "seqAtOrAfter finds the first record at or after a moment" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
         defer journal.deinit(io);
 
         // An empty log has nothing at any moment.
@@ -2308,7 +2317,7 @@ test "seqAtOrAfter finds the first record at or after a moment" {
 
     // The answer survives a reopen, where the timestamps of the sealed
     // segments come back from their index headers rather than from appends.
-    var reopened = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    const reopened = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer reopened.deinit(io);
     try testing.expectEqual(@as(?u64, 4), try reopened.seqAtOrAfter(io, 350));
     try testing.expectEqual(@as(?u64, 9), try reopened.seqAtOrAfter(io, 850));
@@ -2320,7 +2329,7 @@ test "an out-of-order timestamp is found, not assumed away" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(2, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(2, 1024));
     defer journal.deinit(io);
 
     // Nothing makes a caller pass its timestamps in order, so nothing here
@@ -2345,7 +2354,7 @@ test "an out-of-order timestamp is found, not assumed away" {
     // A negative timestamp is a timestamp.
     var back = try Workspace.init("back");
     defer back.deinit();
-    var earlier = try Journal.open(testing.allocator, io, back.path, small(2, 1024));
+    const earlier = try Journal.open(testing.allocator, io, back.path, small(2, 1024));
     defer earlier.deinit(io);
     for ([_]i64{ -500, -100, -900 }, 1..) |at, i| {
         _ = try earlier.append(io, at, created(@intCast(i), "n"));
@@ -2362,7 +2371,7 @@ test "a lookup by time rebuilds a stale index and reads the rest from it" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         for (1..13) |i| _ = try journal.append(io, @intCast(i * 10), created(@intCast(i), "n"));
     }
@@ -2373,7 +2382,7 @@ test "a lookup by time rebuilds a stale index and reads the rest from it" {
     try ws.write(try ws.index(5), "chridx\x02\n" ++ "\x00" ** 24);
     try ws.write(try ws.index(9), "not an index");
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1));
     defer journal.deinit(io);
     try testing.expectEqual(@as(?u64, 3), try journal.seqAtOrAfter(io, 25));
     try testing.expectEqual(@as(?u64, 7), try journal.seqAtOrAfter(io, 65));
@@ -2391,7 +2400,7 @@ test "a lookup by time rebuilds a stale index and reads the rest from it" {
     }
 
     // A reader cannot write an index, and answers anyway.
-    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_records = 4 });
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_records = 4 });
     defer reader.deinit(io);
     try ws.write(try ws.index(1), "gone again");
     try testing.expectEqual(@as(?u64, 3), try reader.seqAtOrAfter(io, 25));
@@ -2424,7 +2433,7 @@ test "a record with no timestamp is named rather than stepped over" {
         \\{"removed":{"id":4}}
     }});
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .tail_records = 0 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .tail_records = 0 });
     defer journal.deinit(io);
     try testing.expectEqual(@as(u64, 4), try journal.lastSeq(io));
 
@@ -2445,7 +2454,7 @@ test "a lookup by time halves the index when the timestamps rise" {
     // halve: the entries are what a lookup by time reads.
     const count = 4_000;
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{
             .sync = .never,
             .index_interval_bytes = 0,
             .max_segment_records = count,
@@ -2456,7 +2465,7 @@ test "a lookup by time halves the index when the timestamps rise" {
         _ = try journal.append(io, (count + 1) * 10, created(1, "n"));
     }
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .never,
         .index_interval_bytes = 0,
         .max_segment_records = count,
@@ -2464,9 +2473,9 @@ test "a lookup by time halves the index when the timestamps rise" {
     });
     defer journal.deinit(io);
 
-    const before = journal.log.index_reads;
+    const before = journalState(journal).log.index_reads;
     try testing.expectEqual(@as(?u64, 3_000), try journal.seqAtOrAfter(io, 30_000));
-    const read = journal.log.index_reads - before;
+    const read = journalState(journal).log.index_reads - before;
     // Halving four thousand entries is twelve reads and a bit, not four
     // thousand. The budget is loose enough not to be a transcription of the
     // implementation and tight enough to fail if the bisection goes.
@@ -2492,14 +2501,14 @@ test "an index of one entry per interval is a fortieth of one per record" {
         defer each.deinit();
         var gpa: FixtureAllocator = .init;
         defer expectNoLeak(&gpa);
-        var journal = try Journal.open(gpa.allocator(), io, each.path, .{
+        const journal = try Journal.open(gpa.allocator(), io, each.path, .{
             .sync = .never,
             .index_interval_bytes = interval,
             .tail_records = 1,
             .max_segment_bytes = 1 << 30,
         });
         defer journal.deinit(io);
-        try fill(&journal, io, 1, count, "n");
+        try fill(journal, io, 1, count, "n");
         try testing.expectEqual(@as(usize, 1), (try journal.segmentCount(io)));
 
         // Whatever the index holds, a seek lands on the record asked for:
@@ -2507,13 +2516,13 @@ test "an index of one entry per interval is a fortieth of one per record" {
         // and steps over what is in between.
         var cursor: u64 = 0;
         while (cursor < count) : (cursor += 1) {
-            var walk = try journal.replay(io, cursor);
+            const walk = try journal.replay(io, cursor);
             defer walk.deinit(io);
             const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
             try testing.expectEqual(cursor + 1, record.seq);
         }
 
-        journal.log.active.?.index_writer.interface.flush() catch {};
+        journalState(journal).log.active.?.index_writer.interface.flush() catch {};
         const size = (try each.read(try each.index(1))).len;
         if (interval == 0) dense_bytes = size else sparse_bytes = size;
     }
@@ -2532,7 +2541,7 @@ test "a snapshot plus the records after it folds to the whole log" {
 
     var whole: Registry = .{};
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         try journal.subscribe(io, whole.sink());
         for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
@@ -2547,7 +2556,7 @@ test "a snapshot plus the records after it folds to the whole log" {
     }
 
     const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, small(4, 1024));
-    var reopened = opened.journal;
+    const reopened = opened.journal;
     defer reopened.deinit(io);
 
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
@@ -2566,7 +2575,7 @@ test "a snapshot newer than a truncated log is not restored" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
         defer journal.deinit(io);
         for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
         try journal.snapshot(io, "state through ten");
@@ -2574,7 +2583,7 @@ test "a snapshot newer than a truncated log is not restored" {
     }
 
     const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, small(3, 1024));
-    var reopened = opened.journal;
+    const reopened = opened.journal;
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 5), try reopened.lastSeq(io));
     try testing.expect(opened.snapshot == null);
@@ -2587,7 +2596,7 @@ test "snapshot refuses a document larger than its read limit" {
 
     const options: Journal.Options = .{ .sync = .never, .max_snapshot_bytes = 64 };
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, options);
+        const journal = try Journal.open(testing.allocator, io, ws.path, options);
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "one"));
         try journal.snapshot(io, "ok");
@@ -2595,7 +2604,7 @@ test "snapshot refuses a document larger than its read limit" {
     }
 
     const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, options);
-    var reopened = opened.journal;
+    const reopened = opened.journal;
     defer reopened.deinit(io);
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
     defer testing.allocator.free(snapshot.state);
@@ -2608,7 +2617,7 @@ test "compact empties the log and the sequence still continues" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
         defer journal.deinit(io);
         for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
@@ -2627,7 +2636,7 @@ test "compact empties the log and the sequence still continues" {
         try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "n")));
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    const reopened = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 6), try reopened.lastSeq(io));
     try testing.expectEqual(@as(u64, 7), try reopened.append(io, 7, created(7, "n")));
@@ -2639,7 +2648,7 @@ test "compact keeps the records after the cut, byte for byte" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
         var copied_tail_22 = try journal.copySince(testing.allocator, io, 0);
@@ -2666,7 +2675,7 @@ test "compact keeps the records after the cut, byte for byte" {
         try testing.expect(copied_tail_25.complete);
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer reopened.deinit(io);
     var copied_tail_26 = try reopened.copySince(testing.allocator, io, 0);
     defer copied_tail_26.deinit();
@@ -2679,7 +2688,7 @@ test "compact can cut inside the segment being written to" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer journal.deinit(io);
     for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     try testing.expectEqual(@as(usize, 2), (try journal.segmentCount(io)));
@@ -2704,7 +2713,7 @@ test "the tail gives way by bytes as well as by count" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .never,
         .tail_records = 1_000,
         .tail_bytes = 512,
@@ -2714,8 +2723,8 @@ test "the tail gives way by bytes as well as by count" {
     const long = "a name long enough that a handful of these is already more than the tail may hold";
     for (1..41) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), long));
 
-    try testing.expect(journal.tail.bytes <= 512);
-    try testing.expect(journal.tail.entries.items.len < 40);
+    try testing.expect(journalState(journal).tail.bytes <= 512);
+    try testing.expect(journalState(journal).tail.entries.items.len < 40);
     var copied_tail_28 = try journal.copySince(testing.allocator, io, 0);
     defer copied_tail_28.deinit();
     try testing.expect(!copied_tail_28.complete);
@@ -2726,7 +2735,7 @@ test "the tail gives way by bytes as well as by count" {
     try testing.expectEqual(@as(u64, 40), copied_tail_29.records[copied_tail_30.records.len - 1].seq);
 
     // Everything the tail let go of is still on the disk, in order.
-    var walk = try journal.replay(io, 0);
+    const walk = try journal.replay(io, 0);
     defer walk.deinit(io);
     var seen: u64 = 0;
     while (try walk.next(io)) |record| {
@@ -2741,7 +2750,7 @@ test "truncateAfter drops the records past the cut and hands the numbers back" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer journal.deinit(io);
     for (1..10) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     try testing.expectEqual(@as(usize, 3), (try journal.segmentCount(io)));
@@ -2787,7 +2796,7 @@ test "a compaction interrupted after its rename leaves a segment the next open r
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         for (1..9) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
@@ -2802,7 +2811,7 @@ test "a compaction interrupted after its rename leaves a segment the next open r
     try replacement.raw(whole[cut..]);
     try ws.write(try ws.segment(3), replacement.written());
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer journal.deinit(io);
     try testing.expect(!ws.exists(try ws.segment(1)));
     try testing.expectEqual(@as(u64, 3), (try journal.oldestSeq(io)));
@@ -2818,7 +2827,7 @@ test "a compaction interrupted after its rename takes the older segments with it
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         for (1..13) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
         try testing.expectEqual(@as(usize, 3), (try journal.segmentCount(io)));
@@ -2837,7 +2846,7 @@ test "a compaction interrupted after its rename takes the older segments with it
 
     // A reader unlinks nothing and still reads what the compaction meant.
     {
-        var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+        const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
         defer reader.deinit(io);
         try testing.expectEqual(@as(u64, 10), (try reader.oldestSeq(io)));
         try testing.expectEqual(@as(u64, 12), try reader.lastSeq(io));
@@ -2846,7 +2855,7 @@ test "a compaction interrupted after its rename takes the older segments with it
     }
 
     // The writer finishes what the compaction started.
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer journal.deinit(io);
     for ([_]u64{ 1, 5, 9 }) |base| try testing.expect(!ws.exists(try ws.segment(base)));
     try testing.expectEqual(@as(u64, 10), (try journal.oldestSeq(io)));
@@ -2874,14 +2883,14 @@ test "an interrupted empty compaction drops the old prefix marker" {
     try ws.write(try ws.segment(5), empty.written());
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         try testing.expectEqual(@as(u64, 5), (try journal.oldestSeq(io)));
         try testing.expect(!ws.exists(try ws.segment(1)));
         try testing.expectEqual(@as(u64, 5), try journal.append(io, 5, created(5, "after")));
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 5), try reopened.lastSeq(io));
     try testing.expectEqual(@as(u64, 1), try reopened.verify(io));
@@ -2893,7 +2902,7 @@ test "a temporary file a crash left behind is ignored" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
@@ -2904,7 +2913,7 @@ test "a temporary file a crash left behind is ignored" {
     }
 
     const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, small(4, 1024));
-    var reopened = opened.journal;
+    const reopened = opened.journal;
     defer reopened.deinit(io);
     try testing.expect(opened.snapshot == null);
     try testing.expectEqual(@as(u64, 5), try reopened.lastSeq(io));
@@ -2916,7 +2925,7 @@ test "dropSegmentsBefore unlinks whole segments and never the newest one" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
         try testing.expectEqual(@as(usize, 3), (try journal.segmentCount(io)));
@@ -2939,7 +2948,7 @@ test "dropSegmentsBefore unlinks whole segments and never the newest one" {
         try testing.expectEqual(@as(u64, 11), try journal.append(io, 11, created(11, "n")));
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const reopened = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 9), (try reopened.oldestSeq(io)));
     try testing.expectEqual(@as(u64, 11), try reopened.lastSeq(io));
@@ -2958,7 +2967,7 @@ test "a backup is a whole journal, snapshot and indexes and all" {
     var whole: Registry = .{};
     var copied: u64 = 0;
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
         defer journal.deinit(io);
         try journal.subscribe(io, whole.sink());
         for (1..12) |i| _ = try journal.append(io, @intCast(i * 10), created(@intCast(i), "n"));
@@ -3004,7 +3013,7 @@ test "a backup is a whole journal, snapshot and indexes and all" {
     // The copy opens, holds the same records byte for byte, and carries the
     // snapshot that was beside them.
     const opened = try Journal.openWithSnapshot(testing.allocator, io, copy_path, small(4, 1024));
-    var copy = opened.journal;
+    const copy = opened.journal;
     defer copy.deinit(io);
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
     defer testing.allocator.free(snapshot.state);
@@ -3027,7 +3036,7 @@ test "a backup refuses its own directory reached through a symbolic link" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(1, 8));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(1, 8));
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "one"));
     _ = try journal.append(io, 2, created(2, "two"));
@@ -3084,7 +3093,7 @@ test "a backup shares the bytes of a sealed segment where the filesystem can" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer journal.deinit(io);
     for (1..13) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
@@ -3094,7 +3103,7 @@ test "a backup shares the bytes of a sealed segment where the filesystem can" {
     _ = try journal.backup(io, dest);
     try testing.expectEqual(@as(u64, 12), try journal.backup(io, dest));
 
-    var copied = try Journal.open(testing.allocator, io, dest, .{ .verify = .full });
+    const copied = try Journal.open(testing.allocator, io, dest, .{ .verify = .full });
     defer copied.deinit(io);
     try testing.expectEqual(@as(u64, 12), try copied.lastSeq(io));
     try testing.expectEqual(@as(u64, 12), try copied.verify(io));
@@ -3117,7 +3126,7 @@ test "a second backup removes segments no longer in the source" {
     defer ws.deinit();
     const dest = try ws.beside("copy");
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer journal.deinit(io);
     for (1..13) |seq| _ = try journal.append(io, @intCast(seq), created(@intCast(seq), "n"));
     try testing.expectEqual(@as(u64, 12), try journal.backup(io, dest));
@@ -3127,7 +3136,7 @@ test "a second backup removes segments no longer in the source" {
     try testing.expectEqual(@as(u64, 5), try journal.backup(io, dest));
     try testing.expect(!ws.exists(try ws.sub("../copy/00000000000000000009.log")));
 
-    var copied = try Journal.open(testing.allocator, io, dest, .{ .verify = .full });
+    const copied = try Journal.open(testing.allocator, io, dest, .{ .verify = .full });
     defer copied.deinit(io);
     try testing.expectEqual(@as(u64, 5), try copied.lastSeq(io));
 }
@@ -3159,7 +3168,7 @@ test "a backup taken while another process appends opens as a journal" {
     try testing.expectEqualStrings("appending", try helperLine(&out.interface));
 
     // A reader takes no lock, so this one runs beside the writer.
-    var reader = try PingJournal.open(testing.allocator, io, ws.path, .{
+    const reader = try PingJournal.open(testing.allocator, io, ws.path, .{
         .access = .read,
         .tail_records = 0,
     });
@@ -3182,7 +3191,7 @@ test "a backup taken while another process appends opens as a journal" {
         try testing.expect(copied >= previous);
         previous = copied;
 
-        var copy = try PingJournal.open(testing.allocator, io, copy_path, .{
+        const copy = try PingJournal.open(testing.allocator, io, copy_path, .{
             .verify = .full,
             .tail_records = 4,
         });
@@ -3211,13 +3220,13 @@ test "a reader backup refreshes rotations and never copies an ahead snapshot" {
     defer ws.deinit();
     const copy_path = try ws.beside("copy");
 
-    var writer = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    const writer = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
     defer writer.deinit(io);
     for (1..4) |seq| _ = try writer.append(io, @intCast(seq), created(@intCast(seq), "n"));
 
     var read_options = small(4, 1024);
     read_options.access = .read;
-    var reader = try Journal.open(testing.allocator, io, ws.path, read_options);
+    const reader = try Journal.open(testing.allocator, io, ws.path, read_options);
     defer reader.deinit(io);
 
     for (4..11) |seq| _ = try writer.append(io, @intCast(seq), created(@intCast(seq), "n"));
@@ -3225,7 +3234,7 @@ test "a reader backup refreshes rotations and never copies an ahead snapshot" {
 
     try testing.expectEqual(@as(u64, 10), try reader.backup(io, copy_path));
     const opened = try Journal.openWithSnapshot(testing.allocator, io, copy_path, small(4, 1024));
-    var copied = opened.journal;
+    const copied = opened.journal;
     defer copied.deinit(io);
     try testing.expectEqual(@as(u64, 10), try copied.lastSeq(io));
     // A reader cannot freeze a concurrent snapshot and segment view together,
@@ -3248,7 +3257,7 @@ test "a second writer is refused while the first holds the lock" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "mine"));
     }
@@ -3271,7 +3280,7 @@ test "a second writer is refused while the first holds the lock" {
     try testing.expectError(error.Locked, Journal.open(testing.allocator, io, ws.path, .{}));
 
     // A reader is not: it takes no lock and writes nothing.
-    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
     defer reader.deinit(io);
     try testing.expectEqual(@as(u64, 1), try reader.lastSeq(io));
     try testing.expectError(error.ReadOnly, reader.append(io, 2, created(2, "not mine")));
@@ -3282,7 +3291,7 @@ test "a second writer is refused while the first holds the lock" {
     child.stdin.?.close(io);
     child.stdin = null;
     _ = try child.wait(io);
-    var second = try Journal.open(testing.allocator, io, ws.path, .{});
+    const second = try Journal.open(testing.allocator, io, ws.path, .{});
     defer second.deinit(io);
     try testing.expectEqual(@as(u64, 2), try second.append(io, 2, created(2, "mine again")));
 }
@@ -3292,11 +3301,11 @@ test "a reader tails a writer by refreshing past its cursor" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var writer = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    const writer = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
     defer writer.deinit(io);
     for (1..4) |i| _ = try writer.append(io, @intCast(i), created(@intCast(i), "n"));
 
-    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_records = 1024 });
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_records = 1024 });
     defer reader.deinit(io);
     try testing.expectEqual(@as(u64, 3), try reader.lastSeq(io));
 
@@ -3305,7 +3314,7 @@ test "a reader tails a writer by refreshing past its cursor" {
     try reader.refresh(io);
     try testing.expectEqual(@as(u64, 9), try reader.lastSeq(io));
 
-    var walk = try reader.replay(io, 3);
+    const walk = try reader.replay(io, 3);
     defer walk.deinit(io);
     var seen: u64 = 3;
     while (try walk.next(io)) |record| {
@@ -3332,7 +3341,7 @@ test "a reader beside a writer mid-record sees the records, not the fragment" {
     try ws.write(try ws.segment(1), midway.written());
     const before = try ws.read(try ws.segment(1));
 
-    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
     defer reader.deinit(io);
     try testing.expectEqual(@as(u64, 1), try reader.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), (try reader.status(io)).dropped_bytes);
@@ -3349,7 +3358,7 @@ test "a flipped byte is caught by the checksum, and a parse would not have been"
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "one"));
         _ = try journal.append(io, 2, created(2, "two"));
@@ -3374,7 +3383,7 @@ test "a flipped byte in a sealed segment is what the full open is for" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 2));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 2));
         defer journal.deinit(io);
         for (1..10) |i| {
             const name: [2]u8 = .{ 'r', '0' + @as(u8, @intCast(i)) };
@@ -3389,7 +3398,7 @@ test "a flipped byte in a sealed segment is what the full open is for" {
     try ws.write(try ws.segment(1), bytes);
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 2));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 2));
         defer journal.deinit(io);
         try testing.expectEqual(@as(u64, 9), try journal.lastSeq(io));
 
@@ -3449,13 +3458,13 @@ test "a segment header may span read-buffer chunks" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "one"));
     }
     try ws.root.deleteFile(io, try ws.index(1));
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .never,
         .read_buffer_size = 1,
     });
@@ -3552,11 +3561,11 @@ test "the two documents beside the log say which shape they are in" {
     defer ws.deinit();
 
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "one"));
         try journal.snapshot(io, "hi");
-        var reader = try journal.tailer(io, "reports");
+        const reader = try journal.tailer(io, "reports");
         defer reader.deinit();
         try reader.commit(io, 1);
     }
@@ -3580,7 +3589,7 @@ test "the two documents beside the log say which shape they are in" {
         Journal.openWithSnapshot(testing.allocator, io, ws.path, .{}),
     );
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
     try ws.write(try ws.sub("reports.cursor"),
         \\{"fmt":2,"seq":1}
@@ -3606,7 +3615,7 @@ test "the record byte ceiling counts the line actually written" {
             defer ws.deinit();
             try ws.write(try ws.segment(1), expected.written()[0..header_bytes]);
             {
-                var journal = try Journal.open(testing.allocator, io, ws.path, .{
+                const journal = try Journal.open(testing.allocator, io, ws.path, .{
                     .sync = .never,
                     .tail_records = tail_records,
                     .max_record_bytes = limit,
@@ -3622,7 +3631,7 @@ test "the record byte ceiling counts the line actually written" {
                     try testing.expectEqualStrings(expected.written(), try ws.read(try ws.segment(1)));
                 }
             }
-            var reader = try Journal.open(testing.allocator, io, ws.path, .{
+            const reader = try Journal.open(testing.allocator, io, ws.path, .{
                 .access = .read,
                 .max_record_bytes = limit,
             });
@@ -3639,7 +3648,7 @@ test "a record longer than a record may be is refused, and so is a segment of on
 
     const cap = 512;
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{
             .sync = .never,
             .max_record_bytes = cap,
         });
@@ -3680,7 +3689,7 @@ test "a record longer than a record may be is refused, and so is a segment of on
     try unfinished.raw(&([_]u8{'x'} ** (cap * 8)));
     try torn.write(try torn.segment(1), unfinished.written());
 
-    var journal = try Journal.open(testing.allocator, io, torn.path, .{ .max_record_bytes = cap });
+    const journal = try Journal.open(testing.allocator, io, torn.path, .{ .max_record_bytes = cap });
     defer journal.deinit(io);
     try testing.expectEqual(@as(usize, cap * 8), (try journal.status(io)).dropped_bytes);
     try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
@@ -3796,7 +3805,7 @@ test "a record is the bytes std.json writes for it, whatever its event's shape" 
     defer ws.deinit();
     // Every record kept in the tail, as it was written: `Record.bytes` is
     // the line on the disk.
-    var journal = try ShapeJournal.open(gpa.allocator(), io, ws.path, .{
+    const journal = try ShapeJournal.open(gpa.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 64,
         .max_segment_bytes = 64 * 1024,
@@ -3852,7 +3861,7 @@ test "a record's envelope is the digits std.json would write, at their edges" {
     for (edges_u32) |version| {
         var ws = try Workspace.init("log");
         defer ws.deinit();
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{
             .sync = .never,
             .schema_version = version,
             .tail_records = edges_i64.len,
@@ -3914,12 +3923,12 @@ test "a record holding a number std.json cannot cast is read as the number, or i
                 try written.checked(covered);
             } else try written.record(1, 1, 1, ev);
             try ws.write(try ws.segment(1), written.written());
-            var journal = WideJournal.open(testing.allocator, io, ws.path, .{}) catch |err| {
+            const journal = WideJournal.open(testing.allocator, io, ws.path, .{}) catch |err| {
                 try testing.expectEqual(error.CorruptRecord, err);
                 continue;
             };
             defer journal.deinit(io);
-            var walk = try journal.replay(io, 0);
+            const walk = try journal.replay(io, 0);
             defer walk.deinit(io);
             testing.expectError(error.CorruptRecord, walk.next(io)) catch |err| {
                 std.debug.print("case {d}, by hand {}\n", .{ i, by_hand });
@@ -3947,9 +3956,9 @@ test "a record holding a number std.json cannot cast is read as the number, or i
                 try written.checked(covered);
             } else try written.record(1, 1, 1, case.ev);
             try ws.write(try ws.segment(1), written.written());
-            var journal = try WideJournal.open(testing.allocator, io, ws.path, .{});
+            const journal = try WideJournal.open(testing.allocator, io, ws.path, .{});
             defer journal.deinit(io);
-            var walk = try journal.replay(io, 0);
+            const walk = try journal.replay(io, 0);
             defer walk.deinit(io);
             try testing.expectEqual(case.want, (try walk.next(io)).?.event);
             try testing.expectEqual(null, try walk.next(io));
@@ -3973,7 +3982,7 @@ test "a journal of events gives them back as appended, through the tail and a re
     // record back as it is appended, and through a replay after a reopen.
     var appended: std.ArrayList(Pair) = .empty;
     {
-        var journal = try PairJournal.open(testing.allocator, io, ws.path, .{ .sync = .never, .max_segment_bytes = 16 * 1024 });
+        const journal = try PairJournal.open(testing.allocator, io, ws.path, .{ .sync = .never, .max_segment_bytes = 16 * 1024 });
         defer journal.deinit(io);
         for (0..500) |i| {
             const padding = if (random.boolean())
@@ -3989,9 +3998,9 @@ test "a journal of events gives them back as appended, through the tail and a re
         }
     }
 
-    var journal = try PairJournal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    const journal = try PairJournal.open(testing.allocator, io, ws.path, .{ .access = .read });
     defer journal.deinit(io);
-    var walk = try journal.replay(io, 0);
+    const walk = try journal.replay(io, 0);
     defer walk.deinit(io);
     var seen: usize = 0;
     while (try walk.next(io)) |record| : (seen += 1) {
@@ -4006,7 +4015,7 @@ test "an append that keeps no record allocates nothing" {
     defer ws.deinit();
 
     var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
-    var journal = try Journal.open(counting.allocator(), io, ws.path, .{
+    const journal = try Journal.open(counting.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 0,
         .tail_bytes = 0,
@@ -4025,7 +4034,7 @@ test "an append that keeps no record allocates nothing" {
     try testing.expectEqual(settled, counting.allocations);
 
     // And what it wrote is what a reader reads.
-    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
     defer reader.deinit(io);
     try testing.expectEqual(@as(u64, 1 + 10 + 200 + 20 * 10), try reader.verify(io));
 }
@@ -4044,22 +4053,22 @@ test "two hundred thousand records open and replay within bounded memory" {
         // A fixture, not what is under test: batched, unsynced, no tail.
         var gpa: FixtureAllocator = .init;
         defer expectNoLeak(&gpa);
-        var journal = try Journal.open(gpa.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
+        const journal = try Journal.open(gpa.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
         defer journal.deinit(io);
-        try fill(&journal, io, 0, count - 1, "a name of some length");
+        try fill(journal, io, 0, count - 1, "a name of some length");
         try testing.expect((try journal.segmentCount(io)) > 1);
     }
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
 
     try testing.expectEqual(@as(u64, count), try journal.lastSeq(io));
 
     // Loose on purpose: record-sized working memory is the newest segment and
     // the tail. Fixed-size segment metadata is accounted separately.
-    try testing.expect(journal.tail.entries.items.len <= (try journal.options(io)).tail_records);
-    var held: usize = journal.scratch.queryCapacity();
-    for (journal.tail.entries.items) |*owned| held += owned.arena.queryCapacity();
+    try testing.expect(journalState(journal).tail.entries.items.len <= (try journal.options(io)).tail_records);
+    var held: usize = journalState(journal).scratch.queryCapacity();
+    for (journalState(journal).tail.entries.items) |*owned| held += owned.arena.queryCapacity();
     try testing.expect(held < 4 * 1024 * 1024);
 
     // And a fold over the whole of it still holds one record at a time.
@@ -4136,7 +4145,7 @@ const open_corpus = [_][]const u8{
 /// checked to be the record `fill`-style appends made for it; and where the
 /// walk ended.
 fn resumeFrom(journal: *Journal, io: Io, position: chronicle.Position, seqs: *std.ArrayList(u64)) !chronicle.Position {
-    var walk = try journal.replayAt(io, position);
+    const walk = try journal.replayAt(io, position);
     defer walk.deinit(io);
     while (try walk.next(io)) |record| {
         try testing.expectEqual(@as(u32, @intCast(record.seq)), record.event.created.id);
@@ -4162,48 +4171,48 @@ test "a replay picks up where the last one stopped, across batches and rotations
     defer seqs.deinit(testing.allocator);
 
     // An empty log: a walk that read nothing hands back its cursor alone.
-    var position = try resumeFrom(&journal, io, .after(0), &seqs);
+    var position = try resumeFrom(journal, io, .after(0), &seqs);
     try testing.expectEqual(chronicle.Position.after(0), position);
 
     for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "one"));
-    position = try resumeFrom(&journal, io, position, &seqs);
+    position = try resumeFrom(journal, io, position, &seqs);
     try expectRun(&seqs, 1, 10);
     try testing.expectEqual(@as(u64, 10), position.cursor);
     try testing.expectEqual(@as(u64, 8), position.last.?.segment);
 
     // Nothing new: nothing, and the same place.
-    try testing.expectEqual(position, try resumeFrom(&journal, io, position, &seqs));
+    try testing.expectEqual(position, try resumeFrom(journal, io, position, &seqs));
     try expectRun(&seqs, 1, 0);
 
     // One at a time, a batch that crosses three rotations, records whose
     // durability rides with the next flush: each pass is what came since.
     _ = try journal.append(io, 11, created(11, "one"));
-    position = try resumeFrom(&journal, io, position, &seqs);
+    position = try resumeFrom(journal, io, position, &seqs);
     try expectRun(&seqs, 11, 11);
-    try fill(&journal, io, 12, 40, "batch");
-    position = try resumeFrom(&journal, io, position, &seqs);
+    try fill(journal, io, 12, 40, "batch");
+    position = try resumeFrom(journal, io, position, &seqs);
     try expectRun(&seqs, 12, 40);
     for (41..44) |i| _ = try journal.appendDeferred(io, @intCast(i), created(@intCast(i), "later"));
-    position = try resumeFrom(&journal, io, position, &seqs);
+    position = try resumeFrom(journal, io, position, &seqs);
     try expectRun(&seqs, 41, 43);
     try testing.expectEqual(@as(u64, 43), position.cursor);
 
     // A walk stopped part of the way hands back where it stopped.
     {
-        var walk = try journal.replay(io, 5);
+        const walk = try journal.replay(io, 5);
         defer walk.deinit(io);
         for (6..9) |_| _ = (try walk.next(io)).?;
         position = walk.position();
     }
     try testing.expectEqual(@as(u64, 8), position.cursor);
     try testing.expectEqual(@as(u64, 8), position.last.?.seq);
-    _ = try resumeFrom(&journal, io, position, &seqs);
+    _ = try resumeFrom(journal, io, position, &seqs);
     try expectRun(&seqs, 9, 43);
 
     // A replay from a cursor steps over the records at and before it, and
     // the last one it stepped over is where it stands.
     {
-        var walk = try journal.replay(io, 43);
+        const walk = try journal.replay(io, 43);
         defer walk.deinit(io);
         try testing.expectEqual(null, try walk.next(io));
         position = walk.position();
@@ -4214,7 +4223,7 @@ test "a replay picks up where the last one stopped, across batches and rotations
     journal.deinit(io);
     journal = try Journal.open(testing.allocator, io, ws.path, small(7, 4));
     _ = try journal.append(io, 44, created(44, "reopened"));
-    _ = try resumeFrom(&journal, io, position, &seqs);
+    _ = try resumeFrom(journal, io, position, &seqs);
     try expectRun(&seqs, 44, 44);
 }
 
@@ -4222,7 +4231,7 @@ test "a re-armed replay allocates nothing on follow-up passes" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var writer = try Journal.open(testing.allocator, io, ws.path, .{
+    const writer = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .never,
         .tail_records = 0,
         .tail_bytes = 0,
@@ -4231,9 +4240,9 @@ test "a re-armed replay allocates nothing on follow-up passes" {
     _ = try writer.append(io, 1, created(1, "a follower record"));
 
     var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
-    var reader = try Journal.open(counting.allocator(), io, ws.path, .{ .access = .read });
+    const reader = try Journal.open(counting.allocator(), io, ws.path, .{ .access = .read });
     defer reader.deinit(io);
-    var walk = try reader.replayAt(io, .after(0));
+    const walk = try reader.replayAt(io, .after(0));
     defer walk.deinit(io);
     try testing.expectEqual(@as(u64, 1), (try walk.next(io)).?.seq);
     try testing.expectEqual(null, try walk.next(io));
@@ -4276,27 +4285,27 @@ test "a replay that stopped at an unfinished record reads it once it is whole" {
     const torn = bytes[0 .. fourth + (bytes.len - fourth) / 2];
     try ws.write(try ws.segment(1), torn);
 
-    var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
     defer reader.deinit(io);
     var seqs: std.ArrayList(u64) = .empty;
     defer seqs.deinit(testing.allocator);
-    var position = try resumeFrom(&reader, io, .after(0), &seqs);
+    var position = try resumeFrom(reader, io, .after(0), &seqs);
     try expectRun(&seqs, 1, 3);
     try testing.expectEqual(@as(u64, fourth), position.last.?.end);
 
     // Still half: still nothing, and still in front of it.
-    try testing.expectEqual(position, try resumeFrom(&reader, io, position, &seqs));
+    try testing.expectEqual(position, try resumeFrom(reader, io, position, &seqs));
     try expectRun(&seqs, 1, 0);
 
     try ws.write(try ws.segment(1), bytes);
-    position = try resumeFrom(&reader, io, position, &seqs);
+    position = try resumeFrom(reader, io, position, &seqs);
     try expectRun(&seqs, 4, 4);
 
     // A writer that crashed mid-record and was opened again drops the half
     // and writes the next record in its place: the position before it is
     // good, and the walk reads what was written there.
     {
-        var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer writer.deinit(io);
         _ = try writer.append(io, 5, created(5, "after"));
         _ = try writer.append(io, 6, created(6, "after"));
@@ -4305,11 +4314,11 @@ test "a replay that stopped at an unfinished record reads it once it is whole" {
     const sixth = std.mem.lastIndexOfScalar(u8, segment[0 .. segment.len - 1], '\n').? + 1;
     try ws.write(try ws.segment(1), segment[0 .. sixth + 10]);
     {
-        var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer writer.deinit(io);
         _ = try writer.append(io, 6, created(6, "again"));
     }
-    _ = try resumeFrom(&reader, io, position, &seqs);
+    _ = try resumeFrom(reader, io, position, &seqs);
     try expectRun(&seqs, 5, 6);
 }
 
@@ -4323,7 +4332,7 @@ test "a position into bytes the log no longer holds is refused, never read" {
     const Setup = struct {
         fn at35(journal: *Journal, sub_io: Io) !chronicle.Position {
             try fill(journal, sub_io, 1, 60, "n");
-            var walk = try journal.replay(sub_io, 0);
+            const walk = try journal.replay(sub_io, 0);
             defer walk.deinit(sub_io);
             for (0..35) |_| _ = (try walk.next(sub_io)).?;
             return walk.position();
@@ -4334,9 +4343,9 @@ test "a position into bytes the log no longer holds is refused, never read" {
         // A compaction that dropped records the reader had not read.
         var ws = try Workspace.init("ahead");
         defer ws.deinit();
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
         defer journal.deinit(io);
-        const position = try Setup.at35(&journal, io);
+        const position = try Setup.at35(journal, io);
         try testing.expectEqual(@as(u64, 31), position.last.?.segment);
         try journal.compact(io, 45);
         try testing.expectError(error.StalePosition, journal.replayAt(io, position));
@@ -4349,12 +4358,12 @@ test "a position into bytes the log no longer holds is refused, never read" {
         // cursor is the way on.
         var ws = try Workspace.init("inside");
         defer ws.deinit();
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
         defer journal.deinit(io);
-        const position = try Setup.at35(&journal, io);
+        const position = try Setup.at35(journal, io);
         try journal.compact(io, 33);
         try testing.expectError(error.StalePosition, journal.replayAt(io, position));
-        _ = try resumeFrom(&journal, io, .after(position.cursor), &seqs);
+        _ = try resumeFrom(journal, io, .after(position.cursor), &seqs);
         try expectRun(&seqs, 36, 60);
     }
     {
@@ -4362,11 +4371,11 @@ test "a position into bytes the log no longer holds is refused, never read" {
         // they were, and the walk goes on.
         var ws = try Workspace.init("behind");
         defer ws.deinit();
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
         defer journal.deinit(io);
-        const position = try Setup.at35(&journal, io);
+        const position = try Setup.at35(journal, io);
         try journal.compact(io, 25);
-        _ = try resumeFrom(&journal, io, position, &seqs);
+        _ = try resumeFrom(journal, io, position, &seqs);
         try expectRun(&seqs, 36, 60);
         _ = try journal.dropSegmentsBefore(io, 40);
         try testing.expectError(error.StalePosition, journal.replayAt(io, position));
@@ -4377,11 +4386,11 @@ test "a position into bytes the log no longer holds is refused, never read" {
         // only the checksum tells apart.
         var ws = try Workspace.init("cut");
         defer ws.deinit();
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
         defer journal.deinit(io);
-        const position = try Setup.at35(&journal, io);
+        const position = try Setup.at35(journal, io);
         try journal.truncateAfter(io, 32);
-        try fill(&journal, io, 33, 50, "m");
+        try fill(journal, io, 33, 50, "m");
         try testing.expectError(error.StalePosition, journal.replayAt(io, position));
         // Cut to shorter than the position and not written again.
         try journal.truncateAfter(io, 32);
@@ -4393,9 +4402,9 @@ test "a replay can be re-armed across segment rotations" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 4));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 4));
     defer journal.deinit(io);
-    var walk = try journal.replayAt(io, .after(0));
+    const walk = try journal.replayAt(io, .after(0));
     defer walk.deinit(io);
 
     for (1..12) |i| {
@@ -4456,7 +4465,7 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
     // these bytes, appending to it and opening again has to agree.
     var held: u64 = 0;
     {
-        var journal = Journal.open(testing.allocator, io, ws.path, .{}) catch |err| {
+        const journal = Journal.open(testing.allocator, io, ws.path, .{}) catch |err| {
             try testing.expect(err != error.TruncatedRecord);
             return;
         };
@@ -4470,7 +4479,7 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
         held = try journal.lastSeq(io);
     }
 
-    var reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
     defer reopened.deinit(io);
     try testing.expectEqual(held, try reopened.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
@@ -4508,7 +4517,7 @@ fn fuzzFraming(_: void, smith: *testing.Smith) anyerror!void {
 
     // A file whose first line does not say what it is must be refused by
     // name -- never read as if its records were this version's.
-    var journal = Journal.open(testing.allocator, io, ws.path, .{}) catch |err| {
+    const journal = Journal.open(testing.allocator, io, ws.path, .{}) catch |err| {
         switch (err) {
             error.UnsupportedFormat, error.CorruptRecord, error.DiscontinuousSeq, error.BrokenChain, error.ChecksumMismatch => return,
             else => return err,
@@ -4544,7 +4553,7 @@ fn fuzzIndex(_: void, smith: *testing.Smith) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
         defer journal.deinit(io);
         for (1..10) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
@@ -4552,11 +4561,11 @@ fn fuzzIndex(_: void, smith: *testing.Smith) anyerror!void {
     try ws.write(try ws.index(4), bytes);
 
     // Whatever the sidecar says, the records are what the segments hold.
-    var journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1));
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1));
     defer journal.deinit(io);
     try testing.expectEqual(@as(u64, 9), try journal.lastSeq(io));
     for ([_]u64{ 0, 1, 4, 5, 8 }) |cursor| {
-        var walk = try journal.replay(io, cursor);
+        const walk = try journal.replay(io, cursor);
         defer walk.deinit(io);
         var seen = cursor;
         while (try walk.next(io)) |record| {
@@ -4641,7 +4650,7 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
 
     var held: u64 = 0;
     {
-        var journal = try PingJournal.open(testing.allocator, io, ws.path, options);
+        const journal = try PingJournal.open(testing.allocator, io, ws.path, options);
         defer journal.deinit(io);
 
         // Every record that survived the killed operation is continuous,
@@ -4661,7 +4670,7 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
     }
 
     // Reopening finds it, with nothing left to repair.
-    var reopened = try PingJournal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
+    const reopened = try PingJournal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail });
     defer reopened.deinit(io);
     try testing.expectEqual(held + 1, try reopened.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
@@ -4734,24 +4743,24 @@ fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     }
     try ws.write(try ws.sub("reports.cursor"), bytes);
 
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
 
     // Whatever the file says, the answer is a cursor or a named error --
     // never a walk that reads past the end of the log or before its start.
-    var reader = journal.tailer(io, "reports") catch |err| switch (err) {
+    const reader = journal.tailer(io, "reports") catch |err| switch (err) {
         error.CorruptCursor, error.UnsupportedFormat => return,
         else => return err,
     };
     defer reader.deinit();
 
-    var walk = try reader.replay(io);
+    const walk = try reader.replay(io);
     defer walk.deinit(io);
     var seen: u64 = 0;
     while (try walk.next(io)) |record| {
@@ -4762,7 +4771,7 @@ fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
 
     // And committing over it leaves a file the next open reads back.
     try reader.commit(io, 3);
-    var again = try journal.tailer(io, "reports");
+    const again = try journal.tailer(io, "reports");
     defer again.deinit();
     try testing.expectEqual(@as(u64, 3), (try again.cursor(io)));
 }
@@ -4798,7 +4807,7 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
         try testing.expectEqual(error.CorruptSnapshot, err);
         return;
     };
-    var journal = opened.journal;
+    const journal = opened.journal;
     defer journal.deinit(io);
     var copied_tail_37 = try journal.copySince(testing.allocator, io, 0);
     defer copied_tail_37.deinit();
@@ -4826,23 +4835,23 @@ test "sealed and active seeks both read an index and skip the segment prefix" {
     const per_segment = 20_000;
     var gpa: FixtureAllocator = .init;
     defer expectNoLeak(&gpa);
-    var journal = try Journal.open(gpa.allocator(), io, ws.path, .{
+    const journal = try Journal.open(gpa.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 4,
         .max_segment_records = per_segment,
         .max_segment_bytes = 1 << 30,
     });
     defer journal.deinit(io);
-    try fill(&journal, io, 1, 2 * per_segment - 1, "a name");
+    try fill(journal, io, 1, 2 * per_segment - 1, "a name");
     try testing.expectEqual(@as(usize, 2), try journal.segmentCount(io));
     for ([_]u64{ per_segment - 2, 2 * per_segment - 3 }, 0..) |cursor, segment| {
-        const reads = journal.log.index_reads;
-        var walk = try journal.replay(io, cursor);
+        const reads = journalState(journal).log.index_reads;
+        const walk = try journal.replay(io, cursor);
         defer walk.deinit(io);
         // The larger sequence fields put one more entry range in the live index.
-        try testing.expectEqual(reads + 9 + segment, journal.log.index_reads);
-        const bytes = journal.log.segments.items[segment].bytes;
-        try testing.expect(walk.scan.position > bytes - bytes / 100);
+        try testing.expectEqual(reads + 9 + segment, journalState(journal).log.index_reads);
+        const bytes = journalState(journal).log.segments.items[segment].bytes;
+        try testing.expect(replayState(Event, walk).scan.position > bytes - bytes / 100);
         try testing.expectEqual(cursor + 1, (try walk.next(io)).?.seq);
     }
 }
@@ -4861,9 +4870,9 @@ test "opening a log that was closed cleanly costs no scan of it" {
     {
         var gpa: FixtureAllocator = .init;
         defer expectNoLeak(&gpa);
-        var journal = try Journal.open(gpa.allocator(), io, ws.path, options);
+        const journal = try Journal.open(gpa.allocator(), io, ws.path, options);
         defer journal.deinit(io);
-        try fill(&journal, io, 1, count, "a name");
+        try fill(journal, io, 1, count, "a name");
         try testing.expectEqual(@as(usize, 1), (try journal.segmentCount(io)));
     }
 
@@ -4882,10 +4891,10 @@ test "opening a log that was closed cleanly costs no scan of it" {
 /// How many segments one open of the log scanned.
 fn openScans(ws: *Workspace, options: Journal.Options) !u64 {
     const io = testing.io;
-    var journal = try Journal.open(testing.allocator, io, ws.path, options);
+    const journal = try Journal.open(testing.allocator, io, ws.path, options);
     defer journal.deinit(io);
     try testing.expect(try journal.lastSeq(io) != 0);
-    return journal.log.segment_scans;
+    return journalState(journal).log.segment_scans;
 }
 
 const CountedEvent = struct {
@@ -4923,7 +4932,7 @@ test "five folds over one pass parse each event once" {
     defer ws.deinit();
     const count = 20_000;
     const J = CountedEvent.J;
-    var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
+    const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
     defer journal.deinit(io);
     const entries: [100]J.Entry = @splat(.{ .at = 1, .event = .{ .id = 1, .name = "a name" } });
     for (0..count / entries.len) |_| _ = try journal.appendAll(io, &entries);
@@ -4967,20 +4976,20 @@ test "a batch shares one durable record sync" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
         .sync = .always,
         .tail_records = 4,
     });
     defer journal.deinit(io);
     const count = 300;
-    const before = journal.log.record_syncs;
+    const before = journalState(journal).log.record_syncs;
     for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name"));
-    try testing.expectEqual(before + count, journal.log.record_syncs);
+    try testing.expectEqual(before + count, journalState(journal).log.record_syncs);
     var batch: [100]Journal.Entry = undefined;
     for (&batch, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "a name") };
-    const singly = journal.log.record_syncs;
+    const singly = journalState(journal).log.record_syncs;
     for (0..count / batch.len) |_| _ = try journal.appendAll(io, &batch);
-    try testing.expectEqual(singly + count / batch.len, journal.log.record_syncs);
+    try testing.expectEqual(singly + count / batch.len, journalState(journal).log.record_syncs);
     try testing.expectEqual(@as(u64, 2 * count), try journal.verify(io));
 }
 
@@ -4988,7 +4997,7 @@ test "waiting and reading keep no storage owned by the journal" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 1 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 1 });
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "first"));
     try testing.expectEqual(@as(u64, 1), try journal.waitPast(io, 0));
@@ -4999,7 +5008,7 @@ test "waiting and reading keep no storage owned by the journal" {
             _ = try j.append(inner, 2, created(2, "second"));
         }
     }.f;
-    var future = try io.concurrent(writer, .{ &journal, io });
+    var future = try io.concurrent(writer, .{ journal, io });
     try future.await(io);
     // A writer has trimmed the tail; the batch still has its own first record.
     try testing.expectEqual(@as(u64, 1), batch.records[0].seq);
@@ -5010,7 +5019,7 @@ test "waitPast reports the newest sequence even with no tail" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "on disk"));
     const arrived = try journal.waitPast(io, 0);
@@ -5030,7 +5039,7 @@ test "copySince owns nested events and bytes after the journal closes" {
     const J = chronicle.Journal(E);
     var batch: J.Batch = undefined;
     {
-        var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "value" }});
         defer testing.allocator.free(values);
@@ -5072,7 +5081,7 @@ test "copySince preserves migrated events without calling the hook again" {
         }
     };
     Migration.calls = 0;
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.f });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.f });
     defer journal.deinit(io);
     var batch = try journal.copySince(testing.allocator, io, 0);
     defer batch.deinit();
@@ -5088,7 +5097,7 @@ test "copySince releases partial copies on every allocation failure" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
     var name: [2048]u8 = @splat('n');
     name[1] = '\n';
@@ -5102,7 +5111,7 @@ test "copySince releases partial copies on every allocation failure" {
             try testing.expectEqual(@as(u64, 2), batch.records[1].seq);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ &journal, io });
+    try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ journal, io });
     try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "after")));
 }
 
@@ -5110,24 +5119,24 @@ test "a refresh that runs out of memory leaves every tail record owned and count
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer writer.deinit(io);
     _ = try writer.append(io, 1, created(1, "initial"));
     var reached_end = false;
     for (0..100) |offset| {
         try writer.truncateAfter(io, 1);
         var failing: testing.FailingAllocator = .init(testing.allocator, .{});
-        var reader = try Journal.open(failing.allocator(), io, ws.path, .{ .access = .read });
+        const reader = try Journal.open(failing.allocator(), io, ws.path, .{ .access = .read });
         defer reader.deinit(io);
-        try fill(&writer, io, 1, 20, "external");
+        try fill(writer, io, 1, 20, "external");
         failing.fail_index = failing.alloc_index + offset;
         reader.refresh(io) catch |err| {
             if (err != error.OutOfMemory) return err;
             // Record metadata itself is in the tail array: count it without
             // dereferencing its event or bytes, which must still be owned.
             var held: usize = 0;
-            for (reader.tail.entries.items) |owned| held += owned.record.bytes.len;
-            try testing.expectEqual(reader.tail.bytes, held);
+            for (journalState(reader).tail.entries.items) |owned| held += owned.record.bytes.len;
+            try testing.expectEqual(journalState(reader).tail.bytes, held);
             var partial = try reader.copySince(testing.allocator, io, 0);
             defer partial.deinit();
             for (partial.records) |record| {
@@ -5151,16 +5160,16 @@ test "a failed refresh never calls a partial tail complete" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer writer.deinit(io);
     _ = try writer.append(io, 1, created(1, "initial"));
     var reached_end = false;
     for (0..100) |offset| {
         try writer.truncateAfter(io, 1);
         var failing: testing.FailingAllocator = .init(testing.allocator, .{});
-        var reader = try Journal.open(failing.allocator(), io, ws.path, .{ .access = .read });
+        const reader = try Journal.open(failing.allocator(), io, ws.path, .{ .access = .read });
         defer reader.deinit(io);
-        try fill(&writer, io, 1, 20, "external");
+        try fill(writer, io, 1, 20, "external");
         failing.fail_index = failing.alloc_index + offset;
         reader.refresh(io) catch |err| {
             if (err != error.OutOfMemory) return err;
@@ -5182,19 +5191,19 @@ test "a tail too small for one record still reopens and refreshes" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
-        var writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer writer.deinit(io);
         _ = try writer.append(io, 1, created(1, "on disk"));
     }
     for ([_]usize{ 0, 1 }) |limit| {
-        var reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_bytes = limit });
+        const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read, .tail_bytes = limit });
         defer reader.deinit(io);
         try testing.expectEqual(@as(u64, 1), try reader.waitPast(io, 0));
         var batch = try reader.copySince(testing.allocator, io, 0);
         defer batch.deinit();
         try testing.expectEqual(@as(usize, 0), batch.records.len);
         try testing.expect(!batch.complete);
-        var walk = try reader.replay(io, 0);
+        const walk = try reader.replay(io, 0);
         defer walk.deinit(io);
         try testing.expectEqualStrings("on disk", (try walk.next(io)).?.event.created.name);
         try testing.expectEqual(@as(?Journal.Record, null), try walk.next(io));
@@ -5206,21 +5215,21 @@ test "starting a replay waits for the writer and can be canceled there" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
-    journal.mutex.lockUncancelable(io);
-    defer journal.mutex.unlock(io);
+    journalState(journal).mutex.lockUncancelable(io);
+    defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
         fn f(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
             ready.store(true, .release);
             // An empty journal needs no file operation to choose its scan:
             // cancellation must reach the lock protecting that choice.
-            var walk = try j.replay(inner, 0);
+            const walk = try j.replay(inner, 0);
             defer walk.deinit(inner);
         }
     };
-    var future = try io.concurrent(Reader.f, .{ &journal, io, &started });
+    var future = try io.concurrent(Reader.f, .{ journal, io, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -5231,16 +5240,16 @@ test "independent replays read committed records beside a rotating writer" {
     defer ws.deinit();
     var options = small(4, 0);
     options.index_interval_bytes = 0;
-    var journal = try Journal.open(testing.allocator, io, ws.path, options);
+    const journal = try Journal.open(testing.allocator, io, ws.path, options);
     defer journal.deinit(io);
-    try fill(&journal, io, 1, 20, "committed");
+    try fill(journal, io, 1, 20, "committed");
     const Worker = struct {
         fn write(j: *Journal, inner: Io) !void {
             try fill(j, inner, 21, 200, "committed");
         }
         fn read(j: *Journal, inner: Io) !void {
             for (0..30) |_| {
-                var walk = try j.replay(inner, 5);
+                const walk = try j.replay(inner, 5);
                 defer walk.deinit(inner);
                 var expected: u64 = 6;
                 while (try walk.next(inner)) |record| : (expected += 1) {
@@ -5252,11 +5261,11 @@ test "independent replays read committed records beside a rotating writer" {
             }
         }
     };
-    var writer = try io.concurrent(Worker.write, .{ &journal, io });
+    var writer = try io.concurrent(Worker.write, .{ journal, io });
     defer writer.cancel(io) catch {};
-    var first = try io.concurrent(Worker.read, .{ &journal, io });
+    var first = try io.concurrent(Worker.read, .{ journal, io });
     defer first.cancel(io) catch {};
-    var second = try io.concurrent(Worker.read, .{ &journal, io });
+    var second = try io.concurrent(Worker.read, .{ journal, io });
     defer second.cancel(io) catch {};
     try first.await(io);
     try second.await(io);
@@ -5270,7 +5279,7 @@ test "replacing a backup releases its inventory on every allocation failure" {
     const dest = try ws.beside("backup");
     try ws.root.createDirPath(io, "backup");
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "source"));
     }
@@ -5281,7 +5290,7 @@ test "replacing a backup releases its inventory on every allocation failure" {
             try root.writeFile(inner, .{ .sub_path = "backup/00000000000000000001.log", .data = "old" });
             try root.writeFile(inner, .{ .sub_path = "backup/00000000000000000002.log", .data = "old" });
             try root.writeFile(inner, .{ .sub_path = "backup/00000000000000000002.idx", .data = "old" });
-            var journal = try Journal.open(a, inner, source, .{ .sync = .never, .tail_records = 0 });
+            const journal = try Journal.open(a, inner, source, .{ .sync = .never, .tail_records = 0 });
             defer journal.deinit(inner);
             try testing.expectEqual(@as(u64, 1), try journal.backup(inner, target));
         }
@@ -5294,7 +5303,7 @@ test "a larger batch nobody keeps needs no larger working memory" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     var counting: testing.FailingAllocator = .init(testing.allocator, .{});
-    var journal = try Journal.open(counting.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
+    const journal = try Journal.open(counting.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
     defer journal.deinit(io);
     var entries: [1024]Journal.Entry = @splat(.{ .at = 0, .event = created(1, "one line") });
     _ = try journal.appendAll(io, entries[0..1]);
@@ -5309,7 +5318,7 @@ test "checking a batch nobody keeps holds only one parsed record at a time" {
     defer ws.deinit();
     var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true, .stack_trace_frames = 0 }) = .init;
     defer if (gpa.deinit() == .leak) @panic("a checked batch leaked");
-    var journal = try Journal.open(gpa.allocator(), io, ws.path, .{
+    const journal = try Journal.open(gpa.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 0,
         .verify_round_trip = true,
@@ -5332,7 +5341,7 @@ test "a batch keeps the allocator carried by a JSON value alive" {
     const J = chronicle.Journal(std.json.Value);
     var batch: J.Batch = undefined;
     {
-        var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
         defer testing.allocator.free(values);
@@ -5353,10 +5362,10 @@ fn canceledInventoryObservation(comptime observation: enum { oldest, segments })
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
-    journal.mutex.lockUncancelable(io);
-    defer journal.mutex.unlock(io);
+    journalState(journal).mutex.lockUncancelable(io);
+    defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
         fn read(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
@@ -5367,7 +5376,7 @@ fn canceledInventoryObservation(comptime observation: enum { oldest, segments })
             }
         }
     };
-    var future = try io.concurrent(Reader.read, .{ &journal, io, &started });
+    var future = try io.concurrent(Reader.read, .{ journal, io, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -5384,10 +5393,10 @@ test "observing persistence status waits for the journal lock" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
-    journal.mutex.lockUncancelable(io);
-    defer journal.mutex.unlock(io);
+    journalState(journal).mutex.lockUncancelable(io);
+    defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
         fn read(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
@@ -5395,7 +5404,7 @@ test "observing persistence status waits for the journal lock" {
             _ = try j.status(inner);
         }
     };
-    var future = try io.concurrent(Reader.read, .{ &journal, io, &started });
+    var future = try io.concurrent(Reader.read, .{ journal, io, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -5405,7 +5414,7 @@ test "a tail keeps the allocator carried by a JSON value at its owner" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const J = chronicle.Journal(std.json.Value);
-    var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 2 });
+    const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 2 });
     defer journal.deinit(io);
     const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
     defer testing.allocator.free(values);
@@ -5414,9 +5423,9 @@ test "a tail keeps the allocator carried by a JSON value at its owner" {
     }
     // Appending moves owners both when the tail grows and when it evicts.
     // Read the internal owner under its lock before exercising the allocator.
-    journal.mutex.lockUncancelable(io);
-    defer journal.mutex.unlock(io);
-    const owned = &journal.tail.entries.items[0];
+    journalState(journal).mutex.lockUncancelable(io);
+    defer journalState(journal).mutex.unlock(io);
+    const owned = &journalState(journal).tail.entries.items[0];
     const context = owned.arena;
     try testing.expectEqual(@as(*anyopaque, context), owned.record.event.array.allocator.ptr);
     var array = owned.record.event.array;
@@ -5435,8 +5444,8 @@ test "starting a positioned replay observes its journal only under the lock" {
         var unlocked: bool = false;
         fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
             if (journal) |j| {
-                if (j.mutex.tryLock()) {
-                    j.mutex.unlock(testing.io);
+                if (journalState(j).mutex.tryLock()) {
+                    journalState(j).mutex.unlock(testing.io);
                     unlocked = true;
                 }
             }
@@ -5446,12 +5455,12 @@ test "starting a positioned replay observes its journal only under the lock" {
     var vtable = testing.allocator.vtable.*;
     vtable.alloc = Probe.alloc;
     const gpa: std.mem.Allocator = .{ .ptr = testing.allocator.ptr, .vtable = &vtable };
-    var journal = try Journal.open(gpa, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(gpa, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "one"));
     Probe.unlocked = false;
-    Probe.journal = &journal;
-    var walk = journal.replayAt(io, .after(0)) catch |err| {
+    Probe.journal = journal;
+    const walk = journal.replayAt(io, .after(0)) catch |err| {
         Probe.journal = null;
         return err;
     };
@@ -5471,8 +5480,8 @@ fn finalizingUnderLock(comptime best_effort: bool) !void {
         fn setLength(ctx: ?*anyopaque, file: Io.File, length: u64) Io.File.SetLengthError!void {
             if (journal) |j| {
                 calls += 1;
-                if (j.mutex.tryLock()) {
-                    j.mutex.unlock(testing.io);
+                if (journalState(j).mutex.tryLock()) {
+                    journalState(j).mutex.unlock(testing.io);
                     unlocked = true;
                 }
             }
@@ -5483,14 +5492,14 @@ fn finalizingUnderLock(comptime best_effort: bool) !void {
     const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .preallocate_bytes = 4096 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .preallocate_bytes = 4096 });
     _ = journal.append(io, 1, created(1, "one")) catch |err| {
         journal.deinit(io);
         return err;
     };
     Probe.unlocked = false;
     Probe.calls = 0;
-    Probe.journal = &journal;
+    Probe.journal = journal;
     defer Probe.journal = null;
     if (best_effort) journal.deinit(io) else try journal.close(io);
     Probe.journal = null;
@@ -5506,27 +5515,27 @@ test "deinitializing a journal finalizes its owned state under the lock" {
     try finalizingUnderLock(true);
 }
 
-test "a moved replay keeps the allocator carried by its last JSON value alive" {
+test "a returned replay keeps the allocator carried by its last JSON value alive" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const J = chronicle.Journal(std.json.Value);
-    var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
+    const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
     defer journal.deinit(io);
     const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
     defer testing.allocator.free(values);
     _ = try journal.append(io, 1, .{ .array = .fromOwnedSlice(testing.allocator, values) });
     const Reader = struct {
-        fn read(j: *J, inner: Io) !struct { walk: J.Replay, record: J.Record } {
-            var walk = try j.replay(inner, 0);
+        fn read(j: *J, inner: Io) !struct { walk: *J.Replay, record: J.Record } {
+            const walk = try j.replay(inner, 0);
             errdefer walk.deinit(inner);
             const record = (try walk.next(inner)).?;
             return .{ .walk = walk, .record = record };
         }
     };
-    var read = try Reader.read(&journal, io);
+    var read = try Reader.read(journal, io);
     defer read.walk.deinit(io);
-    const context = read.walk.arena;
+    const context = &replayState(std.json.Value, read.walk).arena;
     try testing.expectEqual(@as(*anyopaque, context), read.record.event.array.allocator.ptr);
     var array = read.record.event.array;
     try array.ensureTotalCapacity(65536);
@@ -5540,18 +5549,18 @@ test "replay creation releases its scan and stable arena on every allocation fai
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "one"));
     }
     const Reader = struct {
         fn read(gpa: std.mem.Allocator, inner: Io, path: []const u8) !void {
-            var journal = try Journal.open(gpa, inner, path, .{ .access = .read });
+            const journal = try Journal.open(gpa, inner, path, .{ .access = .read });
             defer journal.deinit(inner);
-            var walk = try journal.replay(inner, 0);
+            const walk = try journal.replay(inner, 0);
             defer walk.deinit(inner);
             _ = try walk.next(inner);
-            var positioned = try journal.replayAt(inner, walk.position());
+            const positioned = try journal.replayAt(inner, walk.position());
             defer positioned.deinit(inner);
             try testing.expectEqual(@as(?Journal.Record, null), try positioned.next(inner));
         }
@@ -5563,12 +5572,12 @@ test "observing configuration waits for the journal lock" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 7 });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 7 });
     defer journal.deinit(io);
     const observed = try journal.options(io);
     try testing.expectEqual(@as(usize, 7), observed.tail_records);
-    journal.mutex.lockUncancelable(io);
-    defer journal.mutex.unlock(io);
+    journalState(journal).mutex.lockUncancelable(io);
+    defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
         fn read(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
@@ -5577,7 +5586,7 @@ test "observing configuration waits for the journal lock" {
             try testing.expectEqual(@as(usize, 7), config.tail_records);
         }
     };
-    var future = try io.concurrent(Reader.read, .{ &journal, io, &started });
+    var future = try io.concurrent(Reader.read, .{ journal, io, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -5586,15 +5595,15 @@ test "observing a tailer cursor waits for the journal lock" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
-    var tailer = try journal.tailer(io, "reports");
+    const tailer = try journal.tailer(io, "reports");
     defer tailer.deinit();
     try tailer.commit(io, 7);
     const observed = try tailer.cursor(io);
     try testing.expectEqual(@as(u64, 7), observed);
-    journal.mutex.lockUncancelable(io);
-    defer journal.mutex.unlock(io);
+    journalState(journal).mutex.lockUncancelable(io);
+    defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
         fn read(tail: *Journal.Tailer, inner: Io, ready: *std.atomic.Value(bool)) !void {
@@ -5603,7 +5612,7 @@ test "observing a tailer cursor waits for the journal lock" {
             try testing.expectEqual(@as(u64, 7), seq);
         }
     };
-    var future = try io.concurrent(Reader.read, .{ &tailer, io, &started });
+    var future = try io.concurrent(Reader.read, .{ tailer, io, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -5629,7 +5638,7 @@ test "copySince copies hook values without parsing or stringifying again" {
     defer ws.deinit();
     var batch: J.Batch = undefined;
     {
-        var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         _ = try journal.append(io, 1, .{ .text = "hook value" });
         const parses = Hook.parses;
@@ -5657,7 +5666,7 @@ test "copySince preserves exact migrated Raw bytes" {
     try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev = "{}" }});
     var batch: J.Batch = undefined;
     {
-        var journal = try J.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.migrate });
+        const journal = try J.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.migrate });
         defer journal.deinit(io);
         batch = try journal.copySince(testing.allocator, io, 0);
     }
@@ -5686,7 +5695,7 @@ test "copySince owns dynamic Value keys strings containers and number spelling" 
     try ws.writeRecords(1, 1, &.{.{ .seq = 1, .ev = "{}" }});
     var batch: J.Batch = undefined;
     {
-        var journal = try J.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.migrate });
+        const journal = try J.open(testing.allocator, io, ws.path, .{ .schema_version = 2, .migrate = Migration.migrate });
         defer journal.deinit(io);
         batch = try journal.copySince(testing.allocator, io, 0);
     }
@@ -5706,7 +5715,7 @@ test "an oversized stored snapshot is reported by its read bound" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
-        var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "one"));
         try journal.snapshot(io, "state" ** 20);
@@ -5718,7 +5727,7 @@ test "the shared document bound leaves an oversized cursor a corrupt cursor" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
     try ws.write(try ws.sub("reports.cursor"), " " ** 4097);
     try testing.expectError(error.CorruptCursor, journal.tailer(io, "reports"));
@@ -5779,11 +5788,11 @@ test "reading escaped metadata propagates every allocation failure" {
     try ws.write(try ws.segment(1), written.written());
     const Reader = struct {
         fn read(a: std.mem.Allocator, inner: Io, path: []const u8) !void {
-            var journal = try Journal.open(a, inner, path, .{ .access = .read, .tail_records = 0 });
+            const journal = try Journal.open(a, inner, path, .{ .access = .read, .tail_records = 0 });
             defer journal.deinit(inner);
             try testing.expectEqual(@as(u64, 1), try journal.lastSeq(inner));
             try testing.expectEqual(@as(?u64, 1), try journal.seqAtOrAfter(inner, 1));
-            var walk = try journal.replay(inner, 0);
+            const walk = try journal.replay(inner, 0);
             defer walk.deinit(inner);
             try testing.expectEqualStrings("one", (try walk.next(inner)).?.event.created.name);
         }
@@ -5796,7 +5805,7 @@ test "a rotation reserves its inventory before publishing a new active file" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     var failing = testing.FailingAllocator.init(testing.allocator, .{});
-    var journal = try Journal.open(failing.allocator(), io, ws.path, .{
+    const journal = try Journal.open(failing.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 0,
         .verify_round_trip = false,
@@ -5804,16 +5813,16 @@ test "a rotation reserves its inventory before publishing a new active file" {
     });
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "n"));
-    while (journal.log.segments.items.len < journal.log.segments.capacity) {
+    while (journalState(journal).log.segments.items.len < journalState(journal).log.segments.capacity) {
         _ = try journal.append(io, 1, created(1, "n"));
     }
     const previous = try journal.lastSeq(io);
-    const base = journal.log.segments.items[journal.log.segments.items.len - 1].base_seq;
+    const base = journalState(journal).log.segments.items[journalState(journal).log.segments.items.len - 1].base_seq;
     failing.fail_index = failing.alloc_index;
     try testing.expectError(error.OutOfMemory, journal.append(io, 1, created(1, "n")));
     failing.fail_index = std.math.maxInt(usize);
     // Even a failed write leaves each live file paired with its inventory.
-    try testing.expectEqual(base, journal.log.active.?.builder.base_seq);
+    try testing.expectEqual(base, journalState(journal).log.active.?.builder.base_seq);
     try testing.expectEqual(previous, try journal.lastSeq(io));
     _ = try journal.reconcile(io);
     try testing.expectEqual(previous + 1, try journal.append(io, 1, created(1, "n")));
@@ -5835,7 +5844,7 @@ test "a stringify refusal is distinct from an encoding allocation failure" {
     defer ws.deinit();
     const J = chronicle.Journal(RefusingEvent);
     for ([_]usize{ 0, 2 }) |tail_records| {
-        var journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = tail_records, .verify_round_trip = tail_records != 0 });
+        const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = tail_records, .verify_round_trip = tail_records != 0 });
         defer journal.deinit(io);
         const previous = try journal.lastSeq(io);
         for ([_]bool{ false, true }) |partial| {
@@ -5857,7 +5866,7 @@ test "encoding owns the cause of every allocation failure with and without a tai
             var ws = try Workspace.init("log");
             defer ws.deinit();
             const J = chronicle.Journal(RefusingEvent);
-            var journal = try J.open(a, io, ws.path, .{
+            const journal = try J.open(a, io, ws.path, .{
                 .sync = .never,
                 .tail_records = tail_records,
                 .verify_round_trip = tail_records != 0,
@@ -5870,4 +5879,58 @@ test "encoding owns the cause of every allocation failure with and without a tai
     for ([_]usize{ 0, 2 }) |tail_records| {
         try testing.checkAllAllocationFailures(testing.allocator, Case.append, .{ testing.io, tail_records });
     }
+}
+
+test "managed journal exposes no writable state or live value storage" {
+    try testing.expect(@typeInfo(Journal) == .@"opaque");
+    try testing.expect(@typeInfo(@typeInfo(@TypeOf(Journal.open)).@"fn".return_type.?).error_union.payload == *Journal);
+    try testing.expect(@FieldType(Journal.Opened, "journal") == *Journal);
+}
+
+test "managed replay exposes no writable state or live value storage" {
+    try testing.expect(@typeInfo(Journal.Replay) == .@"opaque");
+    inline for (.{ Journal.replay, Journal.replayAt, Journal.Tailer.replay }) |make| {
+        try testing.expect(@typeInfo(@typeInfo(@TypeOf(make)).@"fn".return_type.?).error_union.payload == *Journal.Replay);
+    }
+}
+
+test "managed tailer exposes no writable state or live value storage" {
+    try testing.expect(@typeInfo(Journal.Tailer) == .@"opaque");
+    try testing.expect(@typeInfo(@typeInfo(@TypeOf(Journal.tailer)).@"fn".return_type.?).error_union.payload == *Journal.Tailer);
+}
+
+test "managed owners release every construction allocation" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+        try journal.snapshot(io, "fold");
+        const tail = try journal.tailer(io, "reports");
+        defer tail.deinit();
+        try tail.commit(io, 1);
+    }
+    const Construct = struct {
+        fn run(gpa: std.mem.Allocator, inner: Io, path: []const u8) !void {
+            const opened = try Journal.openWithSnapshot(gpa, inner, path, .{ .access = .read, .verify = .full });
+            const journal = opened.journal;
+            defer journal.deinit(inner);
+            if (opened.snapshot) |snapshot| gpa.free(snapshot.state);
+            const tail = try journal.tailer(inner, "reports");
+            defer tail.deinit();
+            try testing.expectEqualStrings("reports", tail.name());
+            try testing.expectEqual(@as(u64, 1), try tail.cursor(inner));
+            const walk = try tail.replay(inner);
+            defer walk.deinit(inner);
+            try testing.expectEqual(null, try walk.next(inner));
+            try walk.rearmAt(inner, .after(0));
+            try testing.expectEqual(@as(u64, 1), (try walk.next(inner)).?.seq);
+            const at = try journal.replayAt(inner, walk.position());
+            defer at.deinit(inner);
+            try testing.expectEqual(null, try at.next(inner));
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Construct.run, .{ io, ws.path });
 }

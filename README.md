@@ -30,7 +30,7 @@ var last: u64 = 0;
     // newest records are read back, and the sequence number continues
     // from the last one, so a restart never reuses a number. A second
     // writer would get error.Locked instead of this journal.
-    var ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
+    const ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
     defer ledger.deinit(io);
 
     // A sink is a fold. Subscribing streams it every record already on
@@ -47,7 +47,7 @@ var last: u64 = 0;
 
     // A follower keeps its replay across wakes. Each re-arm checks where
     // the last pass stopped and reuses the scan buffer and record scratch.
-    var follower = try ledger.replayAt(io, .after(0));
+    const follower = try ledger.replayAt(io, .after(0));
     defer follower.deinit(io);
     _ = (try follower.next(io)).?;
 
@@ -76,7 +76,7 @@ var last: u64 = 0;
 // Starting again: restore the snapshot, then fold only what came after
 // it. Without a snapshot `from` stays 0 and the whole log is replayed.
 const opened = try Ledger.openWithSnapshot(gpa, io, path, .{ .schema_version = 1 });
-var reopened = opened.journal;
+const reopened = opened.journal;
 defer reopened.deinit(io);
 
 var restored: Balances = .{};
@@ -107,7 +107,16 @@ which writes and reads a record's line; this package keeps the lines.
 
 ## The API
 
-`chronicle.Journal(comptime Event: type)` returns a type with:
+`chronicle.Journal(comptime Event: type)` returns an opaque owner type.
+`open` and `Opened.journal` return `*Journal(Event)`; `replay`, `replayAt`
+and `Tailer.replay` return `*Replay`, and `tailer` returns `*Tailer`.
+Keep and pass these pointers; they refer to one allocation each, and copying
+one pointer does not create another owner. Release each owner exactly once:
+`close` or `deinit` for a journal, `deinit` for a replay or tailer. Finish all
+calls and release replays and tailers before closing their journal. The
+allocator must outlive them. Observe state through methods.
+
+The journal has:
 
 | | |
 |---|---|
@@ -131,6 +140,7 @@ which writes and reads a record's line; this package keeps the lines.
 | `oldestSeq(io)` | The oldest one still held. |
 | `segmentCount(io)` | How many files the log is spread over. |
 | `refresh(io)` | Read the directory again — how a reader tails a writer. |
+| `Tailer.name()` | The reader's immutable name, borrowed until `deinit`. |
 | `Tailer.cursor(io)` | The committed cursor, copied under the journal lock. |
 | `tailer(io, name)` | A named reader, with the cursor it last committed. |
 | `subscribe(io, sink)` | Fold every record, from the disk and then live. |
@@ -158,8 +168,8 @@ and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Batch`,
 `Opened`, `Migrate`, `Status`, `Stats` and one named error set per operation, with
 `Sync`, `Flush` and `Verify` at the module root. Every
 public declaration carries a doc comment stating its contract;
-`src/chronicle.zig` is the reference and `src/log.zig` the segment store under
-it. `Event` may be any type `std.json` can write and read back; a tagged union
+`src/chronicle.zig` is the reference, `src/journal.zig` owns its private state
+and `src/log.zig` keeps the segments. `Event` may be any type `std.json` can write and read back; a tagged union
 is the expected shape, because it gives each record a name on disk and an
 exhaustive `switch` in the fold. strand writes and reads it, to the bytes
 `std.json` writes and the values it reads, and a `chronicle.Raw` (strand's
@@ -377,8 +387,8 @@ take the lock to choose the segments the walk will cross and copy its decoding
 configuration; the walk itself reads without it and writes nothing. A missing index is walked from the first record. Each
 `Replay` belongs to one reader at a time, and its records borrow only that
 walk's memory. Retention beside a walk may remove files it needs, which is
-reported as an error. `close` and `deinit` require every caller and walk to
-have stopped. Observe recovery and persistence state with `status(io)`. The
+reported as an error. Release each replay and tailer, and stop every caller,
+before the journal's `close` or `deinit`. Observe recovery and persistence state with `status(io)`. The
 `options(io)` call copies the configuration passed to `open` under the lock.
 `Tailer.cursor(io)` observes the committed cursor under that same lock.
 The allocator passed to `open` must support concurrent use when walks or tailers allocate alongside
