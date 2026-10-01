@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- A zero read-buffer size uses the one byte needed for lookahead, so opening, replaying and backing up a journal make progress instead of aborting.
+
 - **Breaking:** Journal, Replay and Tailer are opaque managed owners returned by pointer, including `Opened.journal`; keep their pointers, use methods to observe state (`Tailer.name()` borrows its name), and release each owner exactly once before its allocator, with replays and tailers released before their journal.
 
 - The record byte limit counts the exact encoded line and checksum, so a record at the ceiling is accepted and one above it is refused before any file write.

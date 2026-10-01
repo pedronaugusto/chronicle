@@ -303,7 +303,7 @@ so losing one costs a scan.
 whichever bites first, kept parsed for `copySince` and subscriptions; the
 oldest half goes when either ceiling is reached, so a tail costs a constant
 amount per append. A `Replay`, and so a `subscribe`, holds the record it is on
-and one read buffer, `Options.read_buffer_size`; a line longer than
+and one read buffer, `Options.read_buffer_size` (one byte when zero); a line longer than
 `Options.max_record_bytes` is refused rather than held. `open` walks the
 newest segment's newlines, and the records in it land in the tail under its
 ceilings. The journal also keeps fixed-size metadata for every segment, and a

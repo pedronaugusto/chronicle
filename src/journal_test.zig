@@ -5934,3 +5934,34 @@ test "managed owners release every construction allocation" {
     };
     try testing.checkAllAllocationFailures(testing.allocator, Construct.run, .{ io, ws.path });
 }
+
+test "a zero read buffer still opens replays and backs up whole records" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var copy = try Workspace.init("copy");
+    defer copy.deinit();
+    const options: Journal.Options = .{
+        .sync = .never,
+        .read_buffer_size = 0,
+        .write_buffer_size = 0,
+        .max_segment_records = 2,
+    };
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        try fill(journal, io, 1, 5, "one");
+        try testing.expectEqual(@as(u64, 5), try journal.verify(io));
+        try testing.expectEqual(@as(u64, 5), try journal.backup(io, copy.path));
+    }
+    const reopened = try Journal.open(testing.allocator, io, copy.path, options);
+    defer reopened.deinit(io);
+    const walk = try reopened.replay(io, 0);
+    defer walk.deinit(io);
+    for (1..6) |seq| {
+        const record = (try walk.next(io)).?;
+        try testing.expectEqual(@as(u64, seq), record.seq);
+        try testing.expectEqualStrings("one", record.event.created.name);
+    }
+    try testing.expectEqual(null, try walk.next(io));
+}

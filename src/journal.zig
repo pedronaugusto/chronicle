@@ -427,6 +427,7 @@ pub fn Journal(comptime Event: type) type {
             /// larger than this costs an extra write syscall, nothing more.
             write_buffer_size: usize = 64 * 1024,
             /// Size of the buffer a read from the disk streams through.
+            /// Zero uses one byte, the lookahead needed to recognize a line.
             read_buffer_size: usize = 64 * 1024,
             /// Whether `append` parses every record back out of the bytes it
             /// is about to write, to prove the `Event` survives the round

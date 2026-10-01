@@ -1437,6 +1437,13 @@ fn framing(max_line_bytes: usize) strand.LineReader.Options {
     };
 }
 
+/// Every streamed read needs storage for at least one byte of lookahead.
+/// Copies need a nonempty block to make progress too. Keep that requirement
+/// here, wherever the configured buffer is allocated.
+fn allocateReadBuffer(log: *const Log) Allocator.Error![]u8 {
+    return log.gpa.alloc(u8, @max(log.options.read_buffer_size, 1));
+}
+
 /// Walk a segment's lines, optionally writing each line's offset and
 /// timestamp to an index being built. Memory is one read buffer and one line:
 /// nothing grows with the segment.
@@ -1454,7 +1461,7 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
 
     const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
     defer file.close(io);
-    const buffer = try log.gpa.alloc(u8, log.options.read_buffer_size);
+    const buffer = try log.allocateReadBuffer();
     defer log.gpa.free(buffer);
 
     // The segment is what `segment.bytes` says it is, whatever the file
@@ -1728,7 +1735,7 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64, extent: ScanOpt
         limit.* = if (unbounded) std.math.maxInt(u64) else segment.bytes;
     }
 
-    const buffer = try log.gpa.alloc(u8, log.options.read_buffer_size);
+    const buffer = try log.allocateReadBuffer();
     errdefer log.gpa.free(buffer);
 
     return .{
@@ -2757,7 +2764,7 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) Op
         return true;
     }
 
-    const chunk = try log.gpa.alloc(u8, log.options.read_buffer_size);
+    const chunk = try log.allocateReadBuffer();
     defer log.gpa.free(chunk);
 
     var at: u64 = 0;
