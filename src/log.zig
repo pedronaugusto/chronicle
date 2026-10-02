@@ -164,7 +164,7 @@ pub const Flush = enum {
 };
 
 /// What `Sync.always` issues here. `chronicle.flush` re-exports it, and
-/// README.md's durability rules is written per platform from it.
+/// README.md's durability rules are written per platform from it.
 pub const flush: Flush = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => .full_fsync,
     .windows => .flush_buffers,
