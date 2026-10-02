@@ -5,7 +5,7 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption(bool, "smoke", b.option(bool, "smoke", "Run one tiny iteration") orelse false);
     const optimize = b.standardOptimizeOption(.{});
-    const chronicle_dep = b.dependency("chronicle", .{ .target = target, .optimize = optimize });
+    const chronicle_dep = b.dependency(if (b.option(bool, "snapshot", "Build the archived local revision") orelse false) "chronicle" else "after", .{ .target = target, .optimize = optimize });
     const chronicle = chronicle_dep.module("chronicle");
     const strand = chronicle.import_table.get("strand").?;
 

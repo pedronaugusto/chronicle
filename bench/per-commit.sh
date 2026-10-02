@@ -20,7 +20,7 @@ for c in "$@"; do
   ln -s "$src" "$bb/chronicle-src"
   sed 's|.path = ".."|.path = "chronicle-src"|' "$here/build.zig.zon" > "$bb/build.zig.zon"
   cp -R "$here/src/." "$bb/src/"
-  (cd "$bb" && ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$build/zig-global-cache}" "${ZIG:-zig}" build -j1 --prefix "$bb/out" --cache-dir "$bb/cache" -Doptimize=ReleaseFast)
+  (cd "$bb" && ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$build/zig-global-cache}" "${ZIG:-zig}" build -j1 --prefix "$bb/out" --cache-dir "$bb/cache" -Doptimize=ReleaseFast -Dsnapshot=true)
   cp "$bb/out/bin/chronicle-bench" "$out"
   cp "$bb/out/bin/work-bench" "$work"
   rm -rf "$src" "$bb"

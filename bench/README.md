@@ -13,17 +13,10 @@ OkayWAL smoke uses one worker and a small allocation instead of a 256 MiB
 segment. Reports retain no timing, rate or ratio values. A successful smoke run
 supports no performance claim.
 
-By default A is the last first-parent main commit before **2026-09-30 00:00:00
-+0100**, and B is current local main. The explicit time and offset enforce the
-midnight boundary (Git's date-only `--before=2026-09-30` can inherit the current
-time of day). `--before REV --after REV` selects other immutable snapshots.
-Each job runs A, B, then its existing same-job tools, repeating that order five
-times (`BENCH_RUNS`). One warm-up per side precedes those trials; all raw samples
-are retained and summaries use medians. Inputs are generated once and each side
-owns separate journal data and scratch. The final API returns opaque journal
-and replay owners: `src/compat.zig` borrows the old value or new owner pointer.
-This changes ownership spelling, with the same append/replay/subscription calls
-and payloads. Segment count handles the older infallible observation.
+`revisions.json` fixes A at `9792f666ea550879bb077fe2ba5aef697323525d` and B at
+`991fab9f04870a8b6e723c5a7bd91b8123ff1aa4`. A retains the original
+**2026-09-30 00:00:00 +01:00** cutoff. `--before REV --after REV` selects other
+immutable snapshots; refresh the pins when main advances.
 
 The jobs are no-sync append, durable single append, group commit, full replay,
 suffix replay, clean reopen, follow by cursor/position/rearm, raw-event append
@@ -57,3 +50,7 @@ planning estimate, not a measurement from this preparation. Have at least
 `ZIG`, `GO`, `CARGO`, `PYTHON` and standard tool cache environment variables select
 installed tools/caches. Specialized `run.sh`, `alternate.sh`, `per-commit.sh`
 and `test-snapshot.sh` remain; `quiet.sh` is the complete pass entry point.
+
+Standalone `zig build -Doptimize=Debug` compiles the pinned after harness
+without running it. Snapshot builds pass `-Dsnapshot=true` to compile the
+archived local revision instead; quiet runs retain ReleaseFast.
