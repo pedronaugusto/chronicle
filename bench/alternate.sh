@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interleaved head-to-head: every trial runs each side once, in an order that
+# Interleaved same-job samples: every trial runs each side once, in an order that
 # rotates per trial, and waits for the 1-minute load average to fall under
 # BENCH_MAX_LOAD (default 4) before each timed run. Best of BENCH_RUNS
 # (default 7) per side and workload; raw rows and the load at each run are
@@ -9,7 +9,7 @@
 #
 # Workloads: append_no_fsync append_fsync group_commit replay_all replay_from_n clean_reopen
 #            follow_replay follow_resume (chronicle only)
-#            raw_append raw_replay_all (chronicle only: tycho's Journal(strand.Raw) over
+#            raw_append raw_replay_all (chronicle only: a raw-event Journal(strand.Raw) over
 #            a generated corpus (or BENCH_CORPUS) cycled to 200,000 records)
 set -euo pipefail
 cd "$(dirname "$0")"

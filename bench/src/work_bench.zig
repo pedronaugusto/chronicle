@@ -1,5 +1,6 @@
 const std = @import("std");
 const chronicle = @import("chronicle");
+const ref = @import("compat.zig").ref;
 const smoke = @import("bench_options").smoke;
 const Io = std.Io;
 const Event = struct { id: u32, name: []const u8 };
@@ -52,9 +53,9 @@ fn seeks(io: Io, a: std.mem.Allocator, path: []const u8) !void {
         .max_segment_bytes = 1 << 30,
     });
     defer journal.deinit(io);
-    try fill(&journal, io, 2 * count - 1);
-    const sealed = try seek(&journal, io, count - 2, 20);
-    const active = try seek(&journal, io, 2 * count - 3, 20);
+    try fill(ref(&journal), io, 2 * count - 1);
+    const sealed = try seek(ref(&journal), io, count - 2, if (smoke) 1 else 20);
+    const active = try seek(ref(&journal), io, 2 * count - 3, if (smoke) 1 else 20);
     try metric(io, "sealed_seek", sealed, "ns/seek");
     try metric(io, "active_seek", active, "ns/seek");
     try metric(io, "active_over_sealed_seek", active / sealed, "ratio");
@@ -63,7 +64,7 @@ fn folds(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const count: usize = if (smoke) 20 else 20_000;
     var journal = try J.open(a, io, path, .{ .sync = .never, .tail_records = 4 });
     defer journal.deinit(io);
-    try fill(&journal, io, count);
+    try fill(ref(&journal), io, count);
     var one: Fold = .{};
     const single_start = Io.Clock.awake.now(io);
     try journal.subscribe(io, one.sink());
@@ -104,7 +105,7 @@ fn batches(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     for (0..count) |i| _ = try journal.append(io, @intCast(i), .{ .id = @intCast(i), .name = "a name" });
     const single = elapsed(io, start);
     const batch_start = Io.Clock.awake.now(io);
-    try fill(&journal, io, count);
+    try fill(ref(&journal), io, count);
     const batched = elapsed(io, batch_start);
     if (try journal.lastSeq(io) != 2 * count) return error.WrongCount;
     try metric(io, "durable_singly", single, "ns");

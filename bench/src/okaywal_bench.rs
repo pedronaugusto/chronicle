@@ -94,8 +94,8 @@ fn manager(from: u64, parse: bool) -> (Manager, Arc<AtomicU64>, Arc<AtomicU64>) 
 
 fn config(path: &str) -> Configuration {
     Configuration::default_for(path)
-        .preallocate_bytes(PREALLOCATE)
-        .checkpoint_after_bytes(CHECKPOINT_AFTER)
+        .preallocate_bytes(if smoke() { 4 * 1024 * 1024 } else { PREALLOCATE })
+        .checkpoint_after_bytes(if smoke() { 3 * 1024 * 1024 } else { CHECKPOINT_AFTER })
         .buffer_bytes(64 * 1024)
 }
 
@@ -143,7 +143,7 @@ fn prepare(input_path: &str, path: &str, total: usize) -> io::Result<()> {
     let (state, _, _) = manager(1, false);
     let log = config(path).open(state)?;
     let next = Arc::new(AtomicUsize::new(0));
-    let workers = thread::available_parallelism().map_or(8, usize::from).clamp(4, 32);
+    let workers = if smoke() { 1 } else { thread::available_parallelism().map_or(8, usize::from).clamp(4, 32) };
     thread::scope(|scope| {
         let mut handles = Vec::new();
         for _ in 0..workers {
@@ -259,3 +259,5 @@ fn main() -> io::Result<()> {
         _ => Err(io::Error::other("unknown workload")),
     }
 }
+
+fn smoke() -> bool { std::env::var("BENCH_SMOKE").as_deref() == Ok("1") }

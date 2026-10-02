@@ -1,5 +1,6 @@
 const std = @import("std");
 const chronicle = @import("chronicle");
+const ref = @import("compat.zig").ref;
 const strand = @import("strand");
 
 const record_bytes: usize = 200;
@@ -86,7 +87,7 @@ fn prepare(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []c
     reset(io, path);
     var journal = try Journal.open(gpa, io, path, options(.never, .write));
     defer journal.deinit(io);
-    try writeBatches(&journal, io, input, 1000);
+    try writeBatches(ref(&journal), io, input, 1000);
 }
 
 fn appendWorkload(
@@ -106,7 +107,7 @@ fn appendWorkload(
 
     const started = std.Io.Clock.awake.now(io);
     if (std.mem.eql(u8, workload, "group_commit")) {
-        try writeBatches(&journal, io, input, 100);
+        try writeBatches(ref(&journal), io, input, 100);
     } else {
         for (0..count) |i| _ = try journal.append(io, @intCast(i + 1), input.event);
     }
@@ -154,12 +155,13 @@ fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []co
     reset(io, path);
     var journal = try Journal.open(gpa, io, path, options(.never, .write));
     defer journal.deinit(io);
-    try writeBatches(&journal, io, input, 1000);
+    try writeBatches(ref(&journal), io, input, 1000);
     const wants_rearm = std.mem.eql(u8, workload, "follow_rearm");
     const rearm_at = wants_rearm and @hasDecl(Journal.Replay, "rearmAt");
     const resume_at = std.mem.eql(u8, workload, "follow_resume") or (wants_rearm and !rearm_at);
-    var reusable: ?Journal.Replay = if (rearm_at) try journal.replayAt(io, .after(count)) else null;
-    defer if (reusable) |*walk| walk.deinit(io);
+    const ReplayOwner = @typeInfo(@typeInfo(@TypeOf(Journal.replay)).@"fn".return_type.?).error_union.payload;
+    var reusable: ?ReplayOwner = if (rearm_at) try journal.replayAt(io, .after(count)) else null;
+    defer if (reusable) |*walk| ref(walk).deinit(io);
 
     var cursor: u64 = count;
     var position: chronicle.Position = .after(count);
@@ -170,12 +172,12 @@ fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []co
         const started = std.Io.Clock.awake.now(io);
         if (reusable) |*walk| {
             if (comptime @hasDecl(Journal.Replay, "rearmAt")) {
-                try walk.rearmAt(io, position);
-                while (try walk.next(io)) |record| {
+                try ref(walk).rearmAt(io, position);
+                while (try ref(walk).next(io)) |record| {
                     seen += 1;
                     cursor = record.seq;
                 }
-                position = walk.position();
+                position = ref(walk).position();
             } else return error.UnsupportedWorkload;
         } else {
             var walk = if (resume_at) try journal.replayAt(io, position) else try journal.replay(io, cursor);
@@ -204,9 +206,7 @@ fn reopen(io: std.Io, gpa: std.mem.Allocator, path: []const u8, repetitions: usi
     try printMetric(io, "clean_reopen", "elapsed", elapsed * 1000.0 / @as(f64, @floatFromInt(repetitions)), "ms");
 }
 
-// tycho's case: `chronicle.Journal(strand.Raw)`, each record's event the
-// JSON of an event without its place (bench/codec/src/tycho_events.jsonl,
-// 571 events from tycho's captures, cycled to `count`).
+// Raw-event case: each record carries generated JSON, cycled to `count`.
 const RawJournal = chronicle.Journal(strand.Raw);
 
 fn rawOptions(sync: chronicle.Sync, access: chronicle.Access) RawJournal.Options {
