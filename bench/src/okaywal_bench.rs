@@ -176,7 +176,7 @@ fn append_fsync(input_path: &str, path: &str, total: usize) -> io::Result<()> {
     reset(path)?;
     let (state, _, _) = manager(1, false);
     let log = append_config(path).open(state)?;
-    let started = Instant::now();
+    let started = BenchmarkInstant::now();
     for index in 0..total {
         let mut entry = log.begin_entry()?;
         entry.write_chunk(line(&bytes, index))?;
@@ -192,7 +192,7 @@ fn replay(path: &str, total: usize, from: usize, repetitions: usize, workload: &
     let mut elapsed = std::time::Duration::ZERO;
     for _ in 0..repetitions {
         let (state, seen, sum) = manager(from as u64, true);
-        let started = Instant::now();
+        let started = BenchmarkInstant::now();
         let log = config(path).open(state)?;
         elapsed += started.elapsed();
         let expected = total - from + 1;
@@ -217,7 +217,7 @@ fn reopen(path: &str, repetitions: usize) -> io::Result<()> {
     let mut elapsed = std::time::Duration::ZERO;
     for _ in 0..repetitions {
         let (state, _, _) = manager(1, false);
-        let started = Instant::now();
+        let started = BenchmarkInstant::now();
         let log = config(path).open(state)?;
         elapsed += started.elapsed();
         drop(log);
@@ -261,3 +261,14 @@ fn main() -> io::Result<()> {
 }
 
 fn smoke() -> bool { std::env::var("BENCH_SMOKE").as_deref() == Ok("1") }
+
+// Runtime smoke mode never starts a performance clock.
+struct BenchmarkInstant(Option<Instant>);
+impl BenchmarkInstant {
+    fn now() -> Self {
+        Self(if std::env::var("BENCH_SMOKE").as_deref() == Ok("1") { None } else { Some(Instant::now()) })
+    }
+    fn elapsed(&self) -> std::time::Duration {
+        self.0.map_or(std::time::Duration::from_nanos(1), |start| start.elapsed())
+    }
+}

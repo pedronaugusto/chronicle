@@ -1,3 +1,4 @@
+const smoke = @import("bench_options").smoke;
 const builtin = @import("builtin");
 const std = @import("std");
 
@@ -29,7 +30,7 @@ const Input = struct {
 };
 
 fn seconds(started: std.Io.Timestamp, io: std.Io) f64 {
-    const ns = started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+    const ns = started.durationTo(benchmarkNow(io)).toNanoseconds();
     return @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
 }
 
@@ -79,7 +80,7 @@ fn appendWorkload(
     defer file.close(io);
     var write_buffer: [64 * 1024]u8 = undefined;
     var writer = file.writer(io, &write_buffer);
-    const started = std.Io.Clock.awake.now(io);
+    const started = benchmarkNow(io);
     if (std.mem.eql(u8, workload, "group_commit")) {
         for (0..count) |i| {
             try writer.interface.writeAll(input.line(i));
@@ -118,7 +119,7 @@ fn replay(io: std.Io, gpa: std.mem.Allocator, path: []const u8, count: usize, fr
     defer arena.deinit();
     var elapsed: f64 = 0;
     for (0..repetitions) |_| {
-        const started = std.Io.Clock.awake.now(io);
+        const started = benchmarkNow(io);
         try reader.seekTo((from - 1) * record_bytes);
         var seen: usize = 0;
         var sum: u64 = 0;
@@ -142,7 +143,7 @@ fn replay(io: std.Io, gpa: std.mem.Allocator, path: []const u8, count: usize, fr
 fn reopen(io: std.Io, path: []const u8, repetitions: usize) !void {
     var elapsed: f64 = 0;
     for (0..repetitions) |_| {
-        const started = std.Io.Clock.awake.now(io);
+        const started = benchmarkNow(io);
         const file = try std.Io.Dir.cwd().openFile(io, path, .{});
         const length = try file.length(io);
         elapsed += seconds(started, io);
@@ -178,4 +179,11 @@ pub fn main(init: std.process.Init) !void {
         return reopen(io, path, repetitions);
     }
     return error.UnknownWorkload;
+}
+
+// Smoke exercises correctness without sampling a benchmark clock.
+var smoke_ticks = std.atomic.Value(i64).init(0);
+fn benchmarkNow(io: std.Io) std.Io.Timestamp {
+    if (@import("bench_options").smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
+    return std.Io.Clock.awake.now(io);
 }

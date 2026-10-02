@@ -1,3 +1,4 @@
+const smoke = @import("bench_options").smoke;
 const std = @import("std");
 const chronicle = @import("chronicle");
 const ref = @import("compat.zig").ref;
@@ -56,7 +57,7 @@ fn reset(io: std.Io, path: []const u8) void {
 }
 
 fn seconds(started: std.Io.Timestamp, io: std.Io) f64 {
-    const ns = started.durationTo(std.Io.Clock.awake.now(io)).toNanoseconds();
+    const ns = started.durationTo(benchmarkNow(io)).toNanoseconds();
     return @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
 }
 
@@ -105,7 +106,7 @@ fn appendWorkload(
     var journal = try Journal.open(gpa, io, path, options(policy, .write));
     defer journal.deinit(io);
 
-    const started = std.Io.Clock.awake.now(io);
+    const started = benchmarkNow(io);
     if (std.mem.eql(u8, workload, "group_commit")) {
         try writeBatches(ref(&journal), io, input, 100);
     } else {
@@ -124,7 +125,7 @@ fn replay(io: std.Io, gpa: std.mem.Allocator, path: []const u8, count: usize, fr
     defer journal.deinit(io);
     var elapsed: f64 = 0;
     for (0..repetitions) |_| {
-        const started = std.Io.Clock.awake.now(io);
+        const started = benchmarkNow(io);
         var walk = try journal.replay(io, @intCast(from - 1));
         var seen: usize = 0;
         var sum: u64 = 0;
@@ -169,7 +170,7 @@ fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []co
     var seen: usize = 0;
     for (0..wakes) |i| {
         _ = try journal.append(io, @intCast(count + i + 1), input.event);
-        const started = std.Io.Clock.awake.now(io);
+        const started = benchmarkNow(io);
         if (reusable) |*walk| {
             if (comptime @hasDecl(Journal.Replay, "rearmAt")) {
                 try ref(walk).rearmAt(io, position);
@@ -197,7 +198,7 @@ fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []co
 fn reopen(io: std.Io, gpa: std.mem.Allocator, path: []const u8, repetitions: usize) !void {
     var elapsed: f64 = 0;
     for (0..repetitions) |_| {
-        const started = std.Io.Clock.awake.now(io);
+        const started = benchmarkNow(io);
         var journal = try Journal.open(gpa, io, path, options(.never, .read));
         elapsed += seconds(started, io);
         if (try journal.lastSeq(io) == 0) return error.EmptyJournal;
@@ -236,7 +237,7 @@ fn rawWorkload(io: std.Io, gpa: std.mem.Allocator, corpus_path: []const u8, path
     if (std.mem.eql(u8, workload, "raw_replay_all")) {
         var journal = try RawJournal.open(gpa, io, path, rawOptions(.never, .read));
         defer journal.deinit(io);
-        const started = std.Io.Clock.awake.now(io);
+        const started = benchmarkNow(io);
         var walk = try journal.replay(io, 0);
         var seen: usize = 0;
         var bytes: usize = 0;
@@ -254,10 +255,11 @@ fn rawWorkload(io: std.Io, gpa: std.mem.Allocator, corpus_path: []const u8, path
     reset(io, path);
     var journal = try RawJournal.open(gpa, io, path, rawOptions(.never, .write));
     defer journal.deinit(io);
-    const started = std.Io.Clock.awake.now(io);
+    const measuring = std.mem.eql(u8, workload, "raw_append");
+    const started = if (measuring) benchmarkNow(io) else std.Io.Timestamp{ .nanoseconds = 0 };
     for (0..count) |i| _ = try journal.append(io, @intCast(i + 1), corpus.events[i % corpus.events.len]);
-    const elapsed = seconds(started, io);
-    if (std.mem.eql(u8, workload, "raw_append")) {
+    const elapsed = if (measuring) seconds(started, io) else 1;
+    if (measuring) {
         try printMetric(io, workload, "records_per_second", @as(f64, @floatFromInt(count)) / elapsed, "records/s");
     }
 }
@@ -303,4 +305,11 @@ pub fn main(init: std.process.Init) !void {
         return reopen(io, gpa, path, repetitions);
     }
     return error.UnknownWorkload;
+}
+
+// Smoke exercises correctness without sampling a benchmark clock.
+var smoke_ticks = std.atomic.Value(i64).init(0);
+fn benchmarkNow(io: std.Io) std.Io.Timestamp {
+    if (@import("bench_options").smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
+    return std.Io.Clock.awake.now(io);
 }

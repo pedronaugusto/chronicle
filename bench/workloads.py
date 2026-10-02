@@ -4,15 +4,17 @@ COMPARISONS = ['Go tidwall/wal v1.2.1', 'Rust OkayWAL 0.3.1', 'plain Zig files (
 
 
 def run(p, bins):
-    print('Building existing same-job tools', flush=True)
-    p.command([p.tool('cargo'), 'build', '-j1', '--release', '--locked'])
+    print('Preparing existing same-job tools' if p.preparing else 'Using prepared same-job tools', flush=True)
+    p.setup_command([p.tool('cargo'), 'build', '-j1', '--release', '--locked'])
     tidwall = p.scratch / 'tidwall-bench'
-    p.command([p.tool('go'), 'build', '-p=1', '-mod=readonly', '-trimpath', '-ldflags=-s -w',
+    p.setup_command([p.tool('go'), 'build', '-p=1', '-mod=readonly', '-trimpath', '-ldflags=-s -w',
                '-o', tidwall, './src/tidwall_bench.go'])
     count, sync_count, from_seq, raw_count, wakes = (1, 1, 1, 1, 1) if p.smoke else (1_000_000, 10_000, 900_000, 200_000, 10_000)
     input_path, corpus = p.scratch / 'records.jsonl', p.scratch / 'raw-events.jsonl'
-    p.command([p.tool('python'), 'src/generate_input.py', input_path, count])
-    p.command([p.tool('python'), 'src/generate_input.py', corpus, 1 if p.smoke else 571])
+    p.setup_command([p.tool('python'), 'src/generate_input.py', input_path, count])
+    p.setup_command([p.tool('python'), 'src/generate_input.py', corpus, 1 if p.smoke else 571])
+    p.prepared.require(input_path)
+    p.prepared.require(corpus)
     tools = [('before', bins['before'] / 'chronicle-bench'),
              ('after', bins['after'] / 'chronicle-bench'), ('tidwall', tidwall),
              ('OkayWAL', p.env['CARGO_TARGET_DIR'] + '/release/okaywal-bench'),
@@ -20,7 +22,8 @@ def run(p, bins):
     data = {}
     for side, exe in tools:
         data[side] = p.scratch / f'{side}-data'
-        p.command([exe, 'prepare', input_path, data[side], count])
+        p.setup_command([exe, 'prepare', input_path, data[side], count])
+        p.prepared.require(data[side])
     for mode in ('append_no_fsync', 'append_fsync', 'group_commit', 'replay_all', 'replay_from_n', 'clean_reopen'):
         sides = []
         for side, exe in tools:
@@ -43,7 +46,8 @@ def run(p, bins):
         p.group(mode, [(side, [exe, mode, input_path, p.scratch / f'{side}-{mode}', count, wakes])
                        for side, exe in tools[:2]])
     for side, exe in tools[:2]:
-        p.command([exe, 'raw_prepare', corpus, p.scratch / f'{side}-raw-data', raw_count])
+        p.setup_command([exe, 'raw_prepare', corpus, p.scratch / f'{side}-raw-data', raw_count])
+        p.prepared.require(p.scratch / f'{side}-raw-data')
     for mode in ('raw_append', 'raw_replay_all'):
         p.group(mode, [(side, [exe, mode, corpus,
                               p.scratch / f'{side}-raw-data' if mode == 'raw_replay_all' else p.scratch / f'{side}-raw-append',

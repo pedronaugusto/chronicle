@@ -18,7 +18,7 @@ const Fold = struct {
 };
 
 fn elapsed(io: Io, start: Io.Timestamp) f64 {
-    return @floatFromInt(start.durationTo(Io.Clock.awake.now(io)).toNanoseconds());
+    return @floatFromInt(start.durationTo(benchmarkNow(io)).toNanoseconds());
 }
 fn metric(io: Io, name: []const u8, value: f64, unit: []const u8) !void {
     var buffer: [512]u8 = undefined;
@@ -36,7 +36,7 @@ fn fill(journal: *J, io: Io, count: usize) !void {
     }
 }
 fn seek(journal: *J, io: Io, cursor: u64, rounds: usize) !f64 {
-    const start = Io.Clock.awake.now(io);
+    const start = benchmarkNow(io);
     for (0..rounds) |_| {
         var walk = try journal.replay(io, cursor);
         defer walk.deinit(io);
@@ -66,13 +66,13 @@ fn folds(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     defer journal.deinit(io);
     try fill(ref(&journal), io, count);
     var one: Fold = .{};
-    const single_start = Io.Clock.awake.now(io);
+    const single_start = benchmarkNow(io);
     try journal.subscribe(io, one.sink());
     const single = elapsed(io, single_start);
     var five: [5]Fold = @splat(.{});
     var sinks: [5]J.Sink = undefined;
     for (&five, &sinks) |*fold, *sink| sink.* = fold.sink();
-    const shared_start = Io.Clock.awake.now(io);
+    const shared_start = benchmarkNow(io);
     try journal.subscribeAll(io, &sinks);
     const shared = elapsed(io, shared_start);
     for (five) |fold| if (fold.seen != count) return error.WrongCount;
@@ -85,11 +85,11 @@ fn rates(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const count: usize = if (smoke) 20 else 50_000;
     var journal = try J.open(a, io, path, .{ .sync = .never, .tail_records = 4 });
     defer journal.deinit(io);
-    const start = Io.Clock.awake.now(io);
+    const start = benchmarkNow(io);
     for (0..count) |i| _ = try journal.append(io, @intCast(i), .{ .id = @intCast(i), .name = "a name" });
     const writing = elapsed(io, start);
     var fold: Fold = .{};
-    const read_start = Io.Clock.awake.now(io);
+    const read_start = benchmarkNow(io);
     try journal.subscribe(io, fold.sink());
     const reading = elapsed(io, read_start);
     if (fold.seen != count) return error.WrongCount;
@@ -101,10 +101,10 @@ fn batches(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const count: usize = if (smoke) 3 else 300;
     var journal = try J.open(a, io, path, .{ .sync = .always, .tail_records = 4 });
     defer journal.deinit(io);
-    const start = Io.Clock.awake.now(io);
+    const start = benchmarkNow(io);
     for (0..count) |i| _ = try journal.append(io, @intCast(i), .{ .id = @intCast(i), .name = "a name" });
     const single = elapsed(io, start);
-    const batch_start = Io.Clock.awake.now(io);
+    const batch_start = benchmarkNow(io);
     try fill(ref(&journal), io, count);
     const batched = elapsed(io, batch_start);
     if (try journal.lastSeq(io) != 2 * count) return error.WrongCount;
@@ -140,10 +140,10 @@ fn largeOpen(io: Io, a: std.mem.Allocator, path: []const u8) !void {
             try journal.segmentCount(io);
         if (!smoke and segments <= 1) return error.ExpectedMultipleSegments;
     }
-    const started = Io.Clock.awake.now(io);
+    const started = benchmarkNow(io);
     var journal = try LargeJournal.open(a, io, path, .{});
     defer journal.deinit(io);
-    const elapsed_ms = started.durationTo(Io.Clock.awake.now(io)).toMilliseconds();
+    const elapsed_ms = started.durationTo(benchmarkNow(io)).toMilliseconds();
     if (try journal.lastSeq(io) != count) return error.WrongCount;
     try metric(io, "large_open", @floatFromInt(elapsed_ms), "ms");
     if (!smoke and elapsed_ms >= 30_000) return error.OpenTooSlow;
@@ -162,4 +162,11 @@ pub fn main(init: std.process.Init) !void {
         defer a.free(path);
         try work[1](io, a, path);
     }
+}
+
+// Smoke exercises correctness without sampling a benchmark clock.
+var smoke_ticks = std.atomic.Value(i64).init(0);
+fn benchmarkNow(io: std.Io) std.Io.Timestamp {
+    if (@import("bench_options").smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
+    return std.Io.Clock.awake.now(io);
 }
