@@ -119,6 +119,8 @@ exercises schema migration.
 
 ## Testing
 
+Local build scripts clear `.zig-cache/{o,h,z,tmp}` above the measured cap in `ci/cache.sh`; run `sh ci/cache.sh` before direct Zig builds (only a rebuild is lost).
+
 `zig build test` runs the unit suite, writer-lock helper and examples in Debug by
 default. Tests cover crash prefixes, checksum and chain failures, recovery, replay,
 snapshots, retention, concurrency and allocation cleanup. `zig build examples` runs the
