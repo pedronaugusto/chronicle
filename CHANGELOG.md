@@ -6,13 +6,65 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-- The benchmark harness measures opening 200,000 records and keeps its 30,000 ms ceiling outside the release unit suite; the branch also retains the cancellation progress watchdogs.
+- The blocking-wait tests establish waiter entry, propagate append failures and cancel refused waits; local and CI test runs report hangs by name with a 120-second per-test limit.
 
-- Benchmark snapshots copy the harness sources together and keep both benchmark executables for each library commit.
+- **Breaking:** `copySince` and `readers` return opaque `*Batch` and `*Readers` owners; replace direct fields with `records()`, `complete()` and `items()`, keep their pointers instead of values, and release each owner exactly once before its allocator.
 
-- The benchmark context cast carries its safety reason on the line the cast occurs.
+- A zero read-buffer size uses the one byte needed for lookahead, so opening, replaying and backing up a journal make progress instead of aborting.
 
-- The bench harness measures indexed seeks, shared folds, append and replay rates and group commit in place of unit-suite speed budgets.
+- **Breaking:** Journal, Replay and Tailer are opaque managed owners returned by pointer, including `Opened.journal`; keep their pointers, use methods to observe state (`Tailer.name()` borrows its name), and release each owner exactly once before its allocator, with replays and tailers released before their journal.
+
+- The record byte limit counts the exact encoded line and checksum, so a record at the ceiling is accepted and one above it is refused before any file write.
+
+- Encoding keeps its allocation-failure cause with its writer, so a custom stringify refusal returns `WriteFailed` rather than `OutOfMemory` without latching persistence failure.
+
+- A rotation reserves segment inventory before changing files, so allocation failure cannot publish an active file with no matching segment owner.
+
+- Segment-header, timestamp and back-link probes propagate allocation failure instead of treating valid bytes as missing or corrupt metadata.
+
+- A torn-header recovery closes the files of its first attempt before restarting, so a failed replacement releases each file only once.
+
+- The shared document reader preserves read-bound failures, so an oversized stored snapshot returns `SnapshotTooLarge` while an oversized cursor remains `CorruptCursor`.
+
+- Unit tests count indexed work, event encodings, parses and durable syncs and bound large-log memory; the bench branch owns the speed measurements, the 200,000-record opening ceiling and the cancellation progress watchdogs.
+
+- **Breaking:** `copySince` copies events through `strand.copyOwned`, preserving Raw bytes and dynamic values without hooks; events must meet its finite-data-tree contract and `CopyError` no longer includes `NotRoundTrippable`.
+
+- **Breaking:** pin strand at `3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0`; `Raw.encode` adds `WriteFailed`, byte vectors accept strings and arrays, and framing bounds count payload bytes.
+
+- **Breaking:** `Tailer.cursor(io)` observes the committed cursor under the journal lock, replacing the mutable `Tailer.cursor` field.
+
+- **Breaking:** `options(io)` returns the configuration supplied at open under the journal lock, replacing the public `options` field.
+
+- A replay keeps its record arena at a stable address, so a returned or moved walk preserves allocator contexts retained by its last event.
+
+- Opening, snapshot restoration and final release observe and change journal state under its lock, including cleanup after an error.
+
+- A positioned replay initializes under the journal lock, and independent readers own the decoding configuration and allocator they need without observing journal fields between calls.
+
+- Tail records and staged writes keep their arenas at stable addresses, so allocator contexts retained by events survive publication, growth and eviction.
+
+- **Breaking:** `status(io)` returns a locked `Status` observation in place of the mutable `persistence_failed` and `dropped_bytes` fields.
+
+- **Breaking:** `oldestSeq(io)` and `segmentCount(io)` take the journal lock and return a cancelable observation of its inventory.
+
+- An owned batch keeps its arena at a stable address, so allocator contexts retained by managed JSON containers survive returning and moving the batch.
+
+- A batch with no tail or sink reserves no record storage and holds only one parsed record at a time when round-trip checks are enabled.
+
+- A read-only tail rebuild reads only the complete boundaries its inventory measured, so an external append cannot make a healthy journal look discontinuous.
+
+- Replacing a backup owns its old-file inventory in one temporary arena, so a failed insertion cannot leak a copied filename.
+
+- `replay`, `verify` and `Tailer.replay` choose their scans under the journal lock, so writers and other readers cannot race the segment inventory or shared index state.
+
+- Opening or refreshing a journal works when the tail byte limit keeps no record; sequence continuity is checked by the walk, independent of cache eviction.
+
+- A rebuilt tail is published only after the whole pass succeeds; a failed refresh leaves no partial batch claiming to be complete.
+
+- A tail entry owns its record and arena together, so a refresh that runs out of memory cannot leave an unowned record behind.
+
+- **Breaking:** `waitPast` returns the newest sequence number; `copySince(gpa, io, cursor)` replaces `records`, `since` and `Window` with an owned `Batch`, including every event reference, released with `deinit`.
 
 - `Replay.rearmAt(io, position)` starts another pass on the same walk. A
   follower keeps one scan buffer, segment storage, line buffer and two record

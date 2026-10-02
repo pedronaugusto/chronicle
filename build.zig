@@ -39,7 +39,9 @@ pub fn build(b: *std.Build) void {
     // binary `zig build test --fuzz` builds goes through Zig 0.16.0's test
     // runner without them. The suite reports the same failures either way;
     // what is lost is the chain of returns behind an unexpected error.
+    const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
     const tests = b.addTest(.{
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
         .name = "chronicle-tests",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/chronicle.zig"),
@@ -67,6 +69,21 @@ pub fn build(b: *std.Build) void {
     const install_lock_helper = b.addInstallArtifact(lock_helper, .{});
 
     const run_tests = b.addRunArtifact(tests);
+    // A stalled test must fail by name, including in an ordinary local run.
+    // Zig 0.16 passes per-test timeouts through MakeOptions rather than a
+    // Run field, so give this one test runner a default there. An explicit
+    // --test-timeout still takes precedence; fuzzing keeps its own runner.
+    const TestTimeout = struct {
+        var run: std.Build.Step.MakeFn = undefined;
+
+        fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+            var bounded = options;
+            bounded.unit_test_timeout_ns = options.unit_test_timeout_ns orelse 120 * std.time.ns_per_s;
+            return run(step, bounded);
+        }
+    };
+    TestTimeout.run = run_tests.step.makeFn;
+    run_tests.step.makeFn = TestTimeout.make;
     run_tests.step.dependOn(&install_lock_helper.step);
     run_tests.setEnvironmentVariable(
         "CHRONICLE_LOCK_HELPER",
@@ -111,7 +128,7 @@ pub fn build(b: *std.Build) void {
         run.setCwd(b.path("zig-out"));
         examples_step.dependOn(&run.step);
     }
-    test_step.dependOn(examples_step);
+    if (test_filter == null) test_step.dependOn(examples_step);
 }
 
 /// Every example, listed rather than globbed: a build graph that scans a

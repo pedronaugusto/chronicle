@@ -30,7 +30,7 @@ var last: u64 = 0;
     // newest records are read back, and the sequence number continues
     // from the last one, so a restart never reuses a number. A second
     // writer would get error.Locked instead of this journal.
-    var ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
+    const ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
     defer ledger.deinit(io);
 
     // A sink is a fold. Subscribing streams it every record already on
@@ -47,7 +47,7 @@ var last: u64 = 0;
 
     // A follower keeps its replay across wakes. Each re-arm checks where
     // the last pass stopped and reuses the scan buffer and record scratch.
-    var follower = try ledger.replayAt(io, .after(0));
+    const follower = try ledger.replayAt(io, .after(0));
     defer follower.deinit(io);
     _ = (try follower.next(io)).?;
 
@@ -76,7 +76,7 @@ var last: u64 = 0;
 // Starting again: restore the snapshot, then fold only what came after
 // it. Without a snapshot `from` stays 0 and the whole log is replayed.
 const opened = try Ledger.openWithSnapshot(gpa, io, path, .{ .schema_version = 1 });
-var reopened = opened.journal;
+const reopened = opened.journal;
 defer reopened.deinit(io);
 
 var restored: Balances = .{};
@@ -107,10 +107,20 @@ which writes and reads a record's line; this package keeps the lines.
 
 ## The API
 
-`chronicle.Journal(comptime Event: type)` returns a type with:
+`chronicle.Journal(comptime Event: type)` returns an opaque owner type.
+`open` and `Opened.journal` return `*Journal(Event)`; `replay`, `replayAt`
+and `Tailer.replay` return `*Replay`, and `tailer` returns `*Tailer`.
+Keep and pass these pointers; they refer to one allocation each, and copying
+one pointer does not create another owner. Release each owner exactly once:
+`close` or `deinit` for a journal, `deinit` for a replay or tailer. Finish all
+calls and release replays and tailers before closing their journal. The
+allocator must outlive them. Observe state through methods.
+
+The journal has:
 
 | | |
 |---|---|
+| `options(io)` | The configuration supplied at open, copied under the lock. |
 | `open(gpa, io, path, options)` | Create or read back a journal directory. |
 | `openWithSnapshot(gpa, io, path, options)` | The same, plus the snapshot beside it. |
 | `close(io)` | Durably flush, close, unlock and release; returns a shutdown failure. |
@@ -119,25 +129,26 @@ which writes and reads a record's line; this package keeps the lines.
 | `appendAll(io, entries)` | Write a batch under one `fsync`; returns the last sequence number. |
 | `appendDeferred(io, at, event)` | Write and publish one record now, durable with the next flush. |
 | `reconcile(io)` | After a persistence error, read back what survived and clear the latch. |
-| `records()` | The tail, oldest first, as a `Window`. |
-| `since(cursor)` | The tail after `cursor`, as a `Window`. |
-| `waitPast(io, cursor)` | Block until there is one, then `since(cursor)`. |
+| `copySince(gpa, io, cursor)` | An owned `*Batch` of the tail after `cursor`; read `records()` and `complete()`, then release it with `deinit()`. |
+| `waitPast(io, cursor)` | Block until there is a record after the cursor or a nudge; return the newest sequence number. |
 | `replay(io, cursor)` | A walk over every record after `cursor`, from the disk. |
 | `replayAt(io, position)` | The same, from where an earlier walk's `position()` stopped. |
 | `Replay.rearmAt(io, position)` | Start another pass on the same walk, retaining its scan buffer and scratch allocations. |
 | `nudge(io)` | Wake the waiters with no record behind it. |
 | `lastSeq(io)` | The newest sequence number, or zero. |
 | `seqAtOrAfter(io, at)` | The lowest sequence number stamped at or after `at`. |
-| `oldestSeq()` | The oldest one still held. |
-| `segmentCount()` | How many files the log is spread over. |
+| `oldestSeq(io)` | The oldest one still held. |
+| `segmentCount(io)` | How many files the log is spread over. |
 | `refresh(io)` | Read the directory again — how a reader tails a writer. |
+| `Tailer.name()` | The reader's immutable name, borrowed until `deinit`. |
+| `Tailer.cursor(io)` | The committed cursor, copied under the journal lock. |
 | `tailer(io, name)` | A named reader, with the cursor it last committed. |
 | `subscribe(io, sink)` | Fold every record, from the disk and then live. |
 | `subscribeFrom(io, sink, cursor)` | The same, starting after a snapshot. |
 | `subscribeAll(io, sinks)` | Fold every record into several folds, over one pass. |
 | `subscribeAllFrom(io, sinks, cursor)` | The same, starting after a snapshot. |
 | `unsubscribe(io, sink)` | Drop a fold. |
-| `readers(io)` | Every named reader and the cursor it committed. |
+| `readers(io)` | An owned `*Readers` listing every named reader and the cursor it committed; read `items()`, then release it with `deinit()`. |
 | `minCursor(io)` | The lowest of those, which is what retention may drop to. |
 | `snapshot(io, state_bytes)` | Write the fold out beside the log. |
 | `backup(io, dest)` | Copy the journal into another directory while it runs. |
@@ -145,19 +156,20 @@ which writes and reads a record's line; this package keeps the lines.
 | `dropSegmentsBefore(io, seq)` | Unlink the whole segments a snapshot covers. |
 | `truncateAfter(io, seq)` | Drop every record after `seq`, handing the numbers back. |
 | `verify(io)` | Read every record of every segment through every check. |
+| `status(io)` | Persistence failure and dropped bytes, copied under the lock. |
 | `stats(io)` | Segments, records, and the bytes they take. |
 
 Plus `chronicle.checksum(covered)`, which is the checksum a record carries,
 and `chronicle.segmentName(base_seq)`, which is the file a sequence number
 lives in; `chronicle.Position`, where a walk stopped; `chronicle.Raw`, an
 event kept as its bytes; `chronicle.flush`, which names the call a durable write makes here;
-and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Window`,
+and, on the type `Journal(Event)` returns, `Record`, `Entry`, `Batch`,
 `Replay`, `Tailer`, `Sink`, `Reader`, `Readers`, `Options`, `Snapshot`,
-`Opened`, `Migrate`, `Stats` and one named error set per operation, with
+`Opened`, `Migrate`, `Status`, `Stats` and one named error set per operation, with
 `Sync`, `Flush` and `Verify` at the module root. Every
 public declaration carries a doc comment stating its contract;
-`src/chronicle.zig` is the reference and `src/log.zig` the segment store under
-it. `Event` may be any type `std.json` can write and read back; a tagged union
+`src/chronicle.zig` is the reference, `src/journal.zig` owns its private state
+and `src/log.zig` keeps the segments. `Event` may be any type `std.json` can write and read back; a tagged union
 is the expected shape, because it gives each record a name on disk and an
 exhaustive `switch` in the fold. strand writes and reads it, to the bytes
 `std.json` writes and the values it reads, and a `chronicle.Raw` (strand's
@@ -288,21 +300,43 @@ so losing one costs a scan.
 
 **Record-sized working memory is bounded.** The tail is
 `Options.tail_records` records and `Options.tail_bytes` bytes of them,
-whichever bites first, kept parsed for `records`, `since` and `waitPast`; the
+whichever bites first, kept parsed for `copySince` and subscriptions; the
 oldest half goes when either ceiling is reached, so a tail costs a constant
 amount per append. A `Replay`, and so a `subscribe`, holds the record it is on
-and one read buffer, `Options.read_buffer_size`; a line longer than
+and one read buffer, `Options.read_buffer_size` (one byte when zero); a line longer than
 `Options.max_record_bytes` is refused rather than held. `open` walks the
 newest segment's newlines, and the records in it land in the tail under its
 ceilings. The journal also keeps fixed-size metadata for every segment, and a
 replay snapshots two numbers per segment it will visit, so that memory grows
 with the segment count even though it does not grow with the records inside a
-segment. Every allocation comes from the allocator passed to `open`.
+segment. Journal and replay allocations come from the allocator passed to
+`open`; batches come from the allocator passed to `copySince`. Their memory
+is held until the caller releases them.
 
-A `Record` from a `Window` lasts until the tail releases it, which the next
-`append` may do; one from a `Replay` until the next `next`; one handed to a
-`Sink` for the call. Copy what you need — `record.bytes` is the durable form,
-ready to forward with no re-encoding.
+`Batch` and `Readers` are opaque owners returned by pointer. Store `*Batch`
+and `*Readers`, read `batch.records()`, `batch.complete()` and `list.items()`,
+and release each owner exactly once with `deinit()`, after every user of it
+has finished and before its allocator. Copying a pointer makes an alias to
+the same owner. It does not give that alias another release. A reader list,
+including its names, remains valid after the journal closes; it uses the
+allocator passed to `open`. Both result types hold observations of the time
+they were created; later journal operations do not change them.
+
+A `Record` from a `Batch`, including its bytes and every reference in its
+event, belongs to the batch until `batch.deinit()`, even after the journal
+closes. The batch preserves the stored bytes and schema version and copies
+the current event without running a migration hook again. A record from a
+`Replay` lasts until its next `next`, `rearmAt` or `deinit`; one handed to a
+`Sink` lasts for the call. `record.bytes` is the durable form, ready to
+forward with no re-encoding.
+
+`waitPast` only waits. After it returns, `copySince(gpa, io, cursor)` takes an
+owned copy under the lock. A writer may have moved the tail between the two
+calls: check `batch.complete()`, and use `replay` or `subscribeFrom` for records
+that memory no longer holds. Advance the cursor to the last record handled,
+not to the number returned by the wait. A failed rebuild leaves the tail
+empty until it is rebuilt successfully. An empty batch is complete only when
+its cursor has caught up; a nudge can wake a reader with no new record.
 
 **The writer holds an exclusive advisory lock on `<path>/lock` for as long as
 it is open.**
@@ -334,25 +368,41 @@ version 2.
 `migrate` or the `unknown` arm keeps the version and payload it was written
 with.
 
-**One mutex inside.** `append`, `appendAll`, `waitPast`, `nudge`, `subscribe`,
+**One mutex inside.** `append`, `appendDeferred`, `appendAll`, `copySince`,
+`waitPast`, `nudge`, `subscribe`,
 `subscribeFrom`, `subscribeAll`, `subscribeAllFrom`, `unsubscribe`, `lastSeq`,
-`seqAtOrAfter`, `tailer`, `readers`, `minCursor`, `snapshot`, `backup`,
-`compact`, `dropSegmentsBefore`, `truncateAfter` and `refresh` take it and are
-safe from any task or thread, several at once; the subscribe calls hold it for
+`oldestSeq`, `segmentCount`, `seqAtOrAfter`, `tailer`, `readers`, `minCursor`,
+`snapshot`, `backup`, `compact`, `dropSegmentsBefore`, `truncateAfter`,
+`reconcile`, `options`, `status`, `stats` and `refresh` take it and are safe from any task or thread, several at once; the subscribe calls hold it for
 the whole of their replay, so the hand-over from the disk to the live records
-has no seam in it. A cancel reaches those calls at the lock: waiting for it,
-a call returns `error.Canceled` with nothing done. Once a call that changes
+has no seam in it. A call that can return `error.Canceled` can be canceled
+while waiting for the lock, with nothing done. `nudge` takes the lock without
+cancelation. Calls that read files may also be canceled during their I/O. Once a call that changes
 the files holds it — an append, a batch, a snapshot, a compaction, a
 truncation, a drop, a reconcile, a refresh — it runs to its end with the
 task's cancelation blocked, and the cancel is reported by the task's next
 cancelation point: a record a cancel landed on is written whole, never
-latched as a write that failed. So is a close. A `Replay` takes no lock and writes nothing, so a segment
-whose index is missing is walked from its first record rather than indexed on
-the way; the calls above are what build an index. `records()`, `since()`,
-`segmentCount()`, `oldestSeq()` and a `Replay` do not take it: call them from
-the task that appends, or under coordination of your own. `replayAt` takes it
-to choose the segments the walk will cross; the walk it returns does not. Every file operation
-and the wait primitive go through `std.Io`, so the package runs under
+latched as a write that failed. So is a close. `copySince` returns no borrow
+from the journal: its batch can be read beside writers and released on its
+own, with an allocator suitable for the threads that use it. Events copied into
+a batch must meet `strand.copyOwned`'s finite-data-tree contract; copies
+preserve Raw bytes and dynamic values and call no parse, stringify or migration hooks.
+Sink callbacks
+run under the lock; they must neither call back into the journal nor retain
+a record or its referenced data after the call.
+
+`replay`, `replayAt`, `verify`, `Tailer.replay` and `Replay.rearmAt`
+take the lock to choose the segments the walk will cross and copy its decoding
+configuration; the walk itself reads without it and writes nothing. A missing index is walked from the first record. Each
+`Replay` belongs to one reader at a time, and its records borrow only that
+walk's memory. Retention beside a walk may remove files it needs, which is
+reported as an error. Release each replay and tailer, and stop every caller,
+before the journal's `close` or `deinit`. Observe recovery and persistence state with `status(io)`. The
+`options(io)` call copies the configuration passed to `open` under the lock.
+`Tailer.cursor(io)` observes the committed cursor under that same lock.
+The allocator passed to `open` must support concurrent use when walks or tailers allocate alongside
+journal calls. Every file operation and
+the wait primitive go through `std.Io`, so the package runs under
 `std.testing.io`, a threaded `Io`, or whatever comes next.
 
 **A segment file begins with one line saying what it is, and then holds one
@@ -464,6 +514,9 @@ zig fmt --check src examples build.zig
 ci/linux.sh             # the suite on Linux, in Docker, from any machine
 ```
 
+Each unit test has a 120-second hang limit and a timeout reports its name.
+`--test-timeout` overrides that limit; fuzzing remains unlimited.
+
 Every test runs under `std.testing.allocator` and `std.testing.io`, against
 real directories, in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall. The
 crash shapes are made on the disk rather than simulated: a torn final line, a
@@ -476,14 +529,13 @@ compaction leaves when it dies between its rename and its unlink. Three tests
 spawn a second process — one to hold the lock, one to append while a backup is
 taken beside it, and one to be killed while it mutates the journal — and one
 builds a journal of two hundred thousand records and asserts that opening it
-is proportionate and that record-sized working memory is bounded.
+preserves the record count and keeps record-sized working memory bounded.
 
-The measurements this package is judged on are tests with budgets: a seek into
-the segment being written to against one into a sealed segment, an open of a
-log that was closed cleanly against the same open with the index deleted, five
-folds over one pass against one fold, and — in ReleaseFast — the rates an
-append and a replayed record run at. Ratios wherever a ratio will do, because
-an absolute number says more about the machine than about the package.
+The unit suite counts work: index probes and skipped prefixes for active and
+sealed seeks, scans avoided by a clean close, one parse per record for shared
+folds, one encoding per uncached append, and one durable record sync per batch.
+Speed measurements live in the `bench` branch harness. The large-log test keeps
+its record counts and memory bound; unit tests make no claim about a runner's speed.
 
 Six fuzz tests. Five run over the contents of a file — arbitrary segment bytes,
 an arbitrary first line of a segment, an arbitrary index, an arbitrary snapshot

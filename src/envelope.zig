@@ -138,7 +138,7 @@ pub const Stamp = struct {
 /// runs over every line of the active segment at every open; anything else
 /// is read as members, on an arena over `gpa` that is gone when this
 /// returns.
-pub fn stamp(gpa: Allocator, line: []const u8) ?Stamp {
+pub fn stamp(gpa: Allocator, line: []const u8) Allocator.Error!?Stamp {
     var at: usize = 0;
     quick: {
         const seq = member(i64, line, &at, "{\"seq\":") orelse break :quick;
@@ -152,7 +152,10 @@ pub fn stamp(gpa: Allocator, line: []const u8) ?Stamp {
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
     const Members = struct { seq: strand.Raw, at: strand.Raw = .null };
-    const found = strand.parseLine(Members, arena.allocator(), line, .{}) catch return null;
+    const found = strand.parseLine(Members, arena.allocator(), line, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     const seq = integerOf(found.seq) orelse return null;
     if (seq < 1) return null;
     return .{ .seq = @intCast(seq), .at = integerOf(found.at) };
@@ -161,13 +164,16 @@ pub fn stamp(gpa: Allocator, line: []const u8) ?Stamp {
 /// The `p` a line carries: the checksum of the record before it. Read off
 /// the bytes where the shape is the one this package writes, and as members
 /// where it is not, on an arena over `gpa`.
-pub fn backLink(gpa: Allocator, line: []const u8) ?u32 {
+pub fn backLink(gpa: Allocator, line: []const u8) Allocator.Error!?u32 {
     if (trailer(line)) |t| {
         if (quick(t.covered)) |head| return head.p;
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const found = strand.parseLine(struct { p: strand.Raw }, arena.allocator(), line, .{}) catch return null;
+    const found = strand.parseLine(struct { p: strand.Raw }, arena.allocator(), line, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
     return std.math.cast(u32, integerOf(found.p) orelse return null);
 }
 
@@ -199,10 +205,10 @@ test "the written shape and any other read as the same envelope" {
     try testing.expectEqual(head.v, other.v);
     try testing.expectEqual(head.p, other.p);
     try testing.expectEqualStrings("{\"x\":1}", by_hand[other.ev.from..other.ev.to]);
-    try testing.expectEqual(@as(?u32, 11), backLink(testing.allocator, by_hand));
-    try testing.expectEqual(@as(?u32, 11), backLink(testing.allocator, written));
-    try testing.expectEqual(Stamp{ .seq = 7, .at = -3 }, stamp(testing.allocator, by_hand).?);
-    try testing.expectEqual(Stamp{ .seq = 7, .at = -3 }, stamp(testing.allocator, written).?);
+    try testing.expectEqual(@as(?u32, 11), (try backLink(testing.allocator, by_hand)));
+    try testing.expectEqual(@as(?u32, 11), (try backLink(testing.allocator, written)));
+    try testing.expectEqual(Stamp{ .seq = 7, .at = -3 }, (try stamp(testing.allocator, by_hand)).?);
+    try testing.expectEqual(Stamp{ .seq = 7, .at = -3 }, (try stamp(testing.allocator, written)).?);
 
     // An integer only when written as one, within an `i64`, and a sequence
     // number from 1.
@@ -223,10 +229,17 @@ test "the written shape and any other read as the same envelope" {
     // A record whose `p` is inside its event as well as its envelope is read
     // for its envelope's.
     const shadowed = "{\"ev\":{\"q\":1,\"p\":99},\"seq\":1,\"at\":1,\"v\":1,\"p\":5,\"c\":3}";
-    try testing.expectEqual(@as(?u32, 5), backLink(testing.allocator, shadowed));
+    try testing.expectEqual(@as(?u32, 5), (try backLink(testing.allocator, shadowed)));
     // A timestamp that is not an integer is no timestamp, not a bad line.
-    try testing.expectEqual(Stamp{ .seq = 3, .at = null }, stamp(testing.allocator, "{\"at\":\"x\",\"seq\":3}").?);
-    try testing.expectEqual(@as(?Stamp, null), stamp(testing.allocator, "{\"seq\":0,\"at\":1,\"v\":1}"));
+    try testing.expectEqual(Stamp{ .seq = 3, .at = null }, (try stamp(testing.allocator, "{\"at\":\"x\",\"seq\":3}")).?);
+    try testing.expectEqual(@as(?Stamp, null), (try stamp(testing.allocator, "{\"seq\":0,\"at\":1,\"v\":1}")));
     try testing.expectEqual(@as(?Trailer, null), trailer("{\"seq\":1,\"c\":}"));
     try testing.expectEqual(@as(?Trailer, null), trailer("{\"seq\":1,\"c\":4294967296}"));
+}
+
+test "metadata probes preserve allocation failure instead of declaring bytes invalid" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const line = "{\"s\\u0065q\":1,\"at\":2,\"\\u0070\":3}";
+    try testing.expectError(error.OutOfMemory, stamp(failing.allocator(), line));
+    try testing.expectError(error.OutOfMemory, backLink(failing.allocator(), line));
 }

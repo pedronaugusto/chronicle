@@ -17,58 +17,69 @@ env:
   ZIG_VERSION: 0.16.0
 
 jobs:
-  # The whole suite in every build mode. A journal's promises are about what
-  # survives a crash, and the safety checks that catch a wrong one are only
-  # compiled into some of these, so all four run.
+  # Debug catches safety faults; ReleaseSafe checks optimized code and timing on each host.
+  # Crash recovery has the same contract in every mode; ReleaseSafe keeps its safety checks.
+  # The full test target already builds and runs the examples.
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}, ${{ matrix.optimize }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
+        optimize: [Debug, ReleaseSafe]
+        include:
+          # One unchecked run catches optimizer-dependent behaviour; the other hosts have ReleaseSafe.
+          - os: ubuntu-latest
+            optimize: ReleaseFast
     steps:
       - uses: actions/checkout@v4
-
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+      - name: Test — ${{ matrix.optimize }}
+        run: zig build test -Doptimize=${{ matrix.optimize }} --test-timeout 120s
 
+  # ReleaseSmall must build; its unchecked tests add no distinct assertion to ReleaseFast.
+  small:
+    name: compile (ReleaseSmall)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build check -Doptimize=ReleaseSmall
+
+  # Appenders, waiters and reopen tasks share journal state; ThreadSanitizer checks those accesses.
+  # Linux has a working runtime here; Debug is the detector's most complete instrumentation.
+  sanitizer:
+    name: ThreadSanitizer (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+      - run: zig build test -Dthread-sanitizer -Doptimize=Debug --test-timeout 120s
+
+  # Formatting and source-policy checks read the same files on every host; once is enough.
+  source:
+    name: source checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
       - name: Formatting
         run: zig fmt --check src examples build.zig
-
       - name: Casts out of the type system carry their reason
         run: python3 ci/casts.py
-
-      - name: Test — Debug
-        run: zig build test -Doptimize=Debug
-
-      - name: Test — ReleaseSafe
-        run: zig build test -Doptimize=ReleaseSafe
-
-      - name: Test — ReleaseFast
-        run: zig build test -Doptimize=ReleaseFast
-
-      - name: Test — ReleaseSmall
-        run: zig build test -Doptimize=ReleaseSmall
-
-      # The suite under ThreadSanitizer. A journal is one mutex between an
-      # appender and the tasks waiting on it, and a clean reopen inspects the
-      # segments concurrently; a race there is a claim a detector can check and
-      # a reader cannot. Debug, because that is the mode the detector
-      # instruments most completely. Linux only: Windows has no runtime for it,
-      # and on the hosted macOS runner the instrumented suite is killed by a
-      # segfault before its first test reports, while the same suite passes
-      # under ThreadSanitizer on a Mac, where it is run before a release.
-      - name: Test — ThreadSanitizer
-        if: runner.os == 'Linux'
-        run: zig build test -Dthread-sanitizer -Doptimize=Debug --test-timeout 120s
-
-      # Built AND run: an example that only compiles proves the names still
-      # resolve, and running it is what proves the package still works.
-      - name: Examples
-        run: zig build examples
 
   # README.md's Usage block is a region of examples/usage.zig, which the job
   # above runs. This is what keeps the snippet a reader copies and the code CI

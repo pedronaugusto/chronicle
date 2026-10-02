@@ -61,7 +61,7 @@ pub fn main(init: std.process.Init) !void {
         var step: u64 = 0;
         while (true) : (step +%= 1) {
             const newest = try journal.lastSeq(io);
-            const oldest = journal.oldestSeq();
+            const oldest = (try journal.oldestSeq(io));
             switch (random.random().uintLessThan(u8, 7)) {
                 0 => _ = try journal.append(io, @intCast(step % std.math.maxInt(i64)), .{ .ping = @intCast(step % 1000) }),
                 1 => {
