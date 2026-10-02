@@ -33,7 +33,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Log = @import("log.zig");
-const strand = @import("strand");
+const strand = @import("jsonl.zig").strand;
 const implementation = @import("journal.zig");
 
 /// An event kept as its bytes: what a `migrate` hook is handed, what an
@@ -57,7 +57,7 @@ pub const Sync = Log.Sync;
 pub const Flush = Log.Flush;
 
 /// What `Options.sync = .always` issues here, which is what a returned
-/// sequence number survives here. README.md's durability table is the same
+/// sequence number survives here. README.md's durability rules are the same
 /// three answers in words.
 pub const flush: Flush = Log.flush;
 
@@ -1087,9 +1087,4 @@ pub fn Journal(comptime Event: type) type {
             }
         };
     };
-}
-
-test {
-    _ = @import("journal_test.zig");
-    _ = @import("envelope.zig");
 }

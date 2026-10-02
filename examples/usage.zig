@@ -57,35 +57,18 @@ pub fn main() !void {
     var balances: Balances = .{};
     var last: u64 = 0;
     {
-        // Open the log. The directory is created if it is not there, the
-        // newest records are read back, and the sequence number continues
-        // from the last one, so a restart never reuses a number. A second
-        // writer would get error.Locked instead of this journal.
         const ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
         defer ledger.deinit(io);
 
-        // A sink is a fold. Subscribing streams it every record already on
-        // disk -- one at a time, however long the history -- and then every
-        // record appended, so the state is built the same way whether it
-        // came from a file or from a live writer.
         try ledger.subscribe(io, balances.sink());
 
-        // Append. The returned sequence number means the bytes are on the
-        // disk: the record is written, flushed and fsynced before any reader
-        // can see it.
         const now = std.Io.Clock.real.now(io).toMilliseconds();
         _ = try ledger.append(io, now, .{ .account_opened = .{ .id = 1, .owner = "ada" } });
 
-        // A follower keeps its replay across wakes. Each re-arm checks where
-        // the last pass stopped and reuses the scan buffer and record scratch.
         const follower = try ledger.replayAt(io, .after(0));
         defer follower.deinit(io);
         _ = (try follower.next(io)).?;
 
-        // A batch goes down under one fsync instead of one each. It is group
-        // commit and not a transaction: a crash inside it leaves a prefix of
-        // it on the disk, exactly as a crash inside one append leaves a torn
-        // line, and the next open repairs it the same way.
         last = try ledger.appendAll(io, &.{
             .{ .at = now, .event = .{ .deposited = .{ .id = 1, .cents = 5_000 } } },
             .{ .at = now, .event = .{ .withdrawn = .{ .id = 1, .cents = 1_250 } } },
@@ -95,17 +78,12 @@ pub fn main() !void {
         while (try follower.next(io)) |_| followed += 1;
         if (followed != 2) return error.ReplayMismatch;
 
-        // Write the fold out beside the log and drop the records it covers,
-        // so the next start replays three records instead of three million.
-        // Nothing drops history on your behalf; this is the call that does.
         try ledger.snapshot(io, std.mem.asBytes(&balances));
         try ledger.compact(io, last);
 
         _ = try ledger.append(io, now, .{ .deposited = .{ .id = 1, .cents = 700 } });
     }
 
-    // Starting again: restore the snapshot, then fold only what came after
-    // it. Without a snapshot `from` stays 0 and the whole log is replayed.
     const opened = try Ledger.openWithSnapshot(gpa, io, path, .{ .schema_version = 1 });
     const reopened = opened.journal;
     defer reopened.deinit(io);

@@ -16,6 +16,7 @@
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
+sh ci/cache.sh
 
 image=${CHRONICLE_LINUX_IMAGE:-chronicle-linux-zig-0.16.0}
 
