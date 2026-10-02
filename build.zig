@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    importChecks(b);
+
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -137,3 +139,23 @@ const example_sources = [_][]const u8{
     "examples/usage.zig",
     "examples/migrate.zig",
 };
+
+// Build-only tooling belongs to a root invocation, never a consumer's dependency graph.
+fn importChecks(b: *std.Build) void {
+    const step = b.step("check-imports", "Check source layers and import boundaries");
+    if (b.pkg_hash.len != 0) return;
+    const dependency = if (b.lazyDependency("gantry", .{ .target = b.graph.host, .optimize = .Debug })) |dep| dep.module("gantry") else return;
+    const checker = b.addExecutable(.{
+        .name = "check-imports",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("ci/imports.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{.{ .name = "gantry", .module = dependency }},
+        }),
+    });
+    const run = b.addRunArtifact(checker);
+    run.setCwd(b.path("."));
+    if (b.args) |args| run.addArgs(args);
+    step.dependOn(&run.step);
+}

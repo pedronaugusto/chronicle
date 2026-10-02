@@ -8,6 +8,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Give JSON Lines one adapter below the journal and its storage.
 
+- Check named source layers, cycles, entry files and dependency owners during source CI.
+
 - Assemble journal tests above the public owner so the source graph has no test cycle.
 
 ### Changed

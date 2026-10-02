@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, layers]
   pull_request:
   workflow_dispatch:
 
@@ -77,9 +77,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Formatting
-        run: zig fmt --check src examples build.zig
+        run: zig fmt --check src examples build.zig ci
       - name: Casts out of the type system carry their reason
         run: python3 ci/casts.py
+      - name: Source import boundaries
+        run: zig build check-imports
 
   # README.md's Usage block is a region of examples/usage.zig, which the job
   # above runs. This is what keeps the snippet a reader copies and the code CI
