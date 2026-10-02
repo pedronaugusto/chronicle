@@ -39,7 +39,7 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
       - name: Test — ${{ matrix.optimize }}
-        run: zig build test -Doptimize=${{ matrix.optimize }}
+        run: zig build test -Doptimize=${{ matrix.optimize }} --test-timeout 120s
 
   # ReleaseSmall must build; its unchecked tests add no distinct assertion to ReleaseFast.
   small:

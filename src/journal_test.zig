@@ -1384,6 +1384,29 @@ const Sequenced = struct {
     }
 };
 
+/// Wait until the journal has registered a reader before letting the append
+/// run. The journal's lock owns the waiter count; observing it under that
+/// lock proves waitPast reached its blocking path, independent of scheduling.
+fn appendToWaitingReader(journal: *Journal, io: Io, event: Event) !u64 {
+    const reader = struct {
+        fn run(j: *Journal, inner: Io) Io.Cancelable!u64 {
+            return j.waitPast(inner, 0);
+        }
+    }.run;
+    var future = try io.concurrent(reader, .{ journal, io });
+    defer _ = future.cancel(io) catch {};
+
+    while (true) {
+        journalState(journal).mutex.lockUncancelable(io);
+        const entered = journalState(journal).waiters == 1;
+        journalState(journal).mutex.unlock(io);
+        if (entered) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    _ = try journal.append(io, 1, event);
+    return try future.await(io);
+}
+
 test "waitPast blocks until an append arrives" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -1392,22 +1415,25 @@ test "waitPast blocks until an append arrives" {
     const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
 
-    const appender = struct {
-        fn f(j: *Journal, inner: Io) void {
-            _ = j.append(inner, 1, created(1, "awaited")) catch {};
-        }
-    }.f;
-
-    var group: Io.Group = .init;
-    defer group.cancel(io);
-    try group.concurrent(io, appender, .{ journal, io });
-
-    const arrived = try journal.waitPast(io, 0);
-    try testing.expectEqual(@as(u64, 1), arrived);
+    try testing.expectEqual(@as(u64, 1), try appendToWaitingReader(journal, io, created(1, "awaited")));
     const batch = try journal.copySince(testing.allocator, io, 0);
     defer batch.deinit();
+    try testing.expectEqual(@as(usize, 1), batch.records().len);
     try testing.expectEqualStrings("awaited", batch.records()[0].event.created.name);
-    try group.await(io);
+}
+
+test "a refused append cancels its blocked waiter" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .max_record_bytes = 512 });
+    defer journal.deinit(io);
+
+    const name = [_]u8{'x'} ** 512;
+    try testing.expectError(error.RecordTooLarge, appendToWaitingReader(journal, io, created(1, &name)));
+    try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, 0), journalState(journal).waiters);
 }
 
 test "an append nobody waits on wakes nobody, and one somebody waits on wakes them" {

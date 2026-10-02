@@ -69,6 +69,21 @@ pub fn build(b: *std.Build) void {
     const install_lock_helper = b.addInstallArtifact(lock_helper, .{});
 
     const run_tests = b.addRunArtifact(tests);
+    // A stalled test must fail by name, including in an ordinary local run.
+    // Zig 0.16 passes per-test timeouts through MakeOptions rather than a
+    // Run field, so give this one test runner a default there. An explicit
+    // --test-timeout still takes precedence; fuzzing keeps its own runner.
+    const TestTimeout = struct {
+        var run: std.Build.Step.MakeFn = undefined;
+
+        fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+            var bounded = options;
+            bounded.unit_test_timeout_ns = options.unit_test_timeout_ns orelse 120 * std.time.ns_per_s;
+            return run(step, bounded);
+        }
+    };
+    TestTimeout.run = run_tests.step.makeFn;
+    run_tests.step.makeFn = TestTimeout.make;
     run_tests.step.dependOn(&install_lock_helper.step);
     run_tests.setEnvironmentVariable(
         "CHRONICLE_LOCK_HELPER",

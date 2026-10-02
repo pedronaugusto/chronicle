@@ -514,6 +514,9 @@ zig fmt --check src examples build.zig
 ci/linux.sh             # the suite on Linux, in Docker, from any machine
 ```
 
+Each unit test has a 120-second hang limit and a timeout reports its name.
+`--test-timeout` overrides that limit; fuzzing remains unlimited.
+
 Every test runs under `std.testing.allocator` and `std.testing.io`, against
 real directories, in Debug, ReleaseSafe, ReleaseFast and ReleaseSmall. The
 crash shapes are made on the disk rather than simulated: a torn final line, a
