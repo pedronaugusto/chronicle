@@ -1089,7 +1089,3 @@ pub fn Journal(comptime Event: type) type {
     };
 }
 
-test {
-    _ = @import("journal_test.zig");
-    _ = @import("envelope.zig");
-}

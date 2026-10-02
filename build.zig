@@ -44,7 +44,7 @@ pub fn build(b: *std.Build) void {
         .filters = if (test_filter) |filter| &.{filter} else &.{},
         .name = "chronicle-tests",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/chronicle.zig"),
+            .root_source_file = b.path("src/tests.zig"),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = if (thread_sanitizer) true else null,
