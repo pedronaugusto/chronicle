@@ -138,7 +138,7 @@ pub const OnTruncated = enum {
 /// any of these, because they are what the replacement promise is.
 ///
 /// What "durable" costs is a platform's answer and not this package's:
-/// `flush` names the call, and README.md has the row per platform.
+/// `flush` names the call, and README.md gives the rules per platform.
 pub const Sync = enum {
     /// Flush before every `appendLine` returns, and once per `commit`.
     always,
@@ -164,7 +164,7 @@ pub const Flush = enum {
 };
 
 /// What `Sync.always` issues here. `chronicle.flush` re-exports it, and
-/// README.md's durability table is written per platform from it.
+/// README.md's durability rules is written per platform from it.
 pub const flush: Flush = switch (builtin.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos => .full_fsync,
     .windows => .flush_buffers,

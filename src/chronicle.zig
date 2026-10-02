@@ -57,7 +57,7 @@ pub const Sync = Log.Sync;
 pub const Flush = Log.Flush;
 
 /// What `Options.sync = .always` issues here, which is what a returned
-/// sequence number survives here. README.md's durability table is the same
+/// sequence number survives here. README.md's durability rules is the same
 /// three answers in words.
 pub const flush: Flush = Log.flush;
 

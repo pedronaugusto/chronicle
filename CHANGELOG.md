@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The README usage excerpt keeps the example calls without the surrounding commentary.
+
 - The blocking-wait tests establish waiter entry, propagate append failures and cancel refused waits; local and CI test runs report hangs by name with a 120-second per-test limit.
 
 - **Breaking:** `copySince` and `readers` return opaque `*Batch` and `*Readers` owners; replace direct fields with `records()`, `complete()` and `items()`, keep their pointers instead of values, and release each owner exactly once before its allocator.
