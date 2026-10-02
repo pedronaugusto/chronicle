@@ -82,6 +82,8 @@ jobs:
         run: python3 ci/casts.py
       - name: Source import boundaries
         run: zig build check-imports
+      - name: Import gate regression checks
+        run: python3 ci/test_imports.py
 
   # README.md's Usage block is a region of examples/usage.zig, which the job
   # above runs. This is what keeps the snippet a reader copies and the code CI

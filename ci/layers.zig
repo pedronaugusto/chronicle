@@ -29,9 +29,17 @@ pub const layers: []const gantry.rules.Layer = &.{
     } },
 };
 
+pub const entries: []const []const u8 = &.{
+    "src/lock_helper.zig",
+};
+
 pub const modules: []const gantry.NamedModule = &.{.{ .name = "chronicle", .path = "src/chronicle.zig", .from = "src/lock_helper.zig" }};
 pub const references: []const gantry.rules.ReferenceRule = &.{
-    .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{ "builtin", "std", "strand" } },
+    .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{
+        "builtin",
+        "std",
+        "strand",
+    } },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
     .{ .name = "strand owner", .target = "strand", .except_from = &.{"src/jsonl.zig"} },
 };
