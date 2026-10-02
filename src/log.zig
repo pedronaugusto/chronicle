@@ -27,7 +27,7 @@ const Io = std.Io;
 const crc32c = @import("crc32c.zig");
 const clone = @import("clone.zig");
 const envelopes = @import("envelope.zig");
-const strand = @import("strand");
+const strand = @import("jsonl.zig").strand;
 
 const Log = @This();
 

@@ -6,7 +6,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Log = @import("log.zig");
 const crc32c = @import("crc32c.zig");
-const strand = @import("strand");
+const strand = @import("jsonl.zig").strand;
 const envelope = @import("envelope.zig");
 const Encoding = @import("encoding.zig");
 

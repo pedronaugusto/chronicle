@@ -13,7 +13,7 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const strand = @import("strand");
+const strand = @import("jsonl.zig").strand;
 
 /// One integer member at `at.*`: `opening`, then the integer, a minus in
 /// front of it only where `T` is signed. Parsed as a `T` and stepped over;

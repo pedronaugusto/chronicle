@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Give JSON Lines one adapter below the journal and its storage.
+
 - Assemble journal tests above the public owner so the source graph has no test cycle.
 
 ### Changed

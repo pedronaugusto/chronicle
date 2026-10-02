@@ -33,7 +33,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Log = @import("log.zig");
-const strand = @import("strand");
+const strand = @import("jsonl.zig").strand;
 const implementation = @import("journal.zig");
 
 /// An event kept as its bytes: what a `migrate` hook is handed, what an
@@ -1088,4 +1088,3 @@ pub fn Journal(comptime Event: type) type {
         };
     };
 }
-
