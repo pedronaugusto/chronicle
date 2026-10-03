@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- A record's checksum is read only as a JSON integer: one written with a `0` in front of its digits made a line that is not JSON, and it was accepted as a record and handed out as its bytes.
+
 - A file in the journal's directory is a segment or an index only under the twenty digits its name is written with. A name with a sign or a `_` among them, which `parseInt` reads as the same number, was taken for a second copy of that segment, and an open deleted the real one.
 
 - **Breaking:** `Flush` is `strand.SyncKind` and `flush` is what strand asks for at the whole-file level (`SyncKind.asked(.all)`): `.full` on Darwin and `.plain` elsewhere, replacing `.full_fsync`, `.fsync` and `.flush_buffers`. `Status.flushed` is the call a journal's records last got, which on a Darwin filesystem that declines `F_FULLFSYNC` is `.plain` rather than the `flush` the constant names.

@@ -34,13 +34,16 @@ pub const Trailer = struct {
 };
 
 /// The checksum is the last member of every record this package writes, so
-/// it is found from the end. Null when the line does not end in one.
+/// it is found from the end. Null when the line does not end in one, a JSON
+/// integer that fits a `u32`.
 pub fn trailer(line: []const u8) ?Trailer {
     const opening = ",\"c\":";
     if (line.len < opening.len + 2 or line[line.len - 1] != '}') return null;
     var at = line.len - 1;
     while (at > 0 and std.ascii.isDigit(line[at - 1])) at -= 1;
     if (at == line.len - 1 or at < opening.len) return null;
+    // A JSON integer: no zero in front of other digits.
+    if (line[at] == '0' and at + 1 != line.len - 1) return null;
     if (!std.mem.eql(u8, line[at - opening.len .. at], opening)) return null;
     return .{
         .covered = line[0 .. at - opening.len],

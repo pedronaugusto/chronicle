@@ -3464,6 +3464,28 @@ test "a checksum that is not the last member of its line is not a checksum" {
     );
 }
 
+test "a checksum written with a zero in front of it is not a checksum" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // The number is the record's checksum, but `0` in front of digits is not
+    // a JSON integer, and the line is handed out as a record's durable
+    // bytes: a reader of those bytes would find no JSON in them.
+    var written: Handwritten = try .init(1, 0);
+    defer written.deinit();
+    try written.record(1, 1, 1, "{\"removed\":{\"id\":1}}");
+    const line = written.written();
+    const at = std.mem.lastIndexOf(u8, line, ",\"c\":").? + ",\"c\":".len;
+    const padded = try std.mem.concat(testing.allocator, u8, &.{ line[0..at], "0", line[at..] });
+    defer testing.allocator.free(padded);
+    try ws.write(try ws.segment(1), padded);
+    try testing.expectError(
+        error.CorruptRecord,
+        Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail }),
+    );
+}
+
 test "a file whose name only parses as a segment's number is not a segment" {
     const io = testing.io;
     var ws = try Workspace.init("log");
