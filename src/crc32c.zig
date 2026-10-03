@@ -34,15 +34,11 @@ pub const initial: u32 = 0xffff_ffff;
 pub fn update(from: u32, bytes: []const u8) u32 {
     if (!hardware) return table(from, bytes);
 
-    // One instruction folds in eight bytes, but takes three cycles to give
-    // its answer to the next, so one chain of them leaves two thirds of the
-    // unit idle. Three chains over three blocks keep it busy, and a table
-    // shifts the first chain's answer past the bytes of the next two, which
-    // is how zlib-ng and the crc32c crates go through a long buffer.
-    var crc = threeWays(long, from, bytes);
-    var at = bytes.len - bytes.len % (3 * long);
-    crc = threeWays(short, crc, bytes[at..]);
-    at += (bytes.len - at) - (bytes.len - at) % (3 * short);
+    var crc: u32 = from;
+    var at: usize = 0;
+    // A record is shorter than three blocks and goes straight to the one
+    // chain below; the three are for the buffers that are not.
+    if (bytes.len >= 3 * short) at = interleaved(&crc, bytes);
     while (at + 8 <= bytes.len) : (at += 8) {
         crc = eight(crc, std.mem.readInt(u64, bytes[at..][0..8], .little));
     }
@@ -59,6 +55,21 @@ pub fn update(from: u32, bytes: []const u8) u32 {
 /// of eight.
 const long = 8192;
 const short = 256;
+
+/// One instruction folds in eight bytes, but takes three cycles to give its
+/// answer to the next, so one chain of them leaves two thirds of the unit
+/// idle. Three chains over three blocks keep it busy, and a table shifts the
+/// first chain's answer past the bytes of the next two, which is how zlib-ng
+/// and the crc32c crates go through a long buffer. Carries `crc` over the
+/// runs of three blocks at the front of `bytes` and returns how many bytes
+/// that was.
+noinline fn interleaved(crc: *u32, bytes: []const u8) usize {
+    crc.* = threeWays(long, crc.*, bytes);
+    var at = bytes.len - bytes.len % (3 * long);
+    crc.* = threeWays(short, crc.*, bytes[at..]);
+    at += (bytes.len - at) - (bytes.len - at) % (3 * short);
+    return at;
+}
 
 /// `crc` carried over every whole run of three `block`-byte blocks at the
 /// front of `bytes`.
