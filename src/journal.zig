@@ -65,6 +65,10 @@ pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len:0]u8 
     return Log.segmentName(base_seq, segment_extension);
 }
 
+pub fn indexName(base_seq: u64) [Log.name_digits + index_extension.len:0]u8 {
+    return Log.segmentName(base_seq, index_extension);
+}
+
 /// The version stamped into the two documents that live beside the log: the
 /// snapshot and a named reader's cursor. Neither is part of the log — one is
 /// a copy of a fold and the other is a number a reader keeps — but both are

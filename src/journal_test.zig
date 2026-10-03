@@ -173,9 +173,7 @@ const Workspace = struct {
     }
 
     fn index(self: *Workspace, base_seq: u64) ![]const u8 {
-        var name = chronicle.segmentName(base_seq);
-        @memcpy(name[name.len - 4 ..], chronicle.index_extension);
-        return self.sub(&name);
+        return self.sub(&chronicle.indexName(base_seq));
     }
 
     fn read(self: *Workspace, sub_path: []const u8) ![]u8 {
@@ -3856,6 +3854,20 @@ const written_before = struct {
         ++ "\n" },
     };
 };
+
+test "indexName names the index a segment is written with" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(2, 1024));
+    defer journal.deinit(io);
+    for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    try testing.expectEqualStrings("00000000000000000003.idx", &chronicle.indexName(3));
+    for ([_]u64{ 1, 3 }) |base| {
+        try testing.expect(ws.exists(try ws.segment(base)));
+        try testing.expect(ws.exists(try ws.sub(&chronicle.indexName(base))));
+    }
+}
 
 test "a journal written before reads as written, and its records are written again byte for byte" {
     const io = testing.io;
