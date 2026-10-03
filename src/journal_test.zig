@@ -3554,13 +3554,16 @@ test "an empty segment in the middle of the log is damage, not a rotation to und
 }
 
 /// How many descriptors this process has open, for a test that holds an open
-/// which fails to giving back what it took. POSIX only.
-fn openDescriptors() usize {
+/// which fails to giving back what it took: the entries of `/dev/fd`, which
+/// Linux and Darwin both have. The listing's own descriptor is counted every
+/// time, so two counts compare.
+fn openDescriptors() !usize {
+    const io = testing.io;
+    const dir = try Io.Dir.openDirAbsolute(io, "/dev/fd", .{ .iterate = true });
+    defer dir.close(io);
     var count: usize = 0;
-    var fd: c_int = 0;
-    while (fd < 1024) : (fd += 1) {
-        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) count += 1;
-    }
+    var entries = dir.iterate();
+    while (try entries.next(io)) |_| count += 1;
     return count;
 }
 
@@ -3578,14 +3581,14 @@ test "an open that refuses the log closes every file it opened" {
     // The oldest segment emptied: the open reads the indexes of the ones
     // after it before it finds the gap.
     try ws.write(try ws.segment(1), "");
-    const before = openDescriptors();
+    const before = try openDescriptors();
     for (0..3) |_| {
         try testing.expectError(
             error.DiscontinuousSeq,
             Journal.open(testing.allocator, io, ws.path, .{ .sync = .never }),
         );
     }
-    try testing.expectEqual(before, openDescriptors());
+    try testing.expectEqual(before, try openDescriptors());
 }
 
 test "a segment in an older framing is refused by name, not read" {
