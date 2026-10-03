@@ -70,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
                         .{ .at = @intCast(step % std.math.maxInt(i64)), .event = .{ .ping = 2 } },
                         .{ .at = @intCast(step % std.math.maxInt(i64)), .event = .{ .ping = 3 } },
                     };
-                    _ = try journal.appendAll(io, &batch);
+                    _ = try journal.appendAll(io, &batch, .group);
                 },
                 2 => try journal.compact(io, random.random().intRangeAtMost(u64, 0, newest)),
                 3 => journal.truncateAfter(

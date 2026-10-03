@@ -1427,6 +1427,26 @@ const Scanned = struct {
     chain: u32,
     /// Where the records start: the length of the header line.
     header_bytes: u64,
+    /// What `lines`, `complete_bytes` and `chain` were before the atomic
+    /// batch the segment's records end inside, when its last record is not
+    /// there. Only the active segment can end so; see `withoutOpenBatch`.
+    before_batch: ?BeforeBatch = null,
+
+    const BeforeBatch = struct { lines: u64, complete_bytes: u64, chain: u32 };
+
+    /// The active segment as far as its last whole batch: an open batch is
+    /// counted with the torn line after it, in `partial_bytes`, and the
+    /// rest is as it was before the batch began. `times` still spans the
+    /// batch; a wider range skips nothing it should not.
+    fn withoutOpenBatch(scanned: Scanned) Scanned {
+        const before = scanned.before_batch orelse return scanned;
+        var cut = scanned;
+        cut.lines = before.lines;
+        cut.complete_bytes = before.complete_bytes;
+        cut.chain = before.chain;
+        cut.partial_bytes += scanned.complete_bytes - before.complete_bytes;
+        return cut;
+    }
 };
 
 /// How a segment's lines are framed by strand's `LineReader`: at a `\n`
@@ -1481,6 +1501,9 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
 
     var at_header = true;
     var timed = true;
+    // The atomic batch the records seen last are in, and what the segment
+    // was before it: the end of the segment if the batch never closes.
+    var batch: ?struct { last: u64, before: Scanned.BeforeBatch } = null;
     while (true) {
         const line = lines.next() catch |err| switch (err) {
             // Past what a record may be, and the segment ends inside it: the
@@ -1505,6 +1528,23 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
             at_header = false;
         } else {
             const found = try envelopeOf(log.gpa, line.line);
+            if (found) |envelope| {
+                const in = try envelopes.batchOf(log.gpa, line.line);
+                if (batch) |inside| {
+                    if (in == null or in.?.last != inside.last) batch = null;
+                }
+                if (in) |b| {
+                    if (envelope.seq == b.last) {
+                        batch = null;
+                    } else if (batch == null) {
+                        batch = .{ .last = b.last, .before = .{
+                            .lines = scanned.lines,
+                            .complete_bytes = scanned.complete_bytes,
+                            .chain = scanned.chain,
+                        } };
+                    }
+                }
+            } else batch = null;
             const at: ?i64 = if (found) |envelope| envelope.at else null;
             if (at) |stamp| scanned.times.widen(stamp) else {
                 timed = false;
@@ -1517,6 +1557,7 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
         }
         scanned.complete_bytes = end;
     }
+    if (batch) |inside| scanned.before_batch = inside.before;
     // What is left after the last newline: how much of it somebody wrote,
     // up to the last byte that is not zero. A record this package writes
     // can hold no zero byte -- `std.json` escapes every control character --
@@ -1705,6 +1746,40 @@ pub const Scan = struct {
             }
             return line.line;
         }
+    }
+
+    /// Whether the segment being walked holds the record `seq`, from where
+    /// the walk stands to as far as it may read: a look ahead for the last
+    /// record of an atomic batch, which is in the same segment as its first
+    /// or nowhere. The walk itself does not move.
+    pub fn holds(scan: *Scan, io: Io, seq: u64) ScanError!bool {
+        const file = scan.file orelse return false;
+        var buffer: [4096]u8 = undefined;
+        var reader = file.reader(io, &.{});
+        try reader.seekTo(scan.position);
+        const limit = scan.limits[scan.at] -| scan.position;
+        var bounded = reader.interface.limited(.limited64(limit), &buffer);
+        var lines: strand.LineReader = .resumeAt(scan.gpa, &bounded.interface, framing(scan.max_record_bytes), .{ .offset = scan.position });
+        defer lines.deinit();
+        while (true) {
+            const line = (lines.next() catch |err| switch (err) {
+                error.ReadFailed => return reader.err orelse error.ReadFailed,
+                error.OutOfMemory => return error.OutOfMemory,
+                error.LineTooLong => return false,
+                error.ControlByte, error.MissingSeparator => unreachable,
+            }) orelse return false;
+            const found = (try envelopes.stamp(scan.gpa, line.line)) orelse continue;
+            if (found.seq >= seq) return true;
+        }
+    }
+
+    /// Steps the walk back over the line it just returned, `len` bytes with
+    /// its newline, so that the next `next` returns it again.
+    pub fn rewind(scan: *Scan, io: Io, len: u64) ScanError!void {
+        _ = io;
+        scan.position -= len;
+        try scan.reader.seekTo(scan.position);
+        scan.lines.reset(.{ .offset = scan.position });
     }
 
     /// Whether the bytes of the open segment from `from`, as far as a record
@@ -1964,7 +2039,7 @@ pub fn baseSeq(log: *const Log) u64 {
 /// says otherwise — on the disk. It is `stageLine` and `commit`, which is what
 /// a batch does once around many records rather than once around each.
 pub fn appendLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32) AppendError!void {
-    try log.stageLine(io, bytes, at, checksum);
+    try log.stageLine(io, bytes, at, checksum, .may_rotate);
     try log.commit(io);
 }
 
@@ -1983,14 +2058,19 @@ pub fn chainTip(log: *const Log) u32 {
 /// entry goes out unflushed and unsynced whichever way the record was written:
 /// it is a cache, and a crash that loses it costs the next open a scan of one
 /// segment.
-pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32) AppendError!void {
+///
+/// `.stay` keeps the record in the active segment however far past its
+/// limits that takes it: a record of an atomic batch after the first, since
+/// a batch is never split across segments, which is what lets an open find a
+/// torn one in the active segment alone.
+pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32, rotation: Rotation) AppendError!void {
     if (log.active == null) return error.ReadOnly;
     var segment = &log.segments.items[log.segments.items.len - 1];
 
     const needed = bytes.len + 1;
     const over_bytes = segment.bytes + needed > log.options.max_segment_bytes;
     const over_records = if (log.options.max_segment_records) |limit| segment.count() >= limit else false;
-    if (segment.count() > 0 and (over_bytes or over_records)) {
+    if (rotation == .may_rotate and segment.count() > 0 and (over_bytes or over_records)) {
         // The rotation seals the segment being left, so the records staged
         // into it are durable before the new one is named. The chain carries
         // across it: a rotation is not a break in the records.
@@ -2016,6 +2096,9 @@ pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32) A
     segment.times.widen(at);
     log.chain = checksum;
 }
+
+/// Whether `stageLine` may seal the active segment and start another first.
+pub const Rotation = enum { may_rotate, stay };
 
 /// Put everything `stageLine` has written into the file, and — under
 /// `Options.sync = .always` — on the disk.
@@ -2170,9 +2253,10 @@ fn openActive(log: *Log, io: Io) OpenError!void {
             };
             return;
         }
-        const scanned = try log.scanSegment(io, segment.*, null);
+        const scanned = (try log.scanSegment(io, segment.*, null)).withoutOpenBatch();
         // A reader never shortens a file: bytes after the last newline are a
-        // writer mid-append, not damage.
+        // writer mid-append, not damage, and so is a batch it has not
+        // finished.
         segment.bytes = scanned.complete_bytes;
         segment.last_seq = segment.base_seq + scanned.lines - 1;
         segment.times = scanned.times;
@@ -2246,7 +2330,7 @@ fn resumeActive(log: *Log, io: Io, segment: *Segment) OpenError!?Active {
     var builder: Builder = .init(segment.base_seq, log.options.index_interval_bytes);
     var sink: IndexSink = .{ .builder = &builder, .writer = &index_writer };
 
-    const scanned = try log.scanSegment(io, segment.*, &sink);
+    const scanned = (try log.scanSegment(io, segment.*, &sink)).withoutOpenBatch();
     if (scanned.complete_bytes == 0) {
         // Not one whole line: the file was created and the line that says
         // what it is never reached the disk. It is written again, and
@@ -2265,6 +2349,20 @@ fn resumeActive(log: *Log, io: Io, segment: *Segment) OpenError!?Active {
             log.dropped_bytes = @intCast(scanned.partial_bytes);
             try file.setLength(io, scanned.complete_bytes);
             preallocated = scanned.complete_bytes;
+            if (scanned.before_batch != null) {
+                // The index just built names records of the batch that was
+                // dropped: the segment, as it now is, is read again for one
+                // that does not. Once, after a crash inside a batch.
+                if (log.options.sync != .never) try syncFile(io, file, .whole);
+                segment.bytes = scanned.complete_bytes;
+                const dropped = log.dropped_bytes;
+                file.close(io);
+                index_file.close(io);
+                transferred = true;
+                const again = try log.resumeActive(io, segment);
+                log.dropped_bytes = dropped;
+                return again;
+            }
         },
     };
     segment.bytes = scanned.complete_bytes;
@@ -2733,7 +2831,9 @@ pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {
     var last = log.segments.items[newest];
     const name = segmentName(last.base_seq, segment_extension);
     last.bytes = try log.fileLength(io, &name);
-    const scanned = try log.scanSegment(io, last, null);
+    // A batch the writer has not finished is not copied: the backup ends
+    // where its last whole batch does.
+    const scanned = (try log.scanSegment(io, last, null)).withoutOpenBatch();
     if (!try log.copyFile(io, dest, &name, scanned.complete_bytes)) return error.FileNotFound;
 
     try syncDirHandle(io, dest);

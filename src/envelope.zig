@@ -56,6 +56,15 @@ pub fn trailer(line: []const u8) ?Trailer {
 /// its envelope was read from.
 pub const Span = struct { from: usize, to: usize };
 
+/// The records an atomic batch wrote, which every one of them names: a
+/// record with `first <= seq <= last`. A batch is never split across
+/// segments, so a log that ends with a record of a batch whose `last` it does
+/// not hold ends inside that batch, and the batch is dropped whole.
+pub const Batch = struct {
+    first: u64,
+    last: u64,
+};
+
 /// A record's envelope: everything in its line but the event and the
 /// checksum.
 pub const Head = struct {
@@ -66,6 +75,9 @@ pub const Head = struct {
     v: u32,
     /// The checksum of the record before this one.
     p: u32,
+    /// The atomic batch the record was written in, or null for one written
+    /// on its own or in a group commit.
+    batch: ?Batch = null,
     ev: Span,
 };
 
@@ -74,16 +86,65 @@ pub const Head = struct {
 pub fn quick(covered: []const u8) ?Head {
     const Envelope = struct { seq: i64, at: i64, v: u32, p: u32 };
     const read = strand.leadingIntMembers(Envelope, covered) orelse return null;
-    const ev_prefix = ",\"ev\":";
-    if (!std.mem.startsWith(u8, covered[read.end..], ev_prefix)) return null;
     if (read.value.seq < 1) return null;
+    const seq: u64 = @intCast(read.value.seq);
+    var at = read.end;
+    var batch: ?Batch = null;
+    const bf_prefix = ",\"bf\":";
+    if (std.mem.startsWith(u8, covered[at..], bf_prefix)) {
+        at += bf_prefix.len;
+        const first = digitsAt(covered, &at) orelse return null;
+        const bl_prefix = ",\"bl\":";
+        if (!std.mem.startsWith(u8, covered[at..], bl_prefix)) return null;
+        at += bl_prefix.len;
+        const last = digitsAt(covered, &at) orelse return null;
+        batch = checkedBatch(seq, first, last) orelse return null;
+    }
+    const ev_prefix = ",\"ev\":";
+    if (!std.mem.startsWith(u8, covered[at..], ev_prefix)) return null;
     return .{
-        .seq = @intCast(read.value.seq),
+        .seq = seq,
         .at = read.value.at,
         .v = read.value.v,
         .p = read.value.p,
-        .ev = .{ .from = read.end + ev_prefix.len, .to = covered.len },
+        .batch = batch,
+        .ev = .{ .from = at + ev_prefix.len, .to = covered.len },
     };
+}
+
+/// A JSON integer of digits alone at `at.*`, which moves past it, or null.
+fn digitsAt(bytes: []const u8, at: *usize) ?i64 {
+    const from = at.*;
+    var end = from;
+    while (end < bytes.len and std.ascii.isDigit(bytes[end])) end += 1;
+    if (end == from or (bytes[from] == '0' and end - from > 1)) return null;
+    at.* = end;
+    return std.fmt.parseInt(i64, bytes[from..end], 10) catch null;
+}
+
+/// The batch a record of sequence number `seq` names, when it is one that
+/// record can be in.
+fn checkedBatch(seq: u64, first: i64, last: i64) ?Batch {
+    if (first < 1 or last < 1) return null;
+    const batch: Batch = .{ .first = @intCast(first), .last = @intCast(last) };
+    if (batch.first > seq or seq > batch.last) return null;
+    return batch;
+}
+
+/// The batch a line's record was written in, read as `quick` and `members`
+/// read the envelope. Null for a record written on its own and for a line
+/// that is not a record, which is not this question's to refuse.
+pub fn batchOf(gpa: Allocator, line: []const u8) Allocator.Error!?Batch {
+    if (trailer(line)) |t| {
+        if (quick(t.covered)) |head| return head.batch;
+    }
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const head = members(arena.allocator(), line) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Corrupt => return null,
+    };
+    return head.batch;
 }
 
 /// The envelope of a record in some other shape — members in another
@@ -92,7 +153,7 @@ pub fn quick(covered: []const u8) ?Head {
 /// whatever reading the members took. `error.Corrupt` when the line is not
 /// a record.
 pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt }!Head {
-    const Members = struct { seq: strand.Raw, at: strand.Raw, v: strand.Raw, p: strand.Raw, ev: strand.Raw };
+    const Members = struct { seq: strand.Raw, at: strand.Raw, v: strand.Raw, p: strand.Raw, bf: ?strand.Raw = null, bl: ?strand.Raw = null, ev: strand.Raw };
     const found = strand.parseLine(Members, scratch, line, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Corrupt,
@@ -100,8 +161,16 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
     const seq = integerOf(found.seq) orelse return error.Corrupt;
     if (seq < 1) return error.Corrupt;
     const from = @intFromPtr(found.ev.bytes.ptr) - @intFromPtr(line.ptr); // safe: parseLine without copy_strings hands back a view into line; numbers only
+    // Both members of a batch or neither, and one the record can be in.
+    if ((found.bf == null) != (found.bl == null)) return error.Corrupt;
+    const batch: ?Batch = if (found.bf) |bf| checkedBatch(
+        @intCast(seq),
+        integerOf(bf) orelse return error.Corrupt,
+        integerOf(found.bl.?) orelse return error.Corrupt,
+    ) orelse return error.Corrupt else null;
     return .{
         .seq = @intCast(seq),
+        .batch = batch,
         .at = integerOf(found.at) orelse return error.Corrupt,
         .v = std.math.cast(u32, integerOf(found.v) orelse return error.Corrupt) orelse return error.Corrupt,
         .p = std.math.cast(u32, integerOf(found.p) orelse return error.Corrupt) orelse return error.Corrupt,
@@ -240,10 +309,10 @@ test "metadata probes preserve allocation failure instead of declaring bytes inv
 fn generateLine(smith: *testing.Smith, buf: []u8) []u8 {
     @disableInstrumentation();
     const pieces = [_][]const u8{
-        "{\"seq\":", ",\"at\":",            ",\"v\":",             ",\"p\":",    ",\"ev\":",   ",\"c\":",                                 "}",
-        "{\"x\":1}", "[1,{\"y\":[]}]",      "\"s\\u0070\"",        "null",       " ",          "-",                                       "0",
-        "00",        "9223372036854775807", "9223372036854775808", "4294967295", "4294967296", "{\"created\":{\"id\":1,\"name\":\"x\"}}", "\"p\":",
-        "\"seq\":",  "1.0",                 "1e3",
+        "{\"seq\":",                               ",\"at\":", ",\"v\":",   ",\"p\":",             ",\"ev\":",            ",\"c\":",    "}",
+        ",\"bf\":",                                ",\"bl\":", "{\"x\":1}", "[1,{\"y\":[]}]",      "\"s\\u0070\"",        "null",       " ",
+        "-",                                       "0",        "00",        "9223372036854775807", "9223372036854775808", "4294967295", "4294967296",
+        "{\"created\":{\"id\":1,\"name\":\"x\"}}", "\"p\":",   "\"seq\":",  "1.0",                 "1e3",
     };
     var end: usize = 0;
     while (!smith.eos()) {
@@ -255,7 +324,7 @@ fn generateLine(smith: *testing.Smith, buf: []u8) []u8 {
                 for (chunk[0..n]) |*d| d.* = '0' + smith.valueRangeAtMost(u8, 0, 9);
                 break :digits chunk[0..n];
             },
-            2 => pieces[smith.index(7)],
+            2 => pieces[smith.index(9)],
             else => chunk[0..smith.slice(&chunk)],
         };
         if (end + piece.len > buf.len) break;
@@ -283,6 +352,7 @@ fn expectSameHead(expected: Head, expected_line: []const u8, actual: Head, actua
     try testing.expectEqual(expected.at, actual.at);
     try testing.expectEqual(expected.v, actual.v);
     try testing.expectEqual(expected.p, actual.p);
+    try testing.expectEqual(expected.batch, actual.batch);
     try testing.expectEqualStrings(expected_line[expected.ev.from..expected.ev.to], actual_line[actual.ev.from..actual.ev.to]);
 }
 
@@ -321,11 +391,13 @@ fn checkEnvelope(line: []const u8) !void {
 
         // And the envelope written back in the one shape this package
         // writes reads as itself off the bytes.
-        const written = try std.fmt.allocPrint(a, "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":{s},\"c\":{d}}}", .{
-            head.seq, head.at, head.v, head.p, line[head.ev.from..head.ev.to], if (t) |found| found.c else 7,
+        const batch = if (head.batch) |b| try std.fmt.allocPrint(a, ",\"bf\":{d},\"bl\":{d}", .{ b.first, b.last }) else "";
+        const written = try std.fmt.allocPrint(a, "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d}{s},\"ev\":{s},\"c\":{d}}}", .{
+            head.seq, head.at, head.v, head.p, batch, line[head.ev.from..head.ev.to], if (t) |found| found.c else 7,
         });
         const again = quick(trailer(written).?.covered) orelse return error.TestExpectedQuick;
         try expectSameHead(head, line, again, written);
+        try testing.expectEqual(head.batch, try batchOf(testing.allocator, line));
     }
 
     // `stamp` never reads past the line, whatever it holds, and a stamp is
@@ -357,6 +429,9 @@ test "the envelope properties hold on a table of awkward lines" {
         "{\"seq\":1,\"at\":1,\"v\":1,\"p\":1,\"ev\":1,\"seq\":2,\"c\":1}",
         "{\"seq\":1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{\"p\":2},\"c\":1}",
         "{\"ev\":{\"p\":2},\"seq\":1,\"at\":1,\"v\":1,\"p\":3,\"c\":1}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"bl\":5,\"ev\":{},\"c\":1}",
+        "{\"bl\":5,\"ev\":{},\"bf\":3,\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"c\":1}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":4,\"bl\":3,\"ev\":{},\"c\":1}",
     }) |line| try checkEnvelope(line);
     // Seeded rounds, so a plain `zig build test` goes past the table.
     var prng: std.Random.DefaultPrng = .init(0x656e76);
@@ -371,4 +446,24 @@ test "the envelope properties hold on a table of awkward lines" {
         var smith: testing.Smith = .{ .in = &bytes };
         try checkEnvelope(generateLine(&smith, &buf));
     }
+}
+
+test "a record of an atomic batch names a batch it can be in" {
+    const covered = "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"bl\":5,\"ev\":{}";
+    const head = quick(covered).?;
+    try testing.expectEqual(Batch{ .first = 3, .last = 5 }, head.batch.?);
+    try testing.expectEqualStrings("{}", covered[head.ev.from..head.ev.to]);
+    for ([_][]const u8{
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":5,\"bl\":6,\"ev\":{}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":1,\"bl\":3,\"ev\":{}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":0,\"bl\":4,\"ev\":{}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"ev\":{}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":03,\"bl\":5,\"ev\":{}",
+    }) |bad| try testing.expectEqual(@as(?Head, null), quick(bad));
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    // As members, both or neither, and in range.
+    try testing.expectEqual(Batch{ .first = 3, .last = 5 }, (try members(arena.allocator(), "{\"bl\":5,\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"ev\":{}}")).batch.?);
+    try testing.expectError(error.Corrupt, members(arena.allocator(), "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bl\":5,\"ev\":{}}"));
+    try testing.expectError(error.Corrupt, members(arena.allocator(), "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":5,\"bl\":9,\"ev\":{}}"));
 }

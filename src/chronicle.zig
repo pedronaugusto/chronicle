@@ -300,6 +300,10 @@ pub fn Journal(comptime Event: type) type {
         /// * `ReadOnly` — the journal was opened with `Access.read`.
         pub const AppendError = State.AppendError;
 
+        /// How `appendAll` commits a batch: `.group`, one sync and a crash may
+        /// leave a prefix, or `.atomic`, one sync and all or nothing.
+        pub const Commit = State.Commit;
+
         /// Errors from reconciling the journal after a persistence failure.
         pub const ReconcileError = State.ReconcileError;
 
@@ -504,23 +508,32 @@ pub fn Journal(comptime Event: type) type {
         /// Write every entry, in order, under one `fsync`, and return the
         /// sequence number of the last one.
         ///
-        /// This is group commit and not a transaction. The records go into the
-        /// log one line each, exactly as `append` writes them, and the whole
-        /// batch is made durable once at the end instead of once per record —
-        /// so a batch of a thousand costs one `fsync` under
-        /// `Options.sync = .always` rather than a thousand. What it does not
-        /// buy is atomicity: a crash inside the batch leaves a **prefix** of
-        /// it on the disk, with a torn final line at worst, which is the same
-        /// shape a crash inside a single `append` leaves and is repaired the
-        /// same way. If the batch must be all-or-nothing to your fold, say so
-        /// in the records — a record that opens the group and one that closes
-        /// it — because the log will not say it for you.
+        /// The records go into the log one line each, and the whole batch is
+        /// made durable once at the end instead of once per record — so a
+        /// batch of a thousand costs one `fsync` under `Options.sync = .always`
+        /// rather than a thousand. What a crash inside the batch leaves is
+        /// what `commit` says:
+        ///
+        /// * `.group` — a **prefix** of the batch, with a torn final line at
+        ///   worst, which is the shape a crash inside a single `append` leaves
+        ///   and is repaired the same way.
+        /// * `.atomic` — the whole batch or none of it. Every record of a
+        ///   batch of more than one names the batch's first and last sequence
+        ///   numbers (`"bf"` and `"bl"`, before `"ev"`), the batch is kept in
+        ///   one segment, past `Options.max_segment_bytes` if it has to be,
+        ///   and an open that finds the log ending inside a batch drops the
+        ///   batch whole, as it drops a torn line: `Options.on_truncated`
+        ///   says whether it may. A reader beside the writer reads a batch
+        ///   only once its last record is there, and a replay checks that
+        ///   every batch it walks is whole. Old journals, and records written
+        ///   by `.group`, have no batch members and read as they always did.
         ///
         /// Nothing is published unless the bytes reached the disk: no record
         /// is added to the tail and no sink is called until the `fsync`
         /// returns. A failure part-way through latches the journal exactly as
         /// `append`'s does, and the disk may then hold some of the batch;
-        /// `reconcile` or reopening reads back what survived.
+        /// `reconcile` or reopening reads back what survived, which for an
+        /// `.atomic` batch is all of it or none.
         ///
         /// Each record is serialised as it is written rather than the batch
         /// being formed first, so memory holds the batch only as far as the
@@ -534,8 +547,8 @@ pub fn Journal(comptime Event: type) type {
         /// An empty slice writes nothing and returns `lastSeq`.
         ///
         /// Safe to call from any task or thread.
-        pub fn appendAll(self: *Self, io: Io, entries: []const Entry) AppendError!u64 {
-            return State.appendAll(self.inner(), io, entries);
+        pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!u64 {
+            return State.appendAll(self.inner(), io, entries, commit);
         }
 
         /// Re-read the journal after an append persistence failure and report

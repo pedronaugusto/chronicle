@@ -72,7 +72,7 @@ pub fn main() !void {
         last = try ledger.appendAll(io, &.{
             .{ .at = now, .event = .{ .deposited = .{ .id = 1, .cents = 5_000 } } },
             .{ .at = now, .event = .{ .withdrawn = .{ .id = 1, .cents = 1_250 } } },
-        });
+        }, .group);
         try follower.rearmAt(io, follower.position());
         var followed: usize = 0;
         while (try follower.next(io)) |_| followed += 1;

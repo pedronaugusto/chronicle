@@ -494,7 +494,7 @@ pub fn Journal(comptime Event: type) type {
         ///   `Options.schema_version` and there is neither a `migrate` hook nor
         ///   an `unknown` arm to receive it.
         pub const ReadError = Allocator.Error || MigrateError || Log.ScanError ||
-            error{ ChecksumMismatch, CorruptRecord, TruncatedRecord, DiscontinuousSeq, BrokenChain, NewerSchema, OlderSchema };
+            error{ ChecksumMismatch, CorruptRecord, TruncatedRecord, DiscontinuousSeq, BrokenChain, BrokenBatch, NewerSchema, OlderSchema };
 
         /// `ReadError`, plus what opening a directory and taking its lock can
         /// go wrong with.
@@ -531,6 +531,17 @@ pub fn Journal(comptime Event: type) type {
         /// * `ReadOnly` — the journal was opened with `Access.read`.
         pub const AppendError = Allocator.Error || Log.AppendError ||
             error{ PersistenceFailed, NotRoundTrippable, SequenceExhausted, RecordTooLarge };
+
+        /// How `appendAll` commits a batch.
+        pub const Commit = enum {
+            /// One sync for the batch, and no more: a crash inside it leaves
+            /// a prefix of it on the disk.
+            group,
+            /// One sync for the batch, and all of it or none of it: every
+            /// record names the batch, and an open that finds the log ending
+            /// inside one drops it whole. The batch stays in one segment.
+            atomic,
+        };
 
         /// Errors from reconciling the journal after a persistence failure.
         pub const ReconcileError = OpenError;
@@ -599,6 +610,18 @@ pub fn Journal(comptime Event: type) type {
             /// The checksum of the record before this one, or the segment
             /// header's `root` for the first record in a file.
             p: u32,
+            ev: Event,
+        };
+
+        /// `Line` for a record of an atomic batch: the first and the last
+        /// sequence numbers of the batch, between the back-link and the event.
+        const LineInBatch = struct {
+            seq: u64,
+            at: i64,
+            v: u32,
+            p: u32,
+            bf: u64,
+            bl: u64,
             ev: Event,
         };
 
@@ -750,7 +773,7 @@ pub fn Journal(comptime Event: type) type {
             const next = self.seq + 1;
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
-            var built = try self.encode(next, at, self.log.chainTip(), event);
+            var built = try self.encode(next, at, self.log.chainTip(), event, null);
             var held = false;
             defer if (!held) built.release();
 
@@ -763,7 +786,7 @@ pub fn Journal(comptime Event: type) type {
                 switch (durability) {
                     .now => try self.log.appendLine(io, built.bytes, built.at, built.checksum),
                     .deferred => {
-                        try self.log.stageLine(io, built.bytes, built.at, built.checksum);
+                        try self.log.stageLine(io, built.bytes, built.at, built.checksum, .may_rotate);
                         try self.log.commitDeferred();
                     },
                 }
@@ -777,7 +800,7 @@ pub fn Journal(comptime Event: type) type {
             return next;
         }
 
-        pub fn appendAll(self: *Self, io: Io, entries: []const Entry) AppendError!u64 {
+        pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -806,16 +829,26 @@ pub fn Journal(comptime Event: type) type {
             if (self.keepsRecords()) try built.ensureTotalCapacityPrecise(self.gpa, entries.len);
 
             const before = self.seq;
+            // An atomic batch names itself in every record it writes, so an
+            // open that finds the log ending inside one drops it whole; a
+            // batch of one record is whole or absent anyway, and says nothing.
+            const batch: ?envelope.Batch = if (commit == .atomic and entries.len > 1)
+                .{ .first = before + 1, .last = before + entries.len }
+            else
+                null;
             var link = self.log.chainTip();
             for (entries, 0..) |entry, i| {
-                var item = self.encode(self.seq + i + 1, entry.at, link, entry.event) catch |err| {
+                var item = self.encode(self.seq + i + 1, entry.at, link, entry.event, batch) catch |err| {
                     self.unstage(io, before);
                     return err;
                 };
                 link = item.checksum;
+                // A batch is never split across segments: only its first
+                // record may start a new one.
+                const rotation: Log.Rotation = if (batch != null and i != 0) .stay else .may_rotate;
                 {
                     errdefer self.write_failed = true;
-                    self.log.stageLine(io, item.bytes, item.at, item.checksum) catch |err| {
+                    self.log.stageLine(io, item.bytes, item.at, item.checksum, rotation) catch |err| {
                         item.release();
                         return err;
                     };
@@ -971,8 +1004,17 @@ pub fn Journal(comptime Event: type) type {
             cursor: u64,
             expected: ?u64 = null,
             link: ?u32 = null,
+            /// The atomic batch the walk is inside, from its first record to
+            /// its last.
+            batch: ?envelope.Batch = null,
+            /// Whether a record has been walked yet: the first one may be
+            /// inside a batch whose start the walk began after, or that a
+            /// compaction cut.
+            walked: bool = false,
 
             fn beginSegment(walk: *Continuity, boundary: Log.Scan.Boundary) ReadError!void {
+                // A batch is never split across segments.
+                if (walk.batch != null) return error.BrokenBatch;
                 if (walk.expected) |want| {
                     if (boundary.base_seq != want) return error.DiscontinuousSeq;
                 }
@@ -992,9 +1034,25 @@ pub fn Journal(comptime Event: type) type {
                 if (walk.link) |previous| {
                     if (header.p != previous) return error.BrokenChain;
                 }
+                try walk.acceptBatch(header);
                 walk.expected = header.seq + 1;
                 walk.link = header.c;
                 return header.seq > walk.cursor;
+            }
+
+            /// A batch's records come one after another, each naming the
+            /// batch, from its first to its last, and nothing else does.
+            fn acceptBatch(walk: *Continuity, header: Header) ReadError!void {
+                defer walk.walked = true;
+                if (walk.batch) |inside| {
+                    const named = header.batch orelse return error.BrokenBatch;
+                    if (named.first != inside.first or named.last != inside.last) return error.BrokenBatch;
+                    if (header.seq == inside.last) walk.batch = null;
+                    return;
+                }
+                const named = header.batch orelse return;
+                if (header.seq != named.first and walk.walked) return error.BrokenBatch;
+                if (header.seq != named.last) walk.batch = named;
             }
         };
 
@@ -1012,6 +1070,11 @@ pub fn Journal(comptime Event: type) type {
             run: Continuity,
             /// The last record read whole: handed on, or stepped over.
             last: ?Position.Last = null,
+            /// Every atomic batch up to here is whole: what the journal held
+            /// when the walk was chosen, and the last record of every batch
+            /// found whole since. A record of a batch past it is handed on
+            /// only once the batch's last record is in the file.
+            whole_through: u64,
 
             pub fn deinit(walk: *Replay, io: Io) void {
                 const gpa = walk.scan.gpa;
@@ -1038,6 +1101,11 @@ pub fn Journal(comptime Event: type) type {
                         try self.log.scanFromInto(&walk.scan, io, at.cursor, .{});
                     }
                 }
+                walk.whole_through = whole: {
+                    try self.mutex.lock(io);
+                    defer self.mutex.unlock(io);
+                    break :whole self.seq;
+                };
 
                 walk.run = .{ .cursor = at.cursor };
                 walk.last = null;
@@ -1070,6 +1138,15 @@ pub fn Journal(comptime Event: type) type {
                     if (walk.scan.takeBoundary()) |boundary| try walk.run.beginSegment(boundary);
                     _ = walk.scratch.reset(.retain_capacity);
                     const header = try parseHeader(walk.scratch.allocator(), line);
+                    if (header.batch) |batch| if (batch.last > walk.whole_through) {
+                        // A batch being written beside this walk, or one a
+                        // crash cut: none of it until all of it is there.
+                        if (!try walk.scan.holds(io, batch.last)) {
+                            try walk.scan.rewind(io, line.len + 1);
+                            return null;
+                        }
+                        walk.whole_through = batch.last;
+                    };
                     // Stepping over a record before its event is parsed is
                     // what lets a reader hold a cursor into a log whose
                     // events it does not know.
@@ -1123,6 +1200,7 @@ pub fn Journal(comptime Event: type) type {
                 .arena = .init(self.gpa),
                 .scratch = .init(self.gpa),
                 .run = .{ .cursor = cursor },
+                .whole_through = self.seq,
             };
             return walk;
         }
@@ -1142,6 +1220,7 @@ pub fn Journal(comptime Event: type) type {
                     .arena = .init(self.gpa),
                     .scratch = .init(self.gpa),
                     .run = .{ .cursor = position.cursor },
+                    .whole_through = self.seq,
                 };
                 break :initialized result;
             };
@@ -1696,7 +1775,7 @@ pub fn Journal(comptime Event: type) type {
         /// would produce: an `Event` whose slices point at a stack buffer is
         /// safe to append. Where nothing will, that parse would build a record
         /// and drop it unread, so it is not done.
-        fn encode(self: *Self, seq: u64, at: i64, back_link: u32, event: Event) AppendError!Built {
+        fn encode(self: *Self, seq: u64, at: i64, back_link: u32, event: Event, batch: ?envelope.Batch) AppendError!Built {
             const needs_record = self.needsRecord();
             const arena: ?*std.heap.ArenaAllocator = if (needs_record) try createArena(self.gpa) else null;
             errdefer if (arena) |a| destroyArena(a);
@@ -1723,13 +1802,22 @@ pub fn Journal(comptime Event: type) type {
             // The record is `Line` written by strand, which writes what
             // `std.json` writes (null optionals included, as `std.json`'s
             // default has it), left open: the checksum is its last member.
-            var record = strand.writeObjectOpen(&out.writer, Line{
+            const value_options: strand.ValueOptions = .{ .emit_null_optional_fields = true };
+            var record = if (batch) |b| strand.writeObjectOpen(&out.writer, LineInBatch{
+                .seq = seq,
+                .at = at,
+                .v = self.config.schema_version,
+                .p = back_link,
+                .bf = b.first,
+                .bl = b.last,
+                .ev = event,
+            }, value_options) catch |err| return encoding.diagnose(err) else strand.writeObjectOpen(&out.writer, Line{
                 .seq = seq,
                 .at = at,
                 .v = self.config.schema_version,
                 .p = back_link,
                 .ev = event,
-            }, .{ .emit_null_optional_fields = true }) catch |err| return encoding.diagnose(err);
+            }, value_options) catch |err| return encoding.diagnose(err);
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
             // it.
@@ -1867,6 +1955,8 @@ pub fn Journal(comptime Event: type) type {
             /// This record's own checksum, which the next one carries as its
             /// `p`.
             c: u32,
+            /// The atomic batch the record was written in, if it was.
+            batch: ?envelope.Batch,
             /// Where the event sits in the line, still unparsed.
             ev: Span,
         };
@@ -1886,7 +1976,7 @@ pub fn Journal(comptime Event: type) type {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Corrupt => return error.CorruptRecord,
             };
-            return .{ .seq = head.seq, .at = head.at, .version = head.v, .p = head.p, .c = t.c, .ev = head.ev };
+            return .{ .seq = head.seq, .at = head.at, .version = head.v, .p = head.p, .c = t.c, .batch = head.batch, .ev = head.ev };
         }
 
         /// Only the schema and migration hook determine how an event is read.

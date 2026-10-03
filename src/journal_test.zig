@@ -79,7 +79,7 @@ fn fill(journal: *Journal, io: Io, first: u64, last: u64, name: []const u8) !voi
             batch[n] = .{ .at = @intCast(next), .event = created(@intCast(next), name) };
             n += 1;
         }
-        _ = try journal.appendAll(io, batch[0..n]);
+        _ = try journal.appendAll(io, batch[0..n], .group);
     }
 }
 
@@ -454,7 +454,7 @@ test "appendAll writes every entry and numbers them in order" {
     try journal.subscribe(io, folded.sink());
 
     // An empty batch writes nothing and says where the log got to.
-    try testing.expectEqual(@as(u64, 0), try journal.appendAll(io, &.{}));
+    try testing.expectEqual(@as(u64, 0), try journal.appendAll(io, &.{}, .group));
 
     _ = try journal.append(io, 1, created(1, "alone"));
     const batch = [_]Journal.Entry{
@@ -464,7 +464,7 @@ test "appendAll writes every entry and numbers them in order" {
     };
     // The returned number is the last of the batch, so the records it wrote
     // are the three sequence numbers ending there.
-    try testing.expectEqual(@as(u64, 4), try journal.appendAll(io, &batch));
+    try testing.expectEqual(@as(u64, 4), try journal.appendAll(io, &batch, .group));
     try testing.expectEqual(@as(u64, 4), try journal.lastSeq(io));
 
     // Every record went to the sinks, in order, as if appended one at a time.
@@ -486,7 +486,7 @@ test "appendAll writes every entry and numbers them in order" {
     defer rolling.deinit(io);
     var many: [7]Journal.Entry = undefined;
     for (&many, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "n") };
-    try testing.expectEqual(@as(u64, 7), try rolling.appendAll(io, &many));
+    try testing.expectEqual(@as(u64, 7), try rolling.appendAll(io, &many, .group));
     try testing.expectEqual(@as(usize, 4), (try rolling.segmentCount(io)));
     try testing.expectEqual(@as(u64, 7), try rolling.verify(io));
 }
@@ -519,7 +519,7 @@ test "a batch this journal cannot form leaves the log exactly as it was" {
         .{ .at = 4, .event = created(4, "four") },
         .{ .at = 5, .event = created(5, &long) },
     };
-    try testing.expectError(error.RecordTooLarge, journal.appendAll(io, &batch));
+    try testing.expectError(error.RecordTooLarge, journal.appendAll(io, &batch, .group));
 
     try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
     try testing.expectEqual(@as(usize, 1), (try journal.segmentCount(io)));
@@ -546,7 +546,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
     {
         const journal = try Journal.open(testing.allocator, io, ws.path, .{});
         defer journal.deinit(io);
-        try testing.expectEqual(@as(u64, 4), try journal.appendAll(io, &batch));
+        try testing.expectEqual(@as(u64, 4), try journal.appendAll(io, &batch, .group));
     }
     const whole = try ws.read(try ws.segment(1));
     try testing.expectEqual(@as(usize, 5), std.mem.count(u8, whole, "\n"));
@@ -819,7 +819,7 @@ fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
     try testing.expectEqual(@as(u64, 3), try journal.appendAll(io, &.{
         .{ .at = 2, .event = created(2, "two") },
         .{ .at = 3, .event = created(3, "three") },
-    }));
+    }, .group));
     try testing.expect(!(try journal.status(io)).persistence_failed);
     try testing.expectEqual(@as(u32, 3), fold.events);
     try journal.snapshot(io, "state");
@@ -4328,11 +4328,11 @@ test "an append that keeps no record allocates nothing" {
     _ = try journal.append(io, 1, created(1, "a name of some length"));
     var batch: [10]Journal.Entry = undefined;
     for (&batch, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "a name of some length") };
-    _ = try journal.appendAll(io, &batch);
+    _ = try journal.appendAll(io, &batch, .group);
     const settled = counting.allocations;
 
     for (0..200) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name of some length"));
-    for (0..20) |_| _ = try journal.appendAll(io, &batch);
+    for (0..20) |_| _ = try journal.appendAll(io, &batch, .group);
     try testing.expectEqual(settled, counting.allocations);
 
     // And what it wrote is what a reader reads.
@@ -5291,7 +5291,7 @@ fn fuzzRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
             const last = if (n == 1)
                 try journal.append(io, batch[0].at, batch[0].event)
             else
-                try journal.appendAll(io, batch[0..n]);
+                try journal.appendAll(io, batch[0..n], .group);
             try testing.expectEqual(before + n, last);
             for (batch[0..n], before + 1..) |entry, seq| {
                 try appended.append(a, entry);
@@ -5813,7 +5813,7 @@ test "five folds over one pass parse each event once" {
     const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 0 });
     defer journal.deinit(io);
     const entries: [100]J.Entry = @splat(.{ .at = 1, .event = .{ .id = 1, .name = "a name" } });
-    for (0..count / entries.len) |_| _ = try journal.appendAll(io, &entries);
+    for (0..count / entries.len) |_| _ = try journal.appendAll(io, &entries, .group);
     var one: CountedEvent.Fold = .{};
     const before = CountedEvent.parses;
     try journal.subscribe(io, one.sink());
@@ -5866,7 +5866,7 @@ test "a batch shares one durable record sync" {
     var batch: [100]Journal.Entry = undefined;
     for (&batch, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "a name") };
     const singly = journalState(journal).log.record_syncs;
-    for (0..count / batch.len) |_| _ = try journal.appendAll(io, &batch);
+    for (0..count / batch.len) |_| _ = try journal.appendAll(io, &batch, .group);
     try testing.expectEqual(singly + count / batch.len, journalState(journal).log.record_syncs);
     try testing.expectEqual(@as(u64, 2 * count), try journal.verify(io));
 }
@@ -6184,9 +6184,9 @@ test "a larger batch nobody keeps needs no larger working memory" {
     const journal = try Journal.open(counting.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
     defer journal.deinit(io);
     var entries: [1024]Journal.Entry = @splat(.{ .at = 0, .event = created(1, "one line") });
-    _ = try journal.appendAll(io, entries[0..1]);
+    _ = try journal.appendAll(io, entries[0..1], .group);
     const settled = counting.allocations;
-    try testing.expectEqual(@as(u64, 1025), try journal.appendAll(io, &entries));
+    try testing.expectEqual(@as(u64, 1025), try journal.appendAll(io, &entries, .group));
     try testing.expectEqual(settled, counting.allocations);
 }
 
@@ -6206,7 +6206,7 @@ test "checking a batch nobody keeps holds only one parsed record at a time" {
     gpa.requested_memory_limit = gpa.total_requested_bytes + 64 * 1024;
     const name: [2048]u8 = @splat('n');
     const entries: [128]Journal.Entry = @splat(.{ .at = 0, .event = created(1, &name) });
-    try testing.expectEqual(@as(u64, 128), try journal.appendAll(io, &entries));
+    try testing.expectEqual(@as(u64, 128), try journal.appendAll(io, &entries, .group));
     // Replaying has its own read buffer; the allowance above is for writes.
     gpa.requested_memory_limit = std.math.maxInt(usize);
     try testing.expectEqual(@as(u64, 128), try journal.verify(io));
@@ -6916,4 +6916,217 @@ test "a zero read buffer still opens replays and backs up whole records" {
         try testing.expectEqualStrings("one", record.event.created.name);
     }
     try testing.expectEqual(null, try walk.next(io));
+}
+
+//========================================================================
+// Atomic batches: all of a batch, or none of it.
+//========================================================================
+
+fn atomicEntries() [3]Journal.Entry {
+    return .{
+        .{ .at = 3, .event = created(3, "three") },
+        .{ .at = 4, .event = created(4, "four") },
+        .{ .at = 5, .event = created(5, "five") },
+    };
+}
+
+test "every record of an atomic batch names the batch, and one written alone does not" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+        _ = try journal.appendAll(io, &.{.{ .at = 2, .event = created(2, "alone") }}, .atomic);
+        const batch = atomicEntries();
+        try testing.expectEqual(@as(u64, 5), try journal.appendAll(io, &batch, .atomic));
+        try testing.expectEqual(@as(u64, 5), try journal.verify(io));
+    }
+    const bytes = try ws.read(try ws.segment(1));
+    var lines = std.mem.splitScalar(u8, bytes, '\n');
+    _ = lines.next();
+    for ([_]?[]const u8{ null, null, ",\"bf\":3,\"bl\":5,\"ev\":", ",\"bf\":3,\"bl\":5,\"ev\":", ",\"bf\":3,\"bl\":5,\"ev\":" }) |marker| {
+        const line = lines.next().?;
+        if (marker) |m| try testing.expect(std.mem.indexOf(u8, line, m) != null) else try testing.expect(std.mem.indexOf(u8, line, "\"bf\"") == null);
+    }
+    // Reopened, the same five records, the batch read whole.
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 5), try reopened.verify(io));
+}
+
+/// A journal of records 1 and 2, then an atomic or a group batch of 3 to 5,
+/// in `ws`: its segment file's bytes, and where the batch begins in them.
+fn batchedLog(ws: *Workspace, commit: Journal.Commit) !struct { bytes: []u8, from: usize } {
+    const io = testing.io;
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+        _ = try journal.append(io, 2, created(2, "two"));
+        const batch = atomicEntries();
+        _ = try journal.appendAll(io, &batch, commit);
+    }
+    const bytes = try ws.read(try ws.segment(1));
+    const from = std.mem.indexOf(u8, bytes, "{\"seq\":3,").?;
+    return .{ .bytes = bytes, .from = from };
+}
+
+test "a log cut anywhere inside an atomic batch opens without any of it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const log = try batchedLog(&ws, .atomic);
+
+    // Every cut from the batch's first byte to the byte before its last
+    // newline: a crash at any point of the batch's write.
+    for (log.from + 1..log.bytes.len) |cut| {
+        var each = try Workspace.init("cut");
+        defer each.deinit();
+        try each.write(try each.segment(1), log.bytes[0..cut]);
+
+        // A reader beside the writer never shortens the file, and reads
+        // none of the batch.
+        {
+            const reader = try Journal.open(testing.allocator, io, each.path, .{ .access = .read });
+            defer reader.deinit(io);
+            try testing.expectEqual(@as(u64, 2), try reader.lastSeq(io));
+            try testing.expectEqual(@as(u64, 2), try reader.verify(io));
+        }
+        // A writer may not drop it when told not to.
+        try testing.expectError(error.TruncatedRecord, Journal.open(testing.allocator, io, each.path, .{ .on_truncated = .fail }));
+        // And drops it whole when it may, then carries on after record 2.
+        {
+            const journal = try Journal.open(testing.allocator, io, each.path, .{});
+            defer journal.deinit(io);
+            try testing.expectEqual(@as(u64, 2), try journal.lastSeq(io));
+            try testing.expectEqual(@as(u64, cut - log.from), (try journal.status(io)).dropped_bytes);
+            try testing.expectEqual(@as(u64, 3), try journal.append(io, 9, created(9, "after")));
+            try testing.expectEqual(@as(u64, 3), try journal.verify(io));
+        }
+        const reopened = try Journal.open(testing.allocator, io, each.path, .{});
+        defer reopened.deinit(io);
+        try testing.expectEqual(@as(u64, 3), try reopened.verify(io));
+    }
+
+    // Uncut, the batch is there.
+    const whole = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer whole.deinit(io);
+    try testing.expectEqual(@as(u64, 5), try whole.lastSeq(io));
+}
+
+test "a group batch cut inside keeps the prefix that reached the file" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const log = try batchedLog(&ws, .group);
+    const fourth = std.mem.indexOf(u8, log.bytes, "{\"seq\":5,").?;
+    try ws.write(try ws.segment(1), log.bytes[0 .. fourth + 3]);
+    try ws.root.deleteFile(testing.io, try ws.index(1));
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 4), try journal.lastSeq(io));
+}
+
+test "a reader beside the writer reads a batch once its last record is there" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const log = try batchedLog(&ws, .atomic);
+    const last = std.mem.indexOf(u8, log.bytes, "{\"seq\":5,").?;
+
+    var each = try Workspace.init("live");
+    defer each.deinit();
+    try each.write(try each.segment(1), log.bytes[0..last]);
+    const reader = try Journal.open(testing.allocator, io, each.path, .{ .access = .read });
+    defer reader.deinit(io);
+    const walk = try reader.replay(io, 0);
+    defer walk.deinit(io);
+    try testing.expectEqual(@as(u64, 1), (try walk.next(io)).?.seq);
+    try testing.expectEqual(@as(u64, 2), (try walk.next(io)).?.seq);
+    // Records 3 and 4 are in the file, and their batch is not finished.
+    try testing.expectEqual(@as(?Journal.Record, null), try walk.next(io));
+    try testing.expectEqual(@as(?Journal.Record, null), try walk.next(io));
+
+    // The writer finishes the batch; the same walk goes on through it.
+    try each.write(try each.segment(1), log.bytes);
+    for ([_]u64{ 3, 4, 5 }) |seq| try testing.expectEqual(seq, (try walk.next(io)).?.seq);
+    try testing.expectEqual(@as(?Journal.Record, null), try walk.next(io));
+}
+
+test "an atomic batch stays in one segment past the segment's limits" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(2, 4));
+    defer journal.deinit(io);
+    _ = try journal.append(io, 1, created(1, "one"));
+    _ = try journal.append(io, 2, created(2, "two"));
+    var batch: [5]Journal.Entry = undefined;
+    for (&batch, 0..) |*entry, i| entry.* = .{ .at = @intCast(i + 3), .event = created(@intCast(i + 3), "batched") };
+    try testing.expectEqual(@as(u64, 7), try journal.appendAll(io, &batch, .atomic));
+    // The full segment was left for the batch's first record, and the batch
+    // kept to the one it began, five records in a segment of two.
+    try testing.expectEqual(@as(usize, 2), try journal.segmentCount(io));
+    try testing.expect(ws.exists(try ws.segment(3)));
+    try testing.expectEqual(@as(u64, 8), try journal.append(io, 8, created(8, "next")));
+    try testing.expectEqual(@as(usize, 3), try journal.segmentCount(io));
+    try testing.expect(ws.exists(try ws.segment(8)));
+    try testing.expectEqual(@as(u64, 8), try journal.verify(io));
+}
+
+test "a batch that does not run from its first record to its last is refused by a walk" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var written: Handwritten = try .init(1, 7);
+    defer written.deinit();
+    try written.record(1, 1, 1, "{\"removed\":{\"id\":1}}");
+    var covered: [128]u8 = undefined;
+    // Record 2 names a batch of 2 to 3, and record 3 names none.
+    try written.checked(try std.fmt.bufPrint(&covered, "{{\"seq\":2,\"at\":1,\"v\":1,\"p\":{d},\"bf\":2,\"bl\":3,\"ev\":{{\"removed\":{{\"id\":2}}}}", .{written.link}));
+    try written.record(3, 1, 1, "{\"removed\":{\"id\":3}}");
+    try ws.write(try ws.segment(1), written.written());
+    // The tail an open reads back is walked like any other stretch of the
+    // log, by a writer and by a reader.
+    try testing.expectError(error.BrokenBatch, Journal.open(testing.allocator, io, ws.path, .{}));
+    try testing.expectError(error.BrokenBatch, Journal.open(testing.allocator, io, ws.path, .{ .access = .read }));
+}
+
+test "a backup taken beside an unfinished batch ends before it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const log = try batchedLog(&ws, .atomic);
+    const last = std.mem.indexOf(u8, log.bytes, "{\"seq\":5,").?;
+    var each = try Workspace.init("live");
+    defer each.deinit();
+    try each.write(try each.segment(1), log.bytes[0 .. last + 7]);
+    const reader = try Journal.open(testing.allocator, io, each.path, .{ .access = .read });
+    defer reader.deinit(io);
+    const dest = try each.beside("copy");
+    try testing.expectEqual(@as(u64, 2), try reader.backup(io, dest));
+    // What was copied is whole: it opens with nothing to drop.
+    const copy = try Journal.open(testing.allocator, io, dest, .{ .on_truncated = .fail });
+    defer copy.deinit(io);
+    try testing.expectEqual(@as(u64, 2), try copy.lastSeq(io));
+}
+
+test "a compaction that keeps part of a batch keeps a log that reads" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    _ = try batchedLog(&ws, .atomic);
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        try journal.compact(io, 3);
+        try testing.expectEqual(@as(u64, 2), try journal.verify(io));
+        try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "after")));
+    }
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 3), try reopened.verify(io));
+    try testing.expectEqual(@as(u64, 4), try reopened.oldestSeq(io));
 }
