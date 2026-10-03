@@ -31,10 +31,6 @@ const strand = @import("jsonl.zig").strand;
 
 const Log = @This();
 
-/// Directories cannot be `fsync`ed on Windows, so the promise that a file has
-/// been *named* durably is a POSIX-only one; see README.md.
-const can_sync_dir = builtin.os.tag != .windows;
-
 /// The file a writer holds its advisory lock on. It is never read or written:
 /// locking a data file instead would mean the lock changed identity every time
 /// a segment rotated.
@@ -2381,17 +2377,16 @@ fn closeActive(log: *Log, io: Io) void {
     }
 }
 
-/// `fsync` the log's directory, so that a file this process created or renamed
-/// is still named after a power cut. Windows has no equivalent; there the call
-/// is nothing, and README.md says so.
+/// Sync the log's directory, so that a file this process created or renamed
+/// is still named after a power cut: `strand.syncDir`, the call a file's sync
+/// is on POSIX. Windows has no equivalent; there the call is nothing, and
+/// README.md says so.
 pub fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
     return syncDirHandle(io, log.dir);
 }
 
 fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
-    if (!can_sync_dir) return;
-    const as_file: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
-    try syncFile(io, as_file, .whole);
+    _ = try strand.syncDir(dir, io);
 }
 
 fn deleteSegmentFiles(log: *Log, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {
