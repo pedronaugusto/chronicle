@@ -78,14 +78,15 @@ const SegmentHeader = struct {
     /// records are.
     root: u32,
 
+    /// The members the line holds, in the order it holds them.
+    const Shape = struct { chronicle: u32, base: u64, root: u32 };
+
     /// The line, without its newline. Long enough for twenty digits of `base`
     /// and ten of `root`.
     pub fn line(header: SegmentHeader, buffer: *[96]u8) []const u8 {
-        return std.fmt.bufPrint(
-            buffer,
-            "{{\"chronicle\":{d},\"base\":{d},\"root\":{d}}}",
-            .{ header.version, header.base_seq, header.root },
-        ) catch unreachable;
+        var out: std.Io.Writer = .fixed(buffer);
+        strand.writeValue(&out, Shape{ .chronicle = header.version, .base = header.base_seq, .root = header.root }, .{}) catch unreachable;
+        return out.buffered();
     }
 };
 
@@ -114,12 +115,9 @@ fn parseSegmentHeader(gpa: Allocator, line: []const u8) Allocator.Error!?Segment
 }
 
 fn quickSegmentHeader(line: []const u8) ?SegmentHeader {
-    var at: usize = 0;
-    const version = envelopes.member(u32, line, &at, "{\"chronicle\":") orelse return null;
-    const base_seq = envelopes.member(u64, line, &at, ",\"base\":") orelse return null;
-    const root = envelopes.member(u32, line, &at, ",\"root\":") orelse return null;
-    if (at + 1 != line.len or line[at] != '}') return null;
-    return .{ .version = version, .base_seq = base_seq, .root = root };
+    const read = strand.leadingIntMembers(SegmentHeader.Shape, line) orelse return null;
+    if (read.end + 1 != line.len) return null;
+    return .{ .version = read.value.chronicle, .base_seq = read.value.base, .root = read.value.root };
 }
 
 /// What `open` does with a final line the previous writer did not finish.

@@ -3,8 +3,9 @@
 //! This package writes both in one shape — `{"seq":…,"at":…,"v":…,"p":…,
 //! "ev":…,"c":…}` and `{"chronicle":…,"base":…,"root":…}`, no whitespace,
 //! members in that order — and every read of a record goes through its
-//! envelope, so that shape is read here directly: one integer member reader
-//! for all of it, and the checksum found from the end of the line. A line in
+//! envelope, so that shape is read here directly: its leading integers off
+//! the bytes by strand (`leadingIntMembers`), and the checksum found from the
+//! end of the line. A line in
 //! any other shape, a record written by hand, has its members read by strand
 //! as their bytes, and a member is an integer only when it is written as one
 //! (`integerOf`), which is what a reader of this format has always taken.
@@ -14,22 +15,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const strand = @import("jsonl.zig").strand;
-
-/// One integer member at `at.*`: `opening`, then the integer, a minus in
-/// front of it only where `T` is signed. Parsed as a `T` and stepped over;
-/// null when the member is not there, is not an integer or does not fit.
-pub fn member(comptime T: type, line: []const u8, at: *usize, comptime opening: []const u8) ?T {
-    if (!std.mem.startsWith(u8, line[at.*..], opening)) return null;
-    const from = at.* + opening.len;
-    var end = from;
-    if (@typeInfo(T).int.signedness == .signed and end < line.len and line[end] == '-') end += 1;
-    const digits = end;
-    while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
-    if (end == digits) return null;
-    const value = std.fmt.parseInt(T, line[from..end], 10) catch return null;
-    at.* = end;
-    return value;
-}
 
 /// A member's value as an integer when it is one written as one — no
 /// fraction, no exponent, not a string — and within an `i64`. Null for
@@ -84,20 +69,17 @@ pub const Head = struct {
 /// The envelope of a record in exactly the shape this package writes, read
 /// out of what its checksum covers. Null to say "read it as members".
 pub fn quick(covered: []const u8) ?Head {
-    var at: usize = 0;
-    const seq = member(i64, covered, &at, "{\"seq\":") orelse return null;
-    const when = member(i64, covered, &at, ",\"at\":") orelse return null;
-    const version = member(u32, covered, &at, ",\"v\":") orelse return null;
-    const link = member(u32, covered, &at, ",\"p\":") orelse return null;
+    const Envelope = struct { seq: i64, at: i64, v: u32, p: u32 };
+    const read = strand.leadingIntMembers(Envelope, covered) orelse return null;
     const ev_prefix = ",\"ev\":";
-    if (!std.mem.startsWith(u8, covered[at..], ev_prefix)) return null;
-    if (seq < 1) return null;
+    if (!std.mem.startsWith(u8, covered[read.end..], ev_prefix)) return null;
+    if (read.value.seq < 1) return null;
     return .{
-        .seq = @intCast(seq),
-        .at = when,
-        .v = version,
-        .p = link,
-        .ev = .{ .from = at + ev_prefix.len, .to = covered.len },
+        .seq = @intCast(read.value.seq),
+        .at = read.value.at,
+        .v = read.value.v,
+        .p = read.value.p,
+        .ev = .{ .from = read.end + ev_prefix.len, .to = covered.len },
     };
 }
 
@@ -139,15 +121,12 @@ pub const Stamp = struct {
 /// is read as members, on an arena over `gpa` that is gone when this
 /// returns.
 pub fn stamp(gpa: Allocator, line: []const u8) Allocator.Error!?Stamp {
-    var at: usize = 0;
     quick: {
-        const seq = member(i64, line, &at, "{\"seq\":") orelse break :quick;
-        const when = member(i64, line, &at, ",\"at\":") orelse break :quick;
-        // The member has to end where a member ends, or these were the
-        // first digits of something else.
-        if (at >= line.len or line[at] != ',') break :quick;
-        if (seq < 1) return null;
-        return .{ .seq = @intCast(seq), .at = when };
+        const read = strand.leadingIntMembers(struct { seq: i64, at: i64 }, line) orelse break :quick;
+        // A record goes on past its stamp.
+        if (line[read.end] != ',') break :quick;
+        if (read.value.seq < 1) return null;
+        return .{ .seq = @intCast(read.value.seq), .at = read.value.at };
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -216,6 +195,7 @@ test "the written shape and any other read as the same envelope" {
         "{\"seq\":\"7\",\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":7.0,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":7e0,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
+        "{\"seq\":07,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":0,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":9223372036854775808,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":1,\"at\":1,\"v\":4294967296,\"p\":1,\"ev\":1}",
@@ -226,6 +206,8 @@ test "the written shape and any other read as the same envelope" {
     }) |line| {
         try testing.expectError(error.Corrupt, members(a, line));
     }
+    // A zero in front of digits is not a JSON integer, off the bytes or not.
+    try testing.expectEqual(@as(?Head, null), quick("{\"seq\":07,\"at\":1,\"v\":1,\"p\":1,\"ev\":1"));
     // A record whose `p` is inside its event as well as its envelope is read
     // for its envelope's.
     const shadowed = "{\"ev\":{\"q\":1,\"p\":99},\"seq\":1,\"at\":1,\"v\":1,\"p\":5,\"c\":3}";

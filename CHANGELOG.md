@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Write a record open and its checksum as a member through strand, and read the envelope's and the segment header's leading integers with strand, rather than trimming a brace and scanning digits here. The bytes on disk are unchanged; a journal written before is read and its records written again byte for byte. A leading integer with a zero in front of its digits, which is not JSON, is no longer read off the bytes and is refused as the parser refuses it.
+
 - Reject undeclared dependencies, duplicate layer membership and imports of source executables.
 
 - Give JSON Lines one adapter below the journal and its storage.
