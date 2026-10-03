@@ -4308,6 +4308,20 @@ test "two hundred thousand records open and replay within bounded memory" {
 /// One corpus entry for a test whose first call is `Smith.slice`: a
 /// little-endian byte count and then the bytes, which is how that call reads
 /// one byte string out of the fuzzer's input.
+/// `std.testing.io` around one input of `zig build test --fuzz`.
+///
+/// The test runner sets it up around each test of an ordinary run, and not
+/// around the inputs a fuzzing run feeds one target: there it is never
+/// initialised, and the first task it starts -- a clean open inspects its
+/// sealed segments concurrently -- allocates through a null allocator.
+fn fuzzingIo() void {
+    if (builtin.fuzz) testing.io_instance = .init(testing.allocator, .{});
+}
+
+fn fuzzedIo() void {
+    if (builtin.fuzz) testing.io_instance.deinit();
+}
+
 fn seeded(comptime body: []const u8) []const u8 {
     comptime {
         var entry: [4 + body.len]u8 = undefined;
@@ -4647,6 +4661,8 @@ test "fuzz: open of arbitrary segment contents, and the repair it promises" {
 }
 
 fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     // Bounded so that a generated run of `[` cannot recurse the JSON parser
     // deeper than a stack holds. A journal record is not adversarial input.
@@ -4719,6 +4735,8 @@ test "fuzz: a segment whose first line is arbitrary" {
 }
 
 fn fuzzFraming(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     var buffer: [256]u8 = undefined;
     const head = buffer[0..smith.slice(&buffer)];
@@ -4763,6 +4781,8 @@ test "fuzz: an arbitrary index file is a cache, never an answer" {
 }
 
 fn fuzzIndex(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     var buffer: [512]u8 = undefined;
     const bytes = buffer[0..smith.slice(&buffer)];
@@ -4818,6 +4838,8 @@ const crash_corpus = [_][]const u8{
 };
 
 fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
         error.EnvironmentVariableMissing => return error.SkipZigTest,
@@ -4953,6 +4975,8 @@ test "fuzz: an arbitrary cursor file names a place in the log or an error" {
 }
 
 fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     var buffer: [512]u8 = undefined;
     const bytes = buffer[0..smith.slice(&buffer)];
@@ -5009,6 +5033,8 @@ test "fuzz: openWithSnapshot over an arbitrary snapshot file" {
 }
 
 fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     var buffer: [1024]u8 = undefined;
     const bytes = buffer[0..smith.slice(&buffer)];
