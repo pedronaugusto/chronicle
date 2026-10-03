@@ -65,6 +65,10 @@ pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len:0]u8 
     return Log.segmentName(base_seq, segment_extension);
 }
 
+pub fn indexName(base_seq: u64) [Log.name_digits + index_extension.len:0]u8 {
+    return Log.segmentName(base_seq, index_extension);
+}
+
 /// The version stamped into the two documents that live beside the log: the
 /// snapshot and a named reader's cursor. Neither is part of the log — one is
 /// a copy of a fold and the other is a number a reader keeps — but both are
@@ -1210,6 +1214,11 @@ pub fn Journal(comptime Event: type) type {
             /// How many unterminated bytes were dropped from the newest
             /// segment during opening or recovery. Zero when none were dropped.
             dropped_bytes: usize,
+            /// The call the records last got when they were made durable:
+            /// `flush`, or on Linux `.data` for a write into reserved space,
+            /// and `.plain` where the filesystem declined the stronger call
+            /// — `F_FULLFSYNC` on a network mount. Null before a sync.
+            flushed: ?Flush,
         };
 
         pub fn status(self: *Self, io: Io) Io.Cancelable!Status {
@@ -1218,6 +1227,7 @@ pub fn Journal(comptime Event: type) type {
             return .{
                 .persistence_failed = self.write_failed,
                 .dropped_bytes = self.log.dropped_bytes,
+                .flushed = self.log.flushed,
             };
         }
 
@@ -1704,32 +1714,24 @@ pub fn Journal(comptime Event: type) type {
             }
             // The record is `Line` written by strand, which writes what
             // `std.json` writes (null optionals included, as `std.json`'s
-            // default has it), with its closing brace left off: that is
-            // where the checksum goes.
-            const w = &out.writer;
-            strand.writeValue(w, Line{
+            // default has it), left open: the checksum is its last member.
+            var record = strand.writeObjectOpen(&out.writer, Line{
                 .seq = seq,
                 .at = at,
                 .v = self.config.schema_version,
                 .p = back_link,
                 .ev = event,
             }, .{ .emit_null_optional_fields = true }) catch |err| return encoding.diagnose(err);
-            w.end -= 1;
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
             // it.
-            const covered = out.written();
-            const sum = checksum(covered);
-            // Form the trailer once: the bound counts the exact stored line,
-            // including the checksum's decimal digits, before any file write.
-            var trailer_buffer: [16]u8 = undefined;
-            const trailer = std.fmt.bufPrint(&trailer_buffer, ",\"c\":{d}}}", .{sum}) catch unreachable;
-            if (covered.len > self.config.max_record_bytes or
-                trailer.len > self.config.max_record_bytes - covered.len)
-            {
-                return error.RecordTooLarge;
-            }
-            w.writeAll(trailer) catch return error.OutOfMemory;
+            const covered_len = out.written().len;
+            const sum = checksum(out.written());
+            record.member("c", sum) catch return error.OutOfMemory;
+            record.close() catch return error.OutOfMemory;
+            // The bound counts the exact stored line, the checksum's digits
+            // included, before any file write.
+            if (out.written().len > self.config.max_record_bytes) return error.RecordTooLarge;
 
             if (!needs_record) {
                 const stored = out.written();
@@ -1743,7 +1745,6 @@ pub fn Journal(comptime Event: type) type {
                 };
             }
 
-            const covered_len = covered.len;
             const stored = out.toOwnedSlice() catch return error.OutOfMemory;
             self.record_hint = stored.len;
             // The event is read back out of the bytes that will be written,

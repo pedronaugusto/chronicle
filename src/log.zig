@@ -20,7 +20,6 @@
 //!
 //! This file is internal. `chronicle.zig` is the package.
 
-const builtin = @import("builtin");
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
@@ -30,10 +29,6 @@ const envelopes = @import("envelope.zig");
 const strand = @import("jsonl.zig").strand;
 
 const Log = @This();
-
-/// Directories cannot be `fsync`ed on Windows, so the promise that a file has
-/// been *named* durably is a POSIX-only one; see README.md.
-const can_sync_dir = builtin.os.tag != .windows;
 
 /// The file a writer holds its advisory lock on. It is never read or written:
 /// locking a data file instead would mean the lock changed identity every time
@@ -78,14 +73,15 @@ const SegmentHeader = struct {
     /// records are.
     root: u32,
 
+    /// The members the line holds, in the order it holds them.
+    const Shape = struct { chronicle: u32, base: u64, root: u32 };
+
     /// The line, without its newline. Long enough for twenty digits of `base`
     /// and ten of `root`.
     pub fn line(header: SegmentHeader, buffer: *[96]u8) []const u8 {
-        return std.fmt.bufPrint(
-            buffer,
-            "{{\"chronicle\":{d},\"base\":{d},\"root\":{d}}}",
-            .{ header.version, header.base_seq, header.root },
-        ) catch unreachable;
+        var out: std.Io.Writer = .fixed(buffer);
+        strand.writeValue(&out, Shape{ .chronicle = header.version, .base = header.base_seq, .root = header.root }, .{}) catch unreachable;
+        return out.buffered();
     }
 };
 
@@ -114,12 +110,9 @@ fn parseSegmentHeader(gpa: Allocator, line: []const u8) Allocator.Error!?Segment
 }
 
 fn quickSegmentHeader(line: []const u8) ?SegmentHeader {
-    var at: usize = 0;
-    const version = envelopes.member(u32, line, &at, "{\"chronicle\":") orelse return null;
-    const base_seq = envelopes.member(u64, line, &at, ",\"base\":") orelse return null;
-    const root = envelopes.member(u32, line, &at, ",\"root\":") orelse return null;
-    if (at + 1 != line.len or line[at] != '}') return null;
-    return .{ .version = version, .base_seq = base_seq, .root = root };
+    const read = strand.leadingIntMembers(SegmentHeader.Shape, line) orelse return null;
+    if (read.end + 1 != line.len) return null;
+    return .{ .version = read.value.chronicle, .base_seq = read.value.base, .root = read.value.root };
 }
 
 /// What `open` does with a final line the previous writer did not finish.
@@ -150,26 +143,20 @@ pub const Sync = enum {
     never,
 };
 
-/// The call a durable write makes on a platform.
-pub const Flush = enum {
-    /// `fcntl(F_FULLFSYNC)`: the bytes are on the drive's media, not only in
-    /// its write cache. Darwin, where `fsync` promises the weaker thing.
-    full_fsync,
-    /// `fsync(2)`, or `fdatasync(2)` for a write that did not change the
-    /// file's length. What that means past the drive's cache is the drive's
-    /// promise and the operating system's.
-    fsync,
-    /// `NtFlushBuffersFile`, which is what `Io.File.sync` does on Windows.
-    flush_buffers,
-};
+/// The call a durable write makes: strand's, since strand makes it.
+/// `.full` is `fcntl(F_FULLFSYNC)`, the bytes on the drive's media and not
+/// only in its write cache; `.data` is `fdatasync(2)`, for a write that did
+/// not change the file's length; `.plain` is `fsync(2)`, or on Windows
+/// `NtFlushBuffersFile`.
+pub const Flush = strand.SyncKind;
 
-/// What `Sync.always` issues here. `chronicle.flush` re-exports it, and
-/// README.md's durability rules are written per platform from it.
-pub const flush: Flush = switch (builtin.os.tag) {
-    .macos, .ios, .tvos, .watchos, .visionos => .full_fsync,
-    .windows => .flush_buffers,
-    else => .fsync,
-};
+/// What `Sync.always` asks for here: `F_FULLFSYNC` on Darwin, where `fsync`
+/// promises the weaker thing, and the ordinary call elsewhere. A filesystem
+/// that declines `F_FULLFSYNC` gets `fsync`, which is then the strongest it
+/// has; `Status.flushed` says which call a journal's records actually got.
+/// `chronicle.flush` re-exports it, and README.md's durability rules are
+/// written per platform from it.
+pub const flush: Flush = Flush.asked(.all);
 
 /// How much of a file has to reach the disk.
 const Level = enum {
@@ -188,10 +175,20 @@ const Level = enum {
 /// blocks the calling thread, as `Io.File.sync` does. An interrupted call is
 /// made again; a failure is reported, never answered with a weaker call.
 fn syncFile(io: Io, file: Io.File, level: Level) Io.File.SyncError!void {
-    _ = try strand.syncFile(file, io, switch (level) {
+    _ = try syncKind(io, file, level);
+}
+
+/// `syncFile`, saying which call did it.
+fn syncKind(io: Io, file: Io.File, level: Level) Io.File.SyncError!Flush {
+    return strand.syncFile(file, io, switch (level) {
         .whole => .all,
         .contents => .data,
     });
+}
+
+/// `syncFile` for the active segment, noting which call its records got.
+fn syncActiveFile(log: *Log, io: Io, level: Level) Io.File.SyncError!void {
+    log.flushed = try syncKind(io, log.active.?.file, level);
 }
 
 /// Whether this process may write to the log.
@@ -378,6 +375,9 @@ segment_scans: u64,
 /// by a commit. Not part of any promise either: what the suite counts to
 /// prove that a deferred record is left to the next one.
 record_syncs: u64,
+/// The call the active segment's records last got from a sync, or null
+/// before one. See `Journal.Status.flushed`.
+flushed: ?Flush,
 /// One open handle on a sealed segment's index, kept between seeks. A fold
 /// that seeks repeatedly stays in one segment for as long as it is reading
 /// it, so one handle is the whole of the win and a cache is not needed.
@@ -480,6 +480,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenErro
         .index_reads = 0,
         .segment_scans = 0,
         .record_syncs = 0,
+        .flushed = null,
         .held_index = null,
     };
     errdefer {
@@ -2038,7 +2039,7 @@ fn syncActive(log: *Log, io: Io) Io.File.SyncError!void {
     const active = &log.active.?;
     const segment = log.segments.items[log.segments.items.len - 1];
     const level: Level = if (segment.bytes <= active.preallocated) .contents else .whole;
-    return syncFile(io, active.file, level);
+    return log.syncActiveFile(io, level);
 }
 
 /// Seal the active segment and start a new one named after the record that
@@ -2052,7 +2053,7 @@ fn rotate(log: *Log, io: Io) AppendError!void {
         const active = &log.active.?;
         try active.writer.interface.flush();
         try log.trimPreallocation(io);
-        if (log.options.sync != .never) try syncFile(io, active.file, .whole);
+        if (log.options.sync != .never) try log.syncActiveFile(io, .whole);
         try active.index_writer.interface.flush();
         // A seal that cannot be written leaves an index the next open reads
         // as stale and rebuilds, which is a cost and not a wrong answer -- but
@@ -2383,17 +2384,16 @@ fn closeActive(log: *Log, io: Io) void {
     }
 }
 
-/// `fsync` the log's directory, so that a file this process created or renamed
-/// is still named after a power cut. Windows has no equivalent; there the call
-/// is nothing, and README.md says so.
+/// Sync the log's directory, so that a file this process created or renamed
+/// is still named after a power cut: `strand.syncDir`, the call a file's sync
+/// is on POSIX. Windows has no equivalent; there the call is nothing, and
+/// README.md says so.
 pub fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
     return syncDirHandle(io, log.dir);
 }
 
 fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
-    if (!can_sync_dir) return;
-    const as_file: Io.File = .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
-    try syncFile(io, as_file, .whole);
+    _ = try strand.syncDir(dir, io);
 }
 
 fn deleteSegmentFiles(log: *Log, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {
@@ -2631,7 +2631,7 @@ pub fn syncBeforeSnapshot(log: *Log, io: Io) SnapshotError!void {
     if (log.active == null) return error.ReadOnly;
     const active = &log.active.?;
     try active.writer.interface.flush();
-    try syncFile(io, active.file, .whole);
+    try log.syncActiveFile(io, .whole);
 }
 
 //========================================================================

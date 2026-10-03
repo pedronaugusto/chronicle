@@ -82,6 +82,13 @@ pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len:0]u8 
     return implementation.segmentName(base_seq);
 }
 
+/// The name of the index beside the segment `segmentName(base_seq)` names:
+/// a cache of where its records are, which `open` rebuilds when it is gone
+/// or does not describe the segment.
+pub fn indexName(base_seq: u64) [Log.name_digits + index_extension.len:0]u8 {
+    return implementation.indexName(base_seq);
+}
+
 /// The version stamped into the two documents that live beside the log: the
 /// snapshot and a named reader's cursor. Neither is part of the log — one is
 /// a copy of a fold and the other is a number a reader keeps — but both are

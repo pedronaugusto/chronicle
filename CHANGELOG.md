@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Breaking:** `Flush` is `strand.SyncKind` and `flush` is what strand asks for at the whole-file level (`SyncKind.asked(.all)`): `.full` on Darwin and `.plain` elsewhere, replacing `.full_fsync`, `.fsync` and `.flush_buffers`. `Status.flushed` is the call a journal's records last got, which on a Darwin filesystem that declines `F_FULLFSYNC` is `.plain` rather than the `flush` the constant names.
+
+- Sync the journal's directory with `strand.syncDir` rather than a file handle borrowed from it: the same calls as before — `F_FULLFSYNC` on macOS, `fsync` on Linux, nothing on Windows.
+
+- `indexName`, the name of the index file beside a segment, next to `segmentName`, for a caller that removes or inspects it.
+
+- Write a record open and its checksum as a member through strand, and read the envelope's and the segment header's leading integers with strand, rather than trimming a brace and scanning digits here. The bytes on disk are unchanged; a journal written before is read and its records written again byte for byte. A leading integer with a zero in front of its digits, which is not JSON, is no longer read off the bytes and is refused as the parser refuses it.
+
 - Reject undeclared dependencies, duplicate layer membership and imports of source executables.
 
 - Give JSON Lines one adapter below the journal and its storage.
