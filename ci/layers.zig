@@ -55,3 +55,17 @@ pub const required = blk: {
     };
     break :blk paths;
 };
+
+/// Tokens only their owners may spell: durability, file identity and the
+/// JSON codec are strand's; tests may check against `std.json`.
+pub const owned: []const gantry.rules.TokenRule = &.{
+    .{ .name = "sync owner", .token = "fsync" },
+    .{ .name = "sync owner", .token = "fdatasync" },
+    .{ .name = "sync owner", .token = "F_FULLFSYNC" },
+    .{ .name = "sync owner", .token = "FlushFileBuffers" },
+    .{ .name = "file identity owner", .token = "statx" },
+    .{ .name = "file identity owner", .token = "fstat" },
+    .{ .name = "json owner", .token = "Stringify", .owners = &.{"src/*_test.zig"} },
+    .{ .name = "json owner", .token = "parseFromSlice", .owners = &.{"src/*_test.zig"} },
+    .{ .name = "json owner", .token = "parseFromSliceLeaky", .owners = &.{"src/*_test.zig"} },
+};
