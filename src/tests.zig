@@ -5,4 +5,5 @@ test {
     @import("std").testing.refAllDecls(chronicle);
     _ = @import("journal_test.zig");
     _ = @import("envelope.zig");
+    _ = @import("crc32c.zig");
 }

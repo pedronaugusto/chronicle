@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- `checksum` runs three CRC32C instruction chains side by side over a buffer of 768 bytes or more and joins them with a shift table, as zlib-ng and the crc32c crates do; the value is unchanged.
+
 - An open that refuses the log closes the index file it was reading; each such refusal used to keep one descriptor open.
 
 - An empty segment with segments after it is refused as `UnsupportedFormat` and left in place. Only the newest can be a rotation that crashed before its header; open removed one in the middle as if it were, and then refused the log anyway.
