@@ -1,6 +1,36 @@
-"""The existing journal, follow, raw and counted-work jobs."""
+"""Every public operation: the journal, follow, raw and counted-work jobs and the rest."""
+import shutil
+
 PACKAGE = 'chronicle'
-COMPARISONS = ['Go tidwall/wal v1.2.1', 'Rust OkayWAL 0.3.1', 'plain Zig files (strong and weak sync)']
+COMPARISONS = ['Go tidwall/wal v1.2.1', 'Rust OkayWAL 0.3.1', 'plain Zig files (strong and weak sync)',
+               'CRC32C: Go hash/crc32 (Castagnoli), Rust crc32c 0.6.8, Zig std Crc32Iscsi',
+               'chronicle open with verify = .full beside OkayWAL recovery (both read every record)',
+               'backup: a byte copy with the same syncs (Zig std files)']
+UNAVAILABLE = [
+    'OkayWAL: no no-sync or explicit batching API (append_no_fsync, group_commit)',
+    'before: copySince is new since the before pin (waitPast handed back the records then)',
+    'verify, seq-at, subscribe-from, refresh, wait-past, tailer, snapshot, close: tidwall/wal and OkayWAL have no '
+    'equivalent (no record checksums to verify in tidwall, no time index, no subscriptions, no in-process wait, '
+    'no named cursors, no snapshot beside the log)',
+    'seek, deferred, compact, truncate-after in OkayWAL: no read by entry id without a recovery scan, no explicit sync, '
+    'its checkpoint is not a cut at a sequence',
+    'drop-before in tidwall/wal: TruncateFront always rewrites the segment it cuts (that is compact)',
+]
+
+
+def agree(workload):
+    """Every `checksum` row must match across the sides that print it."""
+    seen = {}
+    def validate(side, rows):
+        found = [r for r in rows if r['unit'] == 'checksum']
+        if not found:
+            raise RuntimeError(f'{workload}/{side}: no checksum rows')
+        for r in found:
+            key = (r['workload'], r['metric'])
+            first = seen.setdefault(key, (side, r['value']))
+            if first[1] != r['value']:
+                raise RuntimeError(f'{workload}/{side}: {key[0]} {key[1]} differs from {first[0]}')
+    return validate
 
 
 def run(p, bins):
@@ -38,6 +68,10 @@ def run(p, bins):
                 reps = 1 if p.smoke else {'before': 200, 'after': 200, 'tidwall': 100, 'OkayWAL': 1, 'plain': 20000}[side]
                 args += [reps]
             sides.append((side, args))
+        if mode == 'clean_reopen':
+            # The same work as OkayWAL's open: every record read and checked.
+            sides += [(f'{side}-verify-full', [bins[side] / 'cover-bench', 'reopen-full', data[side], 1 if p.smoke else 5])
+                      for side in ('before', 'after')]
         if mode == 'append_fsync':
             sides.append(('plain-weak-sync', [bins['after'] / 'plain-zig-bench', 'append_fsync_weak',
                                             input_path, p.scratch / 'plain-weak-sync', sync_count]))
@@ -54,3 +88,46 @@ def run(p, bins):
                               raw_count]) for side, exe in tools[:2]])
     p.group('counted-work', [(side, [bins[side] / 'work-bench', p.scratch / f'{side}-counted-work'])
                              for side in ('before', 'after')], parser='work')
+
+    # The rest of the public operations.
+    go_cover = p.scratch / 'go-cover'
+    p.setup_command([p.tool('go'), 'build', '-p=1', '-mod=readonly', '-trimpath', '-ldflags=-s -w',
+                     '-o', go_cover, './src/go_cover.go'])
+    p.prepared.require(go_cover)
+    crc = p.env['CARGO_TARGET_DIR'] + '/release/crc-bench'
+    cover = {side: bins[side] / 'cover-bench' for side in ('before', 'after')}
+
+    def ours(mode, *args, before=True):
+        return [(side, [cover[side], mode, *[a(side) if callable(a) else a for a in args]])
+                for side in (('before', 'after') if before else ('after',))]
+    def fresh(name):
+        return lambda side: p.scratch / f'{side}-{name}'
+    def clear(name):
+        def prepare(side):
+            shutil.rmtree(p.scratch / f'{side}-{name}', ignore_errors=True)
+        return prepare
+    own_data = lambda side: data[side]
+
+    p.group('checksum', ours('checksum') + [('zig-std-Crc32Iscsi', [cover['after'], 'checksum-std']),
+                                            ('go-hash-crc32', [go_cover, 'checksum']), ('rust-crc32c', [crc])],
+            validate=agree('checksum'))
+    p.group('verify', ours('verify', own_data), validate=agree('verify'))
+    p.group('seek', ours('seek', own_data) + [('tidwall', [go_cover, 'seek', data['tidwall']])], validate=agree('seek'))
+    p.group('seq-at', ours('seq-at', own_data), validate=agree('seq-at'))
+    p.group('subscribe-from', ours('subscribe-from', own_data), validate=agree('subscribe-from'))
+    for job, mode, before in (('copy-since', 'copy-since', False), ('refresh', 'refresh', True),
+                              ('wait-past', 'wait-past', True), ('tailer', 'tailer', True),
+                              ('snapshot', 'snapshot', True), ('close', 'close', True)):
+        p.group(job, ours(mode, fresh(job), before=before), prepare=clear(job),
+                validate=None if job == 'close' else agree(job))
+    p.group('append-deferred', ours('deferred', fresh('deferred')) + [('tidwall', [go_cover, 'deferred', fresh('deferred')('tidwall')])],
+            prepare=clear('deferred'), validate=agree('append-deferred'))
+    def retention_dir(side):
+        directory = p.scratch / f'{side}-retention'
+        shutil.rmtree(directory, ignore_errors=True)
+        directory.mkdir(parents=True)
+    p.group('retention', ours('retention', fresh('retention')) + [('tidwall', [go_cover, 'retention', fresh('retention')('tidwall')])],
+            prepare=retention_dir, validate=agree('retention'))
+    p.group('backup', ours('backup', own_data, fresh('backup')) +
+            [('std-copy', [cover['after'], 'backup-copy', data['after'], fresh('backup')('std-copy')])],
+            validate=agree('backup'))

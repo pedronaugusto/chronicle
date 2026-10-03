@@ -8,7 +8,12 @@ publish = false
 name = "okaywal-bench"
 path = "src/okaywal_bench.rs"
 
+[[bin]]
+name = "crc-bench"
+path = "src/crc_bench.rs"
+
 [dependencies]
+crc32c = "=0.6.8"
 okaywal = "=0.3.1"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.151"

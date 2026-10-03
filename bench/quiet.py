@@ -142,7 +142,7 @@ class Pass:
                 if self.smoke:
                     # Keep only counts/booleans; discard all timing/throughput/ratios.
                     item['correctness'] = [r for r in rows if r['unit'] in
-                                           {'events', 'files', 'bool', 'renames', 'records', 'bytes'}]
+                                           {'events', 'files', 'bool', 'renames', 'records', 'bytes', 'checksum'}]
                     self.data['checks'].append(item)
                 else:
                     item['metrics'] = rows
@@ -237,7 +237,7 @@ def paired(samples):
         if sample['side'] not in ('before', 'after'):
             continue
         for row in sample['metrics']:
-            if row['value'] is None or row['unit'] in {'events', 'files', 'bool', 'renames', 'records', 'bytes'} or row['metric'] == 'target':
+            if row['value'] is None or row['unit'] in {'events', 'files', 'bool', 'renames', 'records', 'bytes', 'checksum'} or row['metric'] == 'target':
                 continue
             key = (sample['job'], row['workload'], row['metric'], row['unit'], sample['trial'])
             values.setdefault(key, {})[sample['side']] = row['value']
