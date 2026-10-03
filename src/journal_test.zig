@@ -3529,6 +3529,30 @@ test "a file whose name only parses as a segment's number is not a segment" {
     for (strays) |name| try testing.expectEqualStrings(first, try ws.read(try ws.sub(name)));
 }
 
+test "an empty segment in the middle of the log is damage, not a rotation to undo" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(1, 4));
+        defer journal.deinit(io);
+        for (1..5) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // A rotation that crashed before its header leaves an empty file, and
+    // only ever as the newest segment. One with segments after it is a
+    // segment that lost even the line that says what it is: refused for
+    // that, and left where it is.
+    try ws.write(try ws.segment(2), "");
+    for ([_]chronicle.OnTruncated{ .fail, .drop }) |mode| {
+        try testing.expectError(
+            error.UnsupportedFormat,
+            Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = mode, .sync = .never }),
+        );
+        try testing.expect(ws.exists(try ws.segment(2)));
+    }
+}
+
 test "a segment in an older framing is refused by name, not read" {
     const io = testing.io;
     var ws = try Workspace.init("log");

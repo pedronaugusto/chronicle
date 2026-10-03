@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- An empty segment with segments after it is refused as `UnsupportedFormat` and left in place. Only the newest can be a rotation that crashed before its header; open removed one in the middle as if it were, and then refused the log anyway.
+
 - A record's checksum is read only as a JSON integer: one written with a `0` in front of its digits made a line that is not JSON, and it was accepted as a record and handed out as its bytes.
 
 - A file in the journal's directory is a segment or an index only under the twenty digits its name is written with. A name with a sign or a `_` among them, which `parseInt` reads as the same number, was taken for a second copy of that segment, and an open deleted the real one.

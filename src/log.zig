@@ -673,7 +673,9 @@ fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
             if (later.count() == 0) {
                 var measured_later = later;
                 measured_later.bytes = try log.fileLength(io, &segmentName(later.base_seq, segment_extension));
-                if (measured_later.bytes == 0) {
+                // Only ever the newest: a segment with others after it was
+                // published, and an empty one there has lost its records.
+                if (measured_later.bytes == 0 and i + 2 == log.segments.items.len) {
                     // The name was created but its header was not published.
                     // Treat the rotation or empty compaction as not having
                     // happened; the preceding segment is still authoritative.
