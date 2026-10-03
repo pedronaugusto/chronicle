@@ -84,7 +84,9 @@ writeback to the operating system. Structural replacement flushes still apply un
 policies.
 
 Durable writes use `fcntl(F_FULLFSYNC)` on macOS, `fsync` on Linux with `fdatasync` for
-writes into reserved space, and `NtFlushBuffersFile` on Windows. The implementation
+writes into reserved space, and `NtFlushBuffersFile` on Windows: strand's `syncFile`. A
+macOS filesystem that declines `F_FULLFSYNC` gets `fsync`, and `status().flushed` says
+which call the records got. The implementation
 syncs directory changes on POSIX. Windows cannot provide that directory-sync guarantee,
 so record flushing does not guarantee a new filename survives power loss.
 

@@ -1214,6 +1214,11 @@ pub fn Journal(comptime Event: type) type {
             /// How many unterminated bytes were dropped from the newest
             /// segment during opening or recovery. Zero when none were dropped.
             dropped_bytes: usize,
+            /// The call the records last got when they were made durable:
+            /// `flush`, or on Linux `.data` for a write into reserved space,
+            /// and `.plain` where the filesystem declined the stronger call
+            /// — `F_FULLFSYNC` on a network mount. Null before a sync.
+            flushed: ?Flush,
         };
 
         pub fn status(self: *Self, io: Io) Io.Cancelable!Status {
@@ -1222,6 +1227,7 @@ pub fn Journal(comptime Event: type) type {
             return .{
                 .persistence_failed = self.write_failed,
                 .dropped_bytes = self.log.dropped_bytes,
+                .flushed = self.log.flushed,
             };
         }
 

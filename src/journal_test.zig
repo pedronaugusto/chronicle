@@ -922,11 +922,23 @@ test "the durable write is the one this platform needs" {
     // platform row changes, this fails rather than the document going quietly
     // out of date.
     const expected: chronicle.Flush = switch (builtin.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => .full_fsync,
-        .windows => .flush_buffers,
-        else => .fsync,
+        .macos, .ios, .tvos, .watchos, .visionos => .full,
+        else => .plain,
     };
     try testing.expectEqual(expected, chronicle.flush);
+    // And it is strand's answer, not one restated here.
+    try testing.expectEqual(chronicle.Flush.asked(.all), chronicle.flush);
+
+    // What a record got is what the filesystem answered: the call asked for
+    // where it takes it, which the one under the suite does.
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(?chronicle.Flush, null), (try journal.status(io)).flushed);
+    _ = try journal.append(io, 1, created(1, "n"));
+    try testing.expectEqual(@as(?chronicle.Flush, chronicle.flush), (try journal.status(io)).flushed);
 }
 
 test "a reserved segment is written into rather than extended, and reserves nothing when closed" {

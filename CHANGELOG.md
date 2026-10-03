@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- **Breaking:** `Flush` is `strand.SyncKind` and `flush` is what strand asks for at the whole-file level (`SyncKind.asked(.all)`): `.full` on Darwin and `.plain` elsewhere, replacing `.full_fsync`, `.fsync` and `.flush_buffers`. `Status.flushed` is the call a journal's records last got, which on a Darwin filesystem that declines `F_FULLFSYNC` is `.plain` rather than the `flush` the constant names.
+
 - Sync the journal's directory with `strand.syncDir` rather than a file handle borrowed from it: the same calls as before — `F_FULLFSYNC` on macOS, `fsync` on Linux, nothing on Windows.
 
 - `indexName`, the name of the index file beside a segment, next to `segmentName`, for a caller that removes or inspects it.
