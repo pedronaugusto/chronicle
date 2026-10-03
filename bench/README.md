@@ -14,7 +14,7 @@ segment. Reports retain no timing, rate or ratio values. A successful smoke run
 supports no performance claim.
 
 `revisions.json` fixes A at `9792f666ea550879bb077fe2ba5aef697323525d` and B at
-`991fab9f04870a8b6e723c5a7bd91b8123ff1aa4`. A retains the original
+`38b8b8e7bd1d3963f452293fee735a52f8d9f8cb`, the final main. A retains the original
 **2026-09-30 00:00:00 +01:00** cutoff. `--before REV --after REV` selects other
 immutable snapshots; refresh the pins when main advances.
 

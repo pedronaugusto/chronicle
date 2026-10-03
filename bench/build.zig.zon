@@ -6,8 +6,8 @@
     .dependencies = .{
         .chronicle = .{ .path = ".." },
         .after = .{
-            .url = "https://github.com/pedronaugusto/chronicle/archive/991fab9f04870a8b6e723c5a7bd91b8123ff1aa4.tar.gz",
-            .hash = "chronicle-0.6.0-cnph1A7qCQBGZSERzGQwQFVMxsxaLAOJrnQn1bgiF9Ra",
+            .url = "https://github.com/pedronaugusto/chronicle/archive/38b8b8e7bd1d3963f452293fee735a52f8d9f8cb.tar.gz",
+            .hash = "chronicle-0.6.0-cnph1DkDCgD1IDoeNbnKmWtCJPcFaJD7d8LJfNm3bBuf",
         },
     },
     .paths = .{ "build.zig", "build.zig.zon", "src" },
