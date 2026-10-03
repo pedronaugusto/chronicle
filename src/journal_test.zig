@@ -6919,6 +6919,124 @@ test "a zero read buffer still opens replays and backs up whole records" {
 }
 
 //========================================================================
+// Conditional appends: expected last sequence number.
+//========================================================================
+
+test "an append that expects the newest record appends only while it is still the newest" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+
+    // An empty journal is one whose newest record is 0.
+    try testing.expectEqual(@as(u64, 1), try journal.appendIf(io, .{ .last = 0 }, 1, created(1, "one")));
+    var found: u64 = 99;
+    try testing.expectError(error.WrongExpectedSeq, journal.appendIf(io, .{ .last = 0, .found = &found }, 2, created(2, "late")));
+    try testing.expectEqual(@as(u64, 1), found);
+    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+    try testing.expectEqual(@as(u64, 2), try journal.appendIf(io, .{ .last = 1 }, 2, created(2, "two")));
+
+    // A batch: all of it or none of it goes on the expectation, an empty
+    // one included.
+    const batch = [_]Journal.Entry{
+        .{ .at = 3, .event = created(3, "three") },
+        .{ .at = 4, .event = created(4, "four") },
+    };
+    try testing.expectError(error.WrongExpectedSeq, journal.appendAllIf(io, .{ .last = 1, .found = &found }, &batch, .group));
+    try testing.expectEqual(@as(u64, 2), found);
+    try testing.expectError(error.WrongExpectedSeq, journal.appendAllIf(io, .{ .last = 1 }, &.{}, .atomic));
+    try testing.expectEqual(@as(u64, 2), try journal.appendAllIf(io, .{ .last = 2 }, &.{}, .atomic));
+    try testing.expectEqual(@as(u64, 4), try journal.appendAllIf(io, .{ .last = 2 }, &batch, .atomic));
+    try testing.expectEqual(@as(u64, 4), try journal.verify(io));
+}
+
+test "an expectation is not looked at by a journal that refuses every append" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+    }
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    defer reader.deinit(io);
+    try testing.expectError(error.ReadOnly, reader.appendIf(io, .{ .last = 7 }, 2, created(2, "no")));
+}
+
+/// One of several writers that fold the journal and append what they
+/// decided, each expecting the record it folded to: every success is the
+/// one record after what it expected.
+const Racer = struct {
+    journal: *Journal,
+    id: u32,
+    rounds: u64,
+    won: std.ArrayList(u64) = .empty,
+    lost: u64 = 0,
+
+    fn run(racer: *Racer, io: Io) anyerror!void {
+        var last = try racer.journal.lastSeq(io);
+        while (last < racer.rounds) {
+            var found: u64 = 0;
+            if (racer.journal.appendIf(io, .{ .last = last, .found = &found }, @intCast(last + 1), created(racer.id, "racing"))) |seq| {
+                if (seq != last + 1) return error.TestNotTheNextRecord;
+                try racer.won.append(testing.allocator, seq);
+                last = seq;
+            } else |err| switch (err) {
+                error.WrongExpectedSeq => {
+                    if (found <= last) return error.TestFoundNotAhead;
+                    racer.lost += 1;
+                    last = found;
+                },
+                else => |e| return e,
+            }
+        }
+    }
+};
+
+test "of several writers expecting the same record, exactly one appends after it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+
+    const rounds = 600;
+    var racers: [6]Racer = undefined;
+    for (&racers, 0..) |*racer, i| racer.* = .{ .journal = journal, .id = @intCast(i), .rounds = rounds };
+    defer for (&racers) |*racer| racer.won.deinit(testing.allocator);
+
+    var tasks: [racers.len]Io.Future(anyerror!void) = undefined;
+    var started: usize = 0;
+    defer for (tasks[0..started]) |*task| task.cancel(io) catch {};
+    for (&racers, &tasks) |*racer, *task| {
+        task.* = io.concurrent(Racer.run, .{ racer, io }) catch |err| switch (err) {
+            error.ConcurrencyUnavailable => return error.SkipZigTest,
+        };
+        started += 1;
+    }
+    for (tasks[0..started]) |*task| try task.await(io);
+    started = 0;
+
+    // Every sequence number has exactly one winner, and the log is exactly
+    // the records the winners appended, in order.
+    var winners = [_]u8{0} ** (rounds + 1);
+    for (&racers) |*racer| for (racer.won.items) |seq| {
+        winners[seq] += 1;
+    };
+    for (winners[1..]) |count| try testing.expectEqual(@as(u8, 1), count);
+    try testing.expectEqual(@as(u64, rounds), try journal.lastSeq(io));
+    try testing.expectEqual(@as(u64, rounds), try journal.verify(io));
+    const walk = try journal.replay(io, 0);
+    defer walk.deinit(io);
+    while (try walk.next(io)) |record| {
+        const id = record.event.created.id;
+        try testing.expect(std.mem.indexOfScalar(u64, racers[id].won.items, record.seq) != null);
+    }
+}
+
+//========================================================================
 // Atomic batches: all of a batch, or none of it.
 //========================================================================
 

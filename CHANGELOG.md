@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- `appendIf` and `appendAllIf` append only while the newest record is still the one the caller expected, as an event store's expected revision; otherwise they return `error.WrongExpectedSeq` with the newest sequence number in `Expected.found`, and write nothing.
+
 - **Breaking:** `appendAll` takes a `Commit`. `.group` is what it did: one sync, and a crash may leave a prefix. `.atomic` writes the batch's first and last sequence numbers (`"bf"`, `"bl"`) into each of its records and keeps it in one segment; an open drops a batch the log ends inside whole, as it drops a torn line, a reader beside the writer reads a batch once it is whole, and a walk refuses a batch that does not run from its first record to its last with `error.BrokenBatch`.
 
 - `readers` and `minCursor` leave out a reader whose cursor file is deleted between the directory listing and its read, as a `forget` from another process can do; it was listed at cursor 0, which held every record back from retention.

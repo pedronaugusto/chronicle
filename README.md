@@ -80,7 +80,10 @@ syncs the record before publishing it or returning its sequence number; `appendA
 shares a record sync across a batch. A `.group` batch cut by a crash leaves a prefix; an
 `.atomic` batch names its first and last records in each of its records, stays in one
 segment, and is dropped whole by an open that finds the log ending inside it. Readers
-beside the writer read an atomic batch only once it is whole. `appendDeferred` publishes before durability and requires a later flush. The
+beside the writer read an atomic batch only once it is whole. `appendIf` and
+`appendAllIf` append only while the newest record is still the one the caller expected,
+and otherwise return `error.WrongExpectedSeq` with the newest sequence number.
+`appendDeferred` publishes before durability and requires a later flush. The
 `.on_segment` policy syncs at sealing and close; `.never` leaves record writeback to the
 operating system. Structural replacement flushes still apply under both policies.
 

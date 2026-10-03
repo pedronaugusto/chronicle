@@ -532,6 +532,21 @@ pub fn Journal(comptime Event: type) type {
         pub const AppendError = Allocator.Error || Log.AppendError ||
             error{ PersistenceFailed, NotRoundTrippable, SequenceExhausted, RecordTooLarge };
 
+        /// `AppendError`, and `WrongExpectedSeq`: the journal's newest record
+        /// is not the one the caller expected, and nothing was written.
+        pub const AppendIfError = AppendError || error{WrongExpectedSeq};
+
+        /// What a conditional append expects of the journal.
+        pub const Expected = struct {
+            /// The sequence number the newest record must still have: zero
+            /// for a journal that must still be empty.
+            last: u64,
+            /// Where `error.WrongExpectedSeq` leaves the sequence number the
+            /// newest record has instead, read under the same lock as the
+            /// comparison. Not written when the append goes ahead.
+            found: ?*u64 = null,
+        };
+
         /// How `appendAll` commits a batch.
         pub const Commit = enum {
             /// One sync for the batch, and no more: a crash inside it leaves
@@ -747,14 +762,34 @@ pub fn Journal(comptime Event: type) type {
         //====================================================================
 
         pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
-            return self.appendOne(io, at, event, .now);
+            return self.appendOne(io, null, at, event, .now) catch |err| switch (err) {
+                error.WrongExpectedSeq => unreachable,
+                else => |e| return e,
+            };
         }
 
         pub fn appendDeferred(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
-            return self.appendOne(io, at, event, .deferred);
+            return self.appendOne(io, null, at, event, .deferred) catch |err| switch (err) {
+                error.WrongExpectedSeq => unreachable,
+                else => |e| return e,
+            };
         }
 
-        fn appendOne(self: *Self, io: Io, at: i64, event: Event, durability: enum { now, deferred }) AppendError!u64 {
+        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: i64, event: Event) AppendIfError!u64 {
+            return self.appendOne(io, expected, at, event, .now);
+        }
+
+        /// Refuse a conditional append whose journal has moved on. Called
+        /// under the lock, after everything that says the journal cannot be
+        /// appended to at all, and before anything is written.
+        fn expect(self: *const Self, expected: ?Expected) error{WrongExpectedSeq}!void {
+            const want = expected orelse return;
+            if (self.seq == want.last) return;
+            if (want.found) |found| found.* = self.seq;
+            return error.WrongExpectedSeq;
+        }
+
+        fn appendOne(self: *Self, io: Io, expected: ?Expected, at: i64, event: Event, durability: enum { now, deferred }) AppendIfError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -768,6 +803,7 @@ pub fn Journal(comptime Event: type) type {
             // one.
             if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
+            try self.expect(expected);
             if (self.seq >= std.math.maxInt(i64)) return error.SequenceExhausted;
 
             const next = self.seq + 1;
@@ -801,6 +837,17 @@ pub fn Journal(comptime Event: type) type {
         }
 
         pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!u64 {
+            return self.appendBatch(io, null, entries, commit) catch |err| switch (err) {
+                error.WrongExpectedSeq => unreachable,
+                else => |e| return e,
+            };
+        }
+
+        pub fn appendAllIf(self: *Self, io: Io, expected: Expected, entries: []const Entry, commit: Commit) AppendIfError!u64 {
+            return self.appendBatch(io, expected, entries, commit);
+        }
+
+        fn appendBatch(self: *Self, io: Io, expected: ?Expected, entries: []const Entry, commit: Commit) AppendIfError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -811,6 +858,7 @@ pub fn Journal(comptime Event: type) type {
             defer _ = io.swapCancelProtection(protection);
             if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
+            try self.expect(expected);
             if (entries.len == 0) return self.seq;
             if (entries.len > std.math.maxInt(i64) - self.seq) return error.SequenceExhausted;
 

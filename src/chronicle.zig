@@ -300,6 +300,16 @@ pub fn Journal(comptime Event: type) type {
         /// * `ReadOnly` — the journal was opened with `Access.read`.
         pub const AppendError = State.AppendError;
 
+        /// `AppendError`, and `WrongExpectedSeq`: the newest record is not the
+        /// one the caller expected, so nothing was written. `Expected.found`
+        /// says which it is.
+        pub const AppendIfError = State.AppendIfError;
+
+        /// What `appendIf` and `appendAllIf` expect of the journal: the
+        /// sequence number its newest record must still have, and where to
+        /// say what it has instead.
+        pub const Expected = State.Expected;
+
         /// How `appendAll` commits a batch: `.group`, one sync and a crash may
         /// leave a prefix, or `.atomic`, one sync and all or nothing.
         pub const Commit = State.Commit;
@@ -549,6 +559,33 @@ pub fn Journal(comptime Event: type) type {
         /// Safe to call from any task or thread.
         pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!u64 {
             return State.appendAll(self.inner(), io, entries, commit);
+        }
+
+        /// `append`, only if the newest record is still `expected.last`:
+        /// optimistic concurrency, as an event store's expected revision. A
+        /// writer that folds the journal, decides, and appends what it decided
+        /// passes the sequence number it folded to, and a writer that lost the
+        /// race to another gets `error.WrongExpectedSeq`, with the newest
+        /// sequence number in `expected.found`, and nothing written — fold the
+        /// records it missed and decide again. The comparison and the append
+        /// are one step under the journal's lock, so of several writers
+        /// expecting the same sequence number exactly one appends.
+        ///
+        /// A journal that refuses every append — opened for reading, latched
+        /// by a failed write — says that first.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: i64, event: Event) AppendIfError!u64 {
+            return State.appendIf(self.inner(), io, expected, at, event);
+        }
+
+        /// `appendAll`, only if the newest record is still `expected.last`:
+        /// `appendIf` for a batch. An empty batch checks the expectation and
+        /// writes nothing.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn appendAllIf(self: *Self, io: Io, expected: Expected, entries: []const Entry, commit: Commit) AppendIfError!u64 {
+            return State.appendAllIf(self.inner(), io, expected, entries, commit);
         }
 
         /// Re-read the journal after an append persistence failure and report
