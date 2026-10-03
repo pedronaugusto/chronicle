@@ -6867,4 +6867,3 @@ test "a zero read buffer still opens replays and backs up whole records" {
     }
     try testing.expectEqual(null, try walk.next(io));
 }
-
