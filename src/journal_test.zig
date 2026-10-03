@@ -3817,6 +3817,84 @@ fn expectStdJsonRecord(comptime E: type, record: chronicle.Journal(E).Record, ve
     try testing.expectEqualStrings(want.written(), record.bytes);
 }
 
+/// A journal as chronicle 991fab9 wrote it, before strand wrote the open
+/// object and read the leading integers: three segments of the events below,
+/// three records each, appended at 1_790_000_000_000 and a millisecond apart.
+const written_before = struct {
+    const Kept = union(enum) {
+        note: struct { text: []const u8, by: ?[]const u8 },
+        count: struct { n: i64, big: u64 },
+        tags: []const []const u8,
+        empty,
+    };
+    const events = [_]Kept{
+        .{ .note = .{ .text = "opened", .by = "ada" } },
+        .{ .count = .{ .n = -42, .big = std.math.maxInt(u64) } },
+        .{ .note = .{ .text = "quote \" back\\slash\nnewline \u{e9} \u{1f600}", .by = null } },
+        .{ .tags = &.{ "a", "", "c d" } },
+        .empty,
+        .{ .count = .{ .n = std.math.minInt(i64), .big = 0 } },
+        .{ .note = .{ .text = "closed", .by = "\u{0}\u{1f}" } },
+    };
+    const first_at: i64 = 1_790_000_000_000;
+    const segments = [_]struct { base: u64, bytes: []const u8 }{
+        .{ .base = 1, .bytes =
+        \\{"chronicle":1,"base":1,"root":1746389379}
+        \\{"seq":1,"at":1790000000000,"v":1,"p":1746389379,"ev":{"note":{"text":"opened","by":"ada"}},"c":3608083353}
+        \\{"seq":2,"at":1790000000001,"v":1,"p":3608083353,"ev":{"count":{"n":-42,"big":18446744073709551615}},"c":2405624118}
+        \\{"seq":3,"at":1790000000002,"v":1,"p":2405624118,"ev":{"note":{"text":"quote \" back\\slash\nnewline é 😀","by":null}},"c":2284513303}
+        ++ "\n" },
+        .{ .base = 4, .bytes =
+        \\{"chronicle":1,"base":4,"root":2284513303}
+        \\{"seq":4,"at":1790000000003,"v":1,"p":2284513303,"ev":{"tags":["a","","c d"]},"c":755855603}
+        \\{"seq":5,"at":1790000000004,"v":1,"p":755855603,"ev":{"empty":{}},"c":483705945}
+        \\{"seq":6,"at":1790000000005,"v":1,"p":483705945,"ev":{"count":{"n":-9223372036854775808,"big":0}},"c":4152690782}
+        ++ "\n" },
+        .{ .base = 7, .bytes =
+        \\{"chronicle":1,"base":7,"root":4152690782}
+        \\{"seq":7,"at":1790000000006,"v":1,"p":4152690782,"ev":{"note":{"text":"closed","by":"\u0000\u001f"}},"c":4024117481}
+        ++ "\n" },
+    };
+};
+
+test "a journal written before reads as written, and its records are written again byte for byte" {
+    const io = testing.io;
+    const J = chronicle.Journal(written_before.Kept);
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    for (written_before.segments) |segment| try ws.write(try ws.segment(segment.base), segment.bytes);
+    const options: J.Options = .{ .max_segment_records = 3, .verify = .full };
+
+    {
+        const journal = try J.open(testing.allocator, io, ws.path, options);
+        errdefer journal.deinit(io);
+        const read = try journal.copySince(testing.allocator, io, 0);
+        defer read.deinit();
+        try testing.expectEqual(written_before.events.len, read.records().len);
+        for (read.records(), written_before.events, 0..) |record, event, i| {
+            try testing.expectEqual(@as(u64, i + 1), record.seq);
+            try testing.expectEqual(written_before.first_at + @as(i64, @intCast(i)), record.at);
+            try testing.expectEqualDeep(event, record.event);
+        }
+
+        // Cut back to the second record and append the rest again: the
+        // chain is the one already on the disk, so every byte after the cut
+        // — the records, and the headers the rotations write — is the same
+        // byte as before.
+        try journal.truncateAfter(io, 2);
+        try testing.expectEqual(@as(u64, 2), try journal.lastSeq(io));
+        try testing.expect(!ws.exists(try ws.segment(4)));
+        try testing.expect(!ws.exists(try ws.segment(7)));
+        for (written_before.events[2..], 2..) |event, i| {
+            _ = try journal.append(io, written_before.first_at + @as(i64, @intCast(i)), event);
+        }
+        try journal.close(io);
+    }
+    for (written_before.segments) |segment| {
+        try testing.expectEqualStrings(segment.bytes, try ws.read(try ws.segment(segment.base)));
+    }
+}
+
 test "a record is the bytes std.json writes for it, whatever its event's shape" {
     const io = testing.io;
     const ShapeJournal = chronicle.Journal(Shape);
