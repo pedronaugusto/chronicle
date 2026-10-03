@@ -3553,6 +3553,41 @@ test "an empty segment in the middle of the log is damage, not a rotation to und
     }
 }
 
+/// How many descriptors this process has open, for a test that holds an open
+/// which fails to giving back what it took. POSIX only.
+fn openDescriptors() usize {
+    var count: usize = 0;
+    var fd: c_int = 0;
+    while (fd < 1024) : (fd += 1) {
+        if (std.c.fcntl(fd, std.c.F.GETFD) != -1) count += 1;
+    }
+    return count;
+}
+
+test "an open that refuses the log closes every file it opened" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(1, 4));
+        defer journal.deinit(io);
+        for (1..5) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // The oldest segment emptied: the open reads the indexes of the ones
+    // after it before it finds the gap.
+    try ws.write(try ws.segment(1), "");
+    const before = openDescriptors();
+    for (0..3) |_| {
+        try testing.expectError(
+            error.DiscontinuousSeq,
+            Journal.open(testing.allocator, io, ws.path, .{ .sync = .never }),
+        );
+    }
+    try testing.expectEqual(before, openDescriptors());
+}
+
 test "a segment in an older framing is refused by name, not read" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -6832,3 +6867,4 @@ test "a zero read buffer still opens replays and backs up whole records" {
     }
     try testing.expectEqual(null, try walk.next(io));
 }
+

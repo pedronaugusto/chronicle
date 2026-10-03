@@ -489,6 +489,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenErro
     };
     errdefer {
         log.closeActive(io);
+        log.releaseIndex(io);
         log.segments.deinit(gpa);
     }
     try log.load(io);
