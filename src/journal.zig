@@ -1429,11 +1429,11 @@ pub fn Journal(comptime Event: type) type {
                 if (!std.mem.endsWith(u8, entry.name, cursor_extension)) continue;
                 const name = entry.name[0 .. entry.name.len - cursor_extension.len];
                 if (!validTailerName(name)) continue;
-                const owned = try a.dupe(u8, name);
-                try found.append(a, .{
-                    .name = owned,
-                    .cursor = try self.readCursor(io, owned),
-                });
+                // Forgotten since the listing — by another process, since
+                // this one holds the lock: a reader that is gone has nothing
+                // left for retention to keep, so it is not listed at zero.
+                const cursor = try self.committedCursor(io, name) orelse continue;
+                try found.append(a, .{ .name = try a.dupe(u8, name), .cursor = cursor });
             }
             list.items = try found.toOwnedSlice(a);
             return list;
@@ -1520,7 +1520,15 @@ pub fn Journal(comptime Event: type) type {
             };
         }
 
+        /// Where the named reader has got to: zero for a name with no
+        /// cursor file, which is a reader that has never committed.
         fn readCursor(self: *Self, io: Io, name: []const u8) TailerError!u64 {
+            return try self.committedCursor(io, name) orelse 0;
+        }
+
+        /// The named reader's committed cursor, or null when there is no
+        /// cursor file for it.
+        fn committedCursor(self: *Self, io: Io, name: []const u8) TailerError!?u64 {
             const file = try cursorName(self.gpa, name);
             defer self.gpa.free(file);
 
@@ -1540,7 +1548,7 @@ pub fn Journal(comptime Event: type) type {
                 error.Canceled => return error.Canceled,
                 error.UnsupportedFormat => return error.UnsupportedFormat,
                 else => return error.CorruptCursor,
-            } orelse return 0;
+            } orelse return null;
             return document.seq;
         }
 

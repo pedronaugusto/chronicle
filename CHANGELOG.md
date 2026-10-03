@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- `readers` and `minCursor` leave out a reader whose cursor file is deleted between the directory listing and its read, as a `forget` from another process can do; it was listed at cursor 0, which held every record back from retention.
+
 - `checksum` runs three CRC32C instruction chains side by side over a buffer of 768 bytes or more and joins them with a shift table, as zlib-ng and the crc32c crates do; the value is unchanged.
 
 - An open that refuses the log closes the index file it was reading; each such refusal used to keep one descriptor open.

@@ -1506,8 +1506,13 @@ test "waitPast is woken by a nudge with no record behind it" {
     defer group.cancel(io);
     try group.concurrent(io, nudger, .{ journal, io, &woken });
 
-    const nothing = try journal.waitPast(io, 0);
-    woken.store(true, .release);
+    // Set however the wait ends: the nudger stops on it and nothing else,
+    // so a wait that failed would otherwise leave it spinning under the
+    // group's cancel.
+    const nothing = nothing: {
+        defer woken.store(true, .release);
+        break :nothing try journal.waitPast(io, 0);
+    };
     try testing.expectEqual(@as(u64, 0), nothing);
     try group.await(io);
 }
@@ -2044,6 +2049,48 @@ test "retention can see what its readers have consumed" {
     try testing.expectEqual(@as(u64, 5), behind);
     _ = try journal.dropSegmentsBefore(io, behind);
     try testing.expectEqual(@as(u64, 5), (try journal.oldestSeq(io)));
+}
+
+/// An `Io` whose open of a cursor file finds it forgotten first: what a
+/// `forget` from another process looks like when it lands between the
+/// directory listing `readers` reads and the open of the file it listed.
+const ForgottenMidList = struct {
+    var real: std.Io.VTable = undefined;
+
+    fn openFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
+        if (std.mem.eql(u8, sub_path, "gone" ++ chronicle.cursor_extension)) {
+            real.dirDeleteFile(userdata, dir, sub_path) catch {};
+        }
+        return real.dirOpenFile(userdata, dir, sub_path, options);
+    }
+};
+
+test "a reader forgotten while the readers are listed is not listed at cursor zero" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    inline for (.{ .{ "kept", 3 }, .{ "gone", 2 } }) |reader| {
+        const tail = try journal.tailer(io, reader[0]);
+        defer tail.deinit();
+        try tail.commit(io, reader[1]);
+    }
+
+    ForgottenMidList.real = testing.io.vtable.*;
+    var vtable = testing.io.vtable.*;
+    vtable.dirOpenFile = ForgottenMidList.openFile;
+    const racing: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+
+    // A cursor that is not there has consumed nothing a retention decision
+    // can wait for; listing it at zero would hold every record back.
+    const list = try journal.readers(racing);
+    defer list.deinit();
+    try testing.expectEqual(@as(usize, 1), list.items().len);
+    try testing.expectEqualStrings("kept", list.items()[0].name);
+    try testing.expectEqual(@as(?u64, 3), try journal.minCursor(io));
 }
 
 test "a tailer's name has to be one that can be a file" {
