@@ -423,6 +423,10 @@ fn parseSegmentName(name: []const u8) ?u64 {
 fn parseNumberedName(name: []const u8, extension: []const u8) ?u64 {
     if (name.len != name_digits + extension.len) return null;
     if (!std.mem.eql(u8, name[name_digits..], extension)) return null;
+    // Digits and nothing else: `parseInt` also takes a sign and `_` between
+    // digits, and a name spelled that way is another file reading as the
+    // same number, not this package's name for it.
+    for (name[0..name_digits]) |byte| if (!std.ascii.isDigit(byte)) return null;
     const seq = std.fmt.parseInt(u64, name[0..name_digits], 10) catch return null;
     if (seq == 0) return null;
     return seq;

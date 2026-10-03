@@ -3464,6 +3464,49 @@ test "a checksum that is not the last member of its line is not a checksum" {
     );
 }
 
+test "a file whose name only parses as a segment's number is not a segment" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // Twenty characters and the extension, read as a number by a parse that
+    // takes a sign and digit separators. Neither is a name this package
+    // writes, and a copy of the first segment under them is somebody's file.
+    const first = try ws.read(try ws.segment(1));
+    const strays = [_][]const u8{
+        "+0000000000000000001" ++ chronicle.segment_extension,
+        "0000000000000000_001" ++ chronicle.segment_extension,
+        "+0000000000000000005" ++ chronicle.index_extension,
+    };
+    for (strays) |name| try ws.write(try ws.sub(name), first);
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
+        try testing.expectEqual(@as(u64, 5), try journal.verify(io));
+
+        // A backup clears the names it manages in its destination, and only
+        // those.
+        const dest = try ws.beside("copy");
+        try Io.Dir.cwd().createDirPath(io, dest);
+        const dest_dir = try Io.Dir.cwd().openDir(io, dest, .{});
+        defer dest_dir.close(io);
+        for (strays) |name| try dest_dir.writeFile(io, .{ .sub_path = name, .data = "kept" });
+        _ = try journal.backup(io, dest);
+        for (strays) |name| {
+            var buffer: [8]u8 = undefined;
+            try testing.expectEqualStrings("kept", try dest_dir.readFile(io, name, &buffer));
+        }
+    }
+    for (strays) |name| try testing.expectEqualStrings(first, try ws.read(try ws.sub(name)));
+}
+
 test "a segment in an older framing is refused by name, not read" {
     const io = testing.io;
     var ws = try Workspace.init("log");
