@@ -423,6 +423,10 @@ fn parseSegmentName(name: []const u8) ?u64 {
 fn parseNumberedName(name: []const u8, extension: []const u8) ?u64 {
     if (name.len != name_digits + extension.len) return null;
     if (!std.mem.eql(u8, name[name_digits..], extension)) return null;
+    // Digits and nothing else: `parseInt` also takes a sign and `_` between
+    // digits, and a name spelled that way is another file reading as the
+    // same number, not this package's name for it.
+    for (name[0..name_digits]) |byte| if (!std.ascii.isDigit(byte)) return null;
     const seq = std.fmt.parseInt(u64, name[0..name_digits], 10) catch return null;
     if (seq == 0) return null;
     return seq;
@@ -485,6 +489,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenErro
     };
     errdefer {
         log.closeActive(io);
+        log.releaseIndex(io);
         log.segments.deinit(gpa);
     }
     try log.load(io);
@@ -669,7 +674,9 @@ fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
             if (later.count() == 0) {
                 var measured_later = later;
                 measured_later.bytes = try log.fileLength(io, &segmentName(later.base_seq, segment_extension));
-                if (measured_later.bytes == 0) {
+                // Only ever the newest: a segment with others after it was
+                // published, and an empty one there has lost its records.
+                if (measured_later.bytes == 0 and i + 2 == log.segments.items.len) {
                     // The name was created but its header was not published.
                     // Treat the rotation or empty compaction as not having
                     // happened; the preceding segment is still authoritative.

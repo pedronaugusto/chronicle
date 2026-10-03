@@ -3464,6 +3464,133 @@ test "a checksum that is not the last member of its line is not a checksum" {
     );
 }
 
+test "a checksum written with a zero in front of it is not a checksum" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // The number is the record's checksum, but `0` in front of digits is not
+    // a JSON integer, and the line is handed out as a record's durable
+    // bytes: a reader of those bytes would find no JSON in them.
+    var written: Handwritten = try .init(1, 0);
+    defer written.deinit();
+    try written.record(1, 1, 1, "{\"removed\":{\"id\":1}}");
+    const line = written.written();
+    const at = std.mem.lastIndexOf(u8, line, ",\"c\":").? + ",\"c\":".len;
+    const padded = try std.mem.concat(testing.allocator, u8, &.{ line[0..at], "0", line[at..] });
+    defer testing.allocator.free(padded);
+    try ws.write(try ws.segment(1), padded);
+    try testing.expectError(
+        error.CorruptRecord,
+        Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail }),
+    );
+}
+
+test "a file whose name only parses as a segment's number is not a segment" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // Twenty characters and the extension, read as a number by a parse that
+    // takes a sign and digit separators. Neither is a name this package
+    // writes, and a copy of the first segment under them is somebody's file.
+    const first = try ws.read(try ws.segment(1));
+    const strays = [_][]const u8{
+        "+0000000000000000001" ++ chronicle.segment_extension,
+        "0000000000000000_001" ++ chronicle.segment_extension,
+        "+0000000000000000005" ++ chronicle.index_extension,
+    };
+    for (strays) |name| try ws.write(try ws.sub(name), first);
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
+        try testing.expectEqual(@as(u64, 5), try journal.verify(io));
+
+        // A backup clears the names it manages in its destination, and only
+        // those.
+        const dest = try ws.beside("copy");
+        try Io.Dir.cwd().createDirPath(io, dest);
+        const dest_dir = try Io.Dir.cwd().openDir(io, dest, .{});
+        defer dest_dir.close(io);
+        for (strays) |name| try dest_dir.writeFile(io, .{ .sub_path = name, .data = "kept" });
+        _ = try journal.backup(io, dest);
+        for (strays) |name| {
+            var buffer: [8]u8 = undefined;
+            try testing.expectEqualStrings("kept", try dest_dir.readFile(io, name, &buffer));
+        }
+    }
+    for (strays) |name| try testing.expectEqualStrings(first, try ws.read(try ws.sub(name)));
+}
+
+test "an empty segment in the middle of the log is damage, not a rotation to undo" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(1, 4));
+        defer journal.deinit(io);
+        for (1..5) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // A rotation that crashed before its header leaves an empty file, and
+    // only ever as the newest segment. One with segments after it is a
+    // segment that lost even the line that says what it is: refused for
+    // that, and left where it is.
+    try ws.write(try ws.segment(2), "");
+    for ([_]chronicle.OnTruncated{ .fail, .drop }) |mode| {
+        try testing.expectError(
+            error.UnsupportedFormat,
+            Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = mode, .sync = .never }),
+        );
+        try testing.expect(ws.exists(try ws.segment(2)));
+    }
+}
+
+/// How many descriptors this process has open, for a test that holds an open
+/// which fails to giving back what it took: the entries of `/dev/fd`, which
+/// Linux and Darwin both have. The listing's own descriptor is counted every
+/// time, so two counts compare.
+fn openDescriptors() !usize {
+    const io = testing.io;
+    const dir = try Io.Dir.openDirAbsolute(io, "/dev/fd", .{ .iterate = true });
+    defer dir.close(io);
+    var count: usize = 0;
+    var entries = dir.iterate();
+    while (try entries.next(io)) |_| count += 1;
+    return count;
+}
+
+test "an open that refuses the log closes every file it opened" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(1, 4));
+        defer journal.deinit(io);
+        for (1..5) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // The oldest segment emptied: the open reads the indexes of the ones
+    // after it before it finds the gap.
+    try ws.write(try ws.segment(1), "");
+    const before = try openDescriptors();
+    for (0..3) |_| {
+        try testing.expectError(
+            error.DiscontinuousSeq,
+            Journal.open(testing.allocator, io, ws.path, .{ .sync = .never }),
+        );
+    }
+    try testing.expectEqual(before, try openDescriptors());
+}
+
 test "a segment in an older framing is refused by name, not read" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -4219,6 +4346,20 @@ test "two hundred thousand records open and replay within bounded memory" {
 /// One corpus entry for a test whose first call is `Smith.slice`: a
 /// little-endian byte count and then the bytes, which is how that call reads
 /// one byte string out of the fuzzer's input.
+/// `std.testing.io` around one input of `zig build test --fuzz`.
+///
+/// The test runner sets it up around each test of an ordinary run, and not
+/// around the inputs a fuzzing run feeds one target: there it is never
+/// initialised, and the first task it starts -- a clean open inspects its
+/// sealed segments concurrently -- allocates through a null allocator.
+fn fuzzingIo() void {
+    if (builtin.fuzz) testing.io_instance = .init(testing.allocator, .{});
+}
+
+fn fuzzedIo() void {
+    if (builtin.fuzz) testing.io_instance.deinit();
+}
+
 fn seeded(comptime body: []const u8) []const u8 {
     comptime {
         var entry: [4 + body.len]u8 = undefined;
@@ -4558,6 +4699,8 @@ test "fuzz: open of arbitrary segment contents, and the repair it promises" {
 }
 
 fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     // Bounded so that a generated run of `[` cannot recurse the JSON parser
     // deeper than a stack holds. A journal record is not adversarial input.
@@ -4630,6 +4773,8 @@ test "fuzz: a segment whose first line is arbitrary" {
 }
 
 fn fuzzFraming(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     var buffer: [256]u8 = undefined;
     const head = buffer[0..smith.slice(&buffer)];
@@ -4674,6 +4819,8 @@ test "fuzz: an arbitrary index file is a cache, never an answer" {
 }
 
 fn fuzzIndex(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     var buffer: [512]u8 = undefined;
     const bytes = buffer[0..smith.slice(&buffer)];
@@ -4729,6 +4876,8 @@ const crash_corpus = [_][]const u8{
 };
 
 fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
         error.EnvironmentVariableMissing => return error.SkipZigTest,
@@ -4864,6 +5013,8 @@ test "fuzz: an arbitrary cursor file names a place in the log or an error" {
 }
 
 fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     var buffer: [512]u8 = undefined;
     const bytes = buffer[0..smith.slice(&buffer)];
@@ -4920,6 +5071,8 @@ test "fuzz: openWithSnapshot over an arbitrary snapshot file" {
 }
 
 fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
     const io = testing.io;
     var buffer: [1024]u8 = undefined;
     const bytes = buffer[0..smith.slice(&buffer)];
@@ -4949,6 +5102,556 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
         const copied_tail_39 = try journal.copySince(testing.allocator, io, 0);
         defer copied_tail_39.deinit();
         try testing.expect(copied_tail_38.records().len <= copied_tail_39.records().len);
+    }
+}
+
+//========================================================================
+// Round trips, damage, records and stray files over generated input. Each
+// target also runs over seeded rounds below, so that a plain `zig build
+// test` checks the properties and `zig build test --fuzz` goes further.
+//========================================================================
+
+/// A name for an event: bytes that need escaping, bytes that are not UTF-8,
+/// and ordinary letters, so a round trip is asked of every kind of string.
+fn generateName(smith: *testing.Smith, buf: []u8) []u8 {
+    @disableInstrumentation();
+    const pieces = [_][]const u8{ "a", "\"", "\\", "\n", "\x00", "\x1f", "\u{e9}", "\u{1f600}", "\xff", "\xc3", "/", " " };
+    var end: usize = 0;
+    while (!smith.eosWeightedSimple(3, 1)) {
+        const piece = pieces[smith.index(pieces.len)];
+        if (end + piece.len > buf.len) break;
+        @memcpy(buf[end..][0..piece.len], piece);
+        end += piece.len;
+    }
+    return buf[0..end];
+}
+
+/// A fold any sequence of records can be put through: every field of every
+/// record, in order. Two folds agree exactly when they saw the same records.
+const Digest = struct {
+    hash: std.hash.Wyhash = .init(0),
+    records: u64 = 0,
+
+    fn sink(self: *Digest) Journal.Sink {
+        return .{ .ctx = self, .f = applySink };
+    }
+
+    fn applySink(ctx: *anyopaque, record: Journal.Record) void {
+        const self: *Digest = @ptrCast(@alignCast(ctx));
+        self.apply(record.seq, record.at, record.event);
+    }
+
+    fn apply(self: *Digest, seq: u64, at: i64, event: Event) void {
+        self.records += 1;
+        self.hash.update(std.mem.asBytes(&seq));
+        self.hash.update(std.mem.asBytes(&at));
+        self.hash.update(@tagName(event));
+        switch (event) {
+            inline .created, .renamed => |e| {
+                self.hash.update(std.mem.asBytes(&e.id));
+                self.hash.update(std.mem.asBytes(&e.name.len));
+                self.hash.update(e.name);
+            },
+            .removed => |e| self.hash.update(std.mem.asBytes(&e.id)),
+            .unknown => {},
+        }
+    }
+
+    fn final(self: *Digest) u64 {
+        return self.hash.final() ^ self.records;
+    }
+};
+
+fn expectSameEvent(expected: Event, actual: Event) !void {
+    try testing.expectEqual(std.meta.activeTag(expected), std.meta.activeTag(actual));
+    switch (expected) {
+        .created => |e| {
+            try testing.expectEqual(e.id, actual.created.id);
+            try testing.expectEqualStrings(e.name, actual.created.name);
+        },
+        .renamed => |e| {
+            try testing.expectEqual(e.id, actual.renamed.id);
+            try testing.expectEqualStrings(e.name, actual.renamed.name);
+        },
+        .removed => |e| try testing.expectEqual(e.id, actual.removed.id),
+        .unknown => return error.TestUnexpectedUnknown,
+    }
+}
+
+/// Every record after `cursor`, checked against what was appended and the
+/// bytes it was first read back as, and folded.
+fn expectReplayed(journal: *Journal, cursor: u64, appended: []const Journal.Entry, lines: []const []const u8) !u64 {
+    const io = testing.io;
+    var fold: Digest = .{};
+    const walk = try journal.replay(io, cursor);
+    defer walk.deinit(io);
+    var seq = @min(cursor, appended.len);
+    while (try walk.next(io)) |record| {
+        seq += 1;
+        try testing.expectEqual(seq, record.seq);
+        try testing.expectEqual(appended[seq - 1].at, record.at);
+        try testing.expectEqual(@as(u32, 1), record.version);
+        try expectSameEvent(appended[seq - 1].event, record.event);
+        if (lines.len != 0) try testing.expectEqualStrings(lines[seq - 1], record.bytes);
+        fold.apply(record.seq, record.at, record.event);
+    }
+    try testing.expectEqual(@as(u64, appended.len), seq);
+    return fold.final();
+}
+
+test "fuzz: what is appended is what is read back, and folds the same" {
+    try testing.fuzz({}, fuzzRoundTrip, .{});
+}
+
+fn fuzzRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    fuzzingIo();
+    defer fuzzedIo();
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const options = small(smith.valueRangeAtMost(u8, 1, 6), smith.valueRangeAtMost(u8, 1, 6));
+    var appended: std.ArrayList(Journal.Entry) = .empty;
+    var lines: std.ArrayList([]const u8) = .empty;
+    var expected: Digest = .{};
+    var live: Digest = .{};
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        try journal.subscribe(io, live.sink());
+
+        var batch: [4]Journal.Entry = undefined;
+        while (appended.items.len < 24 and !smith.eosWeightedSimple(7, 1)) {
+            const n: usize = smith.valueRangeAtMost(u8, 1, batch.len);
+            for (batch[0..n]) |*entry| {
+                var buf: [24]u8 = undefined;
+                const name = try a.dupe(u8, generateName(smith, &buf));
+                const id = smith.value(u32);
+                entry.* = .{ .at = smith.value(i64), .event = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+                    0 => .{ .created = .{ .id = id, .name = name } },
+                    1 => .{ .renamed = .{ .id = id, .name = name } },
+                    else => .{ .removed = .{ .id = id } },
+                } };
+            }
+            const before = try journal.lastSeq(io);
+            // A name that is not UTF-8 is not a JSON string, and is written
+            // as the array of its bytes `std.json` reads back as the same
+            // bytes: every one of these is a record.
+            const last = if (n == 1)
+                try journal.append(io, batch[0].at, batch[0].event)
+            else
+                try journal.appendAll(io, batch[0..n]);
+            try testing.expectEqual(before + n, last);
+            for (batch[0..n], before + 1..) |entry, seq| {
+                try appended.append(a, entry);
+                expected.apply(seq, entry.at, entry.event);
+            }
+        }
+
+        // The records as the journal that wrote them reads them back, and
+        // the bytes they were written as.
+        const walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        while (try walk.next(io)) |record| try lines.append(a, try a.dupe(u8, record.bytes));
+        try testing.expectEqual(expected.final(), try expectReplayed(journal, 0, appended.items, lines.items));
+        try testing.expectEqual(@as(u64, appended.items.len), try journal.verify(io));
+    }
+    // The fold that watched the appends is the fold of what was appended.
+    try testing.expectEqual(expected.final(), live.final());
+
+    // And another process's open reads the same records from the disk, from
+    // anywhere in the log.
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail, .sync = .never });
+    defer journal.deinit(io);
+    try testing.expectEqual(expected.final(), try expectReplayed(journal, 0, appended.items, lines.items));
+    const cursor = smith.index(appended.items.len + 1);
+    _ = try expectReplayed(journal, cursor, appended.items, lines.items);
+    var reopened: Digest = .{};
+    try journal.subscribeFrom(io, reopened.sink(), 0);
+    try testing.expectEqual(expected.final(), reopened.final());
+}
+
+/// What `open` and a walk over the log may answer for bytes that are not the
+/// ones written. Anything else is a bug.
+fn expectNamedDamage(err: anyerror) !void {
+    switch (err) {
+        error.TruncatedRecord,
+        error.ChecksumMismatch,
+        error.CorruptRecord,
+        error.DiscontinuousSeq,
+        error.BrokenChain,
+        error.UnsupportedFormat,
+        => {},
+        else => {
+            std.debug.print("damage answered with {t}\n", .{err});
+            return error.TestUnexpectedError;
+        },
+    }
+}
+
+/// The bytes of every file in the journal's directory but its lock, by name.
+fn journalFiles(ws: *Workspace, a: std.mem.Allocator) !std.StringArrayHashMapUnmanaged([]const u8) {
+    const io = testing.io;
+    var files: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    const dir = try ws.root.openDir(io, ws.name, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file or std.mem.eql(u8, entry.name, chronicle.lock_name)) continue;
+        try files.put(a, try a.dupe(u8, entry.name), try dir.readFileAlloc(io, entry.name, a, .unlimited));
+    }
+    files.sort(struct {
+        keys: []const []const u8,
+        pub fn lessThan(ctx: @This(), x: usize, y: usize) bool {
+            return std.mem.lessThan(u8, ctx.keys[x], ctx.keys[y]);
+        }
+    }{ .keys = files.keys() });
+    return files;
+}
+
+test "fuzz: a log damaged anywhere reads back what was written or says why" {
+    try testing.fuzz({}, fuzzDamage, .{});
+}
+
+fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    fuzzingIo();
+    defer fuzzedIo();
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // A log of a few segments, written by the journal, with a clean close
+    // or without one.
+    const per_segment: u64 = smith.valueRangeAtMost(u8, 1, 4);
+    const count: u64 = smith.valueRangeAtMost(u8, 1, 10);
+    var lines: std.ArrayList([]const u8) = .empty;
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(per_segment, 2));
+        defer journal.deinit(io);
+        for (1..count + 1) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        const walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        while (try walk.next(io)) |record| try lines.append(a, try a.dupe(u8, record.bytes));
+    }
+
+    // One segment, damaged: cut short, a byte changed, or bytes added.
+    var segments: std.ArrayList(u64) = .empty;
+    var base: u64 = 1;
+    while (base <= count) : (base += per_segment) try segments.append(a, base);
+    const which = smith.index(segments.items.len);
+    const damaged_base = segments.items[which];
+    const name = try ws.segment(damaged_base);
+    const original = try ws.read(name);
+    const offset = smith.index(original.len + 1);
+    const damaged: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => original[0..offset],
+        1 => changed: {
+            if (offset == original.len) break :changed original;
+            const copy = try a.dupe(u8, original);
+            copy[offset] = smith.value(u8);
+            break :changed copy;
+        },
+        else => added: {
+            var extra: [32]u8 = undefined;
+            break :added try std.mem.concat(a, u8, &.{ original, extra[0..smith.slice(&extra)] });
+        },
+    };
+    try ws.write(name, damaged);
+    if (smith.boolWeighted(1, 1)) ws.root.deleteFile(io, try ws.index(damaged_base)) catch {};
+
+    // `.fail` repairs nothing: a refusal leaves the segments as they were.
+    const before = try ws.read(name);
+    if (Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail, .sync = .never })) |journal| {
+        journal.deinit(io);
+    } else |err| {
+        try expectNamedDamage(err);
+        try testing.expectEqualStrings(before, try ws.read(name));
+    }
+
+    // `.drop` repairs a torn tail. Whatever it opens, every record it reads
+    // back is one that was written, under its own number, in order.
+    const journal = Journal.open(testing.allocator, io, ws.path, .{ .sync = .never }) catch |err| {
+        try expectNamedDamage(err);
+        return;
+    };
+    var read: u64 = 0;
+    var read_whole = true;
+    {
+        defer journal.deinit(io);
+        const oldest = try journal.oldestSeq(io);
+        const walk = try journal.replay(io, 0);
+        defer walk.deinit(io);
+        var seq = oldest -| 1;
+        while (true) {
+            const record = (walk.next(io) catch |err| {
+                try expectNamedDamage(err);
+                read_whole = false;
+                break;
+            }) orelse break;
+            seq += 1;
+            try testing.expectEqual(seq, record.seq);
+            try testing.expect(record.seq <= count);
+            try testing.expectEqualStrings(lines.items[record.seq - 1], record.bytes);
+            read += 1;
+        }
+        if (read_whole) {
+            try testing.expectEqual(seq, try journal.lastSeq(io));
+            // A cut or a change at `offset` leaves every record that ends
+            // before it as it was, and a log that reads cleanly reads them.
+            if (oldest == 1) {
+                var intact: u64 = damaged_base - 1;
+                var end = std.mem.indexOfScalar(u8, original, '\n').? + 1;
+                while (intact < count and intact - (damaged_base - 1) < per_segment) {
+                    end += lines.items[intact].len + 1;
+                    if (end > offset) break;
+                    intact += 1;
+                }
+                try testing.expect(seq >= intact);
+            }
+        }
+    }
+    if (!read_whole) return;
+
+    // The repair is done once: a second open finds nothing to drop and
+    // changes no file, and the log goes on from where it now ends.
+    const repaired = try journalFiles(&ws, a);
+    {
+        const again = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail, .sync = .never });
+        defer again.deinit(io);
+        try testing.expectEqual(@as(usize, 0), (try again.status(io)).dropped_bytes);
+    }
+    const reopened = try journalFiles(&ws, a);
+    try testing.expectEqual(repaired.count(), reopened.count());
+    for (repaired.keys(), reopened.keys()) |x, y| try testing.expectEqualStrings(x, y);
+    for (repaired.values(), reopened.values()) |x, y| try testing.expectEqualStrings(x, y);
+
+    const last = blk: {
+        const again = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail, .sync = .never });
+        defer again.deinit(io);
+        const last = try again.lastSeq(io);
+        try testing.expectEqual(last + 1, try again.append(io, 0, created(0, "after")));
+        break :blk last;
+    };
+    const again = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail, .sync = .never });
+    defer again.deinit(io);
+    try testing.expectEqual(last + 1, try again.lastSeq(io));
+}
+
+/// Events as JSON, with what a journal of `Event` reads each one as at the
+/// current version: the event, or null for one it must refuse.
+const event_shapes = [_]struct { json: []const u8, event: ?Event }{
+    .{ .json = "{\"created\":{\"id\":1,\"name\":\"x\"}}", .event = created(1, "x") },
+    .{ .json = "{\"renamed\":{\"id\":4294967295,\"name\":\"\\u0041\"}}", .event = .{ .renamed = .{ .id = 4294967295, .name = "A" } } },
+    .{ .json = "{\"removed\":{\"id\":0}}", .event = .{ .removed = .{ .id = 0 } } },
+    .{ .json = "{ \"removed\" : { \"id\" : 7 } }", .event = .{ .removed = .{ .id = 7 } } },
+    .{ .json = "{\"created\":{\"id\":-1,\"name\":\"x\"}}", .event = null },
+    .{ .json = "{\"created\":{\"id\":1}}", .event = null },
+    .{ .json = "{\"removed\":{\"id\":1,\"extra\":2}}", .event = null },
+    .{ .json = "{\"removed\":{\"id\":1},\"created\":{\"id\":1,\"name\":\"x\"}}", .event = null },
+    .{ .json = "[]", .event = null },
+    .{ .json = "\"removed\"", .event = null },
+    .{ .json = "{\"removed\":{\"id\":1.5}}", .event = null },
+    .{ .json = "{\"removed\":{\"id\":1}", .event = null },
+};
+
+test "fuzz: records checksummed and linked, but otherwise anything" {
+    try testing.fuzz({}, fuzzRecords, .{});
+}
+
+fn fuzzRecords(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    fuzzingIo();
+    defer fuzzedIo();
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // Records as a writer would have written them -- one segment, each line
+    // checksummed and linked to the one before -- but with sequence numbers,
+    // versions, links and events drawn from what a damaged or foreign file
+    // could hold.
+    const Planned = struct { seq: u64, at: i64, v: u32, shape: usize };
+    var planned: [12]Planned = undefined;
+    var n: usize = 0;
+    const base: u64 = smith.valueRangeAtMost(u8, 1, 3);
+    var written: Handwritten = try .init(base, smith.valueRangeAtMost(u32, 0, 1));
+    defer written.deinit();
+    var well_formed = true;
+    var refused = false;
+    var next = base;
+    while (n < planned.len and !smith.eosWeightedSimple(5, 1)) : (n += 1) {
+        const seq = switch (smith.valueRangeAtMost(u8, 0, 9)) {
+            0 => next -| 1,
+            1 => next + 1,
+            2 => smith.value(u64),
+            else => next,
+        };
+        const v: u32 = switch (smith.valueRangeAtMost(u8, 0, 9)) {
+            0 => 0,
+            1 => 2,
+            else => 1,
+        };
+        const shape = smith.index(event_shapes.len);
+        if (smith.boolWeighted(15, 1)) written.link +%= 1;
+        // Above `maxInt(i64)` a sequence number is not one this format
+        // reads; the line is still a line.
+        const at = smith.value(i64);
+        const covered = try std.fmt.allocPrint(testing.allocator, "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":{s}", .{
+            seq, at, v, written.link, event_shapes[shape].json,
+        });
+        defer testing.allocator.free(covered);
+        try written.checked(covered);
+        planned[n] = .{ .seq = seq, .at = at, .v = v, .shape = shape };
+        if (seq != next) well_formed = false;
+        if (v == 2 or (v == 1 and event_shapes[shape].event == null)) refused = true;
+        if (v == 0 and !(std.json.validate(testing.allocator, event_shapes[shape].json) catch false)) refused = true;
+        next = seq +% 1;
+    }
+    // The links were broken where `link` was bumped: re-derive from the bytes.
+    {
+        var link = try rootOf(written.written());
+        var lines = std.mem.splitScalar(u8, written.written(), '\n');
+        _ = lines.next();
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            if (try backLinkOf(line) != link) well_formed = false;
+            link = chronicle.checksum(line[0..std.mem.lastIndexOf(u8, line, ",\"c\":").?]);
+        }
+    }
+    try ws.write(try ws.segment(base), written.written());
+
+    // What is read back is exactly what is there, or the reason it is not:
+    // never a record the file does not hold, and never a gap or a broken
+    // link folded over.
+    var seen: usize = 0;
+    const outcome: anyerror!void = read: {
+        const journal = Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .on_truncated = .fail }) catch |err| break :read err;
+        defer journal.deinit(io);
+        const walk = journal.replay(io, 0) catch |err| break :read err;
+        defer walk.deinit(io);
+        while (walk.next(io) catch |err| break :read err) |record| {
+            const plan = planned[seen];
+            seen += 1;
+            try testing.expectEqual(plan.seq, record.seq);
+            try testing.expectEqual(plan.at, record.at);
+            try testing.expectEqual(plan.v, record.version);
+            switch (plan.v) {
+                // An older record lands in the `unknown` arm, as JSON.
+                0 => try testing.expect(record.event == .unknown),
+                1 => try expectSameEvent(event_shapes[plan.shape].event orelse return error.TestExpectedRefusal, record.event),
+                else => return error.TestExpectedRefusal,
+            }
+        }
+        break :read {};
+    };
+    if (outcome) |_| {
+        try testing.expectEqual(n, seen);
+        try testing.expect(well_formed or n == 0);
+        try testing.expect(!refused);
+    } else |err| {
+        switch (err) {
+            error.NewerSchema, error.CorruptRecord => try testing.expect(refused or !well_formed),
+            error.DiscontinuousSeq, error.BrokenChain => try testing.expect(!well_formed),
+            else => {
+                std.debug.print("records answered with {t}\n", .{err});
+                return error.TestUnexpectedError;
+            },
+        }
+        // A log that is well formed, at this version, of events this type
+        // reads, is read: refusing one is as wrong as accepting a bad one.
+        try testing.expect(!well_formed or refused);
+    }
+}
+
+test "fuzz: a file in the journal's directory under any other name is left alone" {
+    try testing.fuzz({}, fuzzStrayName, .{});
+}
+
+/// Whether `name` is one this package writes for a segment or its index.
+fn isLogName(name: []const u8) bool {
+    for ([_][]const u8{ chronicle.segment_extension, chronicle.index_extension }) |extension| {
+        if (name.len != 20 + extension.len or !std.mem.endsWith(u8, name, extension)) continue;
+        for (name[0..20]) |byte| {
+            if (!std.ascii.isDigit(byte)) break;
+        } else if (!std.mem.eql(u8, name[0..20], "0" ** 20)) return true;
+    }
+    return false;
+}
+
+fn fuzzStrayName(_: void, smith: *testing.Smith) anyerror!void {
+    @disableInstrumentation();
+    fuzzingIo();
+    defer fuzzedIo();
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(2, 4));
+        defer journal.deinit(io);
+        for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // A name close to the ones the log uses: digits, a sign, separators, an
+    // extension or the start of one.
+    var buf: [32]u8 = undefined;
+    var len: usize = 0;
+    const alphabet = "0000000000123456789+-_. ";
+    while (len < 20 and !smith.eosWeightedSimple(20, 1)) : (len += 1) buf[len] = alphabet[smith.index(alphabet.len)];
+    const extensions = [_][]const u8{ chronicle.segment_extension, chronicle.index_extension, ".se", ".SEG", "", ".seg.seg" };
+    const extension = extensions[smith.index(extensions.len)];
+    @memcpy(buf[len..][0..extension.len], extension);
+    len += extension.len;
+    const name = buf[0..len];
+    if (name.len == 0 or isLogName(name) or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
+        std.mem.endsWith(u8, name, ".tmp") or std.mem.eql(u8, name, chronicle.lock_name) or
+        std.mem.eql(u8, name, chronicle.snapshot_name)) return;
+    if (std.mem.indexOfScalar(u8, name, '/') != null) return;
+    if (builtin.os.tag == .windows and (std.mem.endsWith(u8, name, ".") or std.mem.endsWith(u8, name, " "))) return;
+
+    // Its contents are a copy of one of the log's own segments, the shape
+    // most likely to be mistaken for one.
+    const copied = try ws.read(try ws.segment(@as(u64, smith.valueRangeAtMost(u8, 0, 2)) * 2 + 1));
+    try ws.write(try ws.sub(name), copied);
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(2, 4));
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 1), try journal.oldestSeq(io));
+        try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
+        try testing.expectEqual(@as(u64, 5), try journal.verify(io));
+        try journal.compact(io, 2);
+        _ = try journal.dropSegmentsBefore(io, 3);
+        try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "n")));
+    }
+    try testing.expectEqualStrings(copied, try ws.read(try ws.sub(name)));
+}
+
+test "the generated-input properties hold over seeded rounds" {
+    var prng: std.Random.DefaultPrng = .init(0xc4a0);
+    var bytes: [512]u8 = undefined;
+    for (0..48) |i| {
+        // Bytes shaped the way a `Smith` reads them: mostly zeros, so that it
+        // goes on choosing rather than ending at once.
+        for (&bytes) |*byte| byte.* = switch (prng.random().uintLessThan(u8, 10)) {
+            0...6 => 0,
+            7, 8 => prng.random().uintLessThan(u8, 12),
+            else => prng.random().int(u8),
+        };
+        inline for (.{ fuzzRoundTrip, fuzzDamage, fuzzRecords, fuzzStrayName }) |property| {
+            var smith: testing.Smith = .{ .in = &bytes };
+            property({}, &smith) catch |err| {
+                std.debug.print("seeded round {d}: {t}\n", .{ i, err });
+                return err;
+            };
+        }
     }
 }
 
