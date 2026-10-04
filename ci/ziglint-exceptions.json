@@ -1,273 +1,273 @@
 [
   {
     "rule": "Z009",
-    "path": "src/Journal/encoding.zig",
+    "path": "src/journal/encoding.zig",
     "source": "//! An allocating writer that remembers whether its storage failed.",
     "detail": "file 'encoding.zig' has top-level fields and should be PascalCase",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z009",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "//! The segmented line store a journal is built on: a directory of files, each",
     "detail": "file 'log.zig' has top-level fields and should be PascalCase",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z012",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn line(header: SegmentHeader, buffer: *[96]u8) []const u8 {",
     "detail": "public function exposes private type 'SegmentHeader'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z012",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn known(times: Times) bool {",
     "detail": "public function exposes private type 'Times'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z012",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn named(base_seq: u64) Segment {",
     "detail": "public function exposes private type 'Segment'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z012",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn count(segment: Segment) u64 {",
     "detail": "public function exposes private type 'Segment'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z023",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "comptime extension: []const u8,",
     "detail": "'comptime' parameter should come before 'other'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!Log {",
     "detail": "public function exposes private error set 'OpenError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn reload(log: *Log, io: Io) OpenError!void {",
     "detail": "public function exposes private error set 'OpenError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z023",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn scanAtInto(log: *Log, scan: *Scan, io: Io, base_seq: u64, offset: u64) ScanError!bool {",
     "detail": "'Io' parameter should come before 'other'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z023",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn scanFromInto(log: *Log, scan: *Scan, io: Io, cursor: u64, options: ScanOptions) ScanError!void {",
     "detail": "'Io' parameter should come before 'other'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) OpenError!?u64 {",
     "detail": "public function exposes private error set 'OpenError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn appendLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32) AppendError!void {",
     "detail": "public function exposes private error set 'AppendError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32, rotation: Rotation) AppendError!void {",
     "detail": "public function exposes private error set 'AppendError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn commit(log: *Log, io: Io) AppendError!void {",
     "detail": "public function exposes private error set 'AppendError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn commitDeferred(log: *Log) AppendError!void {",
     "detail": "public function exposes private error set 'AppendError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn dropSegmentsBefore(log: *Log, io: Io, seq: u64) CompactError!u64 {",
     "detail": "public function exposes private error set 'CompactError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn truncateAfter(log: *Log, io: Io, seq: u64) TruncateError!void {",
     "detail": "public function exposes private error set 'TruncateError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn compact(log: *Log, io: Io, keep_after_seq: u64) CompactError!void {",
     "detail": "public function exposes private error set 'CompactError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) WriteFileError!void {",
     "detail": "public function exposes private error set 'WriteFileError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {",
     "detail": "public function exposes private error set 'SnapshotError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn syncBeforeSnapshot(log: *Log, io: Io) SnapshotError!void {",
     "detail": "public function exposes private error set 'SnapshotError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {",
     "detail": "public function exposes private error set 'BackupError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z015",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn close(log: *Log, io: Io) CloseError!void {",
     "detail": "public function exposes private error set 'CloseError'",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z030",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "pub fn deinit(log: *Log, io: Io) void {",
     "detail": "deinit should set log.* = undefined",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "log.dir.deleteFile(io, &segmentName(segment.base_seq, index_extension)) catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "active.writer.interface.flush() catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "active.index_writer.interface.flush() catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "log.dir.deleteFile(io, &segmentName(base_seq, index_extension)) catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "log.dir.deleteFile(io, &segmentName(holder.base_seq, index_extension)) catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "active.writer.interface.flush() catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "dest.deleteFile(io, name) catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "active.index_writer.interface.flush() catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "}, log.options.sync) catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "active.writer.interface.flush() catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "log.trimPreallocation(io) catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "if (log.options.sync != .never) syncFile(io, active.file, .whole) catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "active.index_writer.interface.flush() catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
     "rule": "Z026",
-    "path": "src/Journal/log.zig",
+    "path": "src/journal/log.zig",
     "source": "}, log.options.sync) catch {};",
     "detail": "empty catch block suppresses errors: `catch {}`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
