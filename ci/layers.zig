@@ -3,16 +3,16 @@ const gantry = @import("gantry");
 
 pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "primitives", .patterns = &.{
-        "src/clone.zig",
-        "src/crc32c.zig",
-        "src/encoding.zig",
-        "src/jsonl.zig",
+        "src/Journal/clone.zig",
+        "src/Journal/crc32c.zig",
+        "src/Journal/encoding.zig",
+        "src/Journal/jsonl.zig",
     } },
     .{ .name = "envelopes", .patterns = &.{
-        "src/envelope.zig",
+        "src/Journal/envelope.zig",
     } },
     .{ .name = "segments", .patterns = &.{
-        "src/log.zig",
+        "src/Journal/log.zig",
     } },
     .{ .name = "journal", .patterns = &.{
         "src/journal.zig",
@@ -22,7 +22,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     } },
     .{ .name = "fixtures", .patterns = &.{
         "src/journal_test.zig",
-        "src/lock_helper.zig",
+        "src/testing/**",
     } },
     .{ .name = "tests", .patterns = &.{
         "src/tests.zig",
@@ -30,10 +30,10 @@ pub const layers: []const gantry.rules.Layer = &.{
 };
 
 pub const entries: []const []const u8 = &.{
-    "src/lock_helper.zig",
+    "src/testing/lock_helper.zig",
 };
 
-pub const modules: []const gantry.NamedModule = &.{.{ .name = "chronicle", .path = "src/chronicle.zig", .from = "src/lock_helper.zig" }};
+pub const modules: []const gantry.NamedModule = &.{.{ .name = "chronicle", .path = "src/chronicle.zig", .from = "src/testing/lock_helper.zig" }};
 pub const references: []const gantry.rules.ReferenceRule = &.{
     .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{
         "builtin",
@@ -41,19 +41,21 @@ pub const references: []const gantry.rules.ReferenceRule = &.{
         "strand",
     } },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
-    .{ .name = "strand owner", .target = "strand", .except_from = &.{"src/jsonl.zig"} },
+    .{ .name = "strand owner", .target = "strand", .except_from = &.{"src/Journal/jsonl.zig"} },
 };
 
-pub const required = blk: {
-    var count: usize = 0;
-    for (layers) |layer| count += layer.patterns.len;
-    var paths: [count][]const u8 = undefined;
-    var i: usize = 0;
-    for (layers) |layer| for (layer.patterns) |path| {
-        paths[i] = path;
-        i += 1;
-    };
-    break :blk paths;
+pub const required = [_][]const u8{
+    "src/Journal/clone.zig",
+    "src/Journal/crc32c.zig",
+    "src/Journal/encoding.zig",
+    "src/Journal/jsonl.zig",
+    "src/Journal/envelope.zig",
+    "src/Journal/log.zig",
+    "src/journal.zig",
+    "src/chronicle.zig",
+    "src/journal_test.zig",
+    "src/testing/lock_helper.zig",
+    "src/tests.zig",
 };
 
 /// Tokens only their owners may spell: durability, file identity and the

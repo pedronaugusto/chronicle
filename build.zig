@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     const lock_helper = b.addExecutable(.{
         .name = "chronicle-lock-helper",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/lock_helper.zig"),
+            .root_source_file = b.path("src/testing/lock_helper.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "chronicle", .module = module }},
