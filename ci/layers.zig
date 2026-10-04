@@ -3,16 +3,16 @@ const gantry = @import("gantry");
 
 pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "primitives", .patterns = &.{
-        "src/Journal/clone.zig",
-        "src/Journal/crc32c.zig",
-        "src/Journal/encoding.zig",
-        "src/Journal/jsonl.zig",
+        "src/journal/clone.zig",
+        "src/journal/crc32c.zig",
+        "src/journal/encoding.zig",
+        "src/journal/jsonl.zig",
     } },
     .{ .name = "envelopes", .patterns = &.{
-        "src/Journal/envelope.zig",
+        "src/journal/envelope.zig",
     } },
     .{ .name = "segments", .patterns = &.{
-        "src/Journal/log.zig",
+        "src/journal/log.zig",
     } },
     .{ .name = "journal", .patterns = &.{
         "src/journal.zig",
@@ -41,16 +41,16 @@ pub const references: []const gantry.rules.ReferenceRule = &.{
         "strand",
     } },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
-    .{ .name = "strand owner", .target = "strand", .except_from = &.{"src/Journal/jsonl.zig"} },
+    .{ .name = "strand owner", .target = "strand", .except_from = &.{"src/journal/jsonl.zig"} },
 };
 
 pub const required = [_][]const u8{
-    "src/Journal/clone.zig",
-    "src/Journal/crc32c.zig",
-    "src/Journal/encoding.zig",
-    "src/Journal/jsonl.zig",
-    "src/Journal/envelope.zig",
-    "src/Journal/log.zig",
+    "src/journal/clone.zig",
+    "src/journal/crc32c.zig",
+    "src/journal/encoding.zig",
+    "src/journal/jsonl.zig",
+    "src/journal/envelope.zig",
+    "src/journal/log.zig",
     "src/journal.zig",
     "src/chronicle.zig",
     "src/journal_test.zig",

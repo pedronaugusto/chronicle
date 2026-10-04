@@ -6,7 +6,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-- Keep journal internals in `src/Journal/`, beside the `src/journal.zig` entry, and the spawned lock helper in `src/testing/`.
+- Keep journal internals in `src/journal/`, beside the `src/journal.zig` entry, and the spawned lock helper in `src/testing/`.
 
 - `appendIf` and `appendAllIf` append only while the newest record is still the one the caller expected, as an event store's expected revision; otherwise they return `error.WrongExpectedSeq` with the newest sequence number in `Expected.found`, and write nothing.
 
@@ -485,7 +485,7 @@ Only the index sidecar: no journal needs converting and no record changes.
 
 ### Changed
 
-- **`snapshot_temporary_name` is gone** from `src/Journal/log.zig`, where it named the
+- **`snapshot_temporary_name` is gone** from `src/journal/log.zig`, where it named the
   file a snapshot is written to before it is renamed into place. It was never
   re-exported from the package root.
 

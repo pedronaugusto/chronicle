@@ -4,11 +4,11 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const Log = @import("Journal/log.zig");
-const crc32c = @import("Journal/crc32c.zig");
-const strand = @import("Journal/jsonl.zig").strand;
-const envelope = @import("Journal/envelope.zig");
-const Encoding = @import("Journal/encoding.zig");
+const Log = @import("journal/log.zig");
+const crc32c = @import("journal/crc32c.zig");
+const strand = @import("journal/jsonl.zig").strand;
+const envelope = @import("journal/envelope.zig");
+const Encoding = @import("journal/encoding.zig");
 
 /// An event kept as its bytes: what a `migrate` hook is handed, what an
 /// `unknown` arm of this type holds, and an `Event` of its own for a journal
