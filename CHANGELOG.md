@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Share the Zig CI gate through preflight, with requested fast runs and full merge checks.
+
 - Keep journal internals in `src/journal/`, beside the `src/journal.zig` entry, and the spawned lock helper in `src/testing/`.
 
 - `appendIf` and `appendAllIf` append only while the newest record is still the one the caller expected, as an event store's expected revision; otherwise they return `error.WrongExpectedSeq` with the newest sequence number in `Expected.found`, and write nothing.

@@ -1,6 +1,6 @@
 # chronicle — a Linux with the pinned Zig in it, and nothing else.
 #
-# ci/linux.sh builds this and runs the suite inside it, so that the file
+# zig build ci-linux -- builds this and runs the suite inside it, so that the file
 # behaviour this package promises is proved on the kernel a daemon runs on and
 # not only on the one the author is typing on. Debian for the libc a released
 # binary is likely to meet; the toolchain is fetched by version so the image is

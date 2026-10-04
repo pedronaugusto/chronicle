@@ -1,0 +1,24 @@
+{
+  "package": "chronicle",
+  "compile_step": "check",
+  "targets": [
+    "x86_64-linux-gnu",
+    "aarch64-linux-gnu",
+    "x86_64-linux-musl",
+    "x86_64-windows-gnu",
+    "aarch64-windows-gnu",
+    "x86_64-macos",
+    "aarch64-macos",
+    {
+      "target": "x86_64-linux-gnu",
+      "cpu": "x86_64_v2"
+    },
+    {
+      "target": "aarch64-linux-gnu",
+      "cpu": "cortex_a72"
+    }
+  ],
+  "compile_once": false,
+  "test_timeout": "--test-timeout 120s",
+  "sanitizer": "test"
+}

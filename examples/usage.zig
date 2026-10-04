@@ -2,7 +2,7 @@
 //! them into state through a sink, write a snapshot, drop what it covers, and
 //! reopen from the snapshot plus the records after it.
 //!
-//! `zig build examples` builds AND runs this; `ci/readme_usage.sh` extracts
+//! `zig build examples` builds AND runs this; `zig build docs -- usage` extracts
 //! the region between the usage markers into README.md, so the snippet a
 //! reader copies is code CI executes.
 

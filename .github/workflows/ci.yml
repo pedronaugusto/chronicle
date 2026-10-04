@@ -1,132 +1,27 @@
 name: CI
-
 on:
   push:
-    branches: [main, layers]
-  pull_request:
+    branches: [main]
   workflow_dispatch:
-
+    inputs:
+      full:
+        description: Run the full merge gate
+        type: boolean
+        default: false
+  pull_request:
+  merge_group:
+  schedule:
+    - cron: '17 4 * * 1'
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 permissions:
   contents: read
-
-env:
-  ZIG_VERSION: 0.16.0
-
+  actions: read
 jobs:
-  # Debug catches safety faults; ReleaseSafe checks optimized code and timing on each host.
-  # Crash recovery has the same contract in every mode; ReleaseSafe keeps its safety checks.
-  # The full test target already builds and runs the examples.
-  test:
-    name: test (${{ matrix.os }}, ${{ matrix.optimize }})
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        optimize: [Debug, ReleaseSafe]
-        include:
-          # One unchecked run catches optimizer-dependent behaviour; the other hosts have ReleaseSafe.
-          - os: ubuntu-latest
-            optimize: ReleaseFast
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - name: Test — ${{ matrix.optimize }}
-        run: zig build test -Doptimize=${{ matrix.optimize }} --test-timeout 120s
-
-  # ReleaseSmall must build; its unchecked tests add no distinct assertion to ReleaseFast.
-  small:
-    name: compile (ReleaseSmall)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - run: zig build check -Doptimize=ReleaseSmall
-
-  # Appenders, waiters and reopen tasks share journal state; ThreadSanitizer checks those accesses.
-  # Linux has a working runtime here; Debug is the detector's most complete instrumentation.
-  sanitizer:
-    name: ThreadSanitizer (Linux)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - run: zig build test -Dthread-sanitizer -Doptimize=Debug --test-timeout 120s
-
-  # Formatting and source-policy checks read the same files on every host; once is enough.
-  source:
-    name: source checks
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - name: Formatting
-        run: zig fmt --check src examples build.zig ci
-      - name: Casts out of the type system carry their reason
-        run: python3 ci/casts.py
-      - name: Source import boundaries
-        run: zig build check-imports
-      - name: Import gate regression checks
-        run: python3 ci/test_imports.py
-
-  # README.md's Usage block is a region of examples/usage.zig, which the job
-  # above runs. This is what keeps the snippet a reader copies and the code CI
-  # executes the same text.
-  docs:
-    name: documented usage
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - run: ci/readme_usage.sh --check
-
-  # Compile-only coverage of the targets the suite cannot execute on. These
-  # prove the sources and the build graph are portable; the `test` job above
-  # is what proves behaviour.
-  #
-  # Two of them name a CPU. The checksum has a path per instruction set,
-  # chosen from the target's features, and a baseline target compiles the
-  # table and nothing else -- so a target that has the instruction is built
-  # too, or the code that uses it would never be seen by a compiler. The
-  # runners the `test` job uses have it and run that path.
-  cross-compile:
-    name: cross (${{ matrix.target }}${{ matrix.cpu && format(' {0}', matrix.cpu) || '' }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-linux-gnu
-          - target: x86_64-linux-gnu
-            cpu: x86_64_v2
-          - target: aarch64-linux-gnu
-          - target: aarch64-linux-gnu
-            cpu: cortex_a72
-          - target: x86_64-linux-musl
-          - target: x86_64-windows-gnu
-          - target: aarch64-windows-gnu
-          - target: x86_64-macos
-          - target: aarch64-macos
-    steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ env.ZIG_VERSION }}
-      - run: zig build check -Dtarget=${{ matrix.target }}${{ matrix.cpu && format(' -Dcpu={0}', matrix.cpu) || '' }}
+  gate:
+    uses: pedronaugusto/preflight/.github/workflows/zig.yml@9cdff538384c14e7f268cbb4942c5075caf0ed42
+    with:
+      preflight-ref: 9cdff538384c14e7f268cbb4942c5075caf0ed42
+      full: ${{ github.event_name != 'workflow_dispatch' || inputs.full }}
+      attest: ${{ github.event_name == 'push' }}
