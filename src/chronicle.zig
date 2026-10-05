@@ -32,8 +32,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const Log = @import("journal/log.zig");
+const Log = @import("journal/Log.zig");
 const strand = @import("journal/jsonl.zig").strand;
+const facade = @import("journal/facade.zig");
 const implementation = @import("journal.zig");
 
 /// An event kept as its bytes: what a `migrate` hook is handed, what an
@@ -1025,49 +1026,7 @@ pub fn Journal(comptime Event: type) type {
 
         /// What `replay` returns: an opaque, allocated walk over the log.
         /// Keep its pointer and release it exactly once, before the journal.
-        pub const Replay = opaque {
-            const Owner = @This();
-            fn inner(self: *Owner) *State.Replay {
-                return @ptrCast(@alignCast(self)); // safe: construction retains this allocated state until deinit.
-            }
-            fn from(state: *State.Replay) *Owner {
-                return @ptrCast(state); // safe: hides the stable allocation without copying it.
-            }
-            fn view(self: *const Owner) *const State.Replay {
-                return @ptrCast(@alignCast(self)); // safe: observes the same allocated replay state without mutating it.
-            }
-            /// Release the walk and every record it owns. Its journal must still be alive.
-            pub fn deinit(walk: *Owner, io: Io) void {
-                return State.Replay.deinit(walk.inner(), io);
-            }
-
-            /// Start another pass after `position`, keeping this walk's scan
-            /// buffer, line buffer, segment storage and record arenas. Call
-            /// after the previous pass has ended or when its remaining records
-            /// are no longer needed. Any record returned by `next` is invalid
-            /// after this call. On error, re-arm or deinit before calling
-            /// `next` again.
-            ///
-            /// The position is checked against the record it names on every
-            /// pass. A changed or removed record is `error.StalePosition`.
-            pub fn rearmAt(walk: *Owner, io: Io, at: Position) ReplayAtError!void {
-                return State.Replay.rearmAt(walk.inner(), io, at);
-            }
-
-            /// The next record, or null at the end of the log. It is valid
-            /// until the next call to `next` or to `deinit`.
-            pub fn next(walk: *Owner, io: Io) ReplayError!?Record {
-                return State.Replay.next(walk.inner(), io);
-            }
-
-            /// Where this walk got to: after the last record `next` returned,
-            /// or the last one it stepped over on the way to the first. A
-            /// walk that ends in an error is at the last record it read
-            /// without one, so a walk from here reads the bad one again.
-            pub fn position(walk: *const Owner) Position {
-                return State.Replay.position(walk.view());
-            }
-        };
+        pub const Replay = facade.ReplayOwner(State, Position);
         /// An opaque, allocated named reader and the cursor it has committed.
         /// Keep its pointer and release it exactly once, before the journal.
         ///
@@ -1088,60 +1047,6 @@ pub fn Journal(comptime Event: type) type {
         /// handled, so that a crash in between replays them again rather than
         /// losing them. It may move backwards, which is how a reader is asked
         /// to do a stretch of history over.
-        pub const Tailer = opaque {
-            const Owner = @This();
-            fn inner(self: *Owner) *State.Tailer {
-                return @ptrCast(@alignCast(self)); // safe: construction retains this allocated state until deinit.
-            }
-            fn from(state: *State.Tailer) *Owner {
-                return @ptrCast(state); // safe: hides the stable allocation without copying it.
-            }
-            /// Where this reader has got to, copied under the journal lock.
-            /// Safe to call from any task or thread, except from inside a sink.
-            pub fn cursor(tail: *Owner, io: Io) Io.Cancelable!u64 {
-                return State.Tailer.cursor(tail.inner(), io);
-            }
-
-            /// Release the owner and its name. The cursor file stays on disk; that is
-            /// the point of it.
-            pub fn deinit(tail: *Owner) void {
-                return State.Tailer.deinit(tail.inner());
-            }
-
-            /// A walk over every record after the committed cursor, read from
-            /// the disk. `Journal.replay(io, try tailer.cursor(io))`, named.
-            /// The cursor and scan are taken under the journal's lock, so
-            /// a concurrent `commit` cannot move the cursor during the choice.
-            pub fn replay(tail: *Owner, io: Io) ReplayError!*Replay {
-                return Replay.from(try State.Tailer.replay(tail.inner(), io));
-            }
-
-            /// Record `seq` as where this reader has got to, durably, and move
-            /// `cursor` to it.
-            ///
-            /// The file is written beside the log and renamed into place, so a
-            /// crash leaves either the whole old cursor or the whole new one —
-            /// never a number that was never reached.
-            ///
-            /// Safe to call from any task or thread.
-            pub fn commit(tail: *Owner, io: Io, seq: u64) TailerError!void {
-                return State.Tailer.commit(tail.inner(), io, seq);
-            }
-
-            /// Remove this reader's cursor file, so that the next `tailer`
-            /// under this name starts from zero. The tailer itself is left at
-            /// the cursor it had; `deinit` is still how it ends.
-            ///
-            /// Safe to call from any task or thread.
-            pub fn forget(tail: *Owner, io: Io) TailerError!void {
-                return State.Tailer.forget(tail.inner(), io);
-            }
-
-            /// This reader's immutable name, borrowed until deinit.
-            pub fn name(tail: *const Owner) []const u8 {
-                const state: *const State.Tailer = @ptrCast(@alignCast(tail)); // safe: borrows the initialized tailer allocation for its lifetime.
-                return state.name;
-            }
-        };
+        pub const Tailer = facade.TailerOwner(State, Replay);
     };
 }

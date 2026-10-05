@@ -4,11 +4,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const Log = @import("journal/log.zig");
+const continuity = @import("journal/continuity.zig");
+const Log = @import("journal/Log.zig");
 const crc32c = @import("journal/crc32c.zig");
 const strand = @import("journal/jsonl.zig").strand;
 const envelope = @import("journal/envelope.zig");
-const Encoding = @import("journal/encoding.zig");
+const Encoding = @import("journal/Encoding.zig");
 
 /// An event kept as its bytes: what a `migrate` hook is handed, what an
 /// `unknown` arm of this type holds, and an `Event` of its own for a journal
@@ -62,11 +63,11 @@ pub const Verify = enum {
 /// the journal's directory. Exposed because a journal's directory is meant to
 /// be read with `tail -f` and with your eyes.
 pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len:0]u8 {
-    return Log.segmentName(base_seq, segment_extension);
+    return Log.segmentName(segment_extension, base_seq);
 }
 
 pub fn indexName(base_seq: u64) [Log.name_digits + index_extension.len:0]u8 {
-    return Log.segmentName(base_seq, index_extension);
+    return Log.segmentName(index_extension, base_seq);
 }
 
 /// The version stamped into the two documents that live beside the log: the
@@ -279,6 +280,10 @@ pub fn Journal(comptime Event: type) type {
             }
 
             fn appendAssumeCapacity(tail: *Tail, owned: OwnedRecord) void {
+                std.debug.assert(tail.entries.items.len < tail.entries.capacity);
+                if (tail.entries.items.len != 0) {
+                    std.debug.assert(tail.entries.items[tail.entries.items.len - 1].record.seq < owned.record.seq);
+                }
                 tail.entries.appendAssumeCapacity(owned);
                 tail.bytes += owned.record.bytes.len;
             }
@@ -299,13 +304,14 @@ pub fn Journal(comptime Event: type) type {
 
             /// Release the prefix and move the surviving owners together.
             fn removePrefix(tail: *Tail, drop: usize) void {
+                std.debug.assert(drop <= tail.entries.items.len);
                 if (drop == 0) return;
                 for (tail.entries.items[0..drop]) |*owned| {
                     tail.bytes -= owned.record.bytes.len;
                     destroyArena(owned.arena);
                 }
                 const kept = tail.entries.items.len - drop;
-                std.mem.copyForwards(OwnedRecord, tail.entries.items[0..kept], tail.entries.items[drop..]);
+                @memmove(tail.entries.items[0..kept], tail.entries.items[drop..]);
                 tail.entries.shrinkRetainingCapacity(kept);
             }
         };
@@ -1048,61 +1054,7 @@ pub fn Journal(comptime Event: type) type {
         /// be ones the reader already has: those are stepped over, and their
         /// checksums are still taken into the chain, so the first record
         /// handed on is checked against the one in front of it.
-        const Continuity = struct {
-            cursor: u64,
-            expected: ?u64 = null,
-            link: ?u32 = null,
-            /// The atomic batch the walk is inside, from its first record to
-            /// its last.
-            batch: ?envelope.Batch = null,
-            /// Whether a record has been walked yet: the first one may be
-            /// inside a batch whose start the walk began after, or that a
-            /// compaction cut.
-            walked: bool = false,
-
-            fn beginSegment(walk: *Continuity, boundary: Log.Scan.Boundary) ReadError!void {
-                // A batch is never split across segments.
-                if (walk.batch != null) return error.BrokenBatch;
-                if (walk.expected) |want| {
-                    if (boundary.base_seq != want) return error.DiscontinuousSeq;
-                }
-                if (walk.link) |previous| {
-                    if (boundary.root != previous) return error.BrokenChain;
-                }
-                walk.expected = boundary.base_seq;
-                walk.link = boundary.root;
-            }
-
-            /// Whether this record is one to hand on. False means it is at or
-            /// behind the cursor and has been stepped over.
-            fn accept(walk: *Continuity, header: Header) ReadError!bool {
-                if (walk.expected) |want| {
-                    if (header.seq != want) return error.DiscontinuousSeq;
-                }
-                if (walk.link) |previous| {
-                    if (header.p != previous) return error.BrokenChain;
-                }
-                try walk.acceptBatch(header);
-                walk.expected = header.seq + 1;
-                walk.link = header.c;
-                return header.seq > walk.cursor;
-            }
-
-            /// A batch's records come one after another, each naming the
-            /// batch, from its first to its last, and nothing else does.
-            fn acceptBatch(walk: *Continuity, header: Header) ReadError!void {
-                defer walk.walked = true;
-                if (walk.batch) |inside| {
-                    const named = header.batch orelse return error.BrokenBatch;
-                    if (named.first != inside.first or named.last != inside.last) return error.BrokenBatch;
-                    if (header.seq == inside.last) walk.batch = null;
-                    return;
-                }
-                const named = header.batch orelse return;
-                if (header.seq != named.first and walk.walked) return error.BrokenBatch;
-                if (header.seq != named.last) walk.batch = named;
-            }
-        };
+        const Continuity = continuity.State(Header, ReadError, Log.Scan.Boundary);
 
         /// What `replay` returns: a walk over the log from the disk.
         pub const Replay = struct {
@@ -1139,14 +1091,14 @@ pub fn Journal(comptime Event: type) type {
                     const found = found: {
                         try self.mutex.lock(io);
                         defer self.mutex.unlock(io);
-                        break :found try self.log.scanAtInto(&walk.scan, io, last.segment, last.start);
+                        break :found try self.log.scanAtInto(io, &walk.scan, last.segment, last.start);
                     };
                     if (!found) return error.StalePosition;
                 } else {
                     {
                         try self.mutex.lock(io);
                         defer self.mutex.unlock(io);
-                        try self.log.scanFromInto(&walk.scan, io, at.cursor, .{});
+                        try self.log.scanFromInto(io, &walk.scan, at.cursor, .{});
                     }
                 }
                 walk.whole_through = whole: {
@@ -1824,6 +1776,12 @@ pub fn Journal(comptime Event: type) type {
         /// safe to append. Where nothing will, that parse would build a record
         /// and drop it unread, so it is not done.
         fn encode(self: *Self, seq: u64, at: i64, back_link: u32, event: Event, batch: ?envelope.Batch) AppendError!Built {
+            std.debug.assert(seq > 0);
+            std.debug.assert(seq <= std.math.maxInt(i64));
+            if (batch) |bounds| {
+                std.debug.assert(bounds.first <= seq);
+                std.debug.assert(seq <= bounds.last);
+            }
             const needs_record = self.needsRecord();
             const arena: ?*std.heap.ArenaAllocator = if (needs_record) try createArena(self.gpa) else null;
             errdefer if (arena) |a| destroyArena(a);
@@ -2057,6 +2015,8 @@ pub fn Journal(comptime Event: type) type {
             ev: Span,
             line: []const u8,
         ) ReadError!Event {
+            std.debug.assert(ev.from <= ev.to);
+            std.debug.assert(ev.to <= line.len);
             if (version == decoding.schema_version) {
                 return strand.parseLine(Event, arena, line[ev.from..ev.to], .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,

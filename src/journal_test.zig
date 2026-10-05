@@ -70,7 +70,7 @@ fn expectNoLeak(gpa: *FixtureAllocator) void {
 /// number, in batches: a fixture of tens of thousands of records written one
 /// flush per batch rather than one per record, and otherwise byte for byte
 /// what `append` would have written.
-fn fill(journal: *Journal, io: Io, first: u64, last: u64, name: []const u8) !void {
+fn fill(io: Io, journal: *Journal, first: u64, last: u64, name: []const u8) !void {
     var batch: [500]Journal.Entry = undefined;
     var next = first;
     while (next <= last) {
@@ -567,7 +567,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
         const stopped = whole[0..cut];
         // A prefix of the batch is whole records up to the last newline; the
         // bytes after it are the line the writer was in the middle of.
-        const complete = std.mem.lastIndexOfScalar(u8, stopped, '\n');
+        const complete = std.mem.findScalarLast(u8, stopped, '\n');
         const kept = if (complete) |at| stopped[0 .. at + 1] else stopped[0..0];
         const records = std.mem.count(u8, kept, "\n") - 1;
 
@@ -1357,7 +1357,7 @@ test "a record appended beside a shared subscribe lands in every fold exactly on
     // hand-over the record falls on, each fold must see it once and the
     // sequence each fold saw must have no gap and no repeat in it.
     const appender = struct {
-        fn f(j: *Journal, inner: Io) void {
+        fn f(inner: Io, j: *Journal) void {
             _ = j.append(inner, 2_001, created(2_001, "beside")) catch |err| {
                 // A fixture operation must fail the test when it cannot complete.
                 std.log.err("fixture operation: {t}", .{err});
@@ -1371,7 +1371,7 @@ test "a record appended beside a shared subscribe lands in every fold exactly on
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, appender, .{ journal, io });
+    try group.concurrent(io, appender, .{ io, journal });
     try journal.subscribeAll(io, &sinks);
     try group.await(io);
 
@@ -1408,13 +1408,13 @@ const Sequenced = struct {
 /// Wait until the journal has registered a reader before letting the append
 /// run. The journal's lock owns the waiter count; observing it under that
 /// lock proves waitPast reached its blocking path, independent of scheduling.
-fn appendToWaitingReader(journal: *Journal, io: Io, event: Event) !u64 {
+fn appendToWaitingReader(io: Io, journal: *Journal, event: Event) !u64 {
     const reader = struct {
-        fn run(j: *Journal, inner: Io) Io.Cancelable!u64 {
+        fn run(inner: Io, j: *Journal) Io.Cancelable!u64 {
             return j.waitPast(inner, 0);
         }
     }.run;
-    var future = try io.concurrent(reader, .{ journal, io });
+    var future = try io.concurrent(reader, .{ io, journal });
     defer _ = future.cancel(io) catch |err| {
         // Cancellation joins the task; its error is expected during cleanup or was checked by await.
         std.log.debug("task cleanup: {t}", .{err});
@@ -1439,7 +1439,7 @@ test "waitPast blocks until an append arrives" {
     const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
 
-    try testing.expectEqual(@as(u64, 1), try appendToWaitingReader(journal, io, created(1, "awaited")));
+    try testing.expectEqual(@as(u64, 1), try appendToWaitingReader(io, journal, created(1, "awaited")));
     const batch = try journal.copySince(testing.allocator, io, 0);
     defer batch.deinit();
     try testing.expectEqual(@as(usize, 1), batch.records().len);
@@ -1455,7 +1455,7 @@ test "a refused append cancels its blocked waiter" {
     defer journal.deinit(io);
 
     const name = [_]u8{'x'} ** 512;
-    try testing.expectError(error.RecordTooLarge, appendToWaitingReader(journal, io, created(1, &name)));
+    try testing.expectError(error.RecordTooLarge, appendToWaitingReader(io, journal, created(1, &name)));
     try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), journalState(journal).waiters);
 }
@@ -1474,11 +1474,11 @@ test "an append nobody waits on wakes nobody, and one somebody waits on wakes th
     try testing.expectEqual(@as(u64, 0), journalState(journal).futex_wakes);
 
     const reader = struct {
-        fn f(j: *Journal, inner: Io, cursor: u64) Io.Cancelable!u64 {
+        fn f(inner: Io, j: *Journal, cursor: u64) Io.Cancelable!u64 {
             return j.waitPast(inner, cursor);
         }
     }.f;
-    var future = try io.concurrent(reader, .{ journal, io, @as(u64, 3) });
+    var future = try io.concurrent(reader, .{ io, journal, @as(u64, 3) });
     defer _ = future.cancel(io) catch |err| {
         // Cancellation joins the task; its error is expected during cleanup or was checked by await.
         std.log.debug("task cleanup: {t}", .{err});
@@ -1511,7 +1511,7 @@ test "waitPast is woken by a nudge with no record behind it" {
     // reports through.
     var woken: std.atomic.Value(bool) = .init(false);
     const nudger = struct {
-        fn f(j: *Journal, inner: Io, done: *std.atomic.Value(bool)) void {
+        fn f(inner: Io, j: *Journal, done: *std.atomic.Value(bool)) void {
             while (!done.load(.acquire)) {
                 j.nudge(inner);
                 std.atomic.spinLoopHint();
@@ -1521,7 +1521,7 @@ test "waitPast is woken by a nudge with no record behind it" {
 
     var group: Io.Group = .init;
     defer group.cancel(io);
-    try group.concurrent(io, nudger, .{ journal, io, &woken });
+    try group.concurrent(io, nudger, .{ io, journal, &woken });
 
     // Set however the wait ends: the nudger stops on it and nothing else,
     // so a wait that failed would otherwise leave it spinning under the
@@ -1548,7 +1548,7 @@ test "a reader stopped as a record arrives is stopped" {
     // 0.16.0 let the broadcast swallow the cancel and hung here within a
     // few hundred rounds; awaiting cancelation must finish every round.
     const reader = struct {
-        fn f(j: *Journal, inner: Io, waiting: *std.atomic.Value(bool)) Io.Cancelable!void {
+        fn f(inner: Io, j: *Journal, waiting: *std.atomic.Value(bool)) Io.Cancelable!void {
             while (true) {
                 waiting.store(true, .release);
                 _ = try j.waitPast(inner, try j.lastSeq(inner));
@@ -1556,7 +1556,7 @@ test "a reader stopped as a record arrives is stopped" {
         }
     }.f;
     const nudger = struct {
-        fn f(j: *Journal, inner: Io, go: *std.atomic.Value(bool), spins: u32) void {
+        fn f(inner: Io, j: *Journal, go: *std.atomic.Value(bool), spins: u32) void {
             while (!go.load(.acquire)) std.atomic.spinLoopHint();
             for (0..spins) |_| std.atomic.spinLoopHint();
             j.nudge(inner);
@@ -1566,9 +1566,9 @@ test "a reader stopped as a record arrives is stopped" {
     for (0..3000) |round| {
         var waiting: std.atomic.Value(bool) = .init(false);
         var go: std.atomic.Value(bool) = .init(false);
-        var future = try io.concurrent(reader, .{ journal, io, &waiting });
+        var future = try io.concurrent(reader, .{ io, journal, &waiting });
         while (!waiting.load(.acquire)) std.atomic.spinLoopHint();
-        const other = try std.Thread.spawn(.{}, nudger, .{ journal, io, &go, @as(u32, @intCast(round % 64)) * 50 });
+        const other = try std.Thread.spawn(.{}, nudger, .{ io, journal, &go, @as(u32, @intCast(round % 64)) * 50 });
         go.store(true, .release);
         future.cancel(io) catch |err| {
             // Cancellation joins the task; its error is expected during cleanup or was checked by await.
@@ -1596,7 +1596,7 @@ test "a walk canceled as it reads an index is canceled" {
     // the second, the walk went on from the segment's start and never saw
     // the cancel again. The task must report the cancel when it is awaited.
     const reader = struct {
-        fn f(j: *Journal, inner: Io, started: *std.atomic.Value(bool)) Journal.ReplayError!void {
+        fn f(inner: Io, j: *Journal, started: *std.atomic.Value(bool)) Journal.ReplayError!void {
             while (true) {
                 started.store(true, .release);
                 const walk = try j.replay(inner, 150);
@@ -1608,7 +1608,7 @@ test "a walk canceled as it reads an index is canceled" {
 
     for (0..500) |round| {
         var started: std.atomic.Value(bool) = .init(false);
-        var future = try io.concurrent(reader, .{ journal, io, &started });
+        var future = try io.concurrent(reader, .{ io, journal, &started });
         while (!started.load(.acquire)) std.atomic.spinLoopHint();
         for (0..(round % 32) * 20) |_| std.atomic.spinLoopHint();
         if (future.cancel(io)) |_| {} else |err| try testing.expectEqual(error.Canceled, err);
@@ -2614,7 +2614,7 @@ test "an index of one entry per interval is a fortieth of one per record" {
             .max_segment_bytes = 1 << 30,
         });
         defer journal.deinit(io);
-        try fill(journal, io, 1, count, "n");
+        try fill(io, journal, 1, count, "n");
         try testing.expectEqual(@as(usize, 1), (try journal.segmentCount(io)));
 
         // Whatever the index holds, a seek lands on the record asked for:
@@ -4383,7 +4383,7 @@ test "two hundred thousand records open and replay within bounded memory" {
         defer expectNoLeak(&gpa);
         const journal = try Journal.open(gpa.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
         defer journal.deinit(io);
-        try fill(journal, io, 0, count - 1, "a name of some length");
+        try fill(io, journal, 0, count - 1, "a name of some length");
         try testing.expect((try journal.segmentCount(io)) > 1);
     }
 
@@ -4486,7 +4486,7 @@ const open_corpus = [_][]const u8{
 /// Every record a walk from `position` hands on, by sequence number, each
 /// checked to be the record `fill`-style appends made for it; and where the
 /// walk ended.
-fn resumeFrom(journal: *Journal, io: Io, position: chronicle.Position, seqs: *std.ArrayList(u64)) !chronicle.Position {
+fn resumeFrom(io: Io, journal: *Journal, position: chronicle.Position, seqs: *std.ArrayList(u64)) !chronicle.Position {
     const walk = try journal.replayAt(io, position);
     defer walk.deinit(io);
     while (try walk.next(io)) |record| {
@@ -4513,29 +4513,29 @@ test "a replay picks up where the last one stopped, across batches and rotations
     defer seqs.deinit(testing.allocator);
 
     // An empty log: a walk that read nothing hands back its cursor alone.
-    var position = try resumeFrom(journal, io, .after(0), &seqs);
+    var position = try resumeFrom(io, journal, .after(0), &seqs);
     try testing.expectEqual(chronicle.Position.after(0), position);
 
     for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "one"));
-    position = try resumeFrom(journal, io, position, &seqs);
+    position = try resumeFrom(io, journal, position, &seqs);
     try expectRun(&seqs, 1, 10);
     try testing.expectEqual(@as(u64, 10), position.cursor);
     try testing.expectEqual(@as(u64, 8), position.last.?.segment);
 
     // Nothing new: nothing, and the same place.
-    try testing.expectEqual(position, try resumeFrom(journal, io, position, &seqs));
+    try testing.expectEqual(position, try resumeFrom(io, journal, position, &seqs));
     try expectRun(&seqs, 1, 0);
 
     // One at a time, a batch that crosses three rotations, records whose
     // durability rides with the next flush: each pass is what came since.
     _ = try journal.append(io, 11, created(11, "one"));
-    position = try resumeFrom(journal, io, position, &seqs);
+    position = try resumeFrom(io, journal, position, &seqs);
     try expectRun(&seqs, 11, 11);
-    try fill(journal, io, 12, 40, "batch");
-    position = try resumeFrom(journal, io, position, &seqs);
+    try fill(io, journal, 12, 40, "batch");
+    position = try resumeFrom(io, journal, position, &seqs);
     try expectRun(&seqs, 12, 40);
     for (41..44) |i| _ = try journal.appendDeferred(io, @intCast(i), created(@intCast(i), "later"));
-    position = try resumeFrom(journal, io, position, &seqs);
+    position = try resumeFrom(io, journal, position, &seqs);
     try expectRun(&seqs, 41, 43);
     try testing.expectEqual(@as(u64, 43), position.cursor);
 
@@ -4548,7 +4548,7 @@ test "a replay picks up where the last one stopped, across batches and rotations
     }
     try testing.expectEqual(@as(u64, 8), position.cursor);
     try testing.expectEqual(@as(u64, 8), position.last.?.seq);
-    _ = try resumeFrom(journal, io, position, &seqs);
+    _ = try resumeFrom(io, journal, position, &seqs);
     try expectRun(&seqs, 9, 43);
 
     // A replay from a cursor steps over the records at and before it, and
@@ -4565,7 +4565,7 @@ test "a replay picks up where the last one stopped, across batches and rotations
     journal.deinit(io);
     journal = try Journal.open(testing.allocator, io, ws.path, small(7, 4));
     _ = try journal.append(io, 44, created(44, "reopened"));
-    _ = try resumeFrom(journal, io, position, &seqs);
+    _ = try resumeFrom(io, journal, position, &seqs);
     try expectRun(&seqs, 44, 44);
 }
 
@@ -4623,7 +4623,7 @@ test "a replay that stopped at an unfinished record reads it once it is whole" {
     const bytes = whole.written();
     // The fourth record half written, as a writer in another process leaves
     // it between two of its writes.
-    const fourth = std.mem.lastIndexOfScalar(u8, bytes[0 .. bytes.len - 1], '\n').? + 1;
+    const fourth = std.mem.findScalarLast(u8, bytes[0 .. bytes.len - 1], '\n').? + 1;
     const torn = bytes[0 .. fourth + (bytes.len - fourth) / 2];
     try ws.write(try ws.segment(1), torn);
 
@@ -4631,16 +4631,16 @@ test "a replay that stopped at an unfinished record reads it once it is whole" {
     defer reader.deinit(io);
     var seqs: std.ArrayList(u64) = .empty;
     defer seqs.deinit(testing.allocator);
-    var position = try resumeFrom(reader, io, .after(0), &seqs);
+    var position = try resumeFrom(io, reader, .after(0), &seqs);
     try expectRun(&seqs, 1, 3);
     try testing.expectEqual(@as(u64, fourth), position.last.?.end);
 
     // Still half: still nothing, and still in front of it.
-    try testing.expectEqual(position, try resumeFrom(reader, io, position, &seqs));
+    try testing.expectEqual(position, try resumeFrom(io, reader, position, &seqs));
     try expectRun(&seqs, 1, 0);
 
     try ws.write(try ws.segment(1), bytes);
-    position = try resumeFrom(reader, io, position, &seqs);
+    position = try resumeFrom(io, reader, position, &seqs);
     try expectRun(&seqs, 4, 4);
 
     // A writer that crashed mid-record and was opened again drops the half
@@ -4653,14 +4653,14 @@ test "a replay that stopped at an unfinished record reads it once it is whole" {
         _ = try writer.append(io, 6, created(6, "after"));
     }
     const segment = try ws.read(try ws.segment(1));
-    const sixth = std.mem.lastIndexOfScalar(u8, segment[0 .. segment.len - 1], '\n').? + 1;
+    const sixth = std.mem.findScalarLast(u8, segment[0 .. segment.len - 1], '\n').? + 1;
     try ws.write(try ws.segment(1), segment[0 .. sixth + 10]);
     {
         const writer = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer writer.deinit(io);
         _ = try writer.append(io, 6, created(6, "again"));
     }
-    _ = try resumeFrom(reader, io, position, &seqs);
+    _ = try resumeFrom(io, reader, position, &seqs);
     try expectRun(&seqs, 5, 6);
 }
 
@@ -4672,8 +4672,8 @@ test "a position into bytes the log no longer holds is refused, never read" {
     // Records 1 to 60, ten to a segment; a reader that got to 35, in the
     // segment named 31.
     const Setup = struct {
-        fn at35(journal: *Journal, sub_io: Io) !chronicle.Position {
-            try fill(journal, sub_io, 1, 60, "n");
+        fn at35(sub_io: Io, journal: *Journal) !chronicle.Position {
+            try fill(sub_io, journal, 1, 60, "n");
             const walk = try journal.replay(sub_io, 0);
             defer walk.deinit(sub_io);
             for (0..35) |_| _ = (try walk.next(sub_io)).?;
@@ -4687,7 +4687,7 @@ test "a position into bytes the log no longer holds is refused, never read" {
         defer ws.deinit();
         const journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
         defer journal.deinit(io);
-        const position = try Setup.at35(journal, io);
+        const position = try Setup.at35(io, journal);
         try testing.expectEqual(@as(u64, 31), position.last.?.segment);
         try journal.compact(io, 45);
         try testing.expectError(error.StalePosition, journal.replayAt(io, position));
@@ -4702,10 +4702,10 @@ test "a position into bytes the log no longer holds is refused, never read" {
         defer ws.deinit();
         const journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
         defer journal.deinit(io);
-        const position = try Setup.at35(journal, io);
+        const position = try Setup.at35(io, journal);
         try journal.compact(io, 33);
         try testing.expectError(error.StalePosition, journal.replayAt(io, position));
-        _ = try resumeFrom(journal, io, .after(position.cursor), &seqs);
+        _ = try resumeFrom(io, journal, .after(position.cursor), &seqs);
         try expectRun(&seqs, 36, 60);
     }
     {
@@ -4715,9 +4715,9 @@ test "a position into bytes the log no longer holds is refused, never read" {
         defer ws.deinit();
         const journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
         defer journal.deinit(io);
-        const position = try Setup.at35(journal, io);
+        const position = try Setup.at35(io, journal);
         try journal.compact(io, 25);
-        _ = try resumeFrom(journal, io, position, &seqs);
+        _ = try resumeFrom(io, journal, position, &seqs);
         try expectRun(&seqs, 36, 60);
         _ = try journal.dropSegmentsBefore(io, 40);
         try testing.expectError(error.StalePosition, journal.replayAt(io, position));
@@ -4730,9 +4730,9 @@ test "a position into bytes the log no longer holds is refused, never read" {
         defer ws.deinit();
         const journal = try Journal.open(testing.allocator, io, ws.path, small(10, 4));
         defer journal.deinit(io);
-        const position = try Setup.at35(journal, io);
+        const position = try Setup.at35(io, journal);
         try journal.truncateAfter(io, 32);
-        try fill(journal, io, 33, 50, "m");
+        try fill(io, journal, 33, 50, "m");
         try testing.expectError(error.StalePosition, journal.replayAt(io, position));
         // Cut to shorter than the position and not written again.
         try journal.truncateAfter(io, 32);
@@ -5367,9 +5367,9 @@ fn expectNamedDamage(err: anyerror) !void {
 }
 
 /// The bytes of every file in the journal's directory but its lock, by name.
-fn journalFiles(ws: *Workspace, a: std.mem.Allocator) !std.StringArrayHashMapUnmanaged([]const u8) {
+fn journalFiles(ws: *Workspace, a: std.mem.Allocator) !std.array_hash_map.String([]const u8) {
     const io = testing.io;
-    var files: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
+    var files: std.array_hash_map.String([]const u8) = .empty;
     const dir = try ws.root.openDir(io, ws.name, .{ .iterate = true });
     defer dir.close(io);
     var it = dir.iterate();
@@ -5378,8 +5378,9 @@ fn journalFiles(ws: *Workspace, a: std.mem.Allocator) !std.StringArrayHashMapUnm
         try files.put(a, try a.dupe(u8, entry.name), try dir.readFileAlloc(io, entry.name, a, .unlimited));
     }
     files.sort(struct {
+        const Self = @This();
         keys: []const []const u8,
-        pub fn lessThan(ctx: @This(), x: usize, y: usize) bool {
+        pub fn lessThan(ctx: Self, x: usize, y: usize) bool {
             return std.mem.lessThan(u8, ctx.keys[x], ctx.keys[y]);
         }
     }{ .keys = files.keys() });
@@ -5388,6 +5389,41 @@ fn journalFiles(ws: *Workspace, a: std.mem.Allocator) !std.StringArrayHashMapUnm
 
 test "fuzz: a log damaged anywhere reads back what was written or says why" {
     try testing.fuzz({}, fuzzDamage, .{});
+}
+
+const Damage = struct { base: u64, name: []const u8, original: []const u8, offset: usize };
+
+/// Choose and mutate one segment; verification stays in the damage property.
+fn damageSegment(a: std.mem.Allocator, ws: *Workspace, smith: *testing.Smith, count: u64, per_segment: u64) !Damage {
+    const io = testing.io;
+    var segments: std.ArrayList(u64) = .empty;
+    var base: u64 = 1;
+    while (base <= count) : (base += per_segment) try segments.append(a, base);
+    const which = smith.index(segments.items.len);
+    const damaged_base = segments.items[which];
+    const name = try ws.segment(damaged_base);
+    const original = try ws.read(name);
+    const offset = smith.index(original.len + 1);
+    const damaged: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+        0 => original[0..offset],
+        1 => changed: {
+            if (offset == original.len) break :changed original;
+            const copy = try a.dupe(u8, original);
+            copy[offset] = smith.value(u8);
+            break :changed copy;
+        },
+        else => added: {
+            var extra: [32]u8 = undefined;
+            break :added try std.mem.concat(a, u8, &.{ original, extra[0..smith.slice(&extra)] });
+        },
+    };
+    try ws.write(name, damaged);
+    if (smith.boolWeighted(1, 1)) ws.root.deleteFile(io, try ws.index(damaged_base)) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+
+    return .{ .base = damaged_base, .name = name, .original = original, .offset = offset };
 }
 
 fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
@@ -5415,33 +5451,11 @@ fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
         while (try walk.next(io)) |record| try lines.append(a, try a.dupe(u8, record.bytes));
     }
 
-    // One segment, damaged: cut short, a byte changed, or bytes added.
-    var segments: std.ArrayList(u64) = .empty;
-    var base: u64 = 1;
-    while (base <= count) : (base += per_segment) try segments.append(a, base);
-    const which = smith.index(segments.items.len);
-    const damaged_base = segments.items[which];
-    const name = try ws.segment(damaged_base);
-    const original = try ws.read(name);
-    const offset = smith.index(original.len + 1);
-    const damaged: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
-        0 => original[0..offset],
-        1 => changed: {
-            if (offset == original.len) break :changed original;
-            const copy = try a.dupe(u8, original);
-            copy[offset] = smith.value(u8);
-            break :changed copy;
-        },
-        else => added: {
-            var extra: [32]u8 = undefined;
-            break :added try std.mem.concat(a, u8, &.{ original, extra[0..smith.slice(&extra)] });
-        },
-    };
-    try ws.write(name, damaged);
-    if (smith.boolWeighted(1, 1)) ws.root.deleteFile(io, try ws.index(damaged_base)) catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    const damage = try damageSegment(a, &ws, smith, count, per_segment);
+    const damaged_base = damage.base;
+    const name = damage.name;
+    const original = damage.original;
+    const offset = damage.offset;
 
     // `.fail` repairs nothing: a refusal leaves the segments as they were.
     const before = try ws.read(name);
@@ -5749,7 +5763,7 @@ test "sealed and active seeks both read an index and skip the segment prefix" {
         .max_segment_bytes = 1 << 30,
     });
     defer journal.deinit(io);
-    try fill(journal, io, 1, 2 * per_segment - 1, "a name");
+    try fill(io, journal, 1, 2 * per_segment - 1, "a name");
     try testing.expectEqual(@as(usize, 2), try journal.segmentCount(io));
     for ([_]u64{ per_segment - 2, 2 * per_segment - 3 }, 0..) |cursor, segment| {
         const reads = journalState(journal).log.index_reads;
@@ -5779,7 +5793,7 @@ test "opening a log that was closed cleanly costs no scan of it" {
         defer expectNoLeak(&gpa);
         const journal = try Journal.open(gpa.allocator(), io, ws.path, options);
         defer journal.deinit(io);
-        try fill(journal, io, 1, count, "a name");
+        try fill(io, journal, 1, count, "a name");
         try testing.expectEqual(@as(usize, 1), (try journal.segmentCount(io)));
     }
 
@@ -5911,11 +5925,11 @@ test "waiting and reading keep no storage owned by the journal" {
     const batch = try journal.copySince(testing.allocator, io, 0);
     defer batch.deinit();
     const writer = struct {
-        fn f(j: *Journal, inner: Io) !void {
+        fn f(inner: Io, j: *Journal) !void {
             _ = try j.append(inner, 2, created(2, "second"));
         }
     }.f;
-    var future = try io.concurrent(writer, .{ journal, io });
+    var future = try io.concurrent(writer, .{ io, journal });
     try future.await(io);
     // A writer has trimmed the tail; the batch still has its own first record.
     try testing.expectEqual(@as(u64, 1), batch.records()[0].seq);
@@ -6011,14 +6025,14 @@ test "copySince releases partial copies on every allocation failure" {
     _ = try journal.append(io, 1, created(1, &name));
     _ = try journal.append(io, 2, created(2, &name));
     const Copy = struct {
-        fn f(a: std.mem.Allocator, j: *Journal, inner: Io) !void {
+        fn f(a: std.mem.Allocator, inner: Io, j: *Journal) !void {
             const batch = try j.copySince(a, inner, 0);
             defer batch.deinit();
             try testing.expectEqual(@as(usize, 2), batch.records().len);
             try testing.expectEqual(@as(u64, 2), batch.records()[1].seq);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ journal, io });
+    try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ io, journal });
     try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "after")));
 }
 
@@ -6035,7 +6049,7 @@ test "a refresh that runs out of memory leaves every tail record owned and count
         var failing: testing.FailingAllocator = .init(testing.allocator, .{});
         const reader = try Journal.open(failing.allocator(), io, ws.path, .{ .access = .read });
         defer reader.deinit(io);
-        try fill(writer, io, 1, 20, "external");
+        try fill(io, writer, 1, 20, "external");
         failing.fail_index = failing.alloc_index + offset;
         reader.refresh(io) catch |err| {
             if (err != error.OutOfMemory) return err;
@@ -6076,7 +6090,7 @@ test "a failed refresh never calls a partial tail complete" {
         var failing: testing.FailingAllocator = .init(testing.allocator, .{});
         const reader = try Journal.open(failing.allocator(), io, ws.path, .{ .access = .read });
         defer reader.deinit(io);
-        try fill(writer, io, 1, 20, "external");
+        try fill(io, writer, 1, 20, "external");
         failing.fail_index = failing.alloc_index + offset;
         reader.refresh(io) catch |err| {
             if (err != error.OutOfMemory) return err;
@@ -6128,7 +6142,7 @@ test "starting a replay waits for the writer and can be canceled there" {
     defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
-        fn f(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
+        fn f(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
             ready.store(true, .release);
             // An empty journal needs no file operation to choose its scan:
             // cancellation must reach the lock protecting that choice.
@@ -6136,7 +6150,7 @@ test "starting a replay waits for the writer and can be canceled there" {
             defer walk.deinit(inner);
         }
     };
-    var future = try io.concurrent(Reader.f, .{ journal, io, &started });
+    var future = try io.concurrent(Reader.f, .{ io, journal, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -6149,12 +6163,12 @@ test "independent replays read committed records beside a rotating writer" {
     options.index_interval_bytes = 0;
     const journal = try Journal.open(testing.allocator, io, ws.path, options);
     defer journal.deinit(io);
-    try fill(journal, io, 1, 20, "committed");
+    try fill(io, journal, 1, 20, "committed");
     const Worker = struct {
-        fn write(j: *Journal, inner: Io) !void {
-            try fill(j, inner, 21, 200, "committed");
+        fn write(inner: Io, j: *Journal) !void {
+            try fill(inner, j, 21, 200, "committed");
         }
-        fn read(j: *Journal, inner: Io) !void {
+        fn read(inner: Io, j: *Journal) !void {
             for (0..30) |_| {
                 const walk = try j.replay(inner, 5);
                 defer walk.deinit(inner);
@@ -6168,17 +6182,17 @@ test "independent replays read committed records beside a rotating writer" {
             }
         }
     };
-    var writer = try io.concurrent(Worker.write, .{ journal, io });
+    var writer = try io.concurrent(Worker.write, .{ io, journal });
     defer writer.cancel(io) catch |err| {
         // Cancellation joins the task; its error is expected during cleanup or was checked by await.
         std.log.debug("task cleanup: {t}", .{err});
     };
-    var first = try io.concurrent(Worker.read, .{ journal, io });
+    var first = try io.concurrent(Worker.read, .{ io, journal });
     defer first.cancel(io) catch |err| {
         // Cancellation joins the task; its error is expected during cleanup or was checked by await.
         std.log.debug("task cleanup: {t}", .{err});
     };
-    var second = try io.concurrent(Worker.read, .{ journal, io });
+    var second = try io.concurrent(Worker.read, .{ io, journal });
     defer second.cancel(io) catch |err| {
         // Cancellation joins the task; its error is expected during cleanup or was checked by await.
         std.log.debug("task cleanup: {t}", .{err});
@@ -6284,7 +6298,7 @@ fn canceledInventoryObservation(comptime observation: enum { oldest, segments })
     defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
-        fn read(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
+        fn read(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
             ready.store(true, .release);
             switch (observation) {
                 .oldest => _ = try j.oldestSeq(inner),
@@ -6292,7 +6306,7 @@ fn canceledInventoryObservation(comptime observation: enum { oldest, segments })
             }
         }
     };
-    var future = try io.concurrent(Reader.read, .{ journal, io, &started });
+    var future = try io.concurrent(Reader.read, .{ io, journal, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -6315,12 +6329,12 @@ test "observing persistence status waits for the journal lock" {
     defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
-        fn read(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
+        fn read(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
             ready.store(true, .release);
             _ = try j.status(inner);
         }
     };
-    var future = try io.concurrent(Reader.read, .{ journal, io, &started });
+    var future = try io.concurrent(Reader.read, .{ io, journal, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -6442,14 +6456,14 @@ test "a returned replay keeps the allocator carried by its last JSON value alive
     defer testing.allocator.free(values);
     _ = try journal.append(io, 1, .{ .array = .fromOwnedSlice(testing.allocator, values) });
     const Reader = struct {
-        fn read(j: *J, inner: Io) !struct { walk: *J.Replay, record: J.Record } {
+        fn read(inner: Io, j: *J) !struct { walk: *J.Replay, record: J.Record } {
             const walk = try j.replay(inner, 0);
             errdefer walk.deinit(inner);
             const record = (try walk.next(inner)).?;
             return .{ .walk = walk, .record = record };
         }
     };
-    var read = try Reader.read(journal, io);
+    var read = try Reader.read(io, journal);
     defer read.walk.deinit(io);
     const context = &replayState(std.json.Value, read.walk).arena;
     try testing.expectEqual(@as(*anyopaque, context), read.record.event.array.allocator.ptr);
@@ -6496,13 +6510,13 @@ test "observing configuration waits for the journal lock" {
     defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
-        fn read(j: *Journal, inner: Io, ready: *std.atomic.Value(bool)) !void {
+        fn read(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
             ready.store(true, .release);
             const config = try j.options(inner);
             try testing.expectEqual(@as(usize, 7), config.tail_records);
         }
     };
-    var future = try io.concurrent(Reader.read, .{ journal, io, &started });
+    var future = try io.concurrent(Reader.read, .{ io, journal, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
@@ -6522,28 +6536,29 @@ test "observing a tailer cursor waits for the journal lock" {
     defer journalState(journal).mutex.unlock(io);
     var started: std.atomic.Value(bool) = .init(false);
     const Reader = struct {
-        fn read(tail: *Journal.Tailer, inner: Io, ready: *std.atomic.Value(bool)) !void {
+        fn read(inner: Io, tail: *Journal.Tailer, ready: *std.atomic.Value(bool)) !void {
             ready.store(true, .release);
             const seq = try tail.cursor(inner);
             try testing.expectEqual(@as(u64, 7), seq);
         }
     };
-    var future = try io.concurrent(Reader.read, .{ tailer, io, &started });
+    var future = try io.concurrent(Reader.read, .{ io, tailer, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
 
 test "copySince copies hook values without parsing or stringifying again" {
     const Hook = struct {
+        pub const Self = @This();
         text: []const u8,
         var parses: usize = 0;
         var writes: usize = 0;
-        pub fn jsonParse(a: std.mem.Allocator, source: anytype, opts: std.json.ParseOptions) !@This() {
+        pub fn jsonParse(a: std.mem.Allocator, source: anytype, opts: std.json.ParseOptions) !Self {
             parses += 1;
             const value = try std.json.innerParse(struct { text: []const u8 }, a, source, opts);
             return .{ .text = value.text };
         }
-        pub fn jsonStringify(value: @This(), writer: anytype) !void {
+        pub fn jsonStringify(value: Self, writer: anytype) !void {
             writes += 1;
             try writer.write(.{ .text = value.text });
         }
@@ -6940,7 +6955,7 @@ test "a zero read buffer still opens replays and backs up whole records" {
     {
         const journal = try Journal.open(testing.allocator, io, ws.path, options);
         defer journal.deinit(io);
-        try fill(journal, io, 1, 5, "one");
+        try fill(io, journal, 1, 5, "one");
         try testing.expectEqual(@as(u64, 5), try journal.verify(io));
         try testing.expectEqual(@as(u64, 5), try journal.backup(io, copy.path));
     }

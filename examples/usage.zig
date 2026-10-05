@@ -52,7 +52,10 @@ pub fn main() !void {
     const output = &display.interface;
 
     var dir = std.Io.Dir.cwd();
-    defer dir.deleteTree(io, "chronicle-example") catch {};
+    defer dir.deleteTree(io, "chronicle-example") catch |err| {
+        // Temporary-directory cleanup runs after the journal closes and cannot return an error.
+        std.log.debug("example cleanup: {t}", .{err});
+    };
     const path = "chronicle-example/ledger";
 
     // --- README:usage ---

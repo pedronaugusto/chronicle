@@ -28,7 +28,7 @@ const clone = @import("clone.zig");
 const envelopes = @import("envelope.zig");
 const strand = @import("jsonl.zig").strand;
 
-const Log = @This();
+const Self = @This();
 
 /// The file a writer holds its advisory lock on. It is never read or written:
 /// locking a data file instead would mean the lock changed identity every time
@@ -188,7 +188,7 @@ fn syncKind(io: Io, file: Io.File, level: Level) Io.File.SyncError!Flush {
 }
 
 /// `syncFile` for the active segment, noting which call its records got.
-fn syncActiveFile(log: *Log, io: Io, level: Level) Io.File.SyncError!void {
+fn syncActiveFile(log: *Self, io: Io, level: Level) Io.File.SyncError!void {
     log.flushed = try syncKind(io, log.active.?.file, level);
 }
 
@@ -237,6 +237,8 @@ pub const Times = struct {
         times.last = at;
         times.lowest = @min(times.lowest, at);
         times.highest = @max(times.highest, at);
+        std.debug.assert(times.lowest <= times.last);
+        std.debug.assert(times.last <= times.highest);
     }
 };
 
@@ -268,6 +270,7 @@ pub const Segment = struct {
     /// A segment as the directory first names it: a file whose length and
     /// contents nothing has read yet.
     pub fn named(base_seq: u64) Segment {
+        std.debug.assert(base_seq > 0);
         return .{
             .base_seq = base_seq,
             .last_seq = base_seq - 1,
@@ -280,6 +283,8 @@ pub const Segment = struct {
 
     /// How many records it holds.
     pub fn count(segment: Segment) u64 {
+        std.debug.assert(segment.base_seq > 0);
+        std.debug.assert(segment.last_seq >= segment.base_seq - 1);
         return segment.last_seq + 1 - segment.base_seq;
     }
 };
@@ -404,8 +409,8 @@ const Active = struct {
 
 /// The name of the file holding segment `base_seq`, with `extension`.
 pub fn segmentName(
-    base_seq: u64,
     comptime extension: []const u8,
+    base_seq: u64,
 ) [name_digits + extension.len:0]u8 {
     // Zero-terminated: some of the calls a copy makes go to the operating
     // system by name rather than through an open file.
@@ -444,7 +449,7 @@ fn parseNumberedName(name: []const u8, extension: []const u8) ?u64 {
 /// the last sequence number and to repair a torn tail — and one line of each
 /// sealed segment. The cost is one segment plus one read per segment, never
 /// the size of the log.
-pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Log.OpenError!Log {
+pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Self.OpenError!Self {
     if (options.index_interval_bytes > std.math.maxInt(u32)) return error.IndexIntervalTooLarge;
     const owned_path = try gpa.dupe(u8, path);
     errdefer gpa.free(owned_path);
@@ -469,7 +474,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Log.Open
     }
     errdefer if (lock_file) |file| file.close(io);
 
-    var log: Log = .{
+    var log: Self = .{
         .gpa = gpa,
         .path = owned_path,
         .dir = dir,
@@ -494,6 +499,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Log.Open
         log.segments.deinit(gpa);
     }
     try log.load(io);
+    log.assertValid();
     return log;
 }
 
@@ -512,14 +518,14 @@ fn openDir(io: Io, path: []const u8, access: Access) OpenError!Io.Dir {
 /// `load`, as a caller may ask for it: read the directory again, keeping the
 /// directory handle and the lock. A `.read` log picks up what the writer has
 /// added since; a `.write` one picks up what its own `compact` rearranged.
-pub fn reload(log: *Log, io: Io) Log.OpenError!void {
+pub fn reload(log: *Self, io: Io) Self.OpenError!void {
     return log.load(io);
 }
 
 /// Close the active segment, forget every segment, and read the directory
 /// again. The directory handle and the lock are kept, so this is also how
 /// `compact` picks up the files it has just rearranged.
-fn load(log: *Log, io: Io) OpenError!void {
+fn load(log: *Self, io: Io) OpenError!void {
     log.closeActive(io);
     log.releaseIndex(io);
     log.segments.clearRetainingCapacity();
@@ -542,7 +548,7 @@ fn load(log: *Log, io: Io) OpenError!void {
 /// segment and opens its own files; an unusual shape, stale index, or I/O
 /// failure is retried through the full sequential path so its exact error and
 /// repair behavior stay unchanged.
-fn describeSealedSegments(log: *Log, io: Io, segments: []Segment) OpenError!void {
+fn describeSealedSegments(log: *Self, io: Io, segments: []Segment) OpenError!void {
     if (segments.len < 4) {
         for (segments) |*segment| try log.describeSealed(io, segment);
         return;
@@ -588,14 +594,14 @@ const CleanSegmentFile = struct {
     header_bytes: u64,
 };
 
-fn inspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64, proof: *?CleanSegmentFile) Io.Cancelable!void {
+fn inspectCleanSegmentFile(log: *Self, io: Io, base_seq: u64, proof: *?CleanSegmentFile) Io.Cancelable!void {
     // a group drops what its task returns, and a task it ran on the
     // caller's own thread would take the caller's cancel with it: put back
     proof.* = log.tryInspectCleanSegmentFile(io, base_seq) catch return io.recancel();
 }
 
-fn tryInspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?CleanSegmentFile {
-    const file = log.dir.openFile(io, &segmentName(base_seq, segment_extension), .{}) catch |e| {
+fn tryInspectCleanSegmentFile(log: *Self, io: Io, base_seq: u64) Io.Cancelable!?CleanSegmentFile {
+    const file = log.dir.openFile(io, &segmentName(segment_extension, base_seq), .{}) catch |e| {
         try cancelOf(e);
         return null;
     };
@@ -619,13 +625,13 @@ fn tryInspectCleanSegmentFile(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?C
     return .{ .bytes = length, .header_bytes = newline + 1 };
 }
 
-fn inspectCleanIndex(log: *Log, io: Io, base_seq: u64, proof: *?IndexProof) Io.Cancelable!void {
+fn inspectCleanIndex(log: *Self, io: Io, base_seq: u64, proof: *?IndexProof) Io.Cancelable!void {
     // as for the segment file: the cancel is put back, never dropped
     proof.* = log.tryInspectCleanIndex(io, base_seq) catch return io.recancel();
 }
 
-fn tryInspectCleanIndex(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?IndexProof {
-    const file = log.dir.openFile(io, &segmentName(base_seq, index_extension), .{}) catch |e| {
+fn tryInspectCleanIndex(log: *Self, io: Io, base_seq: u64) Io.Cancelable!?IndexProof {
+    const file = log.dir.openFile(io, &segmentName(index_extension, base_seq), .{}) catch |e| {
         try cancelOf(e);
         return null;
     };
@@ -636,7 +642,7 @@ fn tryInspectCleanIndex(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?IndexPr
 }
 
 /// Collect the segment files in the directory, in sequence order.
-fn listSegments(log: *Log, io: Io) OpenError!void {
+fn listSegments(log: *Self, io: Io) OpenError!void {
     var iterator = log.dir.iterate();
     while (try iterator.next(io)) |entry| {
         if (entry.kind == .directory) continue;
@@ -661,7 +667,7 @@ fn listSegments(log: *Log, io: Io) OpenError!void {
 /// it, because the rename was the compaction's commit and those were next to
 /// go; left standing they would be a hole in front of the rewrite. Every other
 /// disagreement is `error.DiscontinuousSeq`.
-fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
+fn resolveOverlaps(log: *Self, io: Io) OpenError!void {
     var i: usize = 0;
     while (i + 1 < log.segments.items.len) {
         const earlier = log.segments.items[i];
@@ -674,7 +680,7 @@ fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
             // segment before it.
             if (later.count() == 0) {
                 var measured_later = later;
-                measured_later.bytes = try log.fileLength(io, &segmentName(later.base_seq, segment_extension));
+                measured_later.bytes = try log.fileLength(io, &segmentName(segment_extension, later.base_seq));
                 // Only ever the newest: a segment with others after it was
                 // published, and an empty one there has lost its records.
                 if (measured_later.bytes == 0 and i + 2 == log.segments.items.len) {
@@ -722,7 +728,7 @@ fn resolveOverlaps(log: *Log, io: Io) OpenError!void {
 }
 
 /// The last sequence number a segment holds, whether or not it is sealed.
-fn lastSeqOf(log: *Log, io: Io, segment: Segment) OpenError!u64 {
+fn lastSeqOf(log: *Self, io: Io, segment: Segment) OpenError!u64 {
     var measured = segment;
     try log.describeSealed(io, &measured);
     return measured.last_seq;
@@ -731,9 +737,9 @@ fn lastSeqOf(log: *Log, io: Io, segment: Segment) OpenError!u64 {
 /// Fill in what a sealed segment holds: its last sequence number, from its
 /// index when the index is good for it and from its last line when it is not,
 /// and the timestamps its index header carries.
-fn describeSealed(log: *Log, io: Io, segment: *Segment) OpenError!void {
+fn describeSealed(log: *Self, io: Io, segment: *Segment) OpenError!void {
     segment.times = .unknown;
-    const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
+    const file = try log.dir.openFile(io, &segmentName(segment_extension, segment.base_seq), .{});
     defer file.close(io);
     segment.bytes = try file.length(io);
     if (segment.bytes == 0) {
@@ -764,11 +770,11 @@ fn describeSealed(log: *Log, io: Io, segment: *Segment) OpenError!void {
         const scanned = try log.scanSegment(io, segment.*, null);
         if (scanned.partial_bytes != 0) return error.TruncatedRecord;
         if (log.options.access == .write) {
-            const repair_file = try log.dir.createFile(io, &segmentName(segment.base_seq, segment_extension), .{ .truncate = false });
+            const repair_file = try log.dir.createFile(io, &segmentName(segment_extension, segment.base_seq), .{ .truncate = false });
             defer repair_file.close(io);
             try repair_file.setLength(io, scanned.complete_bytes);
             if (log.options.sync != .never) try syncFile(io, repair_file, .whole);
-            log.dir.deleteFile(io, &segmentName(segment.base_seq, index_extension)) catch |err| {
+            log.dir.deleteFile(io, &segmentName(index_extension, segment.base_seq)) catch |err| {
                 // The index is a rebuildable cache; record durability is handled separately.
                 std.log.debug("optional index maintenance: {t}", .{err});
             };
@@ -833,6 +839,7 @@ const IndexHeader = struct {
     entries_checksum: u32,
 
     fn bytes(header: IndexHeader) [index_header_len]u8 {
+        std.debug.assert(header.base_seq > 0);
         var out: [index_header_len]u8 = @splat(0);
         @memcpy(out[0..index_magic.len], index_magic);
         std.mem.writeInt(u64, out[8..16], header.segment_bytes, .little);
@@ -875,6 +882,7 @@ const IndexEntry = struct {
     at: i64,
 
     fn bytes(entry: IndexEntry) [index_entry_len]u8 {
+        std.debug.assert(entry.seq > 0);
         var out: [index_entry_len]u8 = undefined;
         std.mem.writeInt(u64, out[0..8], entry.seq, .little);
         std.mem.writeInt(u64, out[8..16], entry.offset, .little);
@@ -903,6 +911,7 @@ const Builder = struct {
     last_offset: u64,
 
     fn init(base_seq: u64, interval: u64) Builder {
+        std.debug.assert(base_seq > 0);
         return .{
             .base_seq = base_seq,
             .interval = interval,
@@ -915,6 +924,7 @@ const Builder = struct {
     /// Whether this record earns an entry. The first one in a segment always
     /// does, so a bisection always has somewhere to start.
     fn wants(builder: Builder, offset: u64) bool {
+        std.debug.assert(offset >= builder.last_offset);
         if (builder.entries == 0) return true;
         if (builder.interval == 0) return true;
         return offset - builder.last_offset >= builder.interval;
@@ -977,7 +987,7 @@ const IndexProof = struct {
 /// length it currently has, and the checksum in the header is the checksum of
 /// the entries that follow it. An index that agrees with all three was built
 /// from exactly these bytes and nothing has changed since.
-fn readIndex(log: *Log, io: Io, segment: Segment) Io.Cancelable!?Indexed {
+fn readIndex(log: *Self, io: Io, segment: Segment) Io.Cancelable!?Indexed {
     const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     return readIndexFrom(io, file, segment);
 }
@@ -986,6 +996,8 @@ fn readIndexFrom(io: Io, file: Io.File, segment: Segment) Io.Cancelable!?Indexed
     const proof = (try proveIndexFrom(io, file)) orelse return null;
     if (proof.segment_bytes != segment.bytes) return null;
     if (proof.base_seq != segment.base_seq) return null;
+    std.debug.assert(proof.base_seq > 0);
+    std.debug.assert(proof.indexed.entries <= proof.indexed.count);
     return proof.indexed;
 }
 
@@ -1026,6 +1038,7 @@ fn proveIndexFrom(io: Io, file: Io.File) Io.Cancelable!?IndexProof {
         at += want;
     }
     if (~checksum != header.entries_checksum) return null;
+    std.debug.assert(length == index_header_len + entries * index_entry_len);
 
     return .{
         .segment_bytes = header.segment_bytes,
@@ -1049,7 +1062,7 @@ fn cancelOf(err: anyerror) Io.Cancelable!void {
 }
 
 /// The entry at `slot` of a segment's index, read through an open handle.
-fn indexEntryAt(log: *Log, io: Io, file: Io.File, slot: u64) Io.Cancelable!?IndexEntry {
+fn indexEntryAt(log: *Self, io: Io, file: Io.File, slot: u64) Io.Cancelable!?IndexEntry {
     log.index_reads += 1;
     var raw: [index_entry_len]u8 = undefined;
     const offset = index_header_len + slot * index_entry_len;
@@ -1063,7 +1076,7 @@ fn indexEntryAt(log: *Log, io: Io, file: Io.File, slot: u64) Io.Cancelable!?Inde
 
 /// The slot of the last entry whose sequence number is at or below `seq`, or
 /// null when the first entry is already past it.
-fn bisectSeq(log: *Log, io: Io, file: Io.File, entries: u64, seq: u64) Io.Cancelable!?u64 {
+fn bisectSeq(log: *Self, io: Io, file: Io.File, entries: u64, seq: u64) Io.Cancelable!?u64 {
     var low: u64 = 0;
     var high: u64 = entries;
     var found: ?u64 = null;
@@ -1087,21 +1100,21 @@ const HeldIndex = struct {
 };
 
 /// Let go of the index handle being held, if there is one.
-fn releaseIndex(log: *Log, io: Io) void {
+fn releaseIndex(log: *Self, io: Io) void {
     if (log.held_index) |held| held.file.close(io);
     log.held_index = null;
 }
 
 /// The open index of a sealed segment, opening it if the one being held is
 /// another segment's.
-fn holdIndex(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?Io.File {
+fn holdIndex(log: *Self, io: Io, base_seq: u64) Io.Cancelable!?Io.File {
     if (log.held_index) |held| {
         if (held.base_seq == base_seq) return held.file;
         held.file.close(io);
         log.held_index = null;
     }
     log.index_opens += 1;
-    const file = log.dir.openFile(io, &segmentName(base_seq, index_extension), .{}) catch |e| {
+    const file = log.dir.openFile(io, &segmentName(index_extension, base_seq), .{}) catch |e| {
         try cancelOf(e);
         return null;
     };
@@ -1117,7 +1130,7 @@ fn holdIndex(log: *Log, io: Io, base_seq: u64) Io.Cancelable!?Io.File {
 ///
 /// Every scan is chosen under the journal's lock. `may_write` is false for
 /// an independent walk: it uses an index already there and never builds one.
-fn provenIndex(log: *Log, io: Io, at: usize, may_write: bool) Io.Cancelable!?Indexed {
+fn provenIndex(log: *Self, io: Io, at: usize, may_write: bool) Io.Cancelable!?Indexed {
     const segment = &log.segments.items[at];
     switch (segment.index) {
         .good => |indexed| return indexed,
@@ -1156,7 +1169,7 @@ fn provenIndex(log: *Log, io: Io, at: usize, may_write: bool) Io.Cancelable!?Ind
 /// `index_interval_bytes` the answer is the entry before the record, and the
 /// walk steps over what is between them. A null answer is never wrong — it
 /// costs a walk from the segment's first record.
-fn indexedOffset(log: *Log, io: Io, at: usize, seq: u64, may_write: bool) Io.Cancelable!?u64 {
+fn indexedOffset(log: *Self, io: Io, at: usize, seq: u64, may_write: bool) Io.Cancelable!?u64 {
     const segment = log.segments.items[at];
     if (seq <= segment.base_seq or seq > segment.last_seq) return null;
 
@@ -1187,10 +1200,10 @@ fn indexedOffset(log: *Log, io: Io, at: usize, seq: u64, may_write: bool) Io.Can
 /// a missing or stale index costs and what it costs only once. The header is
 /// written last, so an interrupted rebuild leaves an index that reads as stale
 /// and is simply rebuilt again.
-fn rebuildIndex(log: *Log, io: Io, segment: Segment) OpenError!void {
+fn rebuildIndex(log: *Self, io: Io, segment: Segment) OpenError!void {
     if (log.options.access == .read) return error.ReadOnly;
     log.releaseIndex(io);
-    const file = try log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{ .truncate = true });
+    const file = try log.dir.createFile(io, &segmentName(index_extension, segment.base_seq), .{ .truncate = true });
     defer file.close(io);
     var writer = file.writer(io, log.index_buf);
     var builder: Builder = .init(segment.base_seq, log.options.index_interval_bytes);
@@ -1249,7 +1262,7 @@ const Resumed = struct {
 /// The header is stamped back to "still being appended to" before anything
 /// else happens, so a crash from here on leaves an index that reads as stale
 /// and is rebuilt, exactly as one a crash left half-written does.
-fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
+fn resumeIndex(log: *Self, io: Io, segment: Segment) OpenError!?Resumed {
     if (segment.bytes == 0) return null;
     const indexed = (try log.readIndex(io, segment)) orelse return null;
     if (indexed.interval != log.options.index_interval_bytes) return null;
@@ -1280,7 +1293,7 @@ fn resumeIndex(log: *Log, io: Io, segment: Segment) OpenError!?Resumed {
     }
     log.releaseIndex(io);
 
-    const file = log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{
+    const file = log.dir.createFile(io, &segmentName(index_extension, segment.base_seq), .{
         .read = true,
         .truncate = false,
     }) catch |e| {
@@ -1319,7 +1332,7 @@ const Line = struct {
     terminated: bool,
 };
 
-fn fileLength(log: *Log, io: Io, name: []const u8) OpenError!u64 {
+fn fileLength(log: *Self, io: Io, name: []const u8) OpenError!u64 {
     const file = try log.dir.openFile(io, name, .{});
     defer file.close(io);
     return file.length(io);
@@ -1327,14 +1340,14 @@ fn fileLength(log: *Log, io: Io, name: []const u8) OpenError!u64 {
 
 /// The line beginning at `offset`, read through strand's line layer in
 /// bounded steps rather than by taking the segment into memory.
-fn lineAt(log: *Log, io: Io, segment: Segment, offset: u64) OpenError!Line {
-    const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
+fn lineAt(log: *Self, io: Io, segment: Segment, offset: u64) OpenError!Line {
+    const file = try log.dir.openFile(io, &segmentName(segment_extension, segment.base_seq), .{});
     defer file.close(io);
 
     return log.lineAtFrom(io, file, segment, offset);
 }
 
-fn lineAtFrom(log: *Log, io: Io, file: Io.File, segment: Segment, offset: u64) OpenError!Line {
+fn lineAtFrom(log: *Self, io: Io, file: Io.File, segment: Segment, offset: u64) OpenError!Line {
     var buffer: [4096]u8 = undefined;
     var reader = file.reader(io, &.{});
     try reader.seekTo(offset);
@@ -1355,14 +1368,14 @@ fn lineAtFrom(log: *Log, io: Io, file: Io.File, segment: Segment, offset: u64) O
 /// a time from where the segment's records end, so that the cost is the
 /// size of one record rather than of the segment. `terminated` says whether
 /// the segment ends with the newline that ends a record.
-fn lastLine(log: *Log, io: Io, segment: Segment) OpenError!Line {
-    const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
+fn lastLine(log: *Self, io: Io, segment: Segment) OpenError!Line {
+    const file = try log.dir.openFile(io, &segmentName(segment_extension, segment.base_seq), .{});
     defer file.close(io);
 
     return log.lastLineFrom(io, file, segment);
 }
 
-fn lastLineFrom(log: *Log, io: Io, file: Io.File, segment: Segment) OpenError!Line {
+fn lastLineFrom(log: *Self, io: Io, file: Io.File, segment: Segment) OpenError!Line {
     if (segment.bytes == 0) return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = false };
     var last: [1]u8 = undefined;
     const terminated = try file.readPositionalAll(io, &last, segment.bytes - 1) == 1 and last[0] == '\n';
@@ -1472,14 +1485,14 @@ fn framing(max_line_bytes: usize) strand.LineReader.Options {
 /// Every streamed read needs storage for at least one byte of lookahead.
 /// Copies need a nonempty block to make progress too. Keep that requirement
 /// here, wherever the configured buffer is allocated.
-fn allocateReadBuffer(log: *const Log) Allocator.Error![]u8 {
+fn allocateReadBuffer(log: *const Self) Allocator.Error![]u8 {
     return log.gpa.alloc(u8, @max(log.options.read_buffer_size, 1));
 }
 
 /// Walk a segment's lines, optionally writing each line's offset and
 /// timestamp to an index being built. Memory is one read buffer and one line:
 /// nothing grows with the segment.
-fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenError!Scanned {
+fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenError!Scanned {
     log.segment_scans += 1;
     var scanned: Scanned = .{
         .lines = 0,
@@ -1491,7 +1504,7 @@ fn scanSegment(log: *Log, io: Io, segment: Segment, index: ?*IndexSink) OpenErro
     };
     if (segment.bytes == 0) return scanned;
 
-    const file = try log.dir.openFile(io, &segmentName(segment.base_seq, segment_extension), .{});
+    const file = try log.dir.openFile(io, &segmentName(segment_extension, segment.base_seq), .{});
     defer file.close(io);
     const buffer = try log.allocateReadBuffer();
     defer log.gpa.free(buffer);
@@ -1635,7 +1648,15 @@ pub const Scan = struct {
     /// the walk rather than damage — true for a reader beside a live writer.
     tolerate_partial_tail: bool,
 
+    fn assertValid(scan: *const Scan) void {
+        std.debug.assert(scan.bases.len == scan.limits.len);
+        std.debug.assert(scan.bases.len <= scan.bases_storage.len);
+        std.debug.assert(scan.limits.len <= scan.limits_storage.len);
+        std.debug.assert(scan.at <= scan.bases.len);
+    }
+
     pub fn deinit(scan: *Scan, io: Io) void {
+        scan.assertValid();
         if (scan.file) |file| file.close(io);
         scan.lines.deinit();
         scan.gpa.free(scan.buffer);
@@ -1672,6 +1693,7 @@ pub const Scan = struct {
         scan.at_header = false;
         scan.boundary = null;
         scan.lines.reset(.{ .offset = position });
+        scan.assertValid();
     }
 
     fn nextSegment(scan: *Scan, io: Io) void {
@@ -1684,6 +1706,8 @@ pub const Scan = struct {
     /// The next line, or null at the end of the log. The bytes are valid until
     /// the next call to `next` or to `deinit`.
     pub fn next(scan: *Scan, io: Io) ScanError!?[]const u8 {
+        scan.assertValid();
+        defer scan.assertValid();
         while (true) {
             if (scan.at >= scan.bases.len) return null;
             // Past the records of this segment: what follows them is space a
@@ -1693,7 +1717,7 @@ pub const Scan = struct {
                 continue;
             }
             if (scan.file == null) {
-                const file = try scan.dir.openFile(io, &segmentName(scan.bases[scan.at], segment_extension), .{});
+                const file = try scan.dir.openFile(io, &segmentName(segment_extension, scan.bases[scan.at]), .{});
                 scan.file = file;
                 scan.reader = file.reader(io, scan.buffer);
                 if (scan.position != 0) try scan.reader.seekTo(scan.position);
@@ -1781,6 +1805,7 @@ pub const Scan = struct {
     /// its newline, so that the next `next` returns it again.
     pub fn rewind(scan: *Scan, io: Io, len: u64) ScanError!void {
         _ = io;
+        std.debug.assert(len <= scan.position);
         scan.position -= len;
         try scan.reader.seekTo(scan.position);
         scan.lines.reset(.{ .offset = scan.position });
@@ -1804,7 +1829,7 @@ pub const Scan = struct {
 };
 
 /// A `Scan` over `segments`, starting `position` bytes into the first of them.
-fn scanOver(log: *Log, segments: []const Segment, position: u64, extent: ScanOptions.Extent) ScanError!Scan {
+fn scanOver(log: *Self, segments: []const Segment, position: u64, extent: ScanOptions.Extent) ScanError!Scan {
     // A follower may have stopped in the old active segment just as the
     // writer rotates. Its next pass then spans that segment and the new one.
     const capacity = @max(segments.len, 2);
@@ -1847,13 +1872,13 @@ fn scanOver(log: *Log, segments: []const Segment, position: u64, extent: ScanOpt
 }
 
 /// An idle scan whose buffers can be armed for a replay without replacing it.
-pub fn scanIdle(log: *Log) ScanError!Scan {
+pub fn scanIdle(log: *Self) ScanError!Scan {
     return log.scanOver(&.{}, 0, .live);
 }
 
 /// Re-arm an existing scan at an offset, or report that the segment is gone
 /// or shorter than the offset. It walks this segment and every one after it.
-pub fn scanAtInto(log: *Log, scan: *Scan, io: Io, base_seq: u64, offset: u64) ScanError!bool {
+pub fn scanAtInto(log: *Self, io: Io, scan: *Scan, base_seq: u64, offset: u64) ScanError!bool {
     for (log.segments.items, 0..) |segment, i| {
         if (segment.base_seq != base_seq) continue;
         if (log.options.access != .read and offset > segment.bytes) return false;
@@ -1878,20 +1903,20 @@ pub const ScanOptions = struct {
 ///
 /// The walk may begin a little before it — a caller with a cursor drops what it
 /// has already seen — but never after it.
-pub fn scanFrom(log: *Log, io: Io, cursor: u64, options: ScanOptions) ScanError!Scan {
+pub fn scanFrom(log: *Self, io: Io, cursor: u64, options: ScanOptions) ScanError!Scan {
     const start = try log.scanStart(io, cursor, options.may_write);
     return log.scanOver(start.segments, start.position, options.extent);
 }
 
 /// Re-arm an existing scan from a cursor, retaining its buffers.
-pub fn scanFromInto(log: *Log, scan: *Scan, io: Io, cursor: u64, options: ScanOptions) ScanError!void {
+pub fn scanFromInto(log: *Self, io: Io, scan: *Scan, cursor: u64, options: ScanOptions) ScanError!void {
     const start = try log.scanStart(io, cursor, options.may_write);
     try scan.rearmOver(io, start.segments, start.position, log.options.access == .read and options.extent == .live);
 }
 
 const ScanStart = struct { segments: []const Segment, position: u64 };
 
-fn scanStart(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!ScanStart {
+fn scanStart(log: *Self, io: Io, cursor: u64, may_write: bool) ScanError!ScanStart {
     if (log.segments.items.len == 0) return .{ .segments = &.{}, .position = 0 };
 
     // Saturating: a cursor of every one is a reader past the end of any log
@@ -1928,7 +1953,7 @@ fn scanStart(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!ScanStar
 /// it is missing or stale. For the active segment, whose index is not sealed
 /// yet, a walk of the segment — bounded by `Options.max_segment_bytes`, and
 /// only when its own timestamps say a record could be in there.
-pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) Log.OpenError!?u64 {
+pub fn seqAtOrAfter(log: *Self, io: Io, want: i64) Self.OpenError!?u64 {
     for (log.segments.items, 0..) |*segment, i| {
         if (segment.count() == 0) continue;
         const active = i + 1 == log.segments.items.len;
@@ -1951,7 +1976,7 @@ pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) Log.OpenError!?u64 {
 
 /// The first sequence number at or after `want` inside one segment, read from
 /// the timestamps in its index rather than from the segment itself.
-fn indexedSeqAtOrAfter(log: *Log, io: Io, at: usize, want: i64) OpenError!?u64 {
+fn indexedSeqAtOrAfter(log: *Self, io: Io, at: usize, want: i64) OpenError!?u64 {
     const segment = log.segments.items[at];
     const indexed = (try log.provenIndex(io, at, true)) orelse return null;
     if (indexed.entries == 0) return null;
@@ -2002,7 +2027,7 @@ fn indexedSeqAtOrAfter(log: *Log, io: Io, at: usize, want: i64) OpenError!?u64 {
 /// `error.CorruptRecord`: a lookup by time cannot step over a record that has
 /// none.
 fn scannedSeqAtOrAfter(
-    log: *Log,
+    log: *Self,
     io: Io,
     segment: Segment,
     want: i64,
@@ -2025,15 +2050,26 @@ fn scannedSeqAtOrAfter(
 //========================================================================
 
 /// The newest sequence number the log holds, or zero when it holds none.
-pub fn lastSeq(log: *const Log) u64 {
+pub fn lastSeq(log: *const Self) u64 {
     if (log.segments.items.len == 0) return 0;
     return log.segments.items[log.segments.items.len - 1].last_seq;
 }
 
 /// One below the oldest sequence number the log still holds.
-pub fn baseSeq(log: *const Log) u64 {
+pub fn baseSeq(log: *const Self) u64 {
     if (log.segments.items.len == 0) return 0;
     return log.segments.items[0].base_seq - 1;
+}
+
+fn assertValid(log: *const Self) void {
+    std.debug.assert(log.segments.items.len <= log.segments.capacity);
+    if (log.active) |active| {
+        std.debug.assert(log.options.access == .write);
+        std.debug.assert(log.segments.items.len != 0);
+        const segment = log.segments.items[log.segments.items.len - 1];
+        std.debug.assert(active.builder.base_seq == segment.base_seq);
+        std.debug.assert(segment.header_bytes <= segment.bytes);
+    }
 }
 
 /// Append one record's bytes and the newline that ends it, and make them
@@ -2042,14 +2078,15 @@ pub fn baseSeq(log: *const Log) u64 {
 /// Returns only once the bytes are in the file and — unless `Options.sync`
 /// says otherwise — on the disk. It is `stageLine` and `commit`, which is what
 /// a batch does once around many records rather than once around each.
-pub fn appendLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32) Log.AppendError!void {
+pub fn appendLine(log: *Self, io: Io, bytes: []const u8, at: i64, checksum: u32) Self.AppendError!void {
     try log.stageLine(io, bytes, at, checksum, .may_rotate);
     try log.commit(io);
 }
 
 /// The checksum the next record has to carry as its back-link: the newest
 /// record's, or the active segment's chain root when it holds none.
-pub fn chainTip(log: *const Log) u32 {
+pub fn chainTip(log: *const Self) u32 {
+    log.assertValid();
     return log.chain;
 }
 
@@ -2067,8 +2104,10 @@ pub fn chainTip(log: *const Log) u32 {
 /// limits that takes it: a record of an atomic batch after the first, since
 /// a batch is never split across segments, which is what lets an open find a
 /// torn one in the active segment alone.
-pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32, rotation: Rotation) Log.AppendError!void {
+pub fn stageLine(log: *Self, io: Io, bytes: []const u8, at: i64, checksum: u32, rotation: Rotation) Self.AppendError!void {
+    log.assertValid();
     if (log.active == null) return error.ReadOnly;
+    std.debug.assert(std.mem.findScalar(u8, bytes, '\n') == null);
     var segment = &log.segments.items[log.segments.items.len - 1];
 
     const needed = bytes.len + 1;
@@ -2099,6 +2138,8 @@ pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32, r
     segment.last_seq += 1;
     segment.times.widen(at);
     log.chain = checksum;
+    std.debug.assert(segment.bytes == offset + needed);
+    log.assertValid();
 }
 
 /// Whether `stageLine` may seal the active segment and start another first.
@@ -2109,7 +2150,7 @@ pub const Rotation = enum { may_rotate, stay };
 ///
 /// One `fsync` however many records were staged, which is what makes a batch
 /// cost one where a record at a time costs one each.
-pub fn commit(log: *Log, io: Io) Log.AppendError!void {
+pub fn commit(log: *Self, io: Io) Self.AppendError!void {
     try log.commitDeferred();
     if (log.options.sync == .always) {
         try log.syncActive(io);
@@ -2121,7 +2162,7 @@ pub fn commit(log: *Log, io: Io) Log.AppendError!void {
 /// bytes reach the operating system, and whatever makes the file durable
 /// next — a `commit` under `Options.sync = .always`, a rotation, a close —
 /// makes them durable with it, the file being written in order.
-pub fn commitDeferred(log: *Log) Log.AppendError!void {
+pub fn commitDeferred(log: *Self) Self.AppendError!void {
     if (log.active == null) return error.ReadOnly;
     try log.active.?.writer.interface.flush();
 }
@@ -2129,7 +2170,7 @@ pub fn commitDeferred(log: *Log) Log.AppendError!void {
 /// Make the active segment's bytes durable at the level the file's own shape
 /// allows: the contents alone when the write went into space the file already
 /// had, and the whole file when it grew.
-fn syncActive(log: *Log, io: Io) Io.File.SyncError!void {
+fn syncActive(log: *Self, io: Io) Io.File.SyncError!void {
     const active = &log.active.?;
     const segment = log.segments.items[log.segments.items.len - 1];
     const level: Level = if (segment.bytes <= active.preallocated) .contents else .whole;
@@ -2138,7 +2179,7 @@ fn syncActive(log: *Log, io: Io) Io.File.SyncError!void {
 
 /// Seal the active segment and start a new one named after the record that
 /// will go into it.
-fn rotate(log: *Log, io: Io) AppendError!void {
+fn rotate(log: *Self, io: Io) AppendError!void {
     // Reserve the owner before sealing or naming files. Once a new active
     // file exists, publishing its inventory must have no failure left.
     try log.segments.ensureUnusedCapacity(log.gpa, 1);
@@ -2183,8 +2224,8 @@ const Started = struct {
 
 /// Create a segment file, write the line that says what it is, and open the
 /// index beside it. The returned `Active` is positioned after the header.
-fn startSegment(log: *Log, io: Io, base_seq: u64, root: u32) AppendError!Started {
-    const file = try log.dir.createFile(io, &segmentName(base_seq, segment_extension), .{
+fn startSegment(log: *Self, io: Io, base_seq: u64, root: u32) AppendError!Started {
+    const file = try log.dir.createFile(io, &segmentName(segment_extension, base_seq), .{
         .read = true,
         .truncate = true,
     });
@@ -2205,7 +2246,7 @@ fn startSegment(log: *Log, io: Io, base_seq: u64, root: u32) AppendError!Started
     // Readable as well as writable: `indexedOffset` reads the live index back
     // through this handle, which is what turns a seek into the segment being
     // written to into a read rather than a scan of it.
-    const index_file = try log.dir.createFile(io, &segmentName(base_seq, index_extension), .{
+    const index_file = try log.dir.createFile(io, &segmentName(index_extension, base_seq), .{
         .read = true,
         .truncate = true,
     });
@@ -2229,9 +2270,9 @@ fn startSegment(log: *Log, io: Io, base_seq: u64, root: u32) AppendError!Started
 
 /// Open the newest segment for appending, rebuild its index, and repair a final
 /// line the previous writer did not finish.
-fn openActive(log: *Log, io: Io) OpenError!void {
+fn openActive(log: *Self, io: Io) OpenError!void {
     const segment = &log.segments.items[log.segments.items.len - 1];
-    const name = segmentName(segment.base_seq, segment_extension);
+    const name = segmentName(segment_extension, segment.base_seq);
 
     if (log.options.access == .read) {
         const file = try log.dir.openFile(io, &name, .{});
@@ -2288,8 +2329,8 @@ fn openActive(log: *Log, io: Io) OpenError!void {
 /// Return a fully opened active segment, or null when its torn header needs
 /// replacing. Until success this scope alone owns both files, so a failed
 /// replacement can never release the files of the previous attempt again.
-fn resumeActive(log: *Log, io: Io, segment: *Segment) OpenError!?Active {
-    const name = segmentName(segment.base_seq, segment_extension);
+fn resumeActive(log: *Self, io: Io, segment: *Segment) OpenError!?Active {
+    const name = segmentName(segment_extension, segment.base_seq);
     var transferred = false;
     const file = try log.dir.createFile(io, &name, .{ .read = true, .truncate = false });
     defer if (!transferred) file.close(io);
@@ -2327,7 +2368,7 @@ fn resumeActive(log: *Log, io: Io, segment: *Segment) OpenError!?Active {
     // rebuilt here, from the bytes that are actually in the file. It is opened
     // readable too: `indexedOffset` reads the live index back through this
     // handle rather than scanning the segment.
-    const index_file = try log.dir.createFile(io, &segmentName(segment.base_seq, index_extension), .{ .read = true, .truncate = true });
+    const index_file = try log.dir.createFile(io, &segmentName(index_extension, segment.base_seq), .{ .read = true, .truncate = true });
     defer if (!transferred) index_file.close(io);
     var index_writer = index_file.writer(io, log.index_buf);
     try index_writer.interface.writeAll(&placeholderHeader(segment.base_seq, log.options.index_interval_bytes));
@@ -2391,19 +2432,19 @@ fn resumeActive(log: *Log, io: Io, segment: *Segment) OpenError!?Active {
 
 /// The first line of a segment, which says what format its records are in and
 /// what the first of them links back to.
-fn readSegmentHeader(log: *Log, io: Io, segment: Segment) OpenError!SegmentHead {
+fn readSegmentHeader(log: *Self, io: Io, segment: Segment) OpenError!SegmentHead {
     const line = try log.lineAt(io, segment, 0);
     defer log.gpa.free(line.bytes);
     return log.segmentHeaderFromLine(segment, line);
 }
 
-fn readSegmentHeaderFrom(log: *Log, io: Io, file: Io.File, segment: Segment) OpenError!SegmentHead {
+fn readSegmentHeaderFrom(log: *Self, io: Io, file: Io.File, segment: Segment) OpenError!SegmentHead {
     const line = try log.lineAtFrom(io, file, segment, 0);
     defer log.gpa.free(line.bytes);
     return log.segmentHeaderFromLine(segment, line);
 }
 
-fn segmentHeaderFromLine(log: *Log, segment: Segment, line: Line) OpenError!SegmentHead {
+fn segmentHeaderFromLine(log: *Self, segment: Segment, line: Line) OpenError!SegmentHead {
     if (!line.terminated) return error.UnsupportedFormat;
     const header = (try parseSegmentHeader(log.gpa, line.bytes)) orelse return error.UnsupportedFormat;
     if (header.version != log_format or header.base_seq != segment.base_seq) return error.UnsupportedFormat;
@@ -2412,7 +2453,7 @@ fn segmentHeaderFromLine(log: *Log, segment: Segment, line: Line) OpenError!Segm
 
 /// The checksum of a segment's last record, which the next one links back to.
 /// `root` is the answer for a segment holding no records.
-fn lastChecksum(log: *Log, io: Io, segment: Segment, root: u32) OpenError!u32 {
+fn lastChecksum(log: *Self, io: Io, segment: Segment, root: u32) OpenError!u32 {
     if (segment.count() == 0) return root;
     const line = try log.lastLine(io, segment);
     defer log.gpa.free(line.bytes);
@@ -2433,7 +2474,7 @@ fn lastChecksum(log: *Log, io: Io, segment: Segment, root: u32) OpenError!u32 {
 /// The reserved space is never past `Options.max_segment_bytes`, so a segment
 /// is no larger on the disk than it was without this, and a rotation or a
 /// close cuts back whatever is left of it.
-fn reserveAhead(log: *Log, io: Io, needed: u64) AppendError!void {
+fn reserveAhead(log: *Self, io: Io, needed: u64) AppendError!void {
     const ahead = log.options.preallocate_bytes;
     if (ahead == 0) return;
     const active = &log.active.?;
@@ -2458,7 +2499,7 @@ fn reserveAhead(log: *Log, io: Io, needed: u64) AppendError!void {
 
 /// Cut the reserved space back to the records, so that a sealed segment is
 /// exactly its records and a closed log leaves no zeros behind.
-fn trimPreallocation(log: *Log, io: Io) Io.File.SetLengthError!void {
+fn trimPreallocation(log: *Self, io: Io) Io.File.SetLengthError!void {
     const active = &log.active.?;
     const segment = log.segments.items[log.segments.items.len - 1];
     if (active.preallocated <= segment.bytes) return;
@@ -2467,9 +2508,9 @@ fn trimPreallocation(log: *Log, io: Io) Io.File.SetLengthError!void {
 }
 
 /// Create an empty segment file and make its name durable.
-fn createSegment(log: *Log, io: Io, base_seq: u64) OpenError!void {
+fn createSegment(log: *Self, io: Io, base_seq: u64) OpenError!void {
     if (log.options.access == .read) return error.ReadOnly;
-    const file = try log.dir.createFile(io, &segmentName(base_seq, segment_extension), .{ .truncate = false });
+    const file = try log.dir.createFile(io, &segmentName(segment_extension, base_seq), .{ .truncate = false });
     file.close(io);
     try log.syncDir(io);
     try log.segments.append(log.gpa, .named(base_seq));
@@ -2483,7 +2524,7 @@ fn freshRoot(io: Io) u32 {
     return std.mem.readInt(u32, &bytes, .little);
 }
 
-fn closeActive(log: *Log, io: Io) void {
+fn closeActive(log: *Self, io: Io) void {
     if (log.active) |*active| {
         active.writer.interface.flush() catch |err| {
             // Best-effort resource release cannot return errors; close reports durability failures.
@@ -2503,7 +2544,7 @@ fn closeActive(log: *Log, io: Io) void {
 /// is still named after a power cut: `strand.syncDir`, the call a file's sync
 /// is on POSIX. Windows has no equivalent; there the call is nothing, and
 /// README.md says so.
-pub fn syncDir(log: *Log, io: Io) Io.File.SyncError!void {
+pub fn syncDir(log: *Self, io: Io) Io.File.SyncError!void {
     return syncDirHandle(io, log.dir);
 }
 
@@ -2511,9 +2552,9 @@ fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
     _ = try strand.syncDir(dir, io);
 }
 
-fn deleteSegmentFiles(log: *Log, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {
-    try log.dir.deleteFile(io, &segmentName(base_seq, segment_extension));
-    log.dir.deleteFile(io, &segmentName(base_seq, index_extension)) catch |err| {
+fn deleteSegmentFiles(log: *Self, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {
+    try log.dir.deleteFile(io, &segmentName(segment_extension, base_seq));
+    log.dir.deleteFile(io, &segmentName(index_extension, base_seq)) catch |err| {
         // The index is a rebuildable cache; record durability is handled separately.
         std.log.debug("optional index maintenance: {t}", .{err});
     };
@@ -2530,7 +2571,7 @@ fn deleteSegmentFiles(log: *Log, io: Io, base_seq: u64) Io.Dir.DeleteFileError!v
 /// `unlink` per segment whatever the log holds. Nothing calls it for you:
 /// dropping history is a decision, usually taken just after a `snapshot` that
 /// covers it.
-pub fn dropSegmentsBefore(log: *Log, io: Io, seq: u64) Log.CompactError!u64 {
+pub fn dropSegmentsBefore(log: *Self, io: Io, seq: u64) Self.CompactError!u64 {
     if (log.options.access == .read) return error.ReadOnly;
     var dropped: u64 = 0;
     while (log.segments.items.len > 1 and log.segments.items[0].last_seq <= seq) {
@@ -2555,7 +2596,7 @@ pub fn dropSegmentsBefore(log: *Log, io: Io, seq: u64) Log.CompactError!u64 {
 /// and leaves the segment named for the record that comes next -- the shape a
 /// `compact` that keeps nothing leaves. Below that there is no record to
 /// truncate to and the answer is `error.SeqTooOld`.
-pub fn truncateAfter(log: *Log, io: Io, seq: u64) Log.TruncateError!void {
+pub fn truncateAfter(log: *Self, io: Io, seq: u64) Self.TruncateError!void {
     if (log.options.access == .read) return error.ReadOnly;
     if (log.segments.items.len == 0) return;
     if (seq >= log.lastSeq()) return;
@@ -2580,13 +2621,13 @@ pub fn truncateAfter(log: *Log, io: Io, seq: u64) Log.TruncateError!void {
     try log.syncDir(io);
 
     if (offset != holder.bytes) {
-        const file = try log.dir.createFile(io, &segmentName(holder.base_seq, segment_extension), .{ .truncate = false });
+        const file = try log.dir.createFile(io, &segmentName(segment_extension, holder.base_seq), .{ .truncate = false });
         defer file.close(io);
         try file.setLength(io, offset);
         if (log.options.sync != .never) try syncFile(io, file, .whole);
         // The index describes bytes that are no longer there. Removing it is
         // cheaper than leaving one the next open has to reject and rebuild.
-        log.dir.deleteFile(io, &segmentName(holder.base_seq, index_extension)) catch |err| {
+        log.dir.deleteFile(io, &segmentName(index_extension, holder.base_seq)) catch |err| {
             // The index is a rebuildable cache; record durability is handled separately.
             std.log.debug("optional index maintenance: {t}", .{err});
         };
@@ -2597,7 +2638,7 @@ pub fn truncateAfter(log: *Log, io: Io, seq: u64) Log.TruncateError!void {
 
 /// The byte offset inside `segment` at which the record after `seq` begins,
 /// and `segment.bytes` when `seq` is the last record it holds.
-fn offsetAfter(log: *Log, io: Io, segment: Segment, seq: u64) OpenError!u64 {
+fn offsetAfter(log: *Self, io: Io, segment: Segment, seq: u64) OpenError!u64 {
     var scan = try log.scanOver(&.{segment}, 0, .live);
     defer scan.deinit(io);
     var offset = segment.header_bytes;
@@ -2620,7 +2661,7 @@ fn offsetAfter(log: *Log, io: Io, segment: Segment, seq: u64) OpenError!u64 {
 ///
 /// The sequence number survives a log emptied this way, because a segment's
 /// name is the record that will go into it.
-pub fn compact(log: *Log, io: Io, keep_after_seq: u64) Log.CompactError!void {
+pub fn compact(log: *Self, io: Io, keep_after_seq: u64) Self.CompactError!void {
     if (log.options.access == .read) return error.ReadOnly;
     if (log.segments.items.len == 0) return;
     const keep_from = @min(keep_after_seq, log.lastSeq()) + 1;
@@ -2660,8 +2701,8 @@ pub fn compact(log: *Log, io: Io, keep_after_seq: u64) Log.CompactError!void {
 
 /// Copy the records of `segment` from `keep_from` onward into a new segment
 /// named for `keep_from`, durably, without holding the whole segment.
-fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactError!void {
-    const temporary = segmentName(keep_from, temporary_extension);
+fn rewriteSegment(log: *Self, io: Io, segment: Segment, keep_from: u64) CompactError!void {
+    const temporary = segmentName(temporary_extension, keep_from);
     errdefer log.dir.deleteFile(io, &temporary) catch |err| {
         // Rollback must preserve the original failure even if removing the temporary file fails.
         std.log.debug("temporary-file rollback: {t}", .{err});
@@ -2711,7 +2752,7 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
     // no longer newest and a crash must leave it looking sealed.
     try log.trimPreallocation(io);
     log.closeActive(io);
-    try log.dir.rename(&temporary, log.dir, &segmentName(keep_from, segment_extension), io);
+    try log.dir.rename(&temporary, log.dir, &segmentName(segment_extension, keep_from), io);
     try log.syncDir(io);
 }
 
@@ -2726,7 +2767,7 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
 /// This checks nothing about `Options.access`: whether a file is part of the
 /// log is the caller's to know. A snapshot is; a named reader's cursor is not,
 /// which is what lets a `.read` log keep one.
-pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) Log.WriteFileError!void {
+pub fn writeAtomic(log: *Self, io: Io, name: []const u8, bytes: []const u8) Self.WriteFileError!void {
     const temporary = try std.mem.concat(log.gpa, u8, &.{ name, temporary_extension });
     defer log.gpa.free(temporary);
     errdefer log.dir.deleteFile(io, temporary) catch |err| {
@@ -2747,14 +2788,14 @@ pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) Log.W
 }
 
 /// `writeAtomic` over `<path>/snapshot`, which only a writer may replace.
-pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) Log.SnapshotError!void {
+pub fn writeSnapshot(log: *Self, io: Io, bytes: []const u8) Self.SnapshotError!void {
     if (log.options.access == .read) return error.ReadOnly;
     return log.writeAtomic(io, snapshot_name, bytes);
 }
 
 /// Make every record a snapshot may describe durable before that snapshot is
 /// published, independent of the append sync policy.
-pub fn syncBeforeSnapshot(log: *Log, io: Io) Log.SnapshotError!void {
+pub fn syncBeforeSnapshot(log: *Self, io: Io) Self.SnapshotError!void {
     if (log.active == null) return error.ReadOnly;
     const active = &log.active.?;
     try active.writer.interface.flush();
@@ -2799,7 +2840,7 @@ pub const BackupError = OpenError || strand.FileId.Error || error{BackupInPlace}
 /// `compact` or a `dropSegmentsBefore` unlinking a segment while it is being
 /// read, which comes back as an error rather than as a copy with a hole in it:
 /// take it again.
-pub fn backup(log: *Log, io: Io, dest_path: []const u8) Log.BackupError!u64 {
+pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!u64 {
     const cwd: Io.Dir = .cwd();
     // Opened first, so a destination that is a symbolic link to a directory
     // is that directory: std's `createDirPath` refuses an existing link with
@@ -2842,16 +2883,16 @@ pub fn backup(log: *Log, io: Io, dest_path: []const u8) Log.BackupError!u64 {
 
     const newest = log.segments.items.len - 1;
     for (log.segments.items[0..newest]) |segment| {
-        const name = segmentName(segment.base_seq, segment_extension);
+        const name = segmentName(segment_extension, segment.base_seq);
         if (!try log.copyFile(io, dest, &name, segment.bytes)) return error.FileNotFound;
-        _ = try log.copyFile(io, dest, &segmentName(segment.base_seq, index_extension), null);
+        _ = try log.copyFile(io, dest, &segmentName(index_extension, segment.base_seq), null);
     }
 
     // The newest segment, measured now: a writer in another process may be
     // part-way through a record, and the bytes after its last newline are not
     // one yet.
     var last = log.segments.items[newest];
-    const name = segmentName(last.base_seq, segment_extension);
+    const name = segmentName(segment_extension, last.base_seq);
     last.bytes = try log.fileLength(io, &name);
     // A batch the writer has not finished is not copied: the backup ends
     // where its last whole batch does.
@@ -2866,14 +2907,17 @@ pub fn backup(log: *Log, io: Io, dest_path: []const u8) Log.BackupError!u64 {
 /// Copy `name` into `dest`, either the first `bytes` of it or all of it.
 /// False when there is no such file, which is not an error for a snapshot or
 /// an index — neither is part of the log.
-fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) OpenError!bool {
+fn copyFile(log: *Self, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) OpenError!bool {
     // The filesystem's own copy first, where there is one. A sealed segment
     // is bytes that will never change again, and sharing their extents makes
     // a backup of a year of them the size of a directory entry.
     if (bytes == null and clone.available) {
-        dest.deleteFile(io, name) catch |err| {
-            // Cloning is optional; the ordinary copy path below reports any destination failure.
-            std.log.debug("clone destination cleanup: {t}", .{err});
+        dest.deleteFile(io, name) catch |err| switch (err) {
+            error.FileNotFound => {}, // A new destination needs no removal.
+            else => {
+                // Cloning is optional; the ordinary copy path reports any destination failure.
+                std.log.debug("clone destination cleanup: {t}", .{err});
+            },
         };
         if (clone.whole(io, log.dir, dest, name)) return true;
     }
@@ -2915,7 +2959,7 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) Op
 
 /// Remove the previous backup's log-owned files before writing a new view.
 /// Locks and reader cursors belong to users of the destination and remain.
-fn clearBackup(log: *Log, io: Io, dest: Io.Dir) OpenError!void {
+fn clearBackup(log: *Self, io: Io, dest: Io.Dir) OpenError!void {
     // The inventory is one temporary value: its list and every copied name
     // are released together, including a name whose insertion fails.
     var arena: std.heap.ArenaAllocator = .init(log.gpa);
@@ -2940,7 +2984,7 @@ fn clearBackup(log: *Log, io: Io, dest: Io.Dir) OpenError!void {
 /// caught where a comparison of paths would miss it. Failure to establish
 /// identity stops the copy: treating an unknown destination as different can
 /// open a source segment through the destination handle with truncation.
-fn sameDirectory(log: *Log, dest: Io.Dir) strand.FileId.Error!bool {
+fn sameDirectory(log: *Self, dest: Io.Dir) strand.FileId.Error!bool {
     const here = try strand.FileId.of(log.dir.handle);
     const there = try strand.FileId.of(dest.handle);
     return here.eql(there);
@@ -2952,7 +2996,7 @@ fn sameDirectory(log: *Log, dest: Io.Dir) strand.FileId.Error!bool {
 
 /// Flush and durably close the active segment, then release every resource.
 /// The log is consumed even when durability fails.
-pub fn close(log: *Log, io: Io) Log.CloseError!void {
+pub fn close(log: *Self, io: Io) Self.CloseError!void {
     defer log.release(io);
     if (log.active) |*active| {
         try active.writer.interface.flush();
@@ -2980,7 +3024,7 @@ pub fn close(log: *Log, io: Io) Log.CloseError!void {
     }
 }
 
-pub fn deinit(log: *Log, io: Io) void {
+pub fn deinit(log: *Self, io: Io) void {
     if (log.active) |*active| {
         active.writer.interface.flush() catch |err| {
             // Best-effort resource release cannot return errors; close reports durability failures.
@@ -3017,7 +3061,7 @@ pub fn deinit(log: *Log, io: Io) void {
     log.* = undefined;
 }
 
-fn release(log: *Log, io: Io) void {
+fn release(log: *Self, io: Io) void {
     if (log.active) |active| {
         active.file.close(io);
         active.index_file.close(io);
@@ -3031,4 +3075,11 @@ fn release(log: *Log, io: Io) void {
     log.gpa.free(log.index_buf);
     log.gpa.free(log.path);
     log.* = undefined;
+}
+
+comptime {
+    std.debug.assert(index_magic.len == @sizeOf(u64));
+    std.debug.assert(index_entry_len == 2 * @sizeOf(u64) + @sizeOf(i64));
+    std.debug.assert(index_header_len == 12 * @sizeOf(u64));
+    std.debug.assert(name_digits >= 20);
 }

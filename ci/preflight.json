@@ -11,16 +11,12 @@
   ],
   "function_exceptions": {
     "src/chronicle.zig:Journal": {
-      "lines": 1006,
-      "reason": "Existing implementation at adoption; this exact bound cannot grow and shrinks when the function is split."
+      "lines": 910,
+      "reason": "Compile-time opaque facade factory for Event. Its span includes the named API aliases, ownership documentation, and individually checked forwarding methods; replay and tailer owners are separate factories."
     },
     "src/journal.zig:Journal": {
-      "lines": 1986,
-      "reason": "Existing implementation at adoption; this exact bound cannot grow and shrinks when the function is split."
-    },
-    "src/journal_test.zig:fuzzDamage": {
-      "lines": 127,
-      "reason": "Existing implementation at adoption; this exact bound cannot grow and shrinks when the function is split."
+      "lines": 1945,
+      "reason": "Compile-time state type factory for Event. Its span includes fields, nested record and ownership types, and individually checked methods; record continuity is a separate factory. It executes no runtime journal operation."
     }
   },
   "layout_exceptions": {},

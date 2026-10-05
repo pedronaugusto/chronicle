@@ -161,6 +161,8 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
     const seq = integerOf(found.seq) orelse return error.Corrupt;
     if (seq < 1) return error.Corrupt;
     const from = @intFromPtr(found.ev.bytes.ptr) - @intFromPtr(line.ptr); // safe: parseLine without copy_strings hands back a view into line; numbers only
+    std.debug.assert(from <= line.len);
+    std.debug.assert(found.ev.bytes.len <= line.len - from);
     // Both members of a batch or neither, and one the record can be in.
     if ((found.bf == null) != (found.bl == null)) return error.Corrupt;
     const batch: ?Batch = if (found.bf) |bf| checkedBatch(

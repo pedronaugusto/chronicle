@@ -5,14 +5,16 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "primitives", .patterns = &.{
         "src/journal/clone.zig",
         "src/journal/crc32c.zig",
-        "src/journal/encoding.zig",
+        "src/journal/Encoding.zig",
         "src/journal/jsonl.zig",
     } },
     .{ .name = "envelopes", .patterns = &.{
         "src/journal/envelope.zig",
+        "src/journal/continuity.zig",
+        "src/journal/facade.zig",
     } },
     .{ .name = "segments", .patterns = &.{
-        "src/journal/log.zig",
+        "src/journal/Log.zig",
     } },
     .{ .name = "journal", .patterns = &.{
         "src/journal.zig",
@@ -47,10 +49,12 @@ pub const references: []const gantry.rules.ReferenceRule = &.{
 pub const required = [_][]const u8{
     "src/journal/clone.zig",
     "src/journal/crc32c.zig",
-    "src/journal/encoding.zig",
+    "src/journal/Encoding.zig",
     "src/journal/jsonl.zig",
     "src/journal/envelope.zig",
-    "src/journal/log.zig",
+    "src/journal/continuity.zig",
+    "src/journal/facade.zig",
+    "src/journal/Log.zig",
     "src/journal.zig",
     "src/chronicle.zig",
     "src/journal_test.zig",

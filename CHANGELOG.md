@@ -6,7 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-- Make the internal log module’s `SegmentHeader`, `Times`, and `Segment` types public and named for their public methods. Qualify already-public error unions in log method signatures.
+- Name the existing replay position and reader replay types as `Journal.Replay.Position` and `Journal.Tailer.Replay` when separating their facades.
+
+- Rename internal struct files to `journal/Log.zig` and `journal/Encoding.zig`; put compile-time and I/O parameters first in internal `segmentName`, `scanAtInto`, and `scanFromInto` APIs.
+- Empty the source lint and quality ledgers; separate replay and tailer facades, record continuity, and damage generation. Add assertions for record, segment, scan, index, batch, and tail invariants.
+
+- Make the internal log module's `SegmentHeader`, `Times`, and `Segment` types public and named for their public methods. Qualify already-public error unions in log method signatures.
 - Handle cleanup failures explicitly and propagate record-header flush and fixture failures.
 
 - Share the Zig CI gate through preflight, with requested fast runs and full merge checks.

@@ -28,7 +28,7 @@
   against the source record before reuse.
 - Snapshot and cursor documents carry `document_format`. Cursor names exclude
   path separators and reserved journal filenames. Snapshots cannot get ahead of
-  the journal sequence; tailer acknowledgement cannot get ahead of delivery.
+  the journal sequence. Tailer cursor updates are explicit and may move backwards.
 - The allocating encoding writer installs only its own vtable, and records
   allocation failures without confusing them with a stringify hook's refusal.
 - Best-effort destruction and failed-operation rollback release resources even
