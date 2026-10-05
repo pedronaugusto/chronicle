@@ -58,6 +58,9 @@ pub fn main() !void {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    var display_buffer: [4096]u8 = undefined;
+    var display = std.Io.File.stdout().writer(io, &display_buffer);
+    const output = &display.interface;
 
     var dir = std.Io.Dir.cwd();
     defer dir.deleteTree(io, "chronicle-migrate-example") catch {};
@@ -83,12 +86,13 @@ pub fn main() !void {
     for (batch.records()) |record| {
         switch (record.event) {
             .account_opened => |opened| {
-                std.debug.print("v{d}: {s}, family {s}\n", .{ record.version, opened.given, opened.family });
+                try output.print("v{d}: {s}, family {s}\n", .{ record.version, opened.given, opened.family });
                 if (!std.mem.eql(u8, opened.family, "Lovelace")) return error.MigrationMismatch;
             },
             .deposited => |d| cents += d.cents,
         }
     }
-    std.debug.print("balance: {d} cents\n", .{cents});
+    try output.print("balance: {d} cents\n", .{cents});
     if (cents != 5_700) return error.MigrationMismatch;
+    try output.flush();
 }

@@ -47,6 +47,9 @@ pub fn main() !void {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
+    var display_buffer: [4096]u8 = undefined;
+    var display = std.Io.File.stdout().writer(io, &display_buffer);
+    const output = &display.interface;
 
     var dir = std.Io.Dir.cwd();
     defer dir.deleteTree(io, "chronicle-example") catch {};
@@ -98,15 +101,16 @@ pub fn main() !void {
     try reopened.subscribeFrom(io, restored.sink(), from);
     // --- README:usage ---
 
-    std.debug.print("snapshot: seq {}, {} cents\n", .{ from, balances.cents });
-    std.debug.print("restored: {} accounts, {} cents, seq {}\n", .{ restored.accounts, restored.cents, try reopened.lastSeq(io) });
+    try output.print("snapshot: seq {}, {} cents\n", .{ from, balances.cents });
+    try output.print("restored: {} accounts, {} cents, seq {}\n", .{ restored.accounts, restored.cents, try reopened.lastSeq(io) });
     const batch = try reopened.copySince(gpa, io, from);
     defer batch.deinit();
     if (!batch.complete()) return error.IncompleteTail;
-    std.debug.print("replayed: {} record(s) after the snapshot\n", .{batch.records().len});
+    try output.print("replayed: {} record(s) after the snapshot\n", .{batch.records().len});
     const readers = try reopened.readers(io);
     defer readers.deinit();
     if (readers.items().len != 0) return error.UnexpectedReader;
     if (restored.cents != balances.cents) return error.FoldMismatch;
     if (last != 3) return error.UnexpectedSequence;
+    try output.flush();
 }
