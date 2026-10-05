@@ -63,7 +63,7 @@ const log_format: u32 = 1;
 /// The first line of a segment: which format the records after it are in,
 /// which sequence number the segment starts at, and what the first record's
 /// back-link has to be.
-const SegmentHeader = struct {
+pub const SegmentHeader = struct {
     version: u32,
     base_seq: u64,
     /// The checksum the first record in this file carries as its `p`. A fresh
@@ -207,7 +207,7 @@ pub const Access = enum {
 /// stores the `at` it was handed, and a caller may hand it anything. So it is
 /// the pair, not the ends, and a segment is skipped only when its *highest* is
 /// below what is being looked for.
-const Times = struct {
+pub const Times = struct {
     lowest: i64,
     highest: i64,
     /// Whether no record's `at` was below the one before it. A segment where
@@ -240,7 +240,7 @@ const Times = struct {
 };
 
 /// One segment, as the log knows it.
-const Segment = struct {
+pub const Segment = struct {
     /// The sequence number of this segment's first record, and its name.
     base_seq: u64,
     /// The sequence number of its last record, or `base_seq - 1` when it holds
@@ -443,7 +443,7 @@ fn parseNumberedName(name: []const u8, extension: []const u8) ?u64 {
 /// the last sequence number and to repair a torn tail — and one line of each
 /// sealed segment. The cost is one segment plus one read per segment, never
 /// the size of the log.
-pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!Log {
+pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Log.OpenError!Log {
     if (options.index_interval_bytes > std.math.maxInt(u32)) return error.IndexIntervalTooLarge;
     const owned_path = try gpa.dupe(u8, path);
     errdefer gpa.free(owned_path);
@@ -511,7 +511,7 @@ fn openDir(io: Io, path: []const u8, access: Access) OpenError!Io.Dir {
 /// `load`, as a caller may ask for it: read the directory again, keeping the
 /// directory handle and the lock. A `.read` log picks up what the writer has
 /// added since; a `.write` one picks up what its own `compact` rearranged.
-pub fn reload(log: *Log, io: Io) OpenError!void {
+pub fn reload(log: *Log, io: Io) Log.OpenError!void {
     return log.load(io);
 }
 
@@ -1927,7 +1927,7 @@ fn scanStart(log: *Log, io: Io, cursor: u64, may_write: bool) ScanError!ScanStar
 /// it is missing or stale. For the active segment, whose index is not sealed
 /// yet, a walk of the segment — bounded by `Options.max_segment_bytes`, and
 /// only when its own timestamps say a record could be in there.
-pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) OpenError!?u64 {
+pub fn seqAtOrAfter(log: *Log, io: Io, want: i64) Log.OpenError!?u64 {
     for (log.segments.items, 0..) |*segment, i| {
         if (segment.count() == 0) continue;
         const active = i + 1 == log.segments.items.len;
@@ -2041,7 +2041,7 @@ pub fn baseSeq(log: *const Log) u64 {
 /// Returns only once the bytes are in the file and — unless `Options.sync`
 /// says otherwise — on the disk. It is `stageLine` and `commit`, which is what
 /// a batch does once around many records rather than once around each.
-pub fn appendLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32) AppendError!void {
+pub fn appendLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32) Log.AppendError!void {
     try log.stageLine(io, bytes, at, checksum, .may_rotate);
     try log.commit(io);
 }
@@ -2066,7 +2066,7 @@ pub fn chainTip(log: *const Log) u32 {
 /// limits that takes it: a record of an atomic batch after the first, since
 /// a batch is never split across segments, which is what lets an open find a
 /// torn one in the active segment alone.
-pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32, rotation: Rotation) AppendError!void {
+pub fn stageLine(log: *Log, io: Io, bytes: []const u8, at: i64, checksum: u32, rotation: Rotation) Log.AppendError!void {
     if (log.active == null) return error.ReadOnly;
     var segment = &log.segments.items[log.segments.items.len - 1];
 
@@ -2108,7 +2108,7 @@ pub const Rotation = enum { may_rotate, stay };
 ///
 /// One `fsync` however many records were staged, which is what makes a batch
 /// cost one where a record at a time costs one each.
-pub fn commit(log: *Log, io: Io) AppendError!void {
+pub fn commit(log: *Log, io: Io) Log.AppendError!void {
     try log.commitDeferred();
     if (log.options.sync == .always) {
         try log.syncActive(io);
@@ -2120,7 +2120,7 @@ pub fn commit(log: *Log, io: Io) AppendError!void {
 /// bytes reach the operating system, and whatever makes the file durable
 /// next — a `commit` under `Options.sync = .always`, a rotation, a close —
 /// makes them durable with it, the file being written in order.
-pub fn commitDeferred(log: *Log) AppendError!void {
+pub fn commitDeferred(log: *Log) Log.AppendError!void {
     if (log.active == null) return error.ReadOnly;
     try log.active.?.writer.interface.flush();
 }
@@ -2529,7 +2529,7 @@ fn deleteSegmentFiles(log: *Log, io: Io, base_seq: u64) Io.Dir.DeleteFileError!v
 /// `unlink` per segment whatever the log holds. Nothing calls it for you:
 /// dropping history is a decision, usually taken just after a `snapshot` that
 /// covers it.
-pub fn dropSegmentsBefore(log: *Log, io: Io, seq: u64) CompactError!u64 {
+pub fn dropSegmentsBefore(log: *Log, io: Io, seq: u64) Log.CompactError!u64 {
     if (log.options.access == .read) return error.ReadOnly;
     var dropped: u64 = 0;
     while (log.segments.items.len > 1 and log.segments.items[0].last_seq <= seq) {
@@ -2554,7 +2554,7 @@ pub fn dropSegmentsBefore(log: *Log, io: Io, seq: u64) CompactError!u64 {
 /// and leaves the segment named for the record that comes next -- the shape a
 /// `compact` that keeps nothing leaves. Below that there is no record to
 /// truncate to and the answer is `error.SeqTooOld`.
-pub fn truncateAfter(log: *Log, io: Io, seq: u64) TruncateError!void {
+pub fn truncateAfter(log: *Log, io: Io, seq: u64) Log.TruncateError!void {
     if (log.options.access == .read) return error.ReadOnly;
     if (log.segments.items.len == 0) return;
     if (seq >= log.lastSeq()) return;
@@ -2619,7 +2619,7 @@ fn offsetAfter(log: *Log, io: Io, segment: Segment, seq: u64) OpenError!u64 {
 ///
 /// The sequence number survives a log emptied this way, because a segment's
 /// name is the record that will go into it.
-pub fn compact(log: *Log, io: Io, keep_after_seq: u64) CompactError!void {
+pub fn compact(log: *Log, io: Io, keep_after_seq: u64) Log.CompactError!void {
     if (log.options.access == .read) return error.ReadOnly;
     if (log.segments.items.len == 0) return;
     const keep_from = @min(keep_after_seq, log.lastSeq()) + 1;
@@ -2725,7 +2725,7 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
 /// This checks nothing about `Options.access`: whether a file is part of the
 /// log is the caller's to know. A snapshot is; a named reader's cursor is not,
 /// which is what lets a `.read` log keep one.
-pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) WriteFileError!void {
+pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) Log.WriteFileError!void {
     const temporary = try std.mem.concat(log.gpa, u8, &.{ name, temporary_extension });
     defer log.gpa.free(temporary);
     errdefer log.dir.deleteFile(io, temporary) catch |err| {
@@ -2746,14 +2746,14 @@ pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) Write
 }
 
 /// `writeAtomic` over `<path>/snapshot`, which only a writer may replace.
-pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) SnapshotError!void {
+pub fn writeSnapshot(log: *Log, io: Io, bytes: []const u8) Log.SnapshotError!void {
     if (log.options.access == .read) return error.ReadOnly;
     return log.writeAtomic(io, snapshot_name, bytes);
 }
 
 /// Make every record a snapshot may describe durable before that snapshot is
 /// published, independent of the append sync policy.
-pub fn syncBeforeSnapshot(log: *Log, io: Io) SnapshotError!void {
+pub fn syncBeforeSnapshot(log: *Log, io: Io) Log.SnapshotError!void {
     if (log.active == null) return error.ReadOnly;
     const active = &log.active.?;
     try active.writer.interface.flush();
@@ -2798,7 +2798,7 @@ pub const BackupError = OpenError || strand.FileId.Error || error{BackupInPlace}
 /// `compact` or a `dropSegmentsBefore` unlinking a segment while it is being
 /// read, which comes back as an error rather than as a copy with a hole in it:
 /// take it again.
-pub fn backup(log: *Log, io: Io, dest_path: []const u8) BackupError!u64 {
+pub fn backup(log: *Log, io: Io, dest_path: []const u8) Log.BackupError!u64 {
     const cwd: Io.Dir = .cwd();
     // Opened first, so a destination that is a symbolic link to a directory
     // is that directory: std's `createDirPath` refuses an existing link with
@@ -2951,7 +2951,7 @@ fn sameDirectory(log: *Log, dest: Io.Dir) strand.FileId.Error!bool {
 
 /// Flush and durably close the active segment, then release every resource.
 /// The log is consumed even when durability fails.
-pub fn close(log: *Log, io: Io) CloseError!void {
+pub fn close(log: *Log, io: Io) Log.CloseError!void {
     defer log.release(io);
     if (log.active) |*active| {
         try active.writer.interface.flush();

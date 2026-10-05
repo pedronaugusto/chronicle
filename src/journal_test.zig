@@ -5802,7 +5802,7 @@ fn openScans(ws: *Workspace, options: Journal.Options) !u64 {
     return journalState(journal).log.segment_scans;
 }
 
-const CountedEvent = struct {
+pub const CountedEvent = struct {
     id: u32,
     name: []const u8,
     var parses: usize = 0;
@@ -6742,7 +6742,7 @@ test "a rotation reserves its inventory before publishing a new active file" {
     try testing.expectEqual(previous + 1, try journal.append(io, 1, created(1, "n")));
 }
 
-const RefusingEvent = struct {
+pub const RefusingEvent = struct {
     text: []const u8,
     refuse: bool = false,
     partial: bool = false,

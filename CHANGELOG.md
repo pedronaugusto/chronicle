@@ -6,6 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Make the internal log module’s `SegmentHeader`, `Times`, and `Segment` types public and named for their public methods. Qualify already-public error unions in log method signatures.
+- Handle cleanup failures explicitly and propagate record-header flush and fixture failures.
+
 - Share the Zig CI gate through preflight, with requested fast runs and full merge checks.
 
 - Keep journal internals in `src/journal/`, beside the `src/journal.zig` entry, and the spawned lock helper in `src/testing/`.
