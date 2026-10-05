@@ -9,16 +9,7 @@
     "src/testing/*",
     "src/testing/lock_helper.zig"
   ],
-  "function_exceptions": {
-    "src/chronicle.zig:Journal": {
-      "lines": 910,
-      "reason": "Compile-time opaque facade factory for Event. Its span includes the named API aliases, ownership documentation, and individually checked forwarding methods; replay and tailer owners are separate factories."
-    },
-    "src/journal.zig:Journal": {
-      "lines": 1945,
-      "reason": "Compile-time state type factory for Event. Its span includes fields, nested record and ownership types, and individually checked methods; record continuity is a separate factory. It executes no runtime journal operation."
-    }
-  },
+  "function_exceptions": {},
   "layout_exceptions": {},
   "docs": {
     "zig build docs -- usage": {
