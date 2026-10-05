@@ -767,7 +767,10 @@ fn describeSealed(log: *Log, io: Io, segment: *Segment) OpenError!void {
             defer repair_file.close(io);
             try repair_file.setLength(io, scanned.complete_bytes);
             if (log.options.sync != .never) try syncFile(io, repair_file, .whole);
-            log.dir.deleteFile(io, &segmentName(segment.base_seq, index_extension)) catch {};
+            log.dir.deleteFile(io, &segmentName(segment.base_seq, index_extension)) catch |err| {
+                // The index is a rebuildable cache; record durability is handled separately.
+                std.log.debug("optional index maintenance: {t}", .{err});
+            };
             try log.syncDir(io);
         }
         segment.bytes = scanned.complete_bytes;
@@ -2481,8 +2484,14 @@ fn freshRoot(io: Io) u32 {
 
 fn closeActive(log: *Log, io: Io) void {
     if (log.active) |*active| {
-        active.writer.interface.flush() catch {};
-        active.index_writer.interface.flush() catch {};
+        active.writer.interface.flush() catch |err| {
+            // Best-effort resource release cannot return errors; close reports durability failures.
+            std.log.debug("best-effort log release: {t}", .{err});
+        };
+        active.index_writer.interface.flush() catch |err| {
+            // The index is a rebuildable cache; record durability is handled separately.
+            std.log.debug("optional index maintenance: {t}", .{err});
+        };
         active.file.close(io);
         active.index_file.close(io);
         log.active = null;
@@ -2503,7 +2512,10 @@ fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
 
 fn deleteSegmentFiles(log: *Log, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {
     try log.dir.deleteFile(io, &segmentName(base_seq, segment_extension));
-    log.dir.deleteFile(io, &segmentName(base_seq, index_extension)) catch {};
+    log.dir.deleteFile(io, &segmentName(base_seq, index_extension)) catch |err| {
+        // The index is a rebuildable cache; record durability is handled separately.
+        std.log.debug("optional index maintenance: {t}", .{err});
+    };
 }
 
 //========================================================================
@@ -2573,7 +2585,10 @@ pub fn truncateAfter(log: *Log, io: Io, seq: u64) TruncateError!void {
         if (log.options.sync != .never) try syncFile(io, file, .whole);
         // The index describes bytes that are no longer there. Removing it is
         // cheaper than leaving one the next open has to reject and rebuild.
-        log.dir.deleteFile(io, &segmentName(holder.base_seq, index_extension)) catch {};
+        log.dir.deleteFile(io, &segmentName(holder.base_seq, index_extension)) catch |err| {
+            // The index is a rebuildable cache; record durability is handled separately.
+            std.log.debug("optional index maintenance: {t}", .{err});
+        };
         try log.syncDir(io);
     }
     try log.load(io);
@@ -2628,9 +2643,9 @@ pub fn compact(log: *Log, io: Io, keep_after_seq: u64) CompactError!void {
         log.closeActive(io);
         const started = try log.startSegment(io, keep_from, freshRoot(io));
         var active = started.active;
-        active.writer.interface.flush() catch {};
-        active.file.close(io);
-        active.index_file.close(io);
+        defer active.file.close(io);
+        defer active.index_file.close(io);
+        try active.writer.interface.flush();
         log.chain = chain;
     }
 
@@ -2646,7 +2661,10 @@ pub fn compact(log: *Log, io: Io, keep_after_seq: u64) CompactError!void {
 /// named for `keep_from`, durably, without holding the whole segment.
 fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactError!void {
     const temporary = segmentName(keep_from, temporary_extension);
-    errdefer log.dir.deleteFile(io, &temporary) catch {};
+    errdefer log.dir.deleteFile(io, &temporary) catch |err| {
+        // Rollback must preserve the original failure even if removing the temporary file fails.
+        std.log.debug("temporary-file rollback: {t}", .{err});
+    };
 
     {
         const out = try log.dir.createFile(io, &temporary, .{ .truncate = true });
@@ -2710,7 +2728,10 @@ fn rewriteSegment(log: *Log, io: Io, segment: Segment, keep_from: u64) CompactEr
 pub fn writeAtomic(log: *Log, io: Io, name: []const u8, bytes: []const u8) WriteFileError!void {
     const temporary = try std.mem.concat(log.gpa, u8, &.{ name, temporary_extension });
     defer log.gpa.free(temporary);
-    errdefer log.dir.deleteFile(io, temporary) catch {};
+    errdefer log.dir.deleteFile(io, temporary) catch |err| {
+        // Rollback must preserve the original failure even if removing the temporary file fails.
+        std.log.debug("temporary-file rollback: {t}", .{err});
+    };
     {
         const file = try log.dir.createFile(io, temporary, .{ .truncate = true });
         defer file.close(io);
@@ -2849,7 +2870,10 @@ fn copyFile(log: *Log, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) Op
     // is bytes that will never change again, and sharing their extents makes
     // a backup of a year of them the size of a directory entry.
     if (bytes == null and clone.available) {
-        dest.deleteFile(io, name) catch {};
+        dest.deleteFile(io, name) catch |err| {
+            // Cloning is optional; the ordinary copy path below reports any destination failure.
+            std.log.debug("clone destination cleanup: {t}", .{err});
+        };
         if (clone.whole(io, log.dir, dest, name)) return true;
     }
 
@@ -2936,7 +2960,10 @@ pub fn close(log: *Log, io: Io) CloseError!void {
 
         // The index is only a cache. Failure to finish it costs the next open
         // a scan and does not change whether the log itself was closed durably.
-        active.index_writer.interface.flush() catch {};
+        active.index_writer.interface.flush() catch |err| {
+            // The index is a rebuildable cache; record durability is handled separately.
+            std.log.debug("optional index maintenance: {t}", .{err});
+        };
         const segment = log.segments.items[log.segments.items.len - 1];
         if (segment.bytes != 0) sealIndex(io, active.index_file, .{
             .segment_bytes = segment.bytes,
@@ -2945,16 +2972,31 @@ pub fn close(log: *Log, io: Io) CloseError!void {
             .times = segment.times,
             .interval = @intCast(active.builder.interval),
             .entries_checksum = ~active.builder.checksum,
-        }, log.options.sync) catch {};
+        }, log.options.sync) catch |err| {
+            // The index is a rebuildable cache; record durability is handled separately.
+            std.log.debug("optional index maintenance: {t}", .{err});
+        };
     }
 }
 
 pub fn deinit(log: *Log, io: Io) void {
     if (log.active) |*active| {
-        active.writer.interface.flush() catch {};
-        log.trimPreallocation(io) catch {};
-        if (log.options.sync != .never) syncFile(io, active.file, .whole) catch {};
-        active.index_writer.interface.flush() catch {};
+        active.writer.interface.flush() catch |err| {
+            // Best-effort resource release cannot return errors; close reports durability failures.
+            std.log.debug("best-effort log release: {t}", .{err});
+        };
+        log.trimPreallocation(io) catch |err| {
+            // Best-effort resource release cannot return errors; close reports durability failures.
+            std.log.debug("best-effort log release: {t}", .{err});
+        };
+        if (log.options.sync != .never) syncFile(io, active.file, .whole) catch |err| {
+            // Best-effort resource release cannot return errors; close reports durability failures.
+            std.log.debug("best-effort log release: {t}", .{err});
+        };
+        active.index_writer.interface.flush() catch |err| {
+            // The index is a rebuildable cache; record durability is handled separately.
+            std.log.debug("optional index maintenance: {t}", .{err});
+        };
         // Leave the active index stamped with the length it describes, so that
         // the next open can take it rather than rebuild it.
         const segment = log.segments.items[log.segments.items.len - 1];
@@ -2965,7 +3007,10 @@ pub fn deinit(log: *Log, io: Io) void {
             .times = segment.times,
             .interval = @intCast(active.builder.interval),
             .entries_checksum = ~active.builder.checksum,
-        }, log.options.sync) catch {};
+        }, log.options.sync) catch |err| {
+            // The index is a rebuildable cache; record durability is handled separately.
+            std.log.debug("optional index maintenance: {t}", .{err});
+        };
     }
     log.release(io);
 }

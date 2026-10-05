@@ -101,5 +101,5 @@ pub fn main(init: std.process.Init) !void {
 
     var in_buffer: [64]u8 = undefined;
     var in = std.Io.File.stdin().readerStreaming(io, &in_buffer);
-    _ = in.interface.discardRemaining() catch {};
+    _ = try in.interface.discardRemaining();
 }

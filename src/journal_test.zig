@@ -140,7 +140,10 @@ const Workspace = struct {
         const root_path = try arena.allocator().dupe(u8, workspaceName(&buffer));
         const cwd: Io.Dir = .cwd();
         try cwd.createDirPath(io, root_path);
-        errdefer cwd.deleteTree(io, root_path) catch {};
+        errdefer cwd.deleteTree(io, root_path) catch |err| {
+            // Rollback must preserve the original setup failure.
+            std.log.debug("fixture rollback: {t}", .{err});
+        };
         const root = try cwd.openDir(io, root_path, .{ .iterate = true });
         errdefer root.close(io);
 
@@ -152,7 +155,10 @@ const Workspace = struct {
     fn deinit(self: *Workspace) void {
         const io = testing.io;
         self.root.close(io);
-        Io.Dir.cwd().deleteTree(io, self.root_path) catch {};
+        Io.Dir.cwd().deleteTree(io, self.root_path) catch |err| {
+            // A fixture operation must fail the test when it cannot complete.
+            std.log.err("fixture operation: {t}", .{err});
+        };
         self.arena.deinit();
     }
 
@@ -181,7 +187,7 @@ const Workspace = struct {
     }
 
     fn write(self: *Workspace, sub_path: []const u8, data: []const u8) !void {
-        self.root.createDirPath(testing.io, self.name) catch {};
+        try self.root.createDirPath(testing.io, self.name);
         return self.root.writeFile(testing.io, .{ .sub_path = sub_path, .data = data });
     }
 
@@ -1350,7 +1356,10 @@ test "a record appended beside a shared subscribe lands in every fold exactly on
     // sequence each fold saw must have no gap and no repeat in it.
     const appender = struct {
         fn f(j: *Journal, inner: Io) void {
-            _ = j.append(inner, 2_001, created(2_001, "beside")) catch {};
+            _ = j.append(inner, 2_001, created(2_001, "beside")) catch |err| {
+                // A fixture operation must fail the test when it cannot complete.
+                std.log.err("fixture operation: {t}", .{err});
+            };
         }
     }.f;
 
@@ -1404,7 +1413,10 @@ fn appendToWaitingReader(journal: *Journal, io: Io, event: Event) !u64 {
         }
     }.run;
     var future = try io.concurrent(reader, .{ journal, io });
-    defer _ = future.cancel(io) catch {};
+    defer _ = future.cancel(io) catch |err| {
+        // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+        std.log.debug("task cleanup: {t}", .{err});
+    };
 
     while (true) {
         journalState(journal).mutex.lockUncancelable(io);
@@ -1465,7 +1477,10 @@ test "an append nobody waits on wakes nobody, and one somebody waits on wakes th
         }
     }.f;
     var future = try io.concurrent(reader, .{ journal, io, @as(u64, 3) });
-    defer _ = future.cancel(io) catch {};
+    defer _ = future.cancel(io) catch |err| {
+        // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+        std.log.debug("task cleanup: {t}", .{err});
+    };
 
     // Once the reader has counted itself in — read under the lock it counts
     // itself in under — the next append has somebody to wake, and does.
@@ -1553,7 +1568,10 @@ test "a reader stopped as a record arrives is stopped" {
         while (!waiting.load(.acquire)) std.atomic.spinLoopHint();
         const other = try std.Thread.spawn(.{}, nudger, .{ journal, io, &go, @as(u32, @intCast(round % 64)) * 50 });
         go.store(true, .release);
-        future.cancel(io) catch {};
+        future.cancel(io) catch |err| {
+            // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+            std.log.debug("task cleanup: {t}", .{err});
+        };
         other.join();
     }
 }
@@ -2059,7 +2077,10 @@ const ForgottenMidList = struct {
 
     fn openFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
         if (std.mem.eql(u8, sub_path, "gone" ++ chronicle.cursor_extension)) {
-            real.dirDeleteFile(userdata, dir, sub_path) catch {};
+            real.dirDeleteFile(userdata, dir, sub_path) catch |err| {
+                // A fixture operation must fail the test when it cannot complete.
+                std.log.err("fixture operation: {t}", .{err});
+            };
         }
         return real.dirOpenFile(userdata, dir, sub_path, options);
     }
@@ -2605,7 +2626,7 @@ test "an index of one entry per interval is a fortieth of one per record" {
             try testing.expectEqual(cursor + 1, record.seq);
         }
 
-        journalState(journal).log.active.?.index_writer.interface.flush() catch {};
+        try journalState(journal).log.active.?.index_writer.interface.flush();
         const size = (try each.read(try each.index(1))).len;
         if (interval == 0) dense_bytes = size else sparse_bytes = size;
     }
@@ -3162,7 +3183,10 @@ test "a backup refuses its own directory reached through a symbolic link" {
 /// where it is, so the next call would answer with nothing at all.
 fn helperLine(reader: *Io.Reader) ![]const u8 {
     const text = try reader.takeDelimiterExclusive('\n');
-    _ = reader.takeByte() catch {};
+    _ = reader.takeByte() catch |err| switch (err) {
+        error.EndOfStream => {},
+        else => return err,
+    };
     return text;
 }
 
@@ -5412,7 +5436,10 @@ fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
         },
     };
     try ws.write(name, damaged);
-    if (smith.boolWeighted(1, 1)) ws.root.deleteFile(io, try ws.index(damaged_base)) catch {};
+    if (smith.boolWeighted(1, 1)) ws.root.deleteFile(io, try ws.index(damaged_base)) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 
     // `.fail` repairs nothing: a refusal leaves the segments as they were.
     const before = try ws.read(name);
@@ -6140,11 +6167,20 @@ test "independent replays read committed records beside a rotating writer" {
         }
     };
     var writer = try io.concurrent(Worker.write, .{ journal, io });
-    defer writer.cancel(io) catch {};
+    defer writer.cancel(io) catch |err| {
+        // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+        std.log.debug("task cleanup: {t}", .{err});
+    };
     var first = try io.concurrent(Worker.read, .{ journal, io });
-    defer first.cancel(io) catch {};
+    defer first.cancel(io) catch |err| {
+        // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+        std.log.debug("task cleanup: {t}", .{err});
+    };
     var second = try io.concurrent(Worker.read, .{ journal, io });
-    defer second.cancel(io) catch {};
+    defer second.cancel(io) catch |err| {
+        // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+        std.log.debug("task cleanup: {t}", .{err});
+    };
     try first.await(io);
     try second.await(io);
     try writer.await(io);
@@ -7009,7 +7045,10 @@ test "of several writers expecting the same record, exactly one appends after it
 
     var tasks: [racers.len]Io.Future(anyerror!void) = undefined;
     var started: usize = 0;
-    defer for (tasks[0..started]) |*task| task.cancel(io) catch {};
+    defer for (tasks[0..started]) |*task| task.cancel(io) catch |err| {
+        // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+        std.log.debug("task cleanup: {t}", .{err});
+    };
     for (&racers, &tasks) |*racer, *task| {
         task.* = io.concurrent(Racer.run, .{ racer, io }) catch |err| switch (err) {
             error.ConcurrencyUnavailable => return error.SkipZigTest,
