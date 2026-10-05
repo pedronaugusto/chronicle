@@ -35,13 +35,6 @@
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
-    "rule": "Z030",
-    "path": "src/journal/log.zig",
-    "source": "pub fn deinit(log: *Log, io: Io) void {",
-    "detail": "deinit should set log.* = undefined",
-    "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
-  },
-  {
     "rule": "Z028",
     "path": "src/tests.zig",
     "source": "@import(\"std\").testing.refAllDecls(chronicle);",
@@ -53,20 +46,6 @@
     "path": "src/journal_test.zig",
     "source": "fn fill(journal: *Journal, io: Io, first: u64, last: u64, name: []const u8) !void {",
     "detail": "'Io' parameter should come before 'other'",
-    "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
-  },
-  {
-    "rule": "Z030",
-    "path": "src/journal_test.zig",
-    "source": "fn deinit(self: *Workspace) void {",
-    "detail": "deinit should set self.* = undefined",
-    "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
-  },
-  {
-    "rule": "Z030",
-    "path": "src/journal_test.zig",
-    "source": "fn deinit(self: *Handwritten) void {",
-    "detail": "deinit should set self.* = undefined",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
@@ -98,24 +77,10 @@
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {
-    "rule": "Z017",
-    "path": "src/journal_test.zig",
-    "source": "return try future.await(io);",
-    "detail": "avoid try in return; hoist it to preserve payload coercion: `const value = try future.await(io); return value;`",
-    "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
-  },
-  {
     "rule": "Z023",
     "path": "src/journal_test.zig",
     "source": "fn f(j: *Journal, inner: Io, cursor: u64) Io.Cancelable!u64 {",
     "detail": "'Io' parameter should come before 'other'",
-    "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
-  },
-  {
-    "rule": "Z017",
-    "path": "src/journal_test.zig",
-    "source": "return try j.waitPast(inner, cursor);",
-    "detail": "avoid try in return; hoist it to preserve payload coercion: `const value = try j.waitPast(inner, cursor); return value;`",
     "reason": "Existing finding at migration; this exact source and diagnostic are retained until the owning code is revised."
   },
   {

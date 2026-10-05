@@ -3014,6 +3014,7 @@ pub fn deinit(log: *Log, io: Io) void {
         };
     }
     log.release(io);
+    log.* = undefined;
 }
 
 fn release(log: *Log, io: Io) void {

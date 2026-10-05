@@ -160,6 +160,7 @@ const Workspace = struct {
             std.log.err("fixture operation: {t}", .{err});
         };
         self.arena.deinit();
+        self.* = undefined;
     }
 
     /// `<journal>/<file>`, relative to the temporary directory.
@@ -275,6 +276,7 @@ const Handwritten = struct {
 
     fn deinit(self: *Handwritten) void {
         self.bytes.deinit(testing.allocator);
+        self.* = undefined;
     }
 
     /// One record, checksummed and linked. `ev` is its event as JSON.
@@ -1426,7 +1428,7 @@ fn appendToWaitingReader(journal: *Journal, io: Io, event: Event) !u64 {
         try io.sleep(.fromMilliseconds(1), .awake);
     }
     _ = try journal.append(io, 1, event);
-    return try future.await(io);
+    return future.await(io);
 }
 
 test "waitPast blocks until an append arrives" {
@@ -1473,7 +1475,7 @@ test "an append nobody waits on wakes nobody, and one somebody waits on wakes th
 
     const reader = struct {
         fn f(j: *Journal, inner: Io, cursor: u64) Io.Cancelable!u64 {
-            return try j.waitPast(inner, cursor);
+            return j.waitPast(inner, cursor);
         }
     }.f;
     var future = try io.concurrent(reader, .{ journal, io, @as(u64, 3) });
