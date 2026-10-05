@@ -80,7 +80,8 @@ pub const SegmentHeader = struct {
     /// and ten of `root`.
     pub fn line(header: SegmentHeader, buffer: *[96]u8) []const u8 {
         var out: std.Io.Writer = .fixed(buffer);
-        strand.writeValue(&out, Shape{ .chronicle = header.version, .base = header.base_seq, .root = header.root }, .{}) catch unreachable;
+        strand.writeValue(&out, Shape{ .chronicle = header.version, .base = header.base_seq, .root = header.root }, .{}) catch unreachable; // unreachable: three bounded unsigned integers and fixed JSON punctuation fit in 96 bytes
+        std.debug.assert(out.end <= buffer.len);
         return out.buffered();
     }
 };
@@ -409,7 +410,7 @@ pub fn segmentName(
     // Zero-terminated: some of the calls a copy makes go to the operating
     // system by name rather than through an open file.
     var out: [name_digits + extension.len:0]u8 = undefined;
-    _ = std.fmt.bufPrint(&out, "{d:0>20}" ++ extension, .{base_seq}) catch unreachable;
+    _ = std.fmt.bufPrint(&out, "{d:0>20}" ++ extension, .{base_seq}) catch unreachable; // unreachable: every u64 fits in 20 decimal digits and the buffer includes extension.len
     out[out.len] = 0;
     return out;
 }
