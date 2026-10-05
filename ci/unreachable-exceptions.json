@@ -1,0 +1,16 @@
+[
+  {
+    "rule": "catch-unreachable",
+    "path": "src/journal/log.zig",
+    "source": "strand.writeValue(&out, Shape{ .chronicle = header.version, .base = header.base_seq, .root = header.root }, .{}) catch unreachable;",
+    "detail": "catch unreachable needs // unreachable: <why> on the same or previous line",
+    "reason": "existing at gate adoption; burned down in the cleanup pass"
+  },
+  {
+    "rule": "catch-unreachable",
+    "path": "src/journal/log.zig",
+    "source": "_ = std.fmt.bufPrint(&out, \"{d:0>20}\" ++ extension, .{base_seq}) catch unreachable;",
+    "detail": "catch unreachable needs // unreachable: <why> on the same or previous line",
+    "reason": "existing at gate adoption; burned down in the cleanup pass"
+  }
+]
