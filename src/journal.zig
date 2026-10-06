@@ -370,7 +370,8 @@ pub fn Journal(comptime Event: type) type {
             /// `error.Locked`; `.read` takes no lock, writes nothing, and is
             /// safe to run beside the writer.
             access: Access = .write,
-            /// What to do with an unterminated final line. Ignored under
+            /// What to do with a final record the previous writer did not
+            /// finish (see `OnTruncated`). Ignored under
             /// `.read`, which repairs nothing.
             on_truncated: OnTruncated = .drop,
             /// How much of the log `open` reads back before it returns.
@@ -650,6 +651,13 @@ pub fn Journal(comptime Event: type) type {
 
         /// Whether `Event` has an arm this package can put an unrecognised
         /// older record into, and what shape it is.
+        /// How an event is parsed out of its record: by every read, and by
+        /// the append that proves the event reads back. One value, so an
+        /// append never writes what a read refuses. Strict, because an event
+        /// that writes a member it does not read back would not come back
+        /// as the event that was appended.
+        const event_parse: strand.ParseOptions = .{ .ignore_unknown_fields = false };
+
         const unknown_arm: ?UnknownArm = blk: {
             const info = @typeInfo(Event);
             if (info != .@"union") break :blk null;
@@ -891,9 +899,10 @@ pub fn Journal(comptime Event: type) type {
             else
                 null;
             var link = self.log.chainTip();
+            const staged_from = self.log.mark();
             for (entries, 0..) |entry, i| {
                 var item = self.encode(self.seq + i + 1, entry.at, link, entry.event, batch) catch |err| {
-                    self.unstage(io, before);
+                    self.unstage(io, staged_from);
                     return err;
                 };
                 link = item.checksum;
@@ -938,35 +947,31 @@ pub fn Journal(comptime Event: type) type {
             if (self.config.access == .read) return error.ReadOnly;
             if (!self.write_failed) return self.seq;
 
+            const previous = self.seq;
             try self.log.reload(io);
             self.clearTail();
             try self.fillTail(io);
             self.write_failed = false;
+            try self.caughtUp(io, previous);
             return self.seq;
         }
 
         /// Take back the lines of a batch that was staged and never
         /// committed, so that a batch which could not be formed leaves the
-        /// log exactly as it was.
+        /// log exactly as it was. Nothing staged was published, so the tail
+        /// and the sinks never saw it.
         ///
-        /// It is the same shortening `truncateAfter` does, for the same
-        /// reason: what is on the disk has to end at a record boundary
-        /// whatever happened. Nothing here was ever acknowledged, so nothing
-        /// is lost by it.
-        fn unstage(self: *Self, io: Io, seq: u64) void {
-            if (self.seq <= seq and self.log.lastSeq() <= seq) return;
-            self.putBack(io, seq) catch {
-                // The log could not be put back. What is on the disk is
-                // still whole records in order, and a reopen reads them, but
-                // this process must not hand any of them out as appended.
+        /// What is on the disk has to end at a record boundary whatever
+        /// happened. Nothing here was ever acknowledged, so nothing is lost
+        /// by it.
+        fn unstage(self: *Self, io: Io, from: Log.Mark) void {
+            self.log.discardStaged(io, from) catch {
+                // The log could not be put back. What this process staged
+                // may reach the disk as records it never acknowledged, so it
+                // must not append after them until `reconcile` has read
+                // what is there.
                 self.write_failed = true;
             };
-        }
-
-        fn putBack(self: *Self, io: Io, seq: u64) TruncateError!void {
-            try self.log.truncateAfter(io, seq);
-            self.clearTail();
-            try self.fillTail(io);
         }
 
         pub fn nudge(self: *Self, io: Io) void {
@@ -1262,9 +1267,11 @@ pub fn Journal(comptime Event: type) type {
             // bytes of a record and its flush.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
+            const previous = self.seq;
             try self.log.reload(io);
             self.clearTail();
             try self.fillTail(io);
+            try self.caughtUp(io, previous);
         }
 
         pub fn segmentCount(self: *Self, io: Io) Io.Cancelable!usize {
@@ -1366,18 +1373,34 @@ pub fn Journal(comptime Event: type) type {
             // finds, whatever the caller does with its own array.
             const registered = self.sinks.items[before..];
 
+            try self.deliver(io, registered, cursor);
+        }
+
+        /// Hand `sinks` every record after `cursor` up to the newest: from
+        /// the tail where it reaches back that far, from the disk where it
+        /// does not. Called under the journal's lock.
+        fn deliver(self: *Self, io: Io, sinks: []const Sink, cursor: u64) ReplayError!void {
+            if (sinks.len == 0 or cursor >= self.seq) return;
             var delivered = cursor;
             if (!self.tailSince(cursor).complete) {
                 var walk = try self.replayFrom(io, cursor, true);
                 defer walk.deinit(io);
                 while (try walk.next(io)) |record| {
-                    for (registered) |sink| sink.f(sink.ctx, record);
+                    for (sinks) |sink| sink.f(sink.ctx, record);
                     delivered = record.seq;
                 }
             }
             for (self.tailSince(delivered).records) |owned| {
-                for (registered) |sink| sink.f(sink.ctx, owned.record);
+                for (sinks) |sink| sink.f(sink.ctx, owned.record);
             }
+        }
+
+        /// After the files were read again: wake every `waitPast` if the
+        /// newest record moved, and hand the sinks the records that arrived
+        /// after `previous`, so a fold misses none of them.
+        fn caughtUp(self: *Self, io: Io, previous: u64) ReplayError!void {
+            if (self.seq != previous) self.wake(io);
+            try self.deliver(io, self.sinks.items, previous);
         }
 
         pub fn unsubscribe(self: *Self, io: Io, sink: Sink) Io.Cancelable!bool {
@@ -1694,9 +1717,35 @@ pub fn Journal(comptime Event: type) type {
             defer _ = io.swapCancelProtection(protection);
             if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
+            if (seq < self.seq) try self.retireSnapshotAfter(io, seq);
             try self.log.truncateAfter(io, seq);
             self.clearTail();
             try self.fillTail(io);
+        }
+
+        /// Remove a snapshot folded from records after `seq`, before they
+        /// are cut. The numbers a truncation frees are handed out again, so
+        /// such a snapshot would later look current over a history it never
+        /// saw. Gone first: a crash before the cut leaves a log with no
+        /// snapshot, which replays from the start, never a stale one. A
+        /// snapshot that cannot be read is left for `openWithSnapshot` to
+        /// report.
+        fn retireSnapshotAfter(self: *Self, io: Io, seq: u64) TruncateError!void {
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena.deinit();
+            const Document = struct { seq: u64 };
+            const document = self.readDocument(
+                io,
+                arena.allocator(),
+                Document,
+                Log.snapshot_name,
+                self.config.max_snapshot_bytes,
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                else => return,
+            } orelse return;
+            if (document.seq > seq) try self.log.removeSnapshot(io);
         }
 
         pub fn compact(self: *Self, io: Io, keep_after_seq: u64) CompactError!void {
@@ -1850,15 +1899,15 @@ pub fn Journal(comptime Event: type) type {
             const stored = out.toOwnedSlice() catch return error.OutOfMemory;
             self.record_hint = stored.len;
             // The event is read back out of the bytes that will be written,
-            // found by the envelope reader every replay uses, and read as a
-            // `Line` read with unknown members ignored would read it: the
-            // members around it are the ones just written from numbers.
+            // found by the envelope reader every replay uses, and parsed
+            // exactly as every read parses it, so an event a read would
+            // refuse is refused here, before it reaches the disk.
             const span = (envelope.quick(stored[0..covered_len]) orelse return error.NotRoundTrippable).ev;
             const parsed = strand.parseLine(
                 Event,
                 arena.?.allocator(),
                 stored[span.from..span.to],
-                .{ .ignore_unknown_fields = true },
+                event_parse,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.NotRoundTrippable,
@@ -2018,7 +2067,7 @@ pub fn Journal(comptime Event: type) type {
             std.debug.assert(ev.from <= ev.to);
             std.debug.assert(ev.to <= line.len);
             if (version == decoding.schema_version) {
-                return strand.parseLine(Event, arena, line[ev.from..ev.to], .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
+                return strand.parseLine(Event, arena, line[ev.from..ev.to], event_parse) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.CorruptRecord,
                 };

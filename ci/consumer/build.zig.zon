@@ -1,0 +1,12 @@
+// A program that depends on chronicle and nothing else, built by
+// `zig build check-consumer` with a package directory holding only strand:
+// chronicle's build.zig must compile and run without any of chronicle's own
+// CI dependencies.
+.{
+    .name = .consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x705b37272f017aed,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{ .chronicle = .{ .path = "../.." } },
+    .paths = .{""},
+}

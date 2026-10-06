@@ -94,7 +94,9 @@ which call the records got. The implementation
 syncs directory changes on POSIX. Windows cannot provide that directory-sync guarantee,
 so record flushing does not guarantee a new filename survives power loss.
 
-Opening repairs an unfinished final line by default; `.on_truncated = .fail` refuses it.
+Opening repairs an unfinished final record by default: a line with no newline, or one
+whose newline reached the disk without all of its bytes, as a power cut can leave it.
+`.on_truncated = .fail` refuses either. Damage before the final record is always refused.
 Quick verification checks the active segment and older segment headers; full
 verification checks the history. Failed persistence blocks later appends until
 `reconcile` determines whether the attempted write survived. Schema versions newer than

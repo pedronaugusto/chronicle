@@ -116,12 +116,18 @@ fn quickSegmentHeader(line: []const u8) ?SegmentHeader {
     return .{ .version = read.value.chronicle, .base_seq = read.value.base, .root = read.value.root };
 }
 
-/// What `open` does with a final line the previous writer did not finish.
+/// What `open` does with a final record the previous writer did not finish:
+/// a line with no newline, or -- after a power cut, which need not keep a
+/// file's pages in order -- a final line whose newline reached the disk and
+/// whose bytes did not all follow it, so that its checksum does not match.
 pub const OnTruncated = enum {
-    /// Report `error.TruncatedRecord` and leave the file exactly as found.
+    /// Leave the file exactly as found and refuse it: `error.TruncatedRecord`
+    /// for a line with no newline, and the error reading the record gives
+    /// (`error.ChecksumMismatch`, usually) for one that is not whole.
     fail,
-    /// Drop the unterminated bytes and shorten the segment to the last
-    /// complete record, so the next append is well formed.
+    /// Drop the unfinished bytes and shorten the segment to the last whole
+    /// record, so the next append is well formed. Only the final record of
+    /// the newest segment is ever dropped; damage anywhere else is refused.
     drop,
 };
 
@@ -360,8 +366,8 @@ segments: std.ArrayList(Segment),
 active: ?Active,
 write_buf: []u8,
 index_buf: []u8,
-/// How many unterminated bytes `open` dropped from the end of the active
-/// segment.
+/// How many bytes `open` dropped from the end of the active segment: a line
+/// with no newline, or a final record that is not whole.
 dropped_bytes: usize,
 /// The checksum of the newest record, which the next one carries as its `p`.
 /// For an empty segment it is the segment header's `root`.
@@ -1448,6 +1454,11 @@ const Scanned = struct {
     /// batch the segment's records end inside, when its last record is not
     /// there. Only the active segment can end so; see `withoutOpenBatch`.
     before_batch: ?BeforeBatch = null,
+    /// Where the last complete line starts, when it is a record that is not
+    /// whole (`torn`). The newline after it reached the disk and some of
+    /// the bytes before it did not, which a power cut can leave, since the
+    /// pages of a file need not reach the disk in order.
+    torn_final: ?u64 = null,
 
     const BeforeBatch = struct { lines: u64, complete_bytes: u64, chain: u32 };
 
@@ -1571,6 +1582,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
             }
             if (index) |sink| try sink.record(scanned.lines, line.offset, at orelse 0);
             scanned.lines += 1;
+            scanned.torn_final = if (torn(line.line)) line.offset else null;
         }
         scanned.complete_bytes = end;
     }
@@ -1585,6 +1597,16 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
     // a range that does not cover every record cannot be used to skip one.
     if (!timed) scanned.times = .unknown;
     return scanned;
+}
+
+/// Whether a line is a record whose bytes did not all reach the disk: it
+/// holds a zero byte, which no record this package writes can hold, or it
+/// ends in a checksum the rest does not match. A line that is whole but is
+/// not a record is not torn: it is damage, and refused wherever it is.
+fn torn(line: []const u8) bool {
+    if (std.mem.findScalar(u8, line, 0) != null) return true;
+    const t = envelopes.trailer(line) orelse return false;
+    return crc32c.hash(t.covered) != t.c;
 }
 
 /// How many of the bytes of `file` from `from` to `to` somebody wrote: up to
@@ -2167,8 +2189,72 @@ pub fn commitDeferred(log: *Self) Self.AppendError!void {
     try log.active.?.writer.interface.flush();
 }
 
+/// Where the log stood before records were staged: what `discardStaged`
+/// puts it back to.
+pub const Mark = struct {
+    segments: usize,
+    segment: Segment,
+    chain: u32,
+    builder: Builder,
+    index_length: u64,
+};
+
+/// Where the log stands now, taken before a batch stages its first record.
+pub fn mark(log: *const Self) Mark {
+    log.assertValid();
+    const active = &log.active.?;
+    return .{
+        .segments = log.segments.items.len,
+        .segment = log.segments.items[log.segments.items.len - 1],
+        .chain = log.chain,
+        .builder = active.builder,
+        .index_length = active.index_writer.pos + active.index_writer.interface.end,
+    };
+}
+
+/// Take back every record staged since `at` was marked, none of them
+/// committed, so the log is exactly as it was.
+///
+/// What is still buffered is dropped unwritten. A record longer than the free
+/// buffer has already gone to the file, without the newline that ends it, so
+/// the file is cut back to the mark, or zeroed back to it where the space was
+/// reserved ahead. Nothing is scanned: the mark says where the records ended.
+/// A batch that crossed a rotation has sealed whole records into the segment
+/// it left, and those go the way `truncateAfter` takes records back.
+pub fn discardStaged(log: *Self, io: Io, at: Mark) Self.TruncateError!void {
+    log.assertValid();
+    const active = &log.active.?;
+    active.writer.interface.end = 0;
+    active.index_writer.interface.end = 0;
+    if (log.segments.items.len != at.segments) {
+        return log.truncateAfter(io, at.segment.last_seq);
+    }
+    if (active.writer.pos > at.segment.bytes) {
+        if (active.preallocated > at.segment.bytes) {
+            var zeros: [8192]u8 = @splat(0);
+            var offset = at.segment.bytes;
+            while (offset < active.writer.pos) {
+                const want: usize = @intCast(@min(zeros.len, active.writer.pos - offset));
+                try active.file.writePositionalAll(io, zeros[0..want], offset);
+                offset += want;
+            }
+        } else {
+            try active.file.setLength(io, at.segment.bytes);
+        }
+    }
+    active.writer.pos = at.segment.bytes;
+    if (active.index_writer.pos > at.index_length) {
+        try active.index_file.setLength(io, at.index_length);
+    }
+    active.index_writer.pos = at.index_length;
+    active.builder = at.builder;
+    log.segments.items[log.segments.items.len - 1] = at.segment;
+    log.chain = at.chain;
+    log.assertValid();
+}
+
 /// Make the active segment's bytes durable at the level the file's own shape
-/// allows: the contents alone when the write went into space the file already
+/// allows:the contents alone when the write went into space the file already
 /// had, and the whole file when it grew.
 fn syncActive(log: *Self, io: Io) Io.File.SyncError!void {
     const active = &log.active.?;
@@ -2384,6 +2470,23 @@ fn resumeActive(log: *Self, io: Io, segment: *Segment) OpenError!?Active {
         log.dropped_bytes = @intCast(scanned.partial_bytes);
         return null;
     }
+
+    if (scanned.torn_final) |start| if (log.options.on_truncated == .drop) {
+        // A final record whose newline reached the disk and whose bytes did
+        // not all follow it: torn like one with no newline, and cut the same
+        // way. The segment, as it then is, is read again.
+        const dropped = scanned.complete_bytes - start + scanned.partial_bytes;
+        try file.setLength(io, start);
+        if (log.options.sync != .never) try syncFile(io, file, .whole);
+        segment.bytes = start;
+        file.close(io);
+        index_file.close(io);
+        transferred = true;
+        log.dropped_bytes = 0;
+        const again = try log.resumeActive(io, segment);
+        log.dropped_bytes += @intCast(dropped);
+        return again;
+    };
 
     // Space reserved and never written into is not a record the writer did
     // not finish: the writer carries on into it, and nothing was dropped.
@@ -2791,6 +2894,17 @@ pub fn writeAtomic(log: *Self, io: Io, name: []const u8, bytes: []const u8) Self
 pub fn writeSnapshot(log: *Self, io: Io, bytes: []const u8) Self.SnapshotError!void {
     if (log.options.access == .read) return error.ReadOnly;
     return log.writeAtomic(io, snapshot_name, bytes);
+}
+
+/// Remove `<path>/snapshot` and make its going durable: a snapshot that
+/// describes records about to be cut must be gone before they are.
+pub fn removeSnapshot(log: *Self, io: Io) (Io.Dir.DeleteFileError || Io.File.SyncError || error{ReadOnly})!void {
+    if (log.options.access == .read) return error.ReadOnly;
+    log.dir.deleteFile(io, snapshot_name) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => |e| return e,
+    };
+    try log.syncDir(io);
 }
 
 /// Make every record a snapshot may describe durable before that snapshot is

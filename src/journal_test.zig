@@ -538,6 +538,51 @@ test "a batch this journal cannot form leaves the log exactly as it was" {
     try testing.expectEqual(@as(u64, 2), try journal.append(io, 6, created(6, "after")));
 }
 
+test "a refused batch whose records outgrow the write buffer is taken back whole" {
+    // With nothing reserved the file is cut back; with space reserved ahead
+    // the staged bytes are zeroed back into reserve.
+    for ([_]u64{ 0, 1 << 14 }) |reserve| try refusedBatchOutgrowingTheBuffer(reserve);
+}
+
+fn refusedBatchOutgrowingTheBuffer(reserve: u64) !void {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // The staged record is longer than the buffer, so its bytes reach the
+    // file while its newline is still buffered: the batch is half on the
+    // disk and half in memory when the entry after it is refused.
+    const cap = 256;
+    const sized: [cap / 2]u8 = @splat('s');
+    const long: [cap]u8 = @splat('n');
+    const batch = [_]Journal.Entry{
+        .{ .at = 2, .event = created(2, &sized) },
+        .{ .at = 3, .event = created(3, &long) },
+    };
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{
+            .sync = .never,
+            .max_record_bytes = cap,
+            .write_buffer_size = 8,
+            .preallocate_bytes = reserve,
+        });
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "before"));
+        const was = try ws.read(try ws.segment(1));
+
+        try testing.expectError(error.RecordTooLarge, journal.appendAll(io, &batch, .group));
+        try testing.expect(!(try journal.status(io)).persistence_failed);
+        try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+        try testing.expectEqual(@as(u64, 1), try journal.reconcile(io));
+        try testing.expectEqualStrings(was, try ws.read(try ws.segment(1)));
+        try testing.expectEqual(@as(u64, 2), try journal.append(io, 5, created(5, "after")));
+    }
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 2), try journal.lastSeq(io));
+    try testing.expectEqual(@as(u64, 2), try journal.verify(io));
+}
+
 test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -667,6 +712,75 @@ test "on_truncated .fail refuses the journal and leaves the segment as found" {
     try testing.expectEqualStrings(bytes, try ws.read(try ws.segment(1)));
 }
 
+/// A journal of three records whose third has had eight bytes in its middle
+/// zeroed with its newline kept: a power cut that wrote the page holding the
+/// newline and not the one before it. Returns the segment as written.
+fn tornFinalRecord(io: Io, ws: *Workspace) ![]u8 {
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a record long enough to tear"));
+    }
+    const bytes = try ws.read(try ws.segment(1));
+    const last = std.mem.lastIndexOfScalar(u8, bytes[0 .. bytes.len - 1], '\n').? + 1;
+    const middle = last + (bytes.len - last) / 2;
+    @memset(bytes[middle .. middle + 8], 0);
+    try ws.write(try ws.segment(1), bytes);
+    try ws.root.deleteFile(io, try ws.index(1));
+    return bytes;
+}
+
+test "a final record torn with its newline kept is dropped on open" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const torn = try tornFinalRecord(io, &ws);
+    const last = std.mem.lastIndexOfScalar(u8, torn[0 .. torn.len - 1], '\n').? + 1;
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        try testing.expectEqual(@as(u64, 2), try journal.lastSeq(io));
+        try testing.expectEqual(torn.len - last, (try journal.status(io)).dropped_bytes);
+        try testing.expectEqualStrings(torn[0..last], try ws.read(try ws.segment(1)));
+        try testing.expectEqual(@as(u64, 3), try journal.append(io, 4, created(3, "again")));
+    }
+    const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 3), try reopened.lastSeq(io));
+    try testing.expectEqual(@as(usize, 0), (try reopened.status(io)).dropped_bytes);
+}
+
+test "on_truncated .fail refuses a final record torn with its newline kept" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const torn = try tornFinalRecord(io, &ws);
+    try testing.expectError(
+        error.ChecksumMismatch,
+        Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail }),
+    );
+    try testing.expectEqualStrings(torn, try ws.read(try ws.segment(1)));
+}
+
+test "a damaged record before the final one is refused, not dropped" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+        defer journal.deinit(io);
+        for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a record long enough to tear"));
+    }
+    const bytes = try ws.read(try ws.segment(1));
+    const second = std.mem.indexOf(u8, bytes, "\"seq\":2").?;
+    @memset(bytes[second + 20 .. second + 28], 0);
+    try ws.write(try ws.segment(1), bytes);
+    try ws.root.deleteFile(io, try ws.index(1));
+    try testing.expectError(error.ChecksumMismatch, Journal.open(testing.allocator, io, ws.path, .{}));
+    try testing.expectEqualStrings(bytes, try ws.read(try ws.segment(1)));
+}
+
 test "a torn line in a sealed segment is refused when something reads it" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -783,15 +897,92 @@ test "a write that does not reach the disk publishes nothing and latches" {
     try testing.expectEqual(@as(u64, 2), try journal.append(io, 2, created(2, "retried")));
 }
 
+test "reconcile hands a sink the record that survived a failed write" {
+    var vtable: Io.VTable = undefined;
+    const io = failingIo(&vtable);
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    var fold: Sequenced = .{};
+    try journal.subscribe(io, fold.sink());
+    _ = try journal.append(io, 1, created(1, "one"));
+
+    // The record reaches the file and the answer saying so is lost.
+    fail_after_writes.store(true, .release);
+    defer fail_after_writes.store(false, .release);
+    try testing.expectError(error.WriteFailed, journal.append(io, 2, created(2, "two")));
+    fail_after_writes.store(false, .release);
+    try testing.expectEqual(@as(u64, 1), fold.last);
+
+    try testing.expectEqual(@as(u64, 2), try journal.reconcile(io));
+    try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "three")));
+    // The fold saw exactly the records the log holds.
+    try testing.expect(fold.ok);
+    try testing.expectEqual(@as(u64, 3), fold.seen);
+    try testing.expectEqual(@as(u64, 3), try journal.verify(io));
+}
+
+test "refresh wakes a waiter and hands a read journal's sinks what arrived" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const writer = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer writer.deinit(io);
+    const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+    defer reader.deinit(io);
+    var fold: Sequenced = .{};
+    try reader.subscribe(io, fold.sink());
+
+    var returned: std.atomic.Value(bool) = .init(false);
+    const wait = struct {
+        fn run(inner: Io, j: *Journal, done: *std.atomic.Value(bool)) Io.Cancelable!u64 {
+            defer done.store(true, .release);
+            return j.waitPast(inner, 0);
+        }
+    }.run;
+    var future = try io.concurrent(wait, .{ io, reader, &returned });
+    defer _ = future.cancel(io) catch |err| {
+        // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+        std.log.debug("task cleanup: {t}", .{err});
+    };
+    while (true) {
+        journalState(reader).mutex.lockUncancelable(io);
+        const entered = journalState(reader).waiters == 1;
+        journalState(reader).mutex.unlock(io);
+        if (entered) break;
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+
+    _ = try writer.append(io, 1, created(1, "from the writer"));
+    try reader.refresh(io);
+    // Bounded: a waiter refresh did not wake would sleep until a nudge.
+    var waited: usize = 0;
+    while (!returned.load(.acquire) and waited < 5000) : (waited += 1) {
+        try io.sleep(.fromMilliseconds(1), .awake);
+    }
+    try testing.expect(returned.load(.acquire));
+    try testing.expectEqual(@as(u64, 1), try future.await(io));
+    try testing.expect(fold.ok);
+    try testing.expectEqual(@as(u64, 1), fold.last);
+}
+
 /// Inject a failed write through the same seam every real file write uses.
 var fail_writes: std.atomic.Value(bool) = .init(false);
+/// Report a write as failed after it reached the file: the append the
+/// operating system took and whose answer was lost.
+var fail_after_writes: std.atomic.Value(bool) = .init(false);
 
 fn failingIo(vtable: *Io.VTable) Io {
     vtable.* = testing.io.vtable.*;
     vtable.fileWritePositional = struct {
         fn write(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
             if (fail_writes.load(.acquire)) return error.InputOutput;
-            return testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            const written = try testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
+            if (fail_after_writes.load(.acquire)) return error.InputOutput;
+            return written;
         }
     }.write;
     return .{ .userdata = testing.io.userdata, .vtable = vtable };
@@ -1848,6 +2039,44 @@ test "a record nothing will read is not parsed back, and one something will read
     }
 }
 
+/// An event that writes a member it does not read: a derived figure beside
+/// the one it is derived from. A read that ignored unknown members would take
+/// it back; every read of this journal is strict, so the append must be too.
+pub const Derived = struct {
+    id: u32,
+
+    pub fn jsonStringify(self: Derived, writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("id");
+        try writer.write(self.id);
+        try writer.objectField("note");
+        try writer.write("derived");
+        try writer.endObject();
+    }
+};
+
+test "an event with a member it does not read back is refused before it is written" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const J = chronicle.Journal(Derived);
+    {
+        const journal = try J.open(testing.allocator, io, ws.path, .{
+            .sync = .never,
+            .tail_records = 0,
+            .verify_round_trip = true,
+        });
+        defer journal.deinit(io);
+        try testing.expectError(error.NotRoundTrippable, journal.append(io, 1, .{ .id = 7 }));
+        try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
+        try testing.expectEqual(@as(u64, 0), try journal.verify(io));
+    }
+    // The journal still opens: nothing it refuses to read was written.
+    const journal = try J.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
+}
+
 test "a journal with no tail still appends, and a sink still gets every record" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -2693,6 +2922,50 @@ test "a snapshot newer than a truncated log is not restored" {
     defer reopened.deinit(io);
     try testing.expectEqual(@as(u64, 5), try reopened.lastSeq(io));
     try testing.expect(opened.snapshot == null);
+}
+
+test "a snapshot past a truncation is not restored over the history that replaced it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        defer journal.deinit(io);
+        for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "old"));
+        try journal.snapshot(io, "state through ten (old history)");
+        try journal.truncateAfter(io, 5);
+        // New records pass the snapshot's number again.
+        for (6..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "new"));
+    }
+
+    const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, small(3, 1024));
+    const reopened = opened.journal;
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(u64, 10), try reopened.lastSeq(io));
+    try testing.expect(opened.snapshot == null);
+}
+
+test "a truncation that keeps a snapshot's records keeps the snapshot" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        defer journal.deinit(io);
+        for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        try journal.snapshot(io, "state through five");
+        for (6..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+        try journal.truncateAfter(io, 5);
+    }
+
+    const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, small(3, 1024));
+    const reopened = opened.journal;
+    defer reopened.deinit(io);
+    const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
+    defer testing.allocator.free(snapshot.state);
+    try testing.expectEqual(@as(u64, 5), snapshot.seq);
 }
 
 test "snapshot refuses a document larger than its read limit" {

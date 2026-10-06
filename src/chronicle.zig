@@ -418,9 +418,11 @@ pub fn Journal(comptime Event: type) type {
         /// there, and read back the newest records.
         ///
         /// The sequence number continues from the last record, so a restart
-        /// never reuses a number. A final line the previous writer did not
-        /// finish is handled per `Options.on_truncated`; with the default it is
-        /// dropped, the segment is shortened to the last complete record, and
+        /// never reuses a number. A final record the previous writer did not
+        /// finish -- one with no newline, or one whose newline reached the
+        /// disk without all of its bytes -- is handled per
+        /// `Options.on_truncated`; with the default it is dropped, the
+        /// segment is shortened to the last whole record, and
         /// the byte count is reported by `status(io).dropped_bytes`, so the next `append` writes
         /// a well-formed line.
         ///
@@ -597,7 +599,9 @@ pub fn Journal(comptime Event: type) type {
         /// call succeeds, appends stay latched with `error.PersistenceFailed`.
         /// On success the tail is rebuilt, the latch is cleared, and the
         /// caller can compare the returned sequence with the attempted one
-        /// before deciding whether to retry it.
+        /// before deciding whether to retry it. A record that survived is
+        /// handed to every subscribed sink and wakes every `waitPast`, as
+        /// an append would have.
         pub fn reconcile(self: *Self, io: Io) ReconcileError!u64 {
             return State.reconcile(self.inner(), io);
         }
@@ -762,6 +766,11 @@ pub fn Journal(comptime Event: type) type {
         /// `Replay` already reads to the end of every segment it knows about,
         /// so this is what a reader needs when the writer has *rotated*. It
         /// costs a walk of the newest segment, as `open` does.
+        ///
+        /// Records it finds after the newest one this journal knew are
+        /// handed to every subscribed sink, and a `waitPast` they move past
+        /// returns: a `.read` journal's folds and waiters follow the writer
+        /// through `refresh` the way a writer's follow its appends.
         ///
         /// Safe to call from any task or thread.
         pub fn refresh(self: *Self, io: Io) OpenError!void {
@@ -967,6 +976,10 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// `seq` may be one below the oldest record, which empties the log and
         /// leaves the sequence at `seq`. Below that it is `error.SeqTooOld`.
+        ///
+        /// A snapshot taken after `seq` describes records this cuts, so it is
+        /// removed first; `openWithSnapshot` then finds none, and the fold
+        /// replays from the start of the log.
         ///
         /// Owned batches remain valid; subscribed sinks are not called again.
         ///
