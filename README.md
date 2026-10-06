@@ -58,7 +58,7 @@ defer reopened.deinit(io);
 var restored: Balances = .{};
 var from: u64 = 0;
 if (opened.snapshot) |snapshot| {
-    defer gpa.free(snapshot.state);
+    defer snapshot.deinit(gpa);
     restored = std.mem.bytesToValue(Balances, snapshot.state[0..@sizeOf(Balances)]);
     from = snapshot.seq;
 }
@@ -124,17 +124,15 @@ exercises schema migration.
 - It does not serialize the application's snapshot state for it.
 - It does not choose retention policy or protect history automatically from compaction.
 
-<!-- performance: quiet pass -->
-
 ## Testing
-
-Local build scripts clear `.zig-cache/{o,h,z,tmp}` above the measured cap through preflight; run `zig build cache` before direct Zig builds (only a rebuild is lost).
 
 `zig build test` runs the unit suite, writer-lock helper and examples in Debug by
 default. Tests cover crash prefixes, checksum and chain failures, recovery, replay,
 snapshots, retention, concurrency and allocation cleanup. `zig build examples` runs the
 examples separately; `zig build check` compiles the suite, helper and examples without
-running them. CI also runs `zig build docs -- usage --check`.
+running them. CI also runs `zig build docs -- usage --check`, and
+`zig build check-consumer` builds a project that depends on chronicle with only strand
+fetched.
 
 [CI](.github/workflows/ci.yml) runs tests and examples in Debug and ReleaseSafe on
 `ubuntu-latest`, `macos-latest` and `windows-latest`, plus ReleaseFast on Ubuntu.

@@ -97,7 +97,7 @@ pub fn main() !void {
     var restored: Balances = .{};
     var from: u64 = 0;
     if (opened.snapshot) |snapshot| {
-        defer gpa.free(snapshot.state);
+        defer snapshot.deinit(gpa);
         restored = std.mem.bytesToValue(Balances, snapshot.state[0..@sizeOf(Balances)]);
         from = snapshot.seq;
     }
@@ -110,7 +110,7 @@ pub fn main() !void {
     defer batch.deinit();
     if (!batch.complete()) return error.IncompleteTail;
     try output.print("replayed: {} record(s) after the snapshot\n", .{batch.records().len});
-    const readers = try reopened.readers(io);
+    const readers = try reopened.readers(gpa, io);
     defer readers.deinit();
     if (readers.items().len != 0) return error.UnexpectedReader;
     if (restored.cents != balances.cents) return error.FoldMismatch;

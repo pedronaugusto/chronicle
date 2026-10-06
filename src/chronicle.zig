@@ -235,7 +235,8 @@ pub fn Journal(comptime Event: type) type {
         /// is what `subscribeFrom` and `copySince` take.
         ///
         /// `state` is the caller's, from the allocator `openWithSnapshot` was
-        /// given; free it when the fold has been restored from it.
+        /// given; release it with `Snapshot.deinit` when the fold has been
+        /// restored from it.
         pub const Snapshot = State.Snapshot;
 
         /// What reading a record back can go wrong with.
@@ -255,6 +256,12 @@ pub fn Journal(comptime Event: type) type {
         ///   record spliced in from somewhere else, or a run of them left
         ///   over from an earlier life of the file, is named here rather
         ///   than folded.
+        /// * `BrokenBatch` — the records of an atomic batch do not run from
+        ///   its first to its last, one after another, inside one segment:
+        ///   a batch that was cut or interleaved anywhere but at the end of
+        ///   the newest segment, which `open` drops whole.
+        /// * `RecordTooLarge` — a line runs past `Options.max_record_bytes`
+        ///   without a newline, so it is not read into memory to find out.
         /// * `UnsupportedFormat` — a segment file's first line is not one
         ///   this version writes. The framing carries its version there, so
         ///   a file from another one is refused by name and never read as if
@@ -264,6 +271,10 @@ pub fn Journal(comptime Event: type) type {
         /// * `OlderSchema` — a record was written at a version below
         ///   `Options.schema_version` and there is neither a `migrate` hook nor
         ///   an `unknown` arm to receive it.
+        /// * `Unmigratable` — the `migrate` hook refused a record.
+        ///
+        /// And what reading a file can fail with: `OutOfMemory`, `Canceled`,
+        /// and the errors of opening, reading and seeking a file.
         pub const ReadError = State.ReadError;
 
         /// `ReadError`, plus what opening a directory and taking its lock can
@@ -279,8 +290,9 @@ pub fn Journal(comptime Event: type) type {
         pub const OpenError = State.OpenError;
 
         /// `OpenError`, plus `CorruptSnapshot` for a snapshot file that is not
-        /// the object `snapshot` writes. A missing snapshot file is not an
-        /// error; it yields `Opened.snapshot == null`.
+        /// the object `snapshot` writes, and `SnapshotTooLarge` for one
+        /// longer than `Options.max_snapshot_bytes`. A missing snapshot file
+        /// is not an error; it yields `Opened.snapshot == null`.
         pub const OpenWithSnapshotError = State.OpenWithSnapshotError;
 
         /// Errors from `append`.
@@ -289,7 +301,9 @@ pub fn Journal(comptime Event: type) type {
         ///   disk. Later appends are latched until `reconcile` establishes
         ///   whether the attempted record survived and restores the sequence.
         /// * `NotRoundTrippable` — the event was written to JSON but did not
-        ///   parse back as `Event`. Nothing was written to the file.
+        ///   parse back as `Event` the way every read parses it — one that
+        ///   writes a member it does not read back included. Nothing was
+        ///   written to the file.
         /// * `SequenceExhausted` — the newest sequence number is
         ///   `maxInt(i64)`, and one more could not be read back, because a
         ///   sequence number is a JSON integer.
@@ -333,7 +347,11 @@ pub fn Journal(comptime Event: type) type {
         pub const SeekError = State.SeekError;
 
         /// Errors from `subscribe` and `subscribeFrom`, which replay the
-        /// records a cursor has missed before they register the sink.
+        /// records a cursor has missed before they register the sink:
+        /// `ReplayError`, `Canceled`, and `HistoryDropped` — the cursor is
+        /// older than the oldest record the log still holds, because a
+        /// `compact` or `dropSegmentsBefore` removed the records after it.
+        /// Nothing was registered.
         pub const SubscribeError = State.SubscribeError;
 
         /// Errors from `snapshot`.
@@ -345,10 +363,16 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `tailer` and from a `Tailer`'s own calls.
         ///
         /// * `InvalidName` — a tailer's name becomes a filename beside the
-        ///   log, so it has to be one path component of letters, digits, `-`
-        ///   and `_`, and no more than 64 of them.
+        ///   log, so it has to be one path component of lowercase letters,
+        ///   digits, `-` and `_`, and no more than 64 of them. Lowercase,
+        ///   because macOS and Windows fold case by default and two names
+        ///   differing only in it would share one cursor there.
         /// * `CorruptCursor` — the cursor file is not the object `commit`
         ///   writes. A missing one is not an error; it is a cursor of zero.
+        /// * `UnsupportedFormat` — the cursor file was written in a document
+        ///   format this version does not read.
+        ///
+        /// And what writing the cursor file can fail with.
         pub const TailerError = State.TailerError;
 
         /// Errors from `compact`. It re-reads the journal it has just written,
@@ -664,6 +688,11 @@ pub fn Journal(comptime Event: type) type {
         /// does not hold the journal's lock. `subscribeFrom` is the version
         /// that misses nothing.
         ///
+        /// A cursor below `oldestSeq() - 1` starts at the oldest record the
+        /// log holds: what a `compact` or `dropSegmentsBefore` removed is
+        /// not there to read. Compare the first record's `seq` with
+        /// `cursor + 1` where a gap matters; `subscribeFrom` refuses one.
+        ///
         /// It writes nothing. A segment whose index is missing or stale is
         /// walked from its start rather than indexed on the way, because
         /// building an index is left to `open`, `refresh` and `seqAtOrAfter`.
@@ -829,6 +858,11 @@ pub fn Journal(comptime Event: type) type {
         /// `subscribe`, starting after `cursor` — the sequence number of a
         /// snapshot the fold has already been restored from.
         ///
+        /// A cursor below `oldestSeq() - 1` is `error.HistoryDropped`: the
+        /// records after it are gone, and a fold restored to it would skip
+        /// them without knowing. A caller who accepts the gap starts from
+        /// `oldestSeq() - 1`; zero means everything the log holds.
+        ///
         /// Records the tail no longer holds are streamed from the disk one at a
         /// time, so a fold over a year of records costs the largest record and
         /// not the year. The journal's lock is held for the whole replay: an
@@ -885,13 +919,13 @@ pub fn Journal(comptime Event: type) type {
         /// process; this reads the directory rather than any register this
         /// journal keeps, so a reader in another process is in the list.
         ///
-        /// The list owns its items and names through the allocator passed to
-        /// `open`; release it with `Readers.deinit`. It remains valid after
-        /// the journal closes.
+        /// The list owns its items and names through `gpa`, as a batch from
+        /// `copySince` does; release it with `Readers.deinit`. It remains
+        /// valid after the journal closes.
         ///
         /// Safe to call from any task or thread.
-        pub fn readers(self: *Self, io: Io) TailerError!*Readers {
-            return Readers.from(try State.readers(self.inner(), io));
+        pub fn readers(self: *Self, gpa: Allocator, io: Io) TailerError!*Readers {
+            return Readers.from(try State.readers(self.inner(), gpa, io));
         }
 
         /// The lowest cursor any named reader has committed, or null when no
@@ -912,7 +946,7 @@ pub fn Journal(comptime Event: type) type {
         /// committed — zero if it has never committed one.
         ///
         /// The name becomes a filename beside the log, so it is one path
-        /// component of letters, digits, `-` and `_`; anything else is
+        /// component of lowercase letters, digits, `-` and `_`; anything else is
         /// `error.InvalidName`. Release the handle with `Tailer.deinit`, which
         /// leaves the cursor file where it is.
         ///

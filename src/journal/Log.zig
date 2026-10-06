@@ -387,6 +387,10 @@ segment_scans: u64,
 /// by a commit. Not part of any promise either: what the suite counts to
 /// prove that a deferred record is left to the next one.
 record_syncs: u64,
+/// How many files a backup has had the filesystem clone. Not part of any
+/// promise either: what the suite counts to prove that sealed segments take
+/// the clone where the platform has one.
+clones: u64,
 /// The call the active segment's records last got from a sync, or null
 /// before one. See `Journal.Status.flushed`.
 flushed: ?Flush,
@@ -496,6 +500,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Self.Ope
         .index_reads = 0,
         .segment_scans = 0,
         .record_syncs = 0,
+        .clones = 0,
         .flushed = null,
         .held_index = null,
     };
@@ -2369,7 +2374,20 @@ fn openActive(log: *Self, io: Io) OpenError!void {
         // a writer reopening the file, so a reader need only recover the
         // framing root and chain tip. A missing or stale index still takes the
         // repair scan below (without changing either file).
-        const head = try log.readSegmentHeaderFrom(io, file, segment.*);
+        const first = try log.lineAtFrom(io, file, segment.*, 0);
+        defer log.gpa.free(first.bytes);
+        if (!first.terminated and first.bytes.len < 96) {
+            // No whole header line yet, and no more bytes than one: a writer
+            // is creating this segment, and the line that says what it is has
+            // not reached the file. Until it has, the segment holds nothing.
+            segment.bytes = 0;
+            segment.header_bytes = 0;
+            segment.last_seq = segment.base_seq - 1;
+            segment.times = .unknown;
+            log.chain = 0;
+            return;
+        }
+        const head = try log.segmentHeaderFromLine(segment.*, first);
         segment.header_bytes = head.header_bytes;
         if (try log.readIndex(io, segment.*)) |indexed| {
             segment.last_seq = segment.base_seq + indexed.count - 1;
@@ -2998,7 +3016,11 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!u64 {
     const newest = log.segments.items.len - 1;
     for (log.segments.items[0..newest]) |segment| {
         const name = segmentName(segment_extension, segment.base_seq);
-        if (!try log.copyFile(io, dest, &name, segment.bytes)) return error.FileNotFound;
+        // A rotation trims a segment to its records before sealing it, so
+        // the file is exactly them and goes whole, which is what lets the
+        // filesystem clone it. One that is longer is copied as far as they go.
+        const whole_file = try log.fileLength(io, &name) == segment.bytes;
+        if (!try log.copyFile(io, dest, &name, if (whole_file) null else segment.bytes)) return error.FileNotFound;
         _ = try log.copyFile(io, dest, &segmentName(index_extension, segment.base_seq), null);
     }
 
@@ -3033,7 +3055,10 @@ fn copyFile(log: *Self, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) O
                 std.log.debug("clone destination cleanup: {t}", .{err});
             },
         };
-        if (clone.whole(io, log.dir, dest, name)) return true;
+        if (clone.whole(io, log.dir, dest, name)) {
+            log.clones += 1;
+            return true;
+        }
     }
 
     const from = log.dir.openFile(io, name, .{}) catch |err| switch (err) {

@@ -6,17 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- A project that depends on chronicle builds: `build.zig` reaches the lazy `preflight` dependency through `b.lazyImport`, and only in chronicle's own tree. `zig build check-consumer` builds one with only strand fetched.
+
+- A batch refused part-way (`RecordTooLarge`, `NotRoundTrippable`) is taken back to where it started, without a rescan. Records longer than the write buffer had already reached the file; the journal latched as failed, and a reopen or `reconcile` returned them as committed.
+
+- `append` parses its round trip with the options every read uses. An event that writes a member it does not read back is refused with `NotRoundTrippable`; it was written, and verify, replay and every open then refused the journal.
+
+- `reconcile` and `refresh` hand the records they find after the newest one the journal knew to every subscribed sink, and wake every `waitPast`. A fold missed the record that survived a failed write, and a `.read` journal's waiters slept through a `refresh` until a `nudge`.
+
+- `truncateAfter` removes a snapshot taken after the cut before cutting. Appends that passed the snapshot's number again made `openWithSnapshot` restore state folded from history that no longer exists.
+
+- Under `on_truncated = .drop`, `open` drops a final record that kept its newline but not all of its bytes (a zero byte, or a checksum that does not match), as a power cut can leave it, and counts it in `dropped_bytes`. It refused the journal with `ChecksumMismatch`. Damage before the final record is still refused.
+
+- A `.read` open of a journal whose writer has created the first segment and not yet written its header finds it empty; it was `UnsupportedFormat`.
+
+- `backup` has the filesystem clone a sealed segment where it can (APFS); only indexes and the snapshot were cloned.
+
+- **Breaking:** `subscribeFrom` and `subscribeAllFrom` refuse a cursor below `oldestSeq() - 1` with `error.HistoryDropped` and register nothing, so a fold restored from a snapshot older than a `compact` or `dropSegmentsBefore` is told it would skip records. A cursor of zero still means everything the log holds.
+
+- **Breaking:** tailer names are lowercase letters, digits, `-` and `_`. On a filesystem that folds case, as macOS and Windows do by default, two names differing only in case shared one cursor file.
+
+- **Breaking:** `readers` takes the allocator its list is owned through, as `copySince` does. `Snapshot.deinit(gpa)` frees a snapshot's state.
+
 - Name the existing replay position and reader replay types as `Journal.Replay.Position` and `Journal.Tailer.Replay` when separating their facades.
 
-- Rename internal struct files to `journal/Log.zig` and `journal/Encoding.zig`; put compile-time and I/O parameters first in internal `segmentName`, `scanAtInto`, and `scanFromInto` APIs.
-- Empty the source lint and quality ledgers; separate replay and tailer facades, record continuity, and damage generation. Add assertions for record, segment, scan, index, batch, and tail invariants.
-
-- Make the internal log module's `SegmentHeader`, `Times`, and `Segment` types public and named for their public methods. Qualify already-public error unions in log method signatures.
-- Handle cleanup failures explicitly and propagate record-header flush and fixture failures.
-
-- Share the Zig CI gate through preflight, with requested fast runs and full merge checks.
-
-- Keep journal internals in `src/journal/`, beside the `src/journal.zig` entry, and the spawned lock helper in `src/testing/`.
+- Handle cleanup failures explicitly and propagate record-header flush failures.
 
 - `appendIf` and `appendAllIf` append only while the newest record is still the one the caller expected, as an event store's expected revision; otherwise they return `error.WrongExpectedSeq` with the newest sequence number in `Expected.found`, and write nothing.
 
@@ -42,21 +56,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Write a record open and its checksum as a member through strand, and read the envelope's and the segment header's leading integers with strand, rather than trimming a brace and scanning digits here. The bytes on disk are unchanged; a journal written before is read and its records written again byte for byte. A leading integer with a zero in front of its digits, which is not JSON, is no longer read off the bytes and is refused as the parser refuses it.
 
-- Reject undeclared dependencies, duplicate layer membership and imports of source executables.
-
-- Give JSON Lines one adapter below the journal and its storage.
-
-- Check named source layers, cycles, entry files and dependency owners during source CI.
-
-- Assemble journal tests above the public owner so the source graph has no test cycle.
-
 ### Changed
-
-- The README usage excerpt keeps the example calls without the surrounding commentary.
-
-- Bound local Zig build caches before builds, retaining downloaded packages and tools.
-
-- The blocking-wait tests establish waiter entry, propagate append failures and cancel refused waits; local and CI test runs report hangs by name with a 120-second per-test limit.
 
 - **Breaking:** `copySince` and `readers` return opaque `*Batch` and `*Readers` owners; replace direct fields with `records()`, `complete()` and `items()`, keep their pointers instead of values, and release each owner exactly once before its allocator.
 
@@ -75,8 +75,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A torn-header recovery closes the files of its first attempt before restarting, so a failed replacement releases each file only once.
 
 - The shared document reader preserves read-bound failures, so an oversized stored snapshot returns `SnapshotTooLarge` while an oversized cursor remains `CorruptCursor`.
-
-- Unit tests count indexed work, event encodings, parses and durable syncs and bound large-log memory; the bench branch owns the speed measurements, the 200,000-record opening ceiling and the cancellation progress watchdogs.
 
 - **Breaking:** `copySince` copies events through `strand.copyOwned`, preserving Raw bytes and dynamic values without hooks; events must meet its finite-data-tree contract and `CopyError` no longer includes `NotRoundTrippable`.
 

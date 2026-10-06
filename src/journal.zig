@@ -1,5 +1,6 @@
 //! The private state and operations behind the managed owners.
-//! chronicle.zig is the package API.
+//! chronicle.zig is the package API, and documents every declaration it
+//! hands out; this file documents only what it keeps to itself.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -11,43 +12,24 @@ const strand = @import("journal/jsonl.zig").strand;
 const envelope = @import("journal/envelope.zig");
 const Encoding = @import("journal/Encoding.zig");
 
-/// An event kept as its bytes: what a `migrate` hook is handed, what an
-/// `unknown` arm of this type holds, and an `Event` of its own for a journal
-/// that carries events it does not read. It is strand's, read back as a
-/// slice of the record's line; `Raw.parse` reads it as a type.
 pub const Raw = strand.Raw;
 
-/// What `Journal.open` does with a final line the previous writer did not
-/// finish — the normal shape of a crash during `append`.
 pub const OnTruncated = Log.OnTruncated;
 
-/// Whether a journal may be written to, and so whether it takes the lock.
 pub const Access = Log.Access;
 
-/// How often `append` makes the bytes it wrote durable. README.md states the
-/// promise each level carries, per platform.
 pub const Sync = Log.Sync;
 
-/// The call a durable write makes on a platform.
 pub const Flush = Log.Flush;
 
-/// What `Options.sync = .always` issues here, which is what a returned
-/// sequence number survives here. README.md's durability table is the same
-/// three answers in words.
 pub const flush: Flush = Log.flush;
 
-/// The file inside a journal directory that a writer holds its advisory lock
-/// on. It is never read or written.
 pub const lock_name = Log.lock_name;
-/// The file inside a journal directory that `Journal.snapshot` writes.
 pub const snapshot_name = Log.snapshot_name;
-/// The extensions of the two files that make up one segment.
 pub const segment_extension = Log.segment_extension;
 pub const index_extension = Log.index_extension;
-/// A named reader's cursor file is its name plus this. See `Journal.Tailer`.
 pub const cursor_extension = Log.cursor_extension;
 
-/// How much of a journal `open` reads back before it returns.
 pub const Verify = enum {
     /// The newest segment and one line of each older one, which is enough to
     /// know the sequence runs from the first record to the last without a gap.
@@ -59,9 +41,6 @@ pub const Verify = enum {
     full,
 };
 
-/// The name of the segment file whose first record is `base_seq`, relative to
-/// the journal's directory. Exposed because a journal's directory is meant to
-/// be read with `tail -f` and with your eyes.
 pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len:0]u8 {
     return Log.segmentName(segment_extension, base_seq);
 }
@@ -70,37 +49,12 @@ pub fn indexName(base_seq: u64) [Log.name_digits + index_extension.len:0]u8 {
     return Log.segmentName(index_extension, base_seq);
 }
 
-/// The version stamped into the two documents that live beside the log: the
-/// snapshot and a named reader's cursor. Neither is part of the log — one is
-/// a copy of a fold and the other is a number a reader keeps — but both are
-/// read back by this package, so both say which shape they are in and an
-/// unknown one is `error.UnsupportedFormat` rather than a guess.
 pub const document_format: u32 = 1;
 
-/// The CRC32C of the bytes a record's checksum covers: its line up to, but not
-/// including, the `,"c":` that carries the checksum.
-///
-/// `append` writes it and every read verifies it. It is public so that a tool
-/// reading a segment with something other than this package can check one.
 pub fn checksum(covered: []const u8) u32 {
     return crc32c.hash(covered);
 }
 
-/// Where a `Replay` got to, for the next one to start from: what
-/// `Replay.position` hands back and `Journal.replayAt` takes.
-///
-/// A reader that follows a log -- one that wakes at every append and hands
-/// on what is new -- would otherwise start each pass with `replay(cursor)`,
-/// which lands on the index entry at or before the cursor and reads its way
-/// forward to it. A position goes straight to the byte after the last
-/// record read, in the file it was read from.
-///
-/// It is plain data: kept between passes, handed to another task, or used
-/// with another `Journal` on the same directory. It names a record as well as
-/// a place, and `replayAt` reads that record back before it goes on, so a
-/// position into bytes that are not the ones it was taken from -- a
-/// `compact`, a `truncateAfter`, a `dropSegmentsBefore` since -- is
-/// `error.StalePosition`, never records from the wrong place.
 pub const Position = struct {
     /// The reader has every record up to and including this sequence
     /// number: what it would pass to `replay`.
@@ -127,18 +81,6 @@ pub const Position = struct {
     }
 };
 
-/// An append-only log of `Event` values.
-///
-/// The returned type owns a directory, the newest segment's files, an advisory
-/// lock, a bounded tail of records in memory and one mutex. Create it with
-/// `open` or `openWithSnapshot` and release it with `close`, or with the
-/// best-effort `deinit` where an error cannot be returned.
-///
-/// `Event` must round-trip through `std.json`: `std.json.Stringify.value` must
-/// accept it and `std.json.parseFromSlice` must read back what was written.
-/// strand does both, in `std.json`'s bytes and with its answers. A tagged
-/// union of structs is the expected shape; a `strand.Raw` is an event kept as
-/// its bytes, read back as a slice of the line.
 pub fn Journal(comptime Event: type) type {
     return struct {
         const Self = @This();
@@ -197,11 +139,6 @@ pub fn Journal(comptime Event: type) type {
         /// `lastSeq`, which takes the lock.
         seq: u64,
 
-        /// One entry of the log, as held in memory.
-        ///
-        /// Every slice in a record — `bytes`, and anything `event` points at —
-        /// belongs to the `Batch` or `Replay` that produced it, or lasts for
-        /// the call to a `Sink`. See `Batch.deinit` and `Replay.next`.
         pub const Record = struct {
             /// Position in the log. The first record of a journal that has
             /// never been compacted is 1, and it rises by one per record. It is
@@ -224,9 +161,6 @@ pub fn Journal(comptime Event: type) type {
             bytes: []const u8,
         };
 
-        /// An owned copy of the records after a cursor that memory still holds.
-        /// Every record, its bytes and everything its event points at belongs
-        /// to this batch, independent of the journal and its lifetime.
         /// Only the opaque batch facade hands out access to this state.
         pub const Batch = struct {
             /// The records, oldest first. Empty when the cursor is caught up.
@@ -322,45 +256,21 @@ pub fn Journal(comptime Event: type) type {
             complete: bool,
         };
 
-        /// One record for `appendAll`: what `append` takes as two arguments.
         pub const Entry = struct {
             /// Stored as given; chronicle never reads a clock.
             at: i64,
             event: Event,
         };
 
-        /// A fold, called once per record: for the records the journal replays
-        /// when it subscribes, and then for each one appended, in sequence
-        /// order, with the journal's lock held.
-        ///
-        /// The callback must not call back into the journal, and must not
-        /// retain the `Record` or anything inside it past the call.
         pub const Sink = struct {
             ctx: *anyopaque,
             f: *const fn (*anyopaque, Record) void,
         };
 
-        /// What a `migrate` hook may fail with. `Unmigratable` means the hook
-        /// knows the version and refuses it; it reaches the caller unchanged.
         pub const MigrateError = error{ OutOfMemory, Unmigratable };
 
-        /// Translates a record written at an older schema version into the
-        /// current `Event`.
-        ///
-        /// `arena` is the arena that owns the record being built, and `event`
-        /// is the record's `ev` member as its bytes, checked as JSON: a slice
-        /// of the record's line, which lasts as long as the record does.
-        /// `event.parse(Old, arena, .{})` reads the old shape as a type,
-        /// with its strings borrowed from the line where they need no
-        /// unescaping. What the hook allocates from `arena` — that parse, a
-        /// string put together, a slice of the new form — lasts exactly as
-        /// long as the record does, and so does anything in `event` the
-        /// returned `Event` borrows. Nothing needs freeing: the arena goes
-        /// with the record.
         pub const Migrate = *const fn (arena: Allocator, from_version: u32, event: Raw) MigrateError!Event;
 
-        /// How a journal is opened. Every field has a default; the defaults are
-        /// the durable, forgiving ones.
         pub const Options = struct {
             /// The version stamped into every record `append` writes, and the
             /// version records are expected to be at when read back.
@@ -453,97 +363,33 @@ pub fn Journal(comptime Event: type) type {
             verify_round_trip: bool = false,
         };
 
-        /// A snapshot read back from disk.
-        ///
-        /// `state` is the byte string that was passed to `snapshot`, and `seq`
-        /// is the journal's newest sequence number at that moment: fold `state`
-        /// into your state and then replay only the records after `seq`, which
-        /// is what `subscribeFrom` and `copySince` take.
-        ///
-        /// `state` is the caller's, from the allocator `openWithSnapshot` was
-        /// given; free it when the fold has been restored from it.
         pub const Snapshot = struct {
             seq: u64,
             state: []const u8,
+
+            /// Free `state`, through the allocator `openWithSnapshot` was given.
+            pub fn deinit(found: Snapshot, gpa: Allocator) void {
+                gpa.free(found.state);
+            }
         };
 
-        /// What `openWithSnapshot` returns: the journal, and the snapshot
-        /// beside it if there was one.
         pub const Opened = struct {
             journal: *Self,
             snapshot: ?Snapshot,
         };
 
-        /// What reading a record back can go wrong with.
-        ///
-        /// * `ChecksumMismatch` — a line carries a checksum and does not
-        ///   match it: the bytes on the disk are not the bytes that were
-        ///   written. This is the one corruption a parse cannot find.
-        /// * `CorruptRecord` — a line is not a JSON object with the members
-        ///   this format requires, or its `ev` does not parse as `Event`.
-        /// * `TruncatedRecord` — a line is unterminated where a complete one
-        ///   was required: the final line with `Options.on_truncated` set to
-        ///   `.fail`, or any line of a segment that is not the newest.
-        /// * `DiscontinuousSeq` — sequence numbers skip or repeat, or the
-        ///   records of a segment disagree with the name it is under.
-        /// * `BrokenChain` — a record does not link to the one before it.
-        ///   Every record carries the checksum of its predecessor, so a
-        ///   record spliced in from somewhere else, or a run of them left
-        ///   over from an earlier life of the file, is named here rather
-        ///   than folded.
-        /// * `UnsupportedFormat` — a segment file's first line is not one
-        ///   this version writes. The framing carries its version there, so
-        ///   a file from another one is refused by name and never read as if
-        ///   it were records.
-        /// * `NewerSchema` — a record was written at a version above
-        ///   `Options.schema_version`. This process is the old one.
-        /// * `OlderSchema` — a record was written at a version below
-        ///   `Options.schema_version` and there is neither a `migrate` hook nor
-        ///   an `unknown` arm to receive it.
         pub const ReadError = Allocator.Error || MigrateError || Log.ScanError ||
             error{ ChecksumMismatch, CorruptRecord, TruncatedRecord, DiscontinuousSeq, BrokenChain, BrokenBatch, NewerSchema, OlderSchema };
 
-        /// `ReadError`, plus what opening a directory and taking its lock can
-        /// go wrong with.
-        ///
-        /// * `Locked` — another process holds this journal's write lock. It is
-        ///   the answer a second writer gets, instead of two writers
-        ///   interleaving half-records.
-        /// * `ReadOnly` — `Options.access` is `.read` and something would have
-        ///   had to be written.
-        /// * `IndexIntervalTooLarge` — `Options.index_interval_bytes` cannot
-        ///   be represented by the index format's 32-bit interval field.
         pub const OpenError = ReadError || Log.OpenError;
 
-        /// `OpenError`, plus `CorruptSnapshot` for a snapshot file that is not
-        /// the object `snapshot` writes. A missing snapshot file is not an
-        /// error; it yields `Opened.snapshot == null`.
         pub const OpenWithSnapshotError = OpenError || error{ CorruptSnapshot, SnapshotTooLarge };
 
-        /// Errors from `append`.
-        ///
-        /// * `PersistenceFailed` — an earlier `append` could not reach the
-        ///   disk. Later appends are latched until `reconcile` establishes
-        ///   whether the attempted record survived and restores the sequence.
-        /// * `NotRoundTrippable` — the event was written to JSON but did not
-        ///   parse back as `Event`. Nothing was written to the file.
-        /// * `SequenceExhausted` — the newest sequence number is
-        ///   `maxInt(i64)`, and one more could not be read back, because a
-        ///   sequence number is a JSON integer.
-        /// * `WriteFailed` — a custom stringify hook refused the event, or
-        ///   writing or flushing the file failed. A hook refusal changes no
-        ///   file and does not latch persistence failure.
-        /// * `RecordTooLarge` — the line the record would be written as is
-        ///   longer than `Options.max_record_bytes`. Nothing was written.
-        /// * `ReadOnly` — the journal was opened with `Access.read`.
         pub const AppendError = Allocator.Error || Log.AppendError ||
             error{ PersistenceFailed, NotRoundTrippable, SequenceExhausted, RecordTooLarge };
 
-        /// `AppendError`, and `WrongExpectedSeq`: the journal's newest record
-        /// is not the one the caller expected, and nothing was written.
         pub const AppendIfError = AppendError || error{WrongExpectedSeq};
 
-        /// What a conditional append expects of the journal.
         pub const Expected = struct {
             /// The sequence number the newest record must still have: zero
             /// for a journal that must still be empty.
@@ -554,7 +400,6 @@ pub fn Journal(comptime Event: type) type {
             found: ?*u64 = null,
         };
 
-        /// How `appendAll` commits a batch.
         pub const Commit = enum {
             /// One sync for the batch, and no more: a crash inside it leaves
             /// a prefix of it on the disk.
@@ -565,62 +410,31 @@ pub fn Journal(comptime Event: type) type {
             atomic,
         };
 
-        /// Errors from reconciling the journal after a persistence failure.
         pub const ReconcileError = OpenError;
 
-        /// Errors from `replay`, and from the `Replay` it returns.
         pub const ReplayError = ReadError;
 
-        /// Copying the tail may be canceled at the lock or run out of memory.
         pub const CopyError = Allocator.Error || Io.Cancelable;
 
-        /// `replayAt`'s errors: `replay`'s, and a position that no longer
-        /// names the record it was taken after.
         pub const ReplayAtError = ReplayError || error{StalePosition};
 
-        /// Errors from `seqAtOrAfter`, which may have to rebuild an index
-        /// before it can answer and so can fail at everything `open` can.
         pub const SeekError = OpenError;
 
-        /// Errors from `subscribe` and `subscribeFrom`, which replay the
-        /// records a cursor has missed before they register the sink.
-        pub const SubscribeError = ReplayError || Io.Cancelable;
+        pub const SubscribeError = ReplayError || Io.Cancelable || error{HistoryDropped};
 
-        /// Errors from `snapshot`.
         pub const SnapshotError = Allocator.Error || Log.SnapshotError || error{SnapshotTooLarge};
 
-        /// Errors from durably closing the active segment.
         pub const CloseError = Log.CloseError;
 
-        /// Errors from `tailer` and from a `Tailer`'s own calls.
-        ///
-        /// * `InvalidName` — a tailer's name becomes a filename beside the
-        ///   log, so it has to be one path component of letters, digits, `-`
-        ///   and `_`, and no more than 64 of them.
-        /// * `CorruptCursor` — the cursor file is not the object `commit`
-        ///   writes. A missing one is not an error; it is a cursor of zero.
         pub const TailerError = Allocator.Error || Io.Cancelable ||
             Log.WriteFileError || error{ InvalidName, CorruptCursor, UnsupportedFormat };
 
-        /// Errors from `compact`. It re-reads the journal it has just written,
-        /// so every `OpenError` is possible.
         pub const CompactError = OpenError || Log.CompactError || error{PersistenceFailed};
 
-        /// Errors from `dropSegmentsBefore`.
         pub const DropError = Log.CompactError;
 
-        /// Errors from `backup`.
-        ///
-        /// * `BackupInPlace` — the destination is the journal's own directory,
-        ///   by whatever path it was named (a symbolic link to it included),
-        ///   which would have meant copying its segments over themselves.
         pub const BackupError = OpenError || Log.BackupError;
 
-        /// Errors from `truncateAfter`.
-        ///
-        /// * `SeqTooOld` — the log no longer holds a record at or before the
-        ///   cut, so truncating to it would claim a history that has already
-        ///   been dropped.
         pub const TruncateError = CompactError || Log.TruncateError;
 
         /// The line, as written, except for the checksum `append` appends to
@@ -1061,7 +875,6 @@ pub fn Journal(comptime Event: type) type {
         /// handed on is checked against the one in front of it.
         const Continuity = continuity.State(Header, ReadError, Log.Scan.Boundary);
 
-        /// What `replay` returns: a walk over the log from the disk.
         pub const Replay = struct {
             journal: *Self,
             /// Copied under the journal lock; reading records observes no
@@ -1292,7 +1105,6 @@ pub fn Journal(comptime Event: type) type {
             return self.config;
         }
 
-        /// The journal's recovery and persistence state at one instant.
         pub const Status = struct {
             /// Whether a persistence operation failed. Writes stay refused
             /// until `reconcile` succeeds; see `AppendError.PersistenceFailed`.
@@ -1317,7 +1129,6 @@ pub fn Journal(comptime Event: type) type {
             };
         }
 
-        /// What the log is made of, in numbers.
         pub const Stats = struct {
             /// How many segment files it is spread over.
             segments: usize,
@@ -1365,6 +1176,9 @@ pub fn Journal(comptime Event: type) type {
         pub fn subscribeAllFrom(self: *Self, io: Io, sinks: []const Sink, cursor: u64) SubscribeError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
+            // A fold restored to `cursor` needs the record after it. Zero
+            // asks for whatever the log holds, which is no promise to miss.
+            if (cursor != 0 and cursor < self.log.baseSeq()) return error.HistoryDropped;
             const before = self.sinks.items.len;
             try self.sinks.appendSlice(self.gpa, sinks);
             errdefer self.sinks.shrinkRetainingCapacity(before);
@@ -1414,25 +1228,6 @@ pub fn Journal(comptime Event: type) type {
             return false;
         }
 
-        /// A named reader and the cursor it has committed.
-        ///
-        /// A cursor is a `u64` — the sequence number a reader has finished
-        /// with — and this is that number with a name and somewhere to live:
-        /// `<path>/<name>.cursor`, replaced whole the way a snapshot is, so a
-        /// reader that restarts picks up where it left off without the program
-        /// around it having to keep the number anywhere.
-        ///
-        /// **A tailer writes nothing to the log.** Its cursor file is the one
-        /// file a journal opened with `Options.access = .read` creates, and it
-        /// creates no other: no repair, no index, no compaction, no record. So
-        /// any number of readers, under any number of names, in any number of
-        /// processes, beside a live writer.
-        ///
-        /// Nothing advances the cursor for you. `replay` reads from where it
-        /// is, and `commit` is what moves it — after the records have been
-        /// handled, so that a crash in between replays them again rather than
-        /// losing them. It may move backwards, which is how a reader is asked
-        /// to do a stretch of history over.
         pub const Tailer = struct {
             journal: *Self,
             gpa: Allocator,
@@ -1495,8 +1290,6 @@ pub fn Journal(comptime Event: type) type {
             }
         };
 
-        /// A named reader and where it has got to, as the directory holds
-        /// it: the pair `readers` lists, without opening a `Tailer`.
         pub const Reader = struct {
             /// Owned by the `Readers` it came in.
             name: []const u8,
@@ -1515,12 +1308,12 @@ pub fn Journal(comptime Event: type) type {
             }
         };
 
-        pub fn readers(self: *Self, io: Io) TailerError!*Readers {
+        pub fn readers(self: *Self, gpa: Allocator, io: Io) TailerError!*Readers {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
 
-            const list = try self.gpa.create(Readers);
-            list.* = .{ .items = &.{}, .arena = .init(self.gpa) };
+            const list = try gpa.create(Readers);
+            list.* = .{ .items = &.{}, .arena = .init(gpa) };
             errdefer list.deinit();
             const a = list.arena.allocator();
             var found: std.ArrayList(Reader) = .empty;
@@ -1542,7 +1335,7 @@ pub fn Journal(comptime Event: type) type {
         }
 
         pub fn minCursor(self: *Self, io: Io) TailerError!?u64 {
-            const list = try self.readers(io);
+            const list = try self.readers(self.gpa, io);
             defer list.deinit();
             var lowest: ?u64 = null;
             for (list.items) |reader| {
@@ -1563,14 +1356,17 @@ pub fn Journal(comptime Event: type) type {
             return tail;
         }
 
-        /// One path component of letters, digits, `-` and `_`: the characters
-        /// every filesystem this package runs on agrees about, and none of the
-        /// ones — a separator, a dot, a colon — that would let a name reach out
-        /// of the journal's directory or name a file already in it.
+        /// One path component of lowercase letters, digits, `-` and `_`: the
+        /// characters every filesystem this package runs on agrees about, and
+        /// none of the ones — a separator, a dot, a colon — that would let a
+        /// name reach out of the journal's directory or name a file already
+        /// in it. Lowercase only, because the default filesystems of macOS
+        /// and Windows fold case: two names that differ only in it would
+        /// share one cursor file there.
         fn validTailerName(name: []const u8) bool {
             if (name.len == 0 or name.len > 64) return false;
             for (name) |byte| switch (byte) {
-                'a'...'z', 'A'...'Z', '0'...'9', '-', '_' => {},
+                'a'...'z', '0'...'9', '-', '_' => {},
                 else => return false,
             };
             return true;

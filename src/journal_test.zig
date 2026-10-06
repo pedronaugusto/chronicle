@@ -781,6 +781,28 @@ test "a damaged record before the final one is refused, not dropped" {
     try testing.expectEqualStrings(bytes, try ws.read(try ws.segment(1)));
 }
 
+test "a reader opening while the writer creates the journal finds it empty" {
+    const io = testing.io;
+    // The segment file exists and its header has not reached it, wholly or
+    // in part: the moment between a writer creating the file and writing
+    // the line that says what it is.
+    for ([_][]const u8{ "", "{\"chronicle\":1,\"ba" }) |begun| {
+        var ws = try Workspace.init("log");
+        defer ws.deinit();
+        try ws.write(try ws.segment(1), begun);
+
+        const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+        defer reader.deinit(io);
+        try testing.expectEqual(@as(u64, 0), try reader.lastSeq(io));
+
+        const writer = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer writer.deinit(io);
+        _ = try writer.append(io, 1, created(1, "first"));
+        try reader.refresh(io);
+        try testing.expectEqual(@as(u64, 1), try reader.lastSeq(io));
+    }
+}
+
 test "a torn line in a sealed segment is refused when something reads it" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -2268,7 +2290,7 @@ test "retention can see what its readers have consumed" {
     // Nothing has committed a cursor, so there is nothing to keep for.
     try testing.expectEqual(@as(?u64, null), try journal.minCursor(io));
     {
-        const none = try journal.readers(io);
+        const none = try journal.readers(testing.allocator, io);
         defer none.deinit();
         try testing.expectEqual(@as(usize, 0), none.items().len);
     }
@@ -2284,7 +2306,7 @@ test "retention can see what its readers have consumed" {
 
     // Both are in the list, whoever opened them, because the list is the
     // directory rather than a register this journal keeps.
-    const list = try journal.readers(io);
+    const list = try journal.readers(testing.allocator, io);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 2), list.items().len);
     for (list.items()) |reader| {
@@ -2338,7 +2360,7 @@ test "a reader forgotten while the readers are listed is not listed at cursor ze
 
     // A cursor that is not there has consumed nothing a retention decision
     // can wait for; listing it at zero would hold every record back.
-    const list = try journal.readers(racing);
+    const list = try journal.readers(testing.allocator, racing);
     defer list.deinit();
     try testing.expectEqual(@as(usize, 1), list.items().len);
     try testing.expectEqualStrings("kept", list.items()[0].name);
@@ -2354,10 +2376,12 @@ test "a tailer's name has to be one that can be a file" {
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "n"));
 
-    for ([_][]const u8{ "", "..", "a/b", "a\\b", ".hidden", "with space", "sub/dir", "a" ** 65 }) |name| {
+    // Uppercase too: a filesystem that folds case would give "Reports" and
+    // "reports" one cursor file.
+    for ([_][]const u8{ "", "..", "a/b", "a\\b", ".hidden", "with space", "sub/dir", "a" ** 65, "Reports" }) |name| {
         try testing.expectError(error.InvalidName, journal.tailer(io, name));
     }
-    const fine = try journal.tailer(io, "a_fine-Name9");
+    const fine = try journal.tailer(io, "a_fine-name9");
     defer fine.deinit();
     try testing.expectEqual(@as(u64, 0), (try fine.cursor(io)));
 
@@ -2895,13 +2919,42 @@ test "a snapshot plus the records after it folds to the whole log" {
     defer reopened.deinit(io);
 
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
-    defer testing.allocator.free(snapshot.state);
+    defer snapshot.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 10), snapshot.seq);
     var restored: Registry = std.mem.bytesToValue(Registry, snapshot.state[0..@sizeOf(Registry)]);
     try reopened.subscribeFrom(io, restored.sink(), snapshot.seq);
 
     try testing.expectEqual(whole, restored);
     try testing.expectEqual(@as(u64, 15), try reopened.lastSeq(io));
+}
+
+test "a fold restored to a cursor older than the log's history is told" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer journal.deinit(io);
+    for (1..11) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    _ = try journal.dropSegmentsBefore(io, 6);
+    try testing.expectEqual(@as(u64, 7), try journal.oldestSeq(io));
+
+    var stale: Sequenced = .{ .last = 2 };
+    try testing.expectError(error.HistoryDropped, journal.subscribeFrom(io, stale.sink(), 2));
+    try testing.expectEqual(@as(u64, 0), stale.seen);
+    // Nothing was registered: an append reaches no sink.
+    _ = try journal.append(io, 11, created(11, "n"));
+    try testing.expectEqual(@as(u64, 0), stale.seen);
+
+    // From just before the oldest record, nothing is missed.
+    var exact: Sequenced = .{ .last = 6 };
+    try journal.subscribeFrom(io, exact.sink(), 6);
+    try testing.expect(exact.ok);
+    try testing.expectEqual(@as(u64, 11), exact.last);
+    // And zero is everything the log holds.
+    var everything: Registry = .{};
+    try journal.subscribe(io, everything.sink());
+    try testing.expectEqual(@as(u32, 5), everything.events);
 }
 
 test "a snapshot newer than a truncated log is not restored" {
@@ -2964,7 +3017,7 @@ test "a truncation that keeps a snapshot's records keeps the snapshot" {
     const reopened = opened.journal;
     defer reopened.deinit(io);
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
-    defer testing.allocator.free(snapshot.state);
+    defer snapshot.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 5), snapshot.seq);
 }
 
@@ -2986,7 +3039,7 @@ test "snapshot refuses a document larger than its read limit" {
     const reopened = opened.journal;
     defer reopened.deinit(io);
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
-    defer testing.allocator.free(snapshot.state);
+    defer snapshot.deinit(testing.allocator);
     try testing.expectEqualStrings("ok", snapshot.state);
 }
 
@@ -3395,7 +3448,7 @@ test "a backup is a whole journal, snapshot and indexes and all" {
     const copy = opened.journal;
     defer copy.deinit(io);
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
-    defer testing.allocator.free(snapshot.state);
+    defer snapshot.deinit(testing.allocator);
     try testing.expectEqual(@as(u64, 11), snapshot.seq);
 
     try testing.expectEqual(copied, try copy.lastSeq(io));
@@ -3482,7 +3535,12 @@ test "a backup shares the bytes of a sealed segment where the filesystem can" {
     // Twice into the same directory: the second copy has to replace the
     // first, whichever way the bytes got there.
     const dest = try ws.beside("copy");
+    const clones = journalState(journal).log.clones;
     _ = try journal.backup(io, dest);
+    // APFS clones whole files: the two sealed segments and their indexes.
+    if (builtin.os.tag.isDarwin()) {
+        try testing.expectEqual(clones + 4, journalState(journal).log.clones);
+    }
     try testing.expectEqual(@as(u64, 12), try journal.backup(io, dest));
 
     const copied = try Journal.open(testing.allocator, io, dest, .{ .verify = .full });
@@ -5440,7 +5498,7 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
     defer copied_tail_37.deinit();
     try testing.expectEqual(@as(usize, 1), copied_tail_37.records().len);
     if (opened.snapshot) |snapshot| {
-        defer testing.allocator.free(snapshot.state);
+        defer snapshot.deinit(testing.allocator);
         // Whatever sequence number the file claimed, a cursor is clamped to
         // what the journal holds rather than indexing past it.
         const copied_tail_38 = try journal.copySince(testing.allocator, io, snapshot.seq);
@@ -7131,7 +7189,7 @@ test "managed result readers own their observations after the journal closes" {
         const tail = try journal.tailer(io, "reports");
         defer tail.deinit();
         try tail.commit(io, 7);
-        list = try journal.readers(io);
+        list = try journal.readers(testing.allocator, io);
         errdefer list.deinit();
         try tail.commit(io, 9);
         try tail.forget(io);
@@ -7151,7 +7209,7 @@ test "managed result readers release every construction allocation" {
         fn run(gpa: std.mem.Allocator, inner: Io, path: []const u8, expected: usize) !void {
             const journal = try Journal.open(gpa, inner, path, .{ .access = .read });
             defer journal.deinit(inner);
-            const list = try journal.readers(inner);
+            const list = try journal.readers(gpa, inner);
             defer list.deinit();
             try testing.expectEqual(expected, list.items().len);
             for (list.items()) |reader| try testing.expectEqual(@as(u64, 3), reader.cursor);
@@ -7195,7 +7253,7 @@ test "managed owners release every construction allocation" {
             const opened = try Journal.openWithSnapshot(gpa, inner, path, .{ .access = .read, .verify = .full });
             const journal = opened.journal;
             defer journal.deinit(inner);
-            if (opened.snapshot) |snapshot| gpa.free(snapshot.state);
+            if (opened.snapshot) |snapshot| snapshot.deinit(gpa);
             const tail = try journal.tailer(inner, "reports");
             defer tail.deinit();
             try testing.expectEqualStrings("reports", tail.name());
