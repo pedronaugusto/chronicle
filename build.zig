@@ -69,21 +69,6 @@ pub fn build(b: *std.Build) void {
     const install_lock_helper = b.addInstallArtifact(lock_helper, .{});
 
     const run_tests = b.addRunArtifact(tests);
-    // A stalled test must fail by name, including in an ordinary local run.
-    // Zig 0.16 passes per-test timeouts through MakeOptions rather than a
-    // Run field, so give this one test runner a default there. An explicit
-    // --test-timeout still takes precedence; fuzzing keeps its own runner.
-    const TestTimeout = struct {
-        var run: std.Build.Step.MakeFn = undefined;
-
-        fn make(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
-            var bounded = options;
-            bounded.unit_test_timeout_ns = options.unit_test_timeout_ns orelse 120 * std.time.ns_per_s;
-            return run(step, bounded);
-        }
-    };
-    TestTimeout.run = run_tests.step.makeFn;
-    run_tests.step.makeFn = TestTimeout.make;
     run_tests.step.dependOn(&install_lock_helper.step);
     run_tests.setEnvironmentVariable(
         "CHRONICLE_LOCK_HELPER",
@@ -141,21 +126,16 @@ pub fn build(b: *std.Build) void {
 
     if (b.pkg_hash.len != 0) return;
     if (b.lazyImport(@This(), "preflight")) |preflight| {
-        preflight.addCi(b, .{ .tests = test_step });
+        // A stalled test fails by name, including in an ordinary local run.
+        preflight.addCi(b, .{ .tests = test_step, .test_timeout = .fromSeconds(120) });
+        // A project that depends on chronicle by path, with strand and
+        // nothing else to fetch: the build a consumer gets.
+        preflight.addConsumerCheck(b, .{
+            .package = "chronicle",
+            .program = b.path("ci/consumer.zig"),
+            .packages = &.{b.dependency("strand", .{})},
+        });
     }
-
-    // A project that depends on chronicle by path, built with a package
-    // directory that holds strand and nothing else, so nothing chronicle
-    // fetches for its own CI can be reached. It is the build a consumer gets.
-    const strand_package = b.dependency("strand", .{});
-    const packages = b.addWriteFiles();
-    _ = packages.addCopyDirectory(strand_package.path(""), strand_package.builder.pkg_hash, .{});
-    const consumer = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "--system" });
-    consumer.addDirectoryArg(packages.getDirectory());
-    consumer.setCwd(b.path("ci/consumer"));
-    consumer.has_side_effects = true;
-    consumer.expectExitCode(0);
-    b.step("check-consumer", "Build a project that depends on chronicle, with only strand fetched").dependOn(&consumer.step);
 }
 
 /// Every example, listed rather than globbed: a build graph that scans a

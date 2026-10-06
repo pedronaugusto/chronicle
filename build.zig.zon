@@ -5,21 +5,21 @@
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
         .preflight = .{
-            .url = "https://codeload.github.com/pedronaugusto/preflight/tar.gz/f5e7d2debd34d51b786fa1161e47f0195f7cd706",
-            .hash = "preflight-0.1.0-LX1ZwiiQAgDJIF9YGj18_kcdJqmEn2tt39VwKmYli6Nz",
+            .url = "https://codeload.github.com/pedronaugusto/preflight/tar.gz/9e72aac1b9f2837716105dca4de617685a4ca284",
+            .hash = "preflight-0.1.0-LX1ZwvN6AwDbnX3xF1J-0h68Hi_duYUxFTmiG__3gP6D",
             .lazy = true,
         },
         .gantry = .{
-            .url = "git+https://github.com/pedronaugusto/gantry#b5b991bcc590a8f7032444287465269acda4fdaa",
-            .hash = "gantry-0.1.0-1iNrkcw4BwBD3pRucqF5FkGsGSOPIhkPh0rLr1u4EMDW",
+            .url = "git+https://github.com/pedronaugusto/gantry#441accef3879905cbffc1cc3f8b6dd185ec2a184",
+            .hash = "gantry-0.1.0-1iNrkfv2DABkxXtmW84RKinYp-ifPRhWuao6UZG3R0ws",
             .lazy = true,
         },
 
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#fe8b1e0f470e890073288b7b72a6ef309e37e972",
-            .hash = "strand-0.7.0-8LNWVkmhDABEHsCxdQ8n5dMuHTjeuHXQbY0Jnyv9EQBr",
+            .url = "git+https://github.com/pedronaugusto/strand#a8c5e8384b4c0c2a65c86b87f0386dbd0c0db0f4",
+            .hash = "strand-0.7.0-8LNWVhDDDgAV5weSbC9j2nA_4JIl-k_xFYe2HDMlwMBs",
         },
     },
     .paths = .{

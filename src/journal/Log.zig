@@ -187,7 +187,7 @@ fn syncFile(io: Io, file: Io.File, level: Level) Io.File.SyncError!void {
 
 /// `syncFile`, saying which call did it.
 fn syncKind(io: Io, file: Io.File, level: Level) Io.File.SyncError!Flush {
-    return strand.syncFile(file, io, switch (level) {
+    return strand.syncFile(io, file, switch (level) {
         .whole => .all,
         .contents => .data,
     });
@@ -2670,7 +2670,7 @@ pub fn syncDir(log: *Self, io: Io) Io.File.SyncError!void {
 }
 
 fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
-    _ = try strand.syncDir(dir, io);
+    _ = try strand.syncDir(io, dir);
 }
 
 fn deleteSegmentFiles(log: *Self, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {

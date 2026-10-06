@@ -22,13 +22,6 @@ pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "public", .patterns = &.{
         "src/chronicle.zig",
     } },
-    .{ .name = "fixtures", .patterns = &.{
-        "src/journal_test.zig",
-        "src/testing/**",
-    } },
-    .{ .name = "tests", .patterns = &.{
-        "src/tests.zig",
-    } },
 };
 
 pub const entries: []const []const u8 = &.{

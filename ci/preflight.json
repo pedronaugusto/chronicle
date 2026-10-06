@@ -6,8 +6,7 @@
     "src/tests.zig"
   ],
   "test_support": [
-    "src/testing/*",
-    "src/testing/lock_helper.zig"
+    "src/testing/**"
   ],
   "function_exceptions": {},
   "layout_exceptions": {},
