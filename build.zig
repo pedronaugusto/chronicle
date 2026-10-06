@@ -126,8 +126,7 @@ pub fn build(b: *std.Build) void {
 
     if (b.pkg_hash.len != 0) return;
     if (b.lazyImport(@This(), "preflight")) |preflight| {
-        // A stalled test fails by name, including in an ordinary local run.
-        preflight.addCi(b, .{ .tests = test_step, .test_timeout = .fromSeconds(120) });
+        preflight.addCi(b, .{ .tests = test_step });
         // A project that depends on chronicle by path, with strand and
         // nothing else to fetch: the build a consumer gets.
         preflight.addConsumerCheck(b, .{

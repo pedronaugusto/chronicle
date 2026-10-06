@@ -19,6 +19,5 @@
     }
   ],
   "compile_once": false,
-  "test_timeout": "--test-timeout 120s",
   "sanitizer": "test"
 }

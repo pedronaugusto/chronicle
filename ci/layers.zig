@@ -24,9 +24,7 @@ pub const layers: []const gantry.rules.Layer = &.{
     } },
 };
 
-pub const entries: []const []const u8 = &.{
-    "src/testing/lock_helper.zig",
-};
+pub const entries: []const []const u8 = &.{};
 
 pub const modules: []const gantry.NamedModule = &.{.{ .name = "chronicle", .path = "src/chronicle.zig", .from = "src/testing/lock_helper.zig" }};
 pub const references: []const gantry.rules.ReferenceRule = &.{
@@ -58,13 +56,7 @@ pub const required = [_][]const u8{
 /// Tokens only their owners may spell: durability, file identity and the
 /// JSON codec are strand's; tests may check against `std.json`.
 pub const owned: []const gantry.rules.TokenRule = &.{
-    .{ .name = "sync owner", .token = "fsync" },
-    .{ .name = "sync owner", .token = "fdatasync" },
-    .{ .name = "sync owner", .token = "F_FULLFSYNC" },
-    .{ .name = "sync owner", .token = "FlushFileBuffers" },
-    .{ .name = "file identity owner", .token = "statx" },
-    .{ .name = "file identity owner", .token = "fstat" },
-    .{ .name = "json owner", .token = "Stringify", .owners = &.{"src/*_test.zig"} },
-    .{ .name = "json owner", .token = "parseFromSlice", .owners = &.{"src/*_test.zig"} },
-    .{ .name = "json owner", .token = "parseFromSliceLeaky", .owners = &.{"src/*_test.zig"} },
+    .{ .name = "sync owner", .tokens = &.{ "fsync", "fdatasync", "F_FULLFSYNC", "FlushFileBuffers" } },
+    .{ .name = "file identity owner", .tokens = &.{ "statx", "fstat" } },
+    .{ .name = "json owner", .tokens = &.{ "Stringify", "parseFromSlice", "parseFromSliceLeaky" }, .owners = &.{"src/*_test.zig"} },
 };

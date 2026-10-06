@@ -6,9 +6,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-- Builds against strand a8c5e83, where `syncFile` and `syncDir` take `io` first. A project that depends on chronicle and pins strand itself needs a strand with that order.
+- Builds against strand a8c5e83, whose reads reach chronicle's events. An event type that reaches itself is held to 512 levels of arrays and objects, and a record nested deeper reads as `error.CorruptRecord`, where it overflowed the stack. A `Raw` in an event where no value starts is `error.CorruptRecord`, where it panicked. A union event that declares `jsonl_tag` is written and read tagged inside its object (`{"type":"...",...}`).
 
-- A project that depends on chronicle builds: `build.zig` reaches the lazy `preflight` dependency through `b.lazyImport`, and only in chronicle's own tree. `zig build check-consumer` builds one with only strand fetched.
+- A project that depends on chronicle builds: `build.zig` reaches the lazy `preflight` dependency through `b.lazyImport`, and only in chronicle's own tree.
 
 - A batch refused part-way (`RecordTooLarge`, `NotRoundTrippable`) is taken back to where it started, without a rescan. Records longer than the write buffer had already reached the file; the journal latched as failed, and a reopen or `reconcile` returned them as committed.
 
