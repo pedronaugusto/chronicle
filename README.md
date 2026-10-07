@@ -169,8 +169,9 @@ at its top how to run one workload alone. `zig build test` runs each once with
 
 The release tier's compile-only jobs cover `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`,
 `x86_64-windows-gnu`, `aarch64-windows-gnu`, `x86_64-macos` and `aarch64-macos`.
-Additional Linux builds select `x86_64_v2` and `cortex_a72` CPUs to compile the checksum
-instruction paths.
+CRC32C uses [warp](https://github.com/pedronaugusto/warp), which selects its hardware
+kernel at run time, including in baseline builds. Additional Linux builds select
+`x86_64_v2` and `cortex_a72` CPUs.
 
 ## Licence
 

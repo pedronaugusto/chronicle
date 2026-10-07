@@ -7,13 +7,15 @@ pub fn build(b: *std.Build) !void {
     const optimize = b.standardOptimizeOption(.{});
 
     //=====================================================================
-    // The module. Pure Zig, two dependencies, nothing to configure: the
+    // The module. Pure Zig, three dependencies, nothing to configure: the
     // package's only knobs are the `Options` a caller passes to `open`, so
     // there is no build option to forward and no way for a consumer's build
     // graph to disagree with this one. strand reads and writes a record's
-    // line and airlock makes files durable; this package keeps the lines.
+    // line, airlock makes files durable and warp owns checksums; this
+    // package keeps the lines.
     //=====================================================================
 
+    const warp = b.dependency("warp", .{ .target = target, .optimize = optimize }).module("warp");
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const airlock_dependency = b.dependency("airlock", .{ .target = target, .optimize = optimize });
     const airlock = airlock_dependency.module("airlock");
@@ -22,6 +24,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "warp", .module = warp },
             .{ .name = "strand", .module = strand },
             .{ .name = "airlock", .module = airlock },
         },
@@ -71,6 +74,7 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .sanitize_thread = if (thread_sanitizer) true else null,
             .imports = &.{
+                .{ .name = "warp", .module = warp },
                 .{ .name = "strand", .module = strand },
                 .{ .name = "airlock", .module = airlock },
                 .{ .name = "chronicle_test_options", .module = test_options.createModule() },
@@ -155,21 +159,22 @@ pub fn build(b: *std.Build) !void {
                 .optimize = optimize,
             },
         });
-        // A project that depends on chronicle by path, with strand and
-        // airlock and nothing else to fetch: the build a consumer gets.
+        // A project that depends on chronicle by path, with strand, airlock
+        // and warp and nothing else to fetch: the build a consumer gets.
         preflight.addConsumerCheck(b, .{
             .package = "chronicle",
             .program = b.path("ci/consumer.zig"),
-            .packages = &.{ b.dependency("strand", .{}), b.dependency("airlock", .{}) },
+            .packages = &.{ b.dependency("strand", .{}), b.dependency("airlock", .{}), b.dependency("warp", .{}) },
         });
     }
     return needed;
 }
 
-/// chronicle, strand and airlock again, in the mode a benchmark builds in:
+/// chronicle, strand, airlock and warp again, in the mode a benchmark builds in:
 /// an imported module keeps its own mode, so a ReleaseFast benchmark over
 /// the Debug module would time the Debug module.
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
+    const warp = b.dependency("warp", .{ .target = target, .optimize = optimize }).module("warp");
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const airlock = b.dependency("airlock", .{ .target = target, .optimize = optimize }).module("airlock");
     const chronicle = b.createModule(.{
@@ -177,6 +182,7 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "warp", .module = warp },
             .{ .name = "strand", .module = strand },
             .{ .name = "airlock", .module = airlock },
         },

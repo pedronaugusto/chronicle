@@ -4,7 +4,6 @@ const gantry = @import("gantry");
 pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "primitives", .patterns = &.{
         "src/journal/clone.zig",
-        "src/journal/crc32c.zig",
         "src/journal/Encoding.zig",
         "src/journal/jsonl.zig",
     } },
@@ -36,15 +35,16 @@ pub const references: []const gantry.rules.ReferenceRule = &.{
         "shakedown",
         "std",
         "strand",
+        "warp",
     } },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
+    .{ .name = "checksum owner", .target = "warp", .except_from = &.{ "src/journal.zig", "src/journal/Log.zig", "src/crc32c_test.zig" } },
     .{ .name = "strand owner", .target = "strand", .except_from = &.{"src/journal/jsonl.zig"} },
     .{ .name = "airlock owner", .target = "airlock", .except_from = &.{ "src/journal/Log.zig", "src/journal_test.zig", "src/testing/**" } },
 };
 
 pub const required = [_][]const u8{
     "src/journal/clone.zig",
-    "src/journal/crc32c.zig",
     "src/journal/Encoding.zig",
     "src/journal/jsonl.zig",
     "src/journal/envelope.zig",
@@ -54,6 +54,7 @@ pub const required = [_][]const u8{
     "src/journal.zig",
     "src/chronicle.zig",
     "src/journal_test.zig",
+    "src/crc32c_test.zig",
     "src/testing/lock_helper.zig",
     "src/tests.zig",
 };

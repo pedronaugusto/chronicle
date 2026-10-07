@@ -23,7 +23,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
-const crc32c = @import("crc32c.zig");
+const Crc32c = @import("warp").Crc32c;
 const clone = @import("clone.zig");
 const envelopes = @import("envelope.zig");
 const strand = @import("jsonl.zig").strand;
@@ -911,7 +911,7 @@ const Builder = struct {
     base_seq: u64,
     interval: u64,
     entries: u64,
-    checksum: u32,
+    checksum: Crc32c,
     last_offset: u64,
 
     fn init(base_seq: u64, interval: u64) Builder {
@@ -920,7 +920,7 @@ const Builder = struct {
             .base_seq = base_seq,
             .interval = interval,
             .entries = 0,
-            .checksum = crc32c.initial,
+            .checksum = .init,
             .last_offset = 0,
         };
     }
@@ -946,7 +946,7 @@ const Builder = struct {
         const entry: IndexEntry = .{ .seq = builder.base_seq + ordinal, .offset = offset, .at = at };
         const raw = entry.bytes();
         try writer.interface.writeAll(&raw);
-        builder.checksum = crc32c.update(builder.checksum, &raw);
+        builder.checksum.update(&raw);
         builder.entries += 1;
         builder.last_offset = offset;
     }
@@ -1025,7 +1025,7 @@ fn proveIndexFrom(io: Io, file: Io.File) Io.Cancelable!?IndexProof {
     if (entries == 0 and header.records != 0) return null;
     if (entries > header.records) return null;
 
-    var checksum = crc32c.initial;
+    var checksum: Crc32c = .init;
     // A default 8 MiB segment has about 48 KiB of sparse entries. Read that
     // in one operation rather than in thirty-two 1.5 KiB pieces: proving an
     // index is CPU work once the file is warm, not a succession of syscalls.
@@ -1038,10 +1038,10 @@ fn proveIndexFrom(io: Io, file: Io.File) Io.Cancelable!?IndexProof {
             return null;
         };
         if (read != want) return null;
-        checksum = crc32c.update(checksum, buffer[0..want]);
+        checksum.update(buffer[0..want]);
         at += want;
     }
-    if (~checksum != header.entries_checksum) return null;
+    if (checksum.final() != header.entries_checksum) return null;
     std.debug.assert(length == index_header_len + entries * index_entry_len);
 
     return .{
@@ -1221,7 +1221,7 @@ fn rebuildIndex(log: *Self, io: Io, segment: Segment) OpenError!void {
         .records = scanned.lines,
         .times = scanned.times,
         .interval = @intCast(builder.interval),
-        .entries_checksum = ~builder.checksum,
+        .entries_checksum = builder.checksum.final(),
     }, log.options.sync);
     log.releaseIndex(io);
 }
@@ -1291,7 +1291,7 @@ fn resumeIndex(log: *Self, io: Io, segment: Segment) OpenError!?Resumed {
                 return null;
             };
             if (read != want) return null;
-            builder.checksum = crc32c.update(builder.checksum, buffer[0..want]);
+            builder.checksum.update(buffer[0..want]);
             at += want;
         }
     }
@@ -1604,7 +1604,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
 fn torn(line: []const u8) bool {
     if (std.mem.findScalar(u8, line, 0) != null) return true;
     const t = envelopes.trailer(line) orelse return false;
-    return crc32c.hash(t.covered) != t.c;
+    return Crc32c.hash(t.covered) != t.c;
 }
 
 /// How many of the bytes of `file` from `from` to `to` somebody wrote: up to
@@ -2284,7 +2284,7 @@ fn rotate(log: *Self, io: Io) AppendError!void {
             .records = segment.count(),
             .times = segment.times,
             .interval = @intCast(active.builder.interval),
-            .entries_checksum = ~active.builder.checksum,
+            .entries_checksum = active.builder.checksum.final(),
         }, log.options.sync);
     }
     log.closeActive(io);
@@ -3219,7 +3219,7 @@ pub fn finish(log: *Self, io: Io) Self.FinishError!void {
             .records = segment.count(),
             .times = segment.times,
             .interval = @intCast(active.builder.interval),
-            .entries_checksum = ~active.builder.checksum,
+            .entries_checksum = active.builder.checksum.final(),
         }, log.options.sync) catch |err| {
             // The index is a rebuildable cache; record durability is handled separately.
             std.log.debug("optional index maintenance: {t}", .{err});
@@ -3256,7 +3256,7 @@ pub fn deinit(log: *Self, io: Io) void {
             .records = segment.count(),
             .times = segment.times,
             .interval = @intCast(active.builder.interval),
-            .entries_checksum = ~active.builder.checksum,
+            .entries_checksum = active.builder.checksum.final(),
         }, log.options.sync) catch |err| {
             // The index is a rebuildable cache; record durability is handled separately.
             std.log.debug("optional index maintenance: {t}", .{err});

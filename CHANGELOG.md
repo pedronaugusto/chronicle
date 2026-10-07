@@ -38,6 +38,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as `void` or a `std.json.Value`, and then holds the older record's event
   as its bytes.
 
+### Changed
+
+- CRC32C is supplied by [warp](https://github.com/pedronaugusto/warp), pinned at `e607c19`, with runtime CPU dispatch and hardware kernels in baseline builds. Record and index checksum values are unchanged.
+
 ### Added
 
 - `appendIf` and `appendAllIf` append only while the newest record is still the one the caller expected, as an event store's expected revision; otherwise they return `error.WrongExpectedSeq` with the newest sequence number in `Expected.found`, and write nothing.

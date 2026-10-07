@@ -7,7 +7,7 @@ const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const continuity = @import("journal/continuity.zig");
 const Log = @import("journal/Log.zig");
-const crc32c = @import("journal/crc32c.zig");
+const Crc32c = @import("warp").Crc32c;
 const strand = @import("journal/jsonl.zig").strand;
 const envelope = @import("journal/envelope.zig");
 const Encoding = @import("journal/Encoding.zig");
@@ -52,7 +52,7 @@ pub fn indexName(base_seq: u64) [Log.name_digits + index_extension.len:0]u8 {
 pub const document_format: u32 = 1;
 
 pub fn checksum(covered: []const u8) u32 {
-    return crc32c.hash(covered);
+    return Crc32c.hash(covered);
 }
 
 pub const Position = struct {
