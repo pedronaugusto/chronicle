@@ -71,6 +71,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Test lost write answers and cancel-protected writes with shakedown 1bb13e7 faults, replacing the local Io layers; pin preflight 87ff327 for the package contracts.
 - A snapshot, a cursor and a compacted segment are written under a temporary name drawn at random (`.chronicle-tmp-` and 26 characters) and renamed into place, so two readers committing the same cursor never write into one temporary. A writer's `open` removes those temporaries once they are an hour old; a `<name>.tmp` left by an earlier version is not touched.
 - Windows flushes the directory after a name changes, so a new segment, a compaction, a snapshot and a cursor survive a power cut under their names there too.
 - A backup makes its copies durable together: on macOS and Windows a writeout of each file and one flush of the device, where it flushed the device once per file.

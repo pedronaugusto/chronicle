@@ -953,8 +953,9 @@ test "a write that does not reach the disk publishes nothing and latches" {
 }
 
 test "reconcile hands a sink the record that survived a failed write" {
-    var lost: LostAnswer = .init(testing.io, .{});
-    const io = lost.io();
+    const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{});
+    defer fio.deinit();
+    const io = fio.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
@@ -965,9 +966,12 @@ test "reconcile hands a sink the record that survived a failed write" {
     _ = try journal.append(io, 1, created(1, "one"));
 
     // The record reaches the file and the answer saying so is lost.
-    lost.state.lose = true;
+    try fio.setPlan(&.{.{
+        .at = .{ .nth = .{ .call = .fileWritePositional, .n = 1 } },
+        .fault = .{ .fail_after = error.InputOutput },
+    }});
     try testing.expectError(error.WriteFailed, journal.append(io, 2, created(2, "two")));
-    lost.state.lose = false;
+    try fio.setPlan(&.{});
     try testing.expectEqual(@as(u64, 1), fold.last);
 
     try testing.expectEqual(@as(u64, 2), try journal.reconcile(io));
@@ -1031,38 +1035,6 @@ const writes_fail: shakedown.IoPlan.Entry = .{
     .times = 0,
 };
 
-/// An `Io` whose file writes reach the file and then report failure while
-/// `lose` is set: the append the operating system took and whose answer was
-/// lost. A layer, because shakedown's `FaultIo` fails a call in place of
-/// making it, and this one has to be made.
-const LostAnswer = shakedown.Layer(LostAnswerState, .{ .fileWritePositional = lostAnswerWrite });
-const LostAnswerState = struct { lose: bool = false };
-
-fn lostAnswerWrite(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
-    const layer = LostAnswer.of(userdata);
-    const written = try layer.base.vtable.fileWritePositional(layer.base.userdata, file, header, data, splat, offset);
-    if (layer.state.lose) return error.InputOutput;
-    return written;
-}
-
-/// An `Io` with every file write a cancel point that fires while `on` is
-/// set: the write a cancel would interrupt returns `error.Canceled`, unless
-/// the task has blocked cancelation, exactly as a cancel landing on it does.
-/// A layer, because shakedown's `FaultIo` lands its cancel whatever the
-/// task's cancel protection says.
-const CancelingWrites = shakedown.Layer(CancelingWritesState, .{ .fileWritePositional = cancelingWrite });
-const CancelingWritesState = struct { on: std.atomic.Value(bool) = .init(false) };
-
-fn cancelingWrite(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
-    const layer = CancelingWrites.of(userdata);
-    if (layer.state.on.load(.acquire)) {
-        const protection = layer.base.swapCancelProtection(.blocked);
-        _ = layer.base.swapCancelProtection(protection);
-        if (protection == .unblocked) return error.Canceled;
-    }
-    return layer.base.vtable.fileWritePositional(layer.base.userdata, file, header, data, splat, offset);
-}
-
 /// The writes of a journal's life, each one a cancel point that fires: on a
 /// task of its own, since a task is what has a cancel protection to block.
 fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
@@ -1084,8 +1056,9 @@ fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
 }
 
 test "a cancel that lands on a write is not a failed write" {
-    var canceling: CancelingWrites = .init(testing.io, .{});
-    const io = canceling.io();
+    const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{});
+    defer fio.deinit();
+    const io = fio.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
@@ -1098,10 +1071,14 @@ test "a cancel that lands on a write is not a failed write" {
         // Every write from here is where a cancel would land. Each record
         // still goes down whole, the journal is not latched, and the sink
         // sees each once: a write that has begun runs to its end.
-        canceling.state.on.store(true, .release);
-        defer canceling.state.on.store(false, .release);
+        try fio.setPlan(&.{.{
+            .at = .{ .nth = .{ .call = .fileWritePositional, .n = 1 } },
+            .fault = .cancel,
+            .times = 0,
+        }});
         var task = try io.concurrent(writeThroughCancels, .{ io, journal, &fold });
         try task.await(io);
+        try fio.setPlan(&.{});
     }
 
     const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .verify = .full });

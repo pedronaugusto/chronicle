@@ -5,8 +5,8 @@
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight#045cd2d68a7a9be3c03a6175744f639fc4751718",
-            .hash = "preflight-0.1.0-LX1ZwnBQBgBceaBSMsgOeQ7SHX_0AinOBImDX4xKQvI-",
+            .url = "git+https://github.com/pedronaugusto/preflight#87ff3275e65c154b714a6dedb15c1f121a8b9a91",
+            .hash = "preflight-0.1.0-LX1ZwmxeBgDH-Rzw1x0bCQ68ejjJPpaHk1plc6C61GvP",
             .lazy = true,
         },
 
@@ -26,8 +26,8 @@
         // Test doubles, for the tests alone: no module a consumer builds
         // imports it, and a consumer never fetches it.
         .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown#59e7e2c5a2557eb2eff0b89512807c5b0c603886",
-            .hash = "shakedown-0.1.0-BR8U40ysBwCaMSj_dNrcfybX5fZyMcm_SbqE6k0Xiptx",
+            .url = "git+https://github.com/pedronaugusto/shakedown#1bb13e70ed64563d8bce33ed507ffa450f135769",
+            .hash = "shakedown-0.1.0-BR8U4wZFCADbHwHZYu07dR4hVzc_JjeTiZy8phJDromo",
             .lazy = true,
         },
     },
