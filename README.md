@@ -125,6 +125,14 @@ exercises schema migration.
 - It does not serialize the application's snapshot state for it.
 - It does not choose retention policy or protect history automatically from compaction.
 
+## Built with
+
+- [Zig](https://ziglang.org) 0.17.0 and its standard library; nothing is linked.
+- [strand](https://github.com/pedronaugusto/strand) reads and writes each record's
+  line.
+- [preflight](https://github.com/pedronaugusto/preflight) runs the source checks,
+  the tests and CI.
+
 ## Testing
 
 `zig build test` runs the unit suite, writer-lock helper and examples in Debug by
@@ -139,9 +147,11 @@ fetched.
 the Debug suite with the examples on `ubuntu-latest`. The merge tier also runs the Debug
 suite on `macos-latest` and `windows-latest`. The release tier runs Debug and ReleaseSafe
 on all three hosts, ReleaseFast on Ubuntu, ReleaseSmall compile-only, every cross target
-and ThreadSanitizer.
+and ThreadSanitizer. The merge and release tiers also run the Debug suite on Ubuntu with
+Zig master, a job that reports and never blocks.
 
-`zig build bench` builds the benchmarks in [bench/](bench/); CI only compiles them.
+`zig build bench -Doptimize=fast` installs the benchmarks in [bench/](bench/) under
+`zig-out/bench`, and each says at its top how it is run; CI only compiles them.
 
 The release tier's compile-only jobs cover `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`,
 `x86_64-windows-gnu`, `aarch64-windows-gnu`, `x86_64-macos` and `aarch64-macos`.

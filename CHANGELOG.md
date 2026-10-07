@@ -66,10 +66,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   crash loses none of them, and a power cut at most the deferred records
   since the last flush, a suffix and never a gap.
 - Name the existing replay position and reader replay types as `Journal.Replay.Position` and `Journal.Tailer.Replay` when separating their facades.
-- `zig build bench` builds chronicle's own benchmarks in `bench/` (`chronicle-bench`, `work-bench` and `cover-bench`), in chronicle's own tree only; CI compiles them.
+- `zig build bench` builds chronicle's own benchmarks in `bench/` (`chronicle-bench`, `work-bench` and `cover-bench`) into `zig-out/bench`, in chronicle's own tree only; CI compiles them.
 
 ### Changed
 
+- The fetched package holds the build files, `src`, `examples` and the three documents; `ci/` and `.github/` stay in the repository.
 - Builds against strand a8c5e83, whose reads reach chronicle's events. An event type that reaches itself is held to 512 levels of arrays and objects, and a record nested deeper reads as `error.CorruptRecord`, where it overflowed the stack. A `Raw` in an event where no value starts is `error.CorruptRecord`, where it panicked. A union event that declares `jsonl_tag` is written and read tagged inside its object (`{"type":"...",...}`).
 - `backup` has the filesystem clone a sealed segment where it can (APFS); only indexes and the snapshot were cloned.
 - `checksum` runs three CRC32C instruction chains side by side over a buffer of 768 bytes or more and joins them with a shift table, as zlib-ng and the crc32c crates do; the value is unchanged.

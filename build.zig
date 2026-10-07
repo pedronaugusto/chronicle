@@ -124,8 +124,8 @@ pub fn build(b: *std.Build) void {
     // Only in chronicle's own tree, and never part of `zig build test`: a
     // number that varies with the machine is not a thing to fail a build
     // over. `check` compiles them so they keep up with the API; `bench`
-    // installs them, and each says at its top how it is run. Numbers worth
-    // reading come from -Doptimize=ReleaseFast.
+    // installs them under zig-out/bench, and each says at its top how it is
+    // run. Numbers worth reading come from -Doptimize=fast.
     //=====================================================================
 
     const bench_options = b.addOptions();
@@ -134,7 +134,7 @@ pub fn build(b: *std.Build) void {
         "bench-smoke",
         "Build the benchmarks to run once over tiny inputs, without reading a clock",
     ) orelse false);
-    const bench_step = b.step("bench", "Build the benchmarks into zig-out/bin");
+    const bench_step = b.step("bench", "Build the benchmarks into zig-out/bench");
     for (bench_sources) |source| {
         const bench = b.addExecutable(.{
             .name = source.name,
@@ -149,7 +149,7 @@ pub fn build(b: *std.Build) void {
             }),
         });
         bench.root_module.addOptions("bench_options", bench_options);
-        bench_step.dependOn(&b.addInstallArtifact(bench, .{}).step);
+        bench_step.dependOn(&b.addInstallArtifact(bench, .{ .dest_dir = .{ .override = .{ .custom = "bench" } } }).step);
         check_step.dependOn(&bench.step);
     }
 

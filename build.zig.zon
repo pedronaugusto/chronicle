@@ -20,9 +20,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "ci",
         "examples",
-        ".github",
         "src",
         "CHANGELOG.md",
         "LICENSE",
