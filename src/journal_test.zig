@@ -6,6 +6,9 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const chronicle = @import("chronicle.zig");
+/// The lock helper's path, from the build: `zig build test` compiles it
+/// beside this suite.
+const test_options = @import("chronicle_test_options");
 /// The events of a tiny registry: enough shape to fold, and an `unknown` arm
 /// so a record from an older schema has somewhere to land.
 const Event = union(enum) {
@@ -60,11 +63,76 @@ const Registry = struct {
 /// finds leaks the same way, but captures no stack trace per allocation,
 /// which is where a Debug build of that many appends spends most of a
 /// minute. Deinit through `expectNoLeak`, after the journal that used it.
-const FixtureAllocator = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
-
-fn expectNoLeak(gpa: *FixtureAllocator) void {
-    if (gpa.deinit() == .leak) @panic("the fixture allocator found a leak");
+fn fixtureAllocator() std.heap.SafeAllocator {
+    return .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
 }
+
+fn expectNoLeak(gpa: *std.heap.SafeAllocator) void {
+    if (gpa.deinit() != 0) @panic("the fixture allocator found a leak");
+}
+
+/// An allocator that refuses to hold more than `limit` live bytes at once,
+/// over `testing.allocator`: what a test that bounds a peak needs.
+const Budget = struct {
+    child: std.mem.Allocator,
+    /// Live bytes: what was allocated and not yet freed.
+    live: std.atomic.Value(usize) = .init(0),
+    /// The most `live` may reach; past it, an allocation fails.
+    limit: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
+
+    fn allocator(budget: *Budget) std.mem.Allocator {
+        return .{ .ptr = budget, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    /// Allow `extra` bytes beyond what is live now.
+    fn allow(budget: *Budget, extra: usize) void {
+        budget.limit.store(budget.live.load(.monotonic) + extra, .monotonic);
+    }
+
+    fn take(budget: *Budget, len: usize) bool {
+        const before = budget.live.fetchAdd(len, .monotonic);
+        if (before + len <= budget.limit.load(.monotonic)) return true;
+        _ = budget.live.fetchSub(len, .monotonic);
+        return false;
+    }
+
+    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const budget: *Budget = @ptrCast(@alignCast(context));
+        if (!budget.take(len)) return null;
+        return budget.child.rawAlloc(len, alignment, ret_addr) orelse {
+            _ = budget.live.fetchSub(len, .monotonic);
+            return null;
+        };
+    }
+
+    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const budget: *Budget = @ptrCast(@alignCast(context));
+        if (new_len > memory.len and !budget.take(new_len - memory.len)) return false;
+        if (!budget.child.rawResize(memory, alignment, new_len, ret_addr)) {
+            if (new_len > memory.len) _ = budget.live.fetchSub(new_len - memory.len, .monotonic);
+            return false;
+        }
+        if (new_len < memory.len) _ = budget.live.fetchSub(memory.len - new_len, .monotonic);
+        return true;
+    }
+
+    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const budget: *Budget = @ptrCast(@alignCast(context));
+        if (new_len > memory.len and !budget.take(new_len - memory.len)) return null;
+        const moved = budget.child.rawRemap(memory, alignment, new_len, ret_addr) orelse {
+            if (new_len > memory.len) _ = budget.live.fetchSub(new_len - memory.len, .monotonic);
+            return null;
+        };
+        if (new_len < memory.len) _ = budget.live.fetchSub(memory.len - new_len, .monotonic);
+        return moved;
+    }
+
+    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const budget: *Budget = @ptrCast(@alignCast(context));
+        budget.child.rawFree(memory, alignment, ret_addr);
+        _ = budget.live.fetchSub(memory.len, .monotonic);
+    }
+};
 
 /// Append the records `first` through `last`, each stamped with its own
 /// number, in batches: a fixture of tens of thousands of records written one
@@ -113,7 +181,7 @@ var workspaces: std.atomic.Value(u64) = .init(0);
 fn workspaceName(buffer: *[64]u8) []const u8 {
     var fresh: [8]u8 = undefined;
     testing.io.randomSecure(&fresh) catch testing.io.random(&fresh);
-    return std.fmt.bufPrint(buffer, ".zig-cache/tmp/chronicle-{d}-{d}-{x}", .{
+    return std.mem.print(buffer, ".zig-cache/tmp/chronicle-{d}-{d}-{x}", .{
         processId(),
         workspaces.fetchAdd(1, .monotonic),
         std.mem.readInt(u64, &fresh, .little),
@@ -148,7 +216,7 @@ const Workspace = struct {
         errdefer root.close(io);
 
         const absolute = try root.realPathFileAlloc(io, ".", arena.allocator());
-        const path = try std.fs.path.join(arena.allocator(), &.{ absolute, name });
+        const path = try std.Io.Dir.path.join(arena.allocator(), &.{ absolute, name });
         return .{ .root = root, .arena = arena, .name = name, .path = path, .root_path = root_path };
     }
 
@@ -165,14 +233,14 @@ const Workspace = struct {
 
     /// `<journal>/<file>`, relative to the temporary directory.
     fn sub(self: *Workspace, file: []const u8) ![]const u8 {
-        return std.fs.path.join(self.arena.allocator(), &.{ self.name, file });
+        return std.Io.Dir.path.join(self.arena.allocator(), &.{ self.name, file });
     }
 
     /// An absolute path beside the journal, for a second directory a test
     /// needs — somewhere to copy into, and never inside the journal.
     fn beside(self: *Workspace, other: []const u8) ![]const u8 {
-        const root = std.fs.path.dirname(self.path).?;
-        return std.fs.path.join(self.arena.allocator(), &.{ root, other });
+        const root = std.Io.Dir.path.dirname(self.path).?;
+        return std.Io.Dir.path.join(self.arena.allocator(), &.{ root, other });
     }
 
     fn segment(self: *Workspace, base_seq: u64) ![]const u8 {
@@ -228,7 +296,7 @@ const Workspace = struct {
 /// The `p` a record line carries: the checksum of the record before it.
 fn backLinkOf(line: []const u8) !u32 {
     const opening = ",\"p\":";
-    const at = std.mem.indexOf(u8, line, opening) orelse return error.TestExpectedRecord;
+    const at = std.mem.find(u8, line, opening) orelse return error.TestExpectedRecord;
     var end = at + opening.len;
     while (end < line.len and std.ascii.isDigit(line[end])) end += 1;
     return std.fmt.parseInt(u32, line[at + opening.len .. end], 10);
@@ -237,16 +305,16 @@ fn backLinkOf(line: []const u8) !u32 {
 /// A segment file's records, without the line at its head that says what the
 /// file is.
 fn recordBytes(segment_bytes: []const u8) u64 {
-    const newline = std.mem.indexOfScalar(u8, segment_bytes, '\n') orelse return 0;
+    const newline = std.mem.findScalar(u8, segment_bytes, '\n') orelse return 0;
     return segment_bytes.len - (newline + 1);
 }
 
 /// The chain root a segment file's first line names, for a test that has to
 /// rebuild what the journal wrote.
 fn rootOf(segment_bytes: []const u8) !u32 {
-    const newline = std.mem.indexOfScalar(u8, segment_bytes, '\n') orelse return error.TestExpectedHeader;
+    const newline = std.mem.findScalar(u8, segment_bytes, '\n') orelse return error.TestExpectedHeader;
     const opening = "\"root\":";
-    const at = std.mem.indexOf(u8, segment_bytes[0..newline], opening) orelse return error.TestExpectedHeader;
+    const at = std.mem.find(u8, segment_bytes[0..newline], opening) orelse return error.TestExpectedHeader;
     const digits = segment_bytes[at + opening.len .. newline - 1];
     return std.fmt.parseInt(u32, digits, 10);
 }
@@ -269,7 +337,7 @@ const Handwritten = struct {
     }
 
     fn print(self: *Handwritten, comptime format: []const u8, args: anytype) !void {
-        const text = try std.fmt.allocPrint(testing.allocator, format, args);
+        const text = try testing.allocator.print(format, args);
         defer testing.allocator.free(text);
         try self.bytes.appendSlice(testing.allocator, text);
     }
@@ -281,8 +349,7 @@ const Handwritten = struct {
 
     /// One record, checksummed and linked. `ev` is its event as JSON.
     fn record(self: *Handwritten, seq: u64, at: i64, version: u32, ev: []const u8) !void {
-        const covered = try std.fmt.allocPrint(
-            testing.allocator,
+        const covered = try testing.allocator.print(
             "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":{s}",
             .{ seq, at, version, self.link, ev },
         );
@@ -329,7 +396,7 @@ fn denseIndex(segment: []const u8, base_seq: u64, records: u64) ![]u8 {
     std.mem.writeInt(u32, out.items[48..52], 0, .little);
     std.mem.writeInt(u32, out.items[52..56], 1, .little);
 
-    var offset = std.mem.indexOfScalar(u8, segment, '\n').? + 1;
+    var offset = std.mem.findScalar(u8, segment, '\n').? + 1;
     for (0..records) |ordinal| {
         const start = out.items.len;
         try out.appendNTimes(testing.allocator, 0, 24);
@@ -337,7 +404,7 @@ fn denseIndex(segment: []const u8, base_seq: u64, records: u64) ![]u8 {
         std.mem.writeInt(u64, out.items[start..][0..8], seq, .little);
         std.mem.writeInt(u64, out.items[start + 8 ..][0..8], offset, .little);
         std.mem.writeInt(i64, out.items[start + 16 ..][0..8], @intCast(seq), .little);
-        offset = std.mem.indexOfScalarPos(u8, segment, offset, '\n').? + 1;
+        offset = std.mem.findScalarPos(u8, segment, offset, '\n').? + 1;
     }
     std.mem.writeInt(u32, out.items[92..96], chronicle.checksum(out.items[96..]), .little);
     return out.toOwnedSlice(testing.allocator);
@@ -444,7 +511,7 @@ test "a reopened journal continues the sequence and appends after the last line"
     try testing.expectEqual(@as(u64, 3), try second.append(io, 3, created(3, "after")));
     const on_disk = try ws.read(try ws.segment(1));
     try testing.expectEqual(@as(usize, 4), std.mem.count(u8, on_disk, "\n"));
-    try testing.expect(std.mem.indexOf(u8, on_disk, "\"seq\":3") != null);
+    try testing.expect(std.mem.find(u8, on_disk, "\"seq\":3") != null);
 }
 
 //========================================================================
@@ -484,7 +551,7 @@ test "appendAll writes every entry and numbers them in order" {
     const on_disk = try ws.read(try ws.segment(1));
     try testing.expectEqual(@as(usize, 5), std.mem.count(u8, on_disk, "\n"));
     try testing.expectEqual(@as(usize, 4), std.mem.count(u8, on_disk, ",\"c\":"));
-    try testing.expect(std.mem.indexOf(u8, on_disk, "\"seq\":3,\"at\":30") != null);
+    try testing.expect(std.mem.find(u8, on_disk, "\"seq\":3,\"at\":30") != null);
     try testing.expectEqual(@as(u64, 4), try journal.verify(io));
 
     // A batch crossing a rotation is still one batch.
@@ -607,7 +674,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
     const name = try ws.segment(1);
     // From the end of the line that says what the file is: a crash before
     // that leaves a file that is not a segment yet, which is the case below.
-    var cut = std.mem.indexOfScalar(u8, whole, '\n').? + 1;
+    var cut = std.mem.findScalar(u8, whole, '\n').? + 1;
     while (cut <= whole.len) : (cut += 1) {
         const stopped = whole[0..cut];
         // A prefix of the batch is whole records up to the last newline; the
@@ -638,7 +705,7 @@ test "a batch cut off at any byte leaves a prefix of it, and the log goes on" {
     // A crash inside the first line leaves a file that does not say what it
     // is, which is a segment whose creation did not finish rather than a log
     // with a record in it. The next open writes that line again and starts.
-    const head = std.mem.indexOfScalar(u8, whole, '\n').?;
+    const head = std.mem.findScalar(u8, whole, '\n').?;
     try ws.write(name, whole[0 .. head - 3]);
     const journal = try Journal.open(testing.allocator, io, ws.path, .{});
     defer journal.deinit(io);
@@ -679,7 +746,7 @@ test "a final line the writer did not finish is dropped and the segment repaired
         // process ignored the tail.
         _ = try journal.append(io, 3, created(2, "next"));
         const on_disk = try ws.read(try ws.segment(1));
-        try testing.expect(std.mem.indexOf(u8, on_disk, "crea\"") == null);
+        try testing.expect(std.mem.find(u8, on_disk, "crea\"") == null);
         try testing.expectEqual(@as(usize, 3), std.mem.count(u8, on_disk, "\n"));
     }
 
@@ -722,7 +789,7 @@ fn tornFinalRecord(io: Io, ws: *Workspace) ![]u8 {
         for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a record long enough to tear"));
     }
     const bytes = try ws.read(try ws.segment(1));
-    const last = std.mem.lastIndexOfScalar(u8, bytes[0 .. bytes.len - 1], '\n').? + 1;
+    const last = std.mem.findScalarLast(u8, bytes[0 .. bytes.len - 1], '\n').? + 1;
     const middle = last + (bytes.len - last) / 2;
     @memset(bytes[middle .. middle + 8], 0);
     try ws.write(try ws.segment(1), bytes);
@@ -735,7 +802,7 @@ test "a final record torn with its newline kept is dropped on open" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const torn = try tornFinalRecord(io, &ws);
-    const last = std.mem.lastIndexOfScalar(u8, torn[0 .. torn.len - 1], '\n').? + 1;
+    const last = std.mem.findScalarLast(u8, torn[0 .. torn.len - 1], '\n').? + 1;
 
     {
         const journal = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -773,7 +840,7 @@ test "a damaged record before the final one is refused, not dropped" {
         for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a record long enough to tear"));
     }
     const bytes = try ws.read(try ws.segment(1));
-    const second = std.mem.indexOf(u8, bytes, "\"seq\":2").?;
+    const second = std.mem.find(u8, bytes, "\"seq\":2").?;
     @memset(bytes[second + 20 .. second + 28], 0);
     try ws.write(try ws.segment(1), bytes);
     try ws.root.deleteFile(io, try ws.index(1));
@@ -1316,7 +1383,7 @@ test "a record from an older schema goes through migrate" {
             };
             return .{ .created = .{
                 .id = old.created.id,
-                .name = try std.fmt.allocPrint(arena, "{s} (v1)", .{old.created.title}),
+                .name = try arena.print("{s} (v1)", .{old.created.title}),
             } };
         }
     }.f;
@@ -1667,7 +1734,7 @@ test "a refused append cancels its blocked waiter" {
     const journal = try Journal.open(testing.allocator, io, ws.path, .{ .max_record_bytes = 512 });
     defer journal.deinit(io);
 
-    const name = [_]u8{'x'} ** 512;
+    const name: [512]u8 = @splat('x');
     try testing.expectError(error.RecordTooLarge, appendToWaitingReader(io, journal, created(1, &name)));
     try testing.expectEqual(@as(u64, 0), try journal.lastSeq(io));
     try testing.expectEqual(@as(usize, 0), journalState(journal).waiters);
@@ -2378,7 +2445,7 @@ test "a tailer's name has to be one that can be a file" {
 
     // Uppercase too: a filesystem that folds case would give "Reports" and
     // "reports" one cursor file.
-    for ([_][]const u8{ "", "..", "a/b", "a\\b", ".hidden", "with space", "sub/dir", "a" ** 65, "Reports" }) |name| {
+    for ([_][]const u8{ "", "..", "a/b", "a\\b", ".hidden", "with space", "sub/dir", &@as([65]u8, @splat('a')), "Reports" }) |name| {
         try testing.expectError(error.InvalidName, journal.tailer(io, name));
     }
     const fine = try journal.tailer(io, "a_fine-name9");
@@ -2410,7 +2477,7 @@ test "a missing index is rebuilt and a stale one is not trusted" {
     // version wrote -- which is stale by the same rule and rebuilt the same
     // way, so an old journal opens and keeps working.
     try ws.root.deleteFile(io, try ws.index(1));
-    try ws.write(try ws.index(6), "chridx\x02\n" ++ "\xff" ** 8 ++ "\x00" ** 24);
+    try ws.write(try ws.index(6), "chridx\x02\n" ++ @as([8]u8, @splat(0xff)) ++ @as([24]u8, @splat(0)));
 
     const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 2));
     defer journal.deinit(io);
@@ -2489,8 +2556,8 @@ test "an indexed replay checks the record before its cursor" {
         );
     }
 
-    const original_third = std.mem.indexOf(u8, original.written(), "{\"seq\":3").?;
-    const foreign_third = std.mem.indexOf(u8, foreign.written(), "{\"seq\":3").?;
+    const original_third = std.mem.find(u8, original.written(), "{\"seq\":3").?;
+    const foreign_third = std.mem.find(u8, foreign.written(), "{\"seq\":3").?;
     const spliced = try std.mem.concat(testing.allocator, u8, &.{
         original.written()[0..original_third],
         foreign.written()[foreign_third..],
@@ -2738,7 +2805,7 @@ test "a lookup by time rebuilds a stale index and reads the rest from it" {
     // One index gone, one in the older format, one full of nonsense: none of
     // them is an answer, and all of them are rebuilt on the way past.
     try ws.root.deleteFile(io, try ws.index(1));
-    try ws.write(try ws.index(5), "chridx\x02\n" ++ "\x00" ** 24);
+    try ws.write(try ws.index(5), "chridx\x02\n" ++ @as([24]u8, @splat(0)));
     try ws.write(try ws.index(9), "not an index");
 
     const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1));
@@ -2858,7 +2925,7 @@ test "an index of one entry per interval is a fortieth of one per record" {
     for ([_]u64{ 0, 4096 }) |interval| {
         var each = try Workspace.init("log");
         defer each.deinit();
-        var gpa: FixtureAllocator = .init;
+        var gpa = fixtureAllocator();
         defer expectNoLeak(&gpa);
         const journal = try Journal.open(gpa.allocator(), io, each.path, .{
             .sync = .never,
@@ -3032,7 +3099,7 @@ test "snapshot refuses a document larger than its read limit" {
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "one"));
         try journal.snapshot(io, "ok");
-        try testing.expectError(error.SnapshotTooLarge, journal.snapshot(io, "x" ** 64));
+        try testing.expectError(error.SnapshotTooLarge, journal.snapshot(io, &@as([64]u8, @splat('x'))));
     }
 
     const opened = try Journal.openWithSnapshot(testing.allocator, io, ws.path, options);
@@ -3236,7 +3303,7 @@ test "a compaction interrupted after its rename leaves a segment the next open r
     // What the disk holds between the rename and the unlink: the replacement
     // for records 3..4, and the segment it replaces, still there.
     const whole = try ws.read(try ws.segment(1));
-    const cut = std.mem.indexOfPos(u8, whole, 0, "{\"seq\":3").?;
+    const cut = std.mem.findPos(u8, whole, 0, "{\"seq\":3").?;
     const link = try backLinkOf(whole[cut..]);
     var replacement: Handwritten = try .init(3, link);
     defer replacement.deinit();
@@ -3270,7 +3337,7 @@ test "a compaction interrupted after its rename takes the older segments with it
     // whole segments before the cut still stand, and so does the one the
     // rewrite replaced. The crash fuzz found this shape.
     const whole = try ws.read(try ws.segment(9));
-    const cut = std.mem.indexOfPos(u8, whole, 0, "{\"seq\":10").?;
+    const cut = std.mem.findPos(u8, whole, 0, "{\"seq\":10").?;
     var replacement: Handwritten = try .init(10, try backLinkOf(whole[cut..]));
     defer replacement.deinit();
     try replacement.raw(whole[cut..]);
@@ -3492,8 +3559,8 @@ test "a backup refuses its own directory reached through a symbolic link" {
     // directory above: neither spells the journal's path.
     try testing.expectError(error.BackupInPlace, journal.backup(io, link));
     const root_link = try ws.beside("root-alias");
-    try cwd.symLink(io, std.fs.path.dirname(ws.path).?, root_link, .{ .is_directory = true });
-    const through = try std.fs.path.join(ws.arena.allocator(), &.{ root_link, ws.name });
+    try cwd.symLink(io, std.Io.Dir.path.dirname(ws.path).?, root_link, .{ .is_directory = true });
+    const through = try std.Io.Dir.path.join(ws.arena.allocator(), &.{ root_link, ws.name });
     try testing.expectError(error.BackupInPlace, journal.backup(io, through));
 
     // Nothing was cleared or copied over: the segments are as they were, and
@@ -3553,7 +3620,7 @@ test "a backup shares the bytes of a sealed segment where the filesystem can" {
     const here = try ws.read(try ws.segment(1));
     const there = try ws.root.readFileAlloc(
         io,
-        try std.fs.path.join(ws.arena.allocator(), &.{ "copy", &chronicle.segmentName(1) }),
+        try std.Io.Dir.path.join(ws.arena.allocator(), &.{ "copy", &chronicle.segmentName(1) }),
         ws.arena.allocator(),
         .unlimited,
     );
@@ -3583,11 +3650,7 @@ test "a second backup removes segments no longer in the source" {
 
 test "a backup taken while another process appends opens as a journal" {
     const io = testing.io;
-    const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
-        error.EnvironmentVariableMissing => return error.SkipZigTest,
-        else => |e| return e,
-    };
-    defer testing.allocator.free(helper);
+    const helper = test_options.lock_helper;
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -3620,7 +3683,7 @@ test "a backup taken while another process appends opens as a journal" {
     var previous: u64 = 0;
     for (0..3) |round| {
         var destination: [16]u8 = undefined;
-        const copy_path = try ws.beside(try std.fmt.bufPrint(&destination, "copy{d}", .{round}));
+        const copy_path = try ws.beside(try std.mem.print(&destination, "copy{d}", .{round}));
 
         // Read the growing log back repeatedly first. A walk that runs out of
         // file part-way through a record has to say so, even when the writer
@@ -3688,11 +3751,7 @@ test "a reader backup refreshes rotations and never copies an ahead snapshot" {
 
 test "a second writer is refused while the first holds the lock" {
     const io = testing.io;
-    const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
-        error.EnvironmentVariableMissing => return error.SkipZigTest,
-        else => |e| return e,
-    };
-    defer testing.allocator.free(helper);
+    const helper = test_options.lock_helper;
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -3809,7 +3868,7 @@ test "a flipped byte is caught by the checksum, and a parse would not have been"
     // and the sequence still runs without a gap: the checksum is the only
     // thing left that can say the bytes are not the ones that were written.
     const bytes = try ws.read(try ws.segment(1));
-    bytes[std.mem.indexOf(u8, bytes, "two").?] = 'x';
+    bytes[std.mem.find(u8, bytes, "two").?] = 'x';
     try ws.write(try ws.segment(1), bytes);
 
     try testing.expectError(
@@ -3834,7 +3893,7 @@ test "a flipped byte in a sealed segment is what the full open is for" {
     // The second record of the oldest segment: not its last line, so nothing
     // a quick open reads goes near it.
     const bytes = try ws.read(try ws.segment(1));
-    bytes[std.mem.indexOf(u8, bytes, "r2").? + 1] = 'x';
+    bytes[std.mem.find(u8, bytes, "r2").? + 1] = 'x';
     try ws.write(try ws.segment(1), bytes);
 
     {
@@ -3880,7 +3939,7 @@ test "a checksum written with a zero in front of it is not a checksum" {
     defer written.deinit();
     try written.record(1, 1, 1, "{\"removed\":{\"id\":1}}");
     const line = written.written();
-    const at = std.mem.lastIndexOf(u8, line, ",\"c\":").? + ",\"c\":".len;
+    const at = std.mem.findLast(u8, line, ",\"c\":").? + ",\"c\":".len;
     const padded = try std.mem.concat(testing.allocator, u8, &.{ line[0..at], "0", line[at..] });
     defer testing.allocator.free(padded);
     try ws.write(try ws.segment(1), padded);
@@ -4109,7 +4168,7 @@ test "the checksum is the same number however it is computed" {
         for (0..4097) |length| {
             const slice = bytes[start..][0..length];
             try testing.expectEqual(
-                std.hash.crc.Crc32Iscsi.hash(slice),
+                std.hash.crc.@"CRC-32/ISCSI".hash(slice),
                 chronicle.checksum(slice),
             );
         }
@@ -4235,7 +4294,7 @@ test "a record longer than a record may be is refused, and so is a segment of on
         defer other.deinit();
         var long: Handwritten = try .init(1, 1);
         defer long.deinit();
-        try long.raw(&([_]u8{'x'} ** (cap + 64)));
+        try long.raw(&@as([cap + 64]u8, @splat('x')));
         try long.raw("\n");
         try other.write(try other.segment(1), long.written());
         try testing.expectError(
@@ -4253,7 +4312,7 @@ test "a record longer than a record may be is refused, and so is a segment of on
     try unfinished.record(1, 1, 1,
         \\{"removed":{"id":1}}
     );
-    try unfinished.raw(&([_]u8{'x'} ** (cap * 8)));
+    try unfinished.raw(&@as([cap * 8]u8, @splat('x')));
     try torn.write(try torn.segment(1), unfinished.written());
 
     const journal = try Journal.open(testing.allocator, io, torn.path, .{ .max_record_bytes = cap });
@@ -4340,8 +4399,8 @@ fn awkward(random: std.Random, buffer: []u8) []const u8 {
 /// is what the chain says it is and is checked by every read.
 fn expectStdJsonRecord(comptime E: type, record: chronicle.Journal(E).Record, version: u32) !void {
     const Line = struct { seq: u64, at: i64, v: u32, p: u32, ev: E };
-    const p_at = std.mem.indexOf(u8, record.bytes, ",\"p\":").? + ",\"p\":".len;
-    const p_end = std.mem.indexOfScalarPos(u8, record.bytes, p_at, ',').?;
+    const p_at = std.mem.find(u8, record.bytes, ",\"p\":").? + ",\"p\":".len;
+    const p_end = std.mem.findScalarPos(u8, record.bytes, p_at, ',').?;
     const back_link = try std.fmt.parseInt(u32, record.bytes[p_at..p_end], 10);
     var want: std.Io.Writer.Allocating = .init(testing.allocator);
     defer want.deinit();
@@ -4457,7 +4516,7 @@ test "a record is the bytes std.json writes for it, whatever its event's shape" 
     const random = prng.random();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    var gpa: FixtureAllocator = .{};
+    var gpa = fixtureAllocator();
     defer expectNoLeak(&gpa);
 
     var ws = try Workspace.init("log");
@@ -4577,7 +4636,7 @@ test "a record holding a number std.json cannot cast is read as the number, or i
             var written: Handwritten = try .init(1, 1);
             defer written.deinit();
             if (by_hand) {
-                const covered = try std.fmt.allocPrint(testing.allocator, "{{\"seq\": 1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{s}", .{ev});
+                const covered = try testing.allocator.print("{{\"seq\": 1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{s}", .{ev});
                 defer testing.allocator.free(covered);
                 try written.checked(covered);
             } else try written.record(1, 1, 1, ev);
@@ -4610,7 +4669,7 @@ test "a record holding a number std.json cannot cast is read as the number, or i
             var written: Handwritten = try .init(1, 1);
             defer written.deinit();
             if (by_hand) {
-                const covered = try std.fmt.allocPrint(testing.allocator, "{{\"seq\": 1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{s}", .{case.ev});
+                const covered = try testing.allocator.print("{{\"seq\": 1,\"at\":1,\"v\":1,\"p\":1,\"ev\":{s}", .{case.ev});
                 defer testing.allocator.free(covered);
                 try written.checked(covered);
             } else try written.record(1, 1, 1, case.ev);
@@ -4710,7 +4769,7 @@ test "two hundred thousand records open and replay within bounded memory" {
     const count = 200_000;
     {
         // A fixture, not what is under test: batched, unsynced, no tail.
-        var gpa: FixtureAllocator = .init;
+        var gpa = fixtureAllocator();
         defer expectNoLeak(&gpa);
         const journal = try Journal.open(gpa.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
         defer journal.deinit(io);
@@ -4798,8 +4857,8 @@ const open_corpus = [_][]const u8{
     seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"crea"),
     // The zeros a writer's reservation leaves, after a whole record and
     // after half of one.
-    seeded(a_record ++ "\x00" ** 64),
-    seeded(a_record ++ "{\"seq\":2,\"at\":2" ++ "\x00" ** 64),
+    seeded(a_record ++ @as([64]u8, @splat(0))),
+    seeded(a_record ++ "{\"seq\":2,\"at\":2" ++ @as([64]u8, @splat(0))),
     // A record whose checksum is not its own, and one that does not link to
     // the record before it.
     seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":0}\n"),
@@ -4948,7 +5007,7 @@ test "a replay that stopped at an unfinished record reads it once it is whole" {
     defer whole.deinit();
     for (1..5) |i| {
         var buffer: [64]u8 = undefined;
-        const ev = try std.fmt.bufPrint(&buffer, "{{\"created\":{{\"id\":{d},\"name\":\"n\"}}}}", .{i});
+        const ev = try std.mem.print(&buffer, "{{\"created\":{{\"id\":{d},\"name\":\"n\"}}}}", .{i});
         try whole.record(i, 1, 1, ev);
     }
     const bytes = whole.written();
@@ -5211,11 +5270,11 @@ const index_corpus = [_][]const u8{
     seeded(""),
     seeded("chridx\x02\n"),
     seeded("chridx\x03\n"),
-    seeded("chridx\x03\n" ++ "\x00" ** 88),
-    seeded("chridx\x03\n" ++ "\x00" ** 88 ++ "\x00" ** 24),
-    seeded("chridx\x03\n" ++ "\xff" ** 88),
+    seeded("chridx\x03\n" ++ @as([88]u8, @splat(0))),
+    seeded("chridx\x03\n" ++ @as([88]u8, @splat(0)) ++ @as([24]u8, @splat(0))),
+    seeded("chridx\x03\n" ++ @as([88]u8, @splat(0xff))),
     seeded("not an index at all"),
-    seeded("chridx\x03\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ "\x00" ** 80),
+    seeded("chridx\x03\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ @as([80]u8, @splat(0))),
 };
 
 test "fuzz: an arbitrary index file is a cache, never an answer" {
@@ -5283,11 +5342,7 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
-    const helper = testing.environ.getAlloc(testing.allocator, "CHRONICLE_LOCK_HELPER") catch |err| switch (err) {
-        error.EnvironmentVariableMissing => return error.SkipZigTest,
-        else => |e| return e,
-    };
-    defer testing.allocator.free(helper);
+    const helper = test_options.lock_helper;
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5297,7 +5352,7 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
     const bytes = input[0..smith.slice(&input)];
     const seed = std.hash.Wyhash.hash(0x6372617368, bytes);
     var seed_buffer: [32]u8 = undefined;
-    const seed_text = try std.fmt.bufPrint(&seed_buffer, "{d}", .{seed});
+    const seed_text = try std.mem.print(&seed_buffer, "{d}", .{seed});
 
     // The helper loops over append, batch, compaction, truncation, retention,
     // backup and snapshot in its own process. Once mutation has begun, the
@@ -5829,7 +5884,7 @@ fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
             // before it as it was, and a log that reads cleanly reads them.
             if (oldest == 1) {
                 var intact: u64 = damaged_base - 1;
-                var end = std.mem.indexOfScalar(u8, original, '\n').? + 1;
+                var end = std.mem.findScalar(u8, original, '\n').? + 1;
                 while (intact < count and intact - (damaged_base - 1) < per_segment) {
                     end += lines.items[intact].len + 1;
                     if (end > offset) break;
@@ -5925,7 +5980,7 @@ fn fuzzRecords(_: void, smith: *testing.Smith) anyerror!void {
         // Above `maxInt(i64)` a sequence number is not one this format
         // reads; the line is still a line.
         const at = smith.value(i64);
-        const covered = try std.fmt.allocPrint(testing.allocator, "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":{s}", .{
+        const covered = try testing.allocator.print("{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":{s}", .{
             seq, at, v, written.link, event_shapes[shape].json,
         });
         defer testing.allocator.free(covered);
@@ -5944,7 +5999,7 @@ fn fuzzRecords(_: void, smith: *testing.Smith) anyerror!void {
         while (lines.next()) |line| {
             if (line.len == 0) continue;
             if (try backLinkOf(line) != link) well_formed = false;
-            link = chronicle.checksum(line[0..std.mem.lastIndexOf(u8, line, ",\"c\":").?]);
+            link = chronicle.checksum(line[0..std.mem.findLast(u8, line, ",\"c\":").?]);
         }
     }
     try ws.write(try ws.segment(base), written.written());
@@ -6002,7 +6057,7 @@ fn isLogName(name: []const u8) bool {
         if (name.len != 20 + extension.len or !std.mem.endsWith(u8, name, extension)) continue;
         for (name[0..20]) |byte| {
             if (!std.ascii.isDigit(byte)) break;
-        } else if (!std.mem.eql(u8, name[0..20], "0" ** 20)) return true;
+        } else if (!std.mem.eql(u8, name[0..20], &@as([20]u8, @splat('0')))) return true;
     }
     return false;
 }
@@ -6034,7 +6089,7 @@ fn fuzzStrayName(_: void, smith: *testing.Smith) anyerror!void {
     if (name.len == 0 or isLogName(name) or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
         std.mem.endsWith(u8, name, ".tmp") or std.mem.eql(u8, name, chronicle.lock_name) or
         std.mem.eql(u8, name, chronicle.snapshot_name)) return;
-    if (std.mem.indexOfScalar(u8, name, '/') != null) return;
+    if (std.mem.findScalar(u8, name, '/') != null) return;
     if (builtin.os.tag == .windows and (std.mem.endsWith(u8, name, ".") or std.mem.endsWith(u8, name, " "))) return;
 
     // Its contents are a copy of one of the log's own segments, the shape
@@ -6085,7 +6140,7 @@ test "sealed and active seeks both read an index and skip the segment prefix" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const per_segment = 20_000;
-    var gpa: FixtureAllocator = .init;
+    var gpa = fixtureAllocator();
     defer expectNoLeak(&gpa);
     const journal = try Journal.open(gpa.allocator(), io, ws.path, .{
         .sync = .never,
@@ -6120,7 +6175,7 @@ test "opening a log that was closed cleanly costs no scan of it" {
         .max_segment_bytes = 1 << 30,
     };
     {
-        var gpa: FixtureAllocator = .init;
+        var gpa = fixtureAllocator();
         defer expectNoLeak(&gpa);
         const journal = try Journal.open(gpa.allocator(), io, ws.path, options);
         defer journal.deinit(io);
@@ -6315,7 +6370,7 @@ test "copySince owns nested events and bytes after the journal closes" {
     try testing.expectEqualSlices(?u32, &.{ 7, null, 9 }, record.event.nested[0].numbers);
     try testing.expectEqualStrings("value", record.event.value.array.items[0].string);
     try testing.expectEqualStrings("{ \"raw\": [1, 2] }", record.event.raw.bytes);
-    try testing.expect(std.mem.indexOf(u8, record.bytes, "inside") != null);
+    try testing.expect(std.mem.find(u8, record.bytes, "inside") != null);
 }
 
 test "copySince preserves migrated events without calling the hook again" {
@@ -6329,7 +6384,7 @@ test "copySince preserves migrated events without calling the hook again" {
         var calls: usize = 0;
         fn f(arena: std.mem.Allocator, _: u32, _: chronicle.Raw) Journal.MigrateError!Event {
             calls += 1;
-            return created(7, try std.fmt.allocPrint(arena, "migration {d}", .{calls}));
+            return created(7, try arena.print("migration {d}", .{calls}));
         }
     };
     Migration.calls = 0;
@@ -6340,7 +6395,7 @@ test "copySince preserves migrated events without calling the hook again" {
     try testing.expectEqual(@as(usize, 1), Migration.calls);
     try testing.expectEqual(@as(u32, 1), batch.records()[0].version);
     try testing.expectEqualStrings("migration 1", batch.records()[0].event.created.name);
-    try testing.expect(std.mem.indexOf(u8, batch.records()[0].bytes, "title") != null);
+    try testing.expect(std.mem.find(u8, batch.records()[0].bytes, "title") != null);
     try journal.compact(io, 1);
     try testing.expectEqualStrings("migration 1", batch.records()[0].event.created.name);
 }
@@ -6556,7 +6611,12 @@ test "replacing a backup releases its inventory on every allocation failure" {
             try testing.expectEqual(@as(u64, 1), try journal.backup(inner, target));
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ io, ws.root, ws.path, dest });
+    // Nothing grows in place: whether `testing.allocator` can extend a
+    // block depends on what earlier attempts left in its heap, and an
+    // arena that grew in place on one attempt and asked for a new block
+    // on the next would count a different number of allocations.
+    var fixed: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
+    try testing.checkAllAllocationFailures(fixed.allocator(), Copy.f, .{ io, ws.root, ws.path, dest });
 }
 
 test "a larger batch nobody keeps needs no larger working memory" {
@@ -6577,21 +6637,20 @@ test "checking a batch nobody keeps holds only one parsed record at a time" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var gpa: std.heap.DebugAllocator(.{ .enable_memory_limit = true, .stack_trace_frames = 0 }) = .init;
-    defer if (gpa.deinit() == .leak) @panic("a checked batch leaked");
-    const journal = try Journal.open(gpa.allocator(), io, ws.path, .{
+    var budget: Budget = .{ .child = testing.allocator };
+    const journal = try Journal.open(budget.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 0,
         .verify_round_trip = true,
     });
     defer journal.deinit(io);
     // A fixed allowance for one record, independent of the batch's length.
-    gpa.requested_memory_limit = gpa.total_requested_bytes + 64 * 1024;
+    budget.allow(64 * 1024);
     const name: [2048]u8 = @splat('n');
     const entries: [128]Journal.Entry = @splat(.{ .at = 0, .event = created(1, &name) });
     try testing.expectEqual(@as(u64, 128), try journal.appendAll(io, &entries, .group));
     // Replaying has its own read buffer; the allowance above is for writes.
-    gpa.requested_memory_limit = std.math.maxInt(usize);
+    budget.limit.store(std.math.maxInt(usize), .monotonic);
     try testing.expectEqual(@as(u64, 128), try journal.verify(io));
 }
 
@@ -6935,7 +6994,7 @@ test "copySince preserves exact migrated Raw bytes" {
     defer batch.deinit();
     try testing.expectEqualStrings(Migration.bytes, batch.records()[0].event.bytes);
     try testing.expectEqual(@as(u32, 1), batch.records()[0].version);
-    try testing.expect(std.mem.indexOf(u8, batch.records()[0].bytes, "\"ev\":{}") != null);
+    try testing.expect(std.mem.find(u8, batch.records()[0].bytes, "\"ev\":{}") != null);
 }
 
 test "copySince owns dynamic Value keys strings containers and number spelling" {
@@ -6980,7 +7039,7 @@ test "an oversized stored snapshot is reported by its read bound" {
         const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
         _ = try journal.append(io, 1, created(1, "one"));
-        try journal.snapshot(io, "state" ** 20);
+        try journal.snapshot(io, &@as([100]u8, @splat('s')));
     }
     try testing.expectError(error.SnapshotTooLarge, Journal.openWithSnapshot(testing.allocator, io, ws.path, .{ .max_snapshot_bytes = 64 }));
 }
@@ -6991,7 +7050,7 @@ test "the shared document bound leaves an oversized cursor a corrupt cursor" {
     defer ws.deinit();
     const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
-    try ws.write(try ws.sub("reports.cursor"), " " ** 4097);
+    try ws.write(try ws.sub("reports.cursor"), &@as([4097]u8, @splat(' ')));
     try testing.expectError(error.CorruptCursor, journal.tailer(io, "reports"));
 }
 
@@ -7014,7 +7073,7 @@ test "a failed restart releases each file only once after a torn header" {
         }
         fn close(ctx: ?*anyopaque, files: []const Io.File) void {
             for (files) |file| {
-                const slot = std.mem.indexOfScalar(Io.File.Handle, live.items, file.handle) orelse {
+                const slot = std.mem.findScalar(Io.File.Handle, live.items, file.handle) orelse {
                     duplicate += 1;
                     continue;
                 };
@@ -7111,7 +7170,7 @@ test "a stringify refusal is distinct from an encoding allocation failure" {
         const previous = try journal.lastSeq(io);
         for ([_]bool{ false, true }) |partial| {
             try testing.expectError(error.WriteFailed, journal.append(io, 1, .{
-                .text = "x" ** 4096,
+                .text = &@as([4096]u8, @splat('x')),
                 .refuse = true,
                 .partial = partial,
             }));
@@ -7134,7 +7193,7 @@ test "encoding owns the cause of every allocation failure with and without a tai
                 .verify_round_trip = tail_records != 0,
             });
             defer journal.deinit(io);
-            _ = try journal.append(io, 1, .{ .text = "x" ** 4096 });
+            _ = try journal.append(io, 1, .{ .text = &@as([4096]u8, @splat('x')) });
             try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
         }
     };
@@ -7226,7 +7285,7 @@ test "managed result readers release every construction allocation" {
         // More than one ArrayList growth, with independently owned names.
         for (0..40) |i| {
             var buffer: [32]u8 = undefined;
-            const name = try std.fmt.bufPrint(&buffer, "reader-{d}", .{i});
+            const name = try std.mem.print(&buffer, "reader-{d}", .{i});
             const tail = try journal.tailer(io, name);
             defer tail.deinit();
             try tail.commit(io, 3);
@@ -7408,7 +7467,7 @@ test "of several writers expecting the same record, exactly one appends after it
 
     // Every sequence number has exactly one winner, and the log is exactly
     // the records the winners appended, in order.
-    var winners = [_]u8{0} ** (rounds + 1);
+    var winners: [rounds + 1]u8 = @splat(0);
     for (&racers) |*racer| for (racer.won.items) |seq| {
         winners[seq] += 1;
     };
@@ -7419,7 +7478,7 @@ test "of several writers expecting the same record, exactly one appends after it
     defer walk.deinit(io);
     while (try walk.next(io)) |record| {
         const id = record.event.created.id;
-        try testing.expect(std.mem.indexOfScalar(u64, racers[id].won.items, record.seq) != null);
+        try testing.expect(std.mem.findScalar(u64, racers[id].won.items, record.seq) != null);
     }
 }
 
@@ -7453,7 +7512,7 @@ test "every record of an atomic batch names the batch, and one written alone doe
     _ = lines.next();
     for ([_]?[]const u8{ null, null, ",\"bf\":3,\"bl\":5,\"ev\":", ",\"bf\":3,\"bl\":5,\"ev\":", ",\"bf\":3,\"bl\":5,\"ev\":" }) |marker| {
         const line = lines.next().?;
-        if (marker) |m| try testing.expect(std.mem.indexOf(u8, line, m) != null) else try testing.expect(std.mem.indexOf(u8, line, "\"bf\"") == null);
+        if (marker) |m| try testing.expect(std.mem.find(u8, line, m) != null) else try testing.expect(std.mem.find(u8, line, "\"bf\"") == null);
     }
     // Reopened, the same five records, the batch read whole.
     const reopened = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -7474,7 +7533,7 @@ fn batchedLog(ws: *Workspace, commit: Journal.Commit) !struct { bytes: []u8, fro
         _ = try journal.appendAll(io, &batch, commit);
     }
     const bytes = try ws.read(try ws.segment(1));
-    const from = std.mem.indexOf(u8, bytes, "{\"seq\":3,").?;
+    const from = std.mem.find(u8, bytes, "{\"seq\":3,").?;
     return .{ .bytes = bytes, .from = from };
 }
 
@@ -7526,7 +7585,7 @@ test "a group batch cut inside keeps the prefix that reached the file" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const log = try batchedLog(&ws, .group);
-    const fourth = std.mem.indexOf(u8, log.bytes, "{\"seq\":5,").?;
+    const fourth = std.mem.find(u8, log.bytes, "{\"seq\":5,").?;
     try ws.write(try ws.segment(1), log.bytes[0 .. fourth + 3]);
     try ws.root.deleteFile(testing.io, try ws.index(1));
     const journal = try Journal.open(testing.allocator, io, ws.path, .{});
@@ -7539,7 +7598,7 @@ test "a reader beside the writer reads a batch once its last record is there" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const log = try batchedLog(&ws, .atomic);
-    const last = std.mem.indexOf(u8, log.bytes, "{\"seq\":5,").?;
+    const last = std.mem.find(u8, log.bytes, "{\"seq\":5,").?;
 
     var each = try Workspace.init("live");
     defer each.deinit();
@@ -7590,7 +7649,7 @@ test "a batch that does not run from its first record to its last is refused by 
     try written.record(1, 1, 1, "{\"removed\":{\"id\":1}}");
     var covered: [128]u8 = undefined;
     // Record 2 names a batch of 2 to 3, and record 3 names none.
-    try written.checked(try std.fmt.bufPrint(&covered, "{{\"seq\":2,\"at\":1,\"v\":1,\"p\":{d},\"bf\":2,\"bl\":3,\"ev\":{{\"removed\":{{\"id\":2}}}}", .{written.link}));
+    try written.checked(try std.mem.print(&covered, "{{\"seq\":2,\"at\":1,\"v\":1,\"p\":{d},\"bf\":2,\"bl\":3,\"ev\":{{\"removed\":{{\"id\":2}}}}", .{written.link}));
     try written.record(3, 1, 1, "{\"removed\":{\"id\":3}}");
     try ws.write(try ws.segment(1), written.written());
     // The tail an open reads back is walked like any other stretch of the
@@ -7604,7 +7663,7 @@ test "a backup taken beside an unfinished batch ends before it" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const log = try batchedLog(&ws, .atomic);
-    const last = std.mem.indexOf(u8, log.bytes, "{\"seq\":5,").?;
+    const last = std.mem.find(u8, log.bytes, "{\"seq\":5,").?;
     var each = try Workspace.init("live");
     defer each.deinit();
     try each.write(try each.segment(1), log.bytes[0 .. last + 7]);

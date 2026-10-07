@@ -35,28 +35,9 @@ pub fn build(b: *std.Build) void {
         "Build the tests with ThreadSanitizer",
     ) orelse false;
 
-    // Error return traces are off on the test binary, so that the second
-    // binary `zig build test --fuzz` builds goes through Zig 0.16.0's test
-    // runner without them. The suite reports the same failures either way;
-    // what is lost is the chain of returns behind an unexpected error.
-    const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
-    const tests = b.addTest(.{
-        .filters = if (test_filter) |filter| &.{filter} else &.{},
-        .name = "chronicle-tests",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
-            .target = target,
-            .optimize = optimize,
-            .sanitize_thread = if (thread_sanitizer) true else null,
-            .error_tracing = false,
-            .imports = &.{.{ .name = "strand", .module = strand }},
-        }),
-    });
-
     // A second process is the only honest way to prove that a second writer
-    // is refused, so the suite spawns one. The binary is built and installed
-    // here and its path handed over in the environment; a test binary run
-    // without it skips that one test rather than failing.
+    // is refused, so the suite spawns one. The helper is built here and its
+    // path compiled into the suite.
     const lock_helper = b.addExecutable(.{
         .name = "chronicle-lock-helper",
         .root_module = b.createModule(.{
@@ -66,14 +47,25 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "chronicle", .module = module }},
         }),
     });
-    const install_lock_helper = b.addInstallArtifact(lock_helper, .{});
+    const test_options = b.addOptions();
+    test_options.addOptionPath("lock_helper", lock_helper.getEmittedBin());
 
+    const test_filter = b.option([]const u8, "test-filter", "Run tests whose names contain this text");
+    const tests = b.addTest(.{
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
+        .name = "chronicle-tests",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests.zig"),
+            .target = target,
+            .optimize = optimize,
+            .sanitize_thread = if (thread_sanitizer) true else null,
+            .imports = &.{
+                .{ .name = "strand", .module = strand },
+                .{ .name = "chronicle_test_options", .module = test_options.createModule() },
+            },
+        }),
+    });
     const run_tests = b.addRunArtifact(tests);
-    run_tests.step.dependOn(&install_lock_helper.step);
-    run_tests.setEnvironmentVariable(
-        "CHRONICLE_LOCK_HELPER",
-        b.getInstallPath(.bin, lock_helper.out_filename),
-    );
 
     const test_step = b.step("test", "Run chronicle tests");
     test_step.dependOn(&run_tests.step);
@@ -98,7 +90,7 @@ pub fn build(b: *std.Build) void {
     const examples_step = b.step("examples", "Build and run the examples");
     for (example_sources) |source| {
         const example = b.addExecutable(.{
-            .name = std.fs.path.stem(source),
+            .name = std.Io.Dir.path.stem(source),
             .root_module = b.createModule(.{
                 .root_source_file = b.path(source),
                 .target = target,

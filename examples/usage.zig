@@ -40,9 +40,9 @@ const Balances = struct {
 };
 
 pub fn main() !void {
-    var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = debug_allocator.deinit();
-    const gpa = debug_allocator.allocator();
+    var safe_allocator: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{});
+    defer _ = safe_allocator.deinit();
+    const gpa = safe_allocator.allocator();
 
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();

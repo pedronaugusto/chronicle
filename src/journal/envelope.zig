@@ -393,8 +393,8 @@ fn checkEnvelope(line: []const u8) !void {
 
         // And the envelope written back in the one shape this package
         // writes reads as itself off the bytes.
-        const batch = if (head.batch) |b| try std.fmt.allocPrint(a, ",\"bf\":{d},\"bl\":{d}", .{ b.first, b.last }) else "";
-        const written = try std.fmt.allocPrint(a, "{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d}{s},\"ev\":{s},\"c\":{d}}}", .{
+        const batch = if (head.batch) |b| try a.print(",\"bf\":{d},\"bl\":{d}", .{ b.first, b.last }) else "";
+        const written = try a.print("{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d}{s},\"ev\":{s},\"c\":{d}}}", .{
             head.seq, head.at, head.v, head.p, batch, line[head.ev.from..head.ev.to], if (t) |found| found.c else 7,
         });
         const again = quick(trailer(written).?.covered) orelse return error.TestExpectedQuick;

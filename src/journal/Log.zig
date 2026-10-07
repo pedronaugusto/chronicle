@@ -425,7 +425,7 @@ pub fn segmentName(
     // Zero-terminated: some of the calls a copy makes go to the operating
     // system by name rather than through an open file.
     var out: [name_digits + extension.len:0]u8 = undefined;
-    _ = std.fmt.bufPrint(&out, "{d:0>20}" ++ extension, .{base_seq}) catch unreachable; // unreachable: every u64 fits in 20 decimal digits and the buffer includes extension.len
+    _ = std.mem.print(&out, "{d:0>20}" ++ extension, .{base_seq}) catch unreachable; // unreachable: every u64 fits in 20 decimal digits and the buffer includes extension.len
     out[out.len] = 0;
     return out;
 }
@@ -630,7 +630,7 @@ fn tryInspectCleanSegmentFile(log: *Self, io: Io, base_seq: u64) Io.Cancelable!?
         return null;
     };
     if (read != want) return null;
-    const newline = std.mem.indexOfScalar(u8, raw[0..want], '\n') orelse return null;
+    const newline = std.mem.findScalar(u8, raw[0..want], '\n') orelse return null;
     const head = quickSegmentHeader(raw[0..newline]) orelse return null;
     if (head.version != log_format or head.base_seq != base_seq) return null;
     return .{ .bytes = length, .header_bytes = newline + 1 };
@@ -1365,7 +1365,7 @@ fn lineAtFrom(log: *Self, io: Io, file: Io.File, segment: Segment, offset: u64) 
     var bounded = reader.interface.limited(.limited64(segment.bytes -| offset), &buffer);
     // Unbounded, as a line read here always was: what it is for is decided
     // by whoever asked for it.
-    var lines: strand.LineReader = .resumeAt(log.gpa, &bounded.interface, framing(std.math.maxInt(usize)), .{ .offset = offset });
+    var lines: strand.LineReader = .resumeAt(log.gpa, &bounded.interface, .{ .offset = offset }, framing(std.math.maxInt(usize)));
     defer lines.deinit();
     const line = lines.next() catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
@@ -1814,7 +1814,7 @@ pub const Scan = struct {
         try reader.seekTo(scan.position);
         const limit = scan.limits[scan.at] -| scan.position;
         var bounded = reader.interface.limited(.limited64(limit), &buffer);
-        var lines: strand.LineReader = .resumeAt(scan.gpa, &bounded.interface, framing(scan.max_record_bytes), .{ .offset = scan.position });
+        var lines: strand.LineReader = .resumeAt(scan.gpa, &bounded.interface, .{ .offset = scan.position }, framing(scan.max_record_bytes));
         defer lines.deinit();
         while (true) {
             const line = (lines.next() catch |err| switch (err) {
@@ -1847,7 +1847,7 @@ pub const Scan = struct {
         while (at < to) {
             const want: usize = @intCast(@min(block.len, to - at));
             const read = try scan.file.?.readPositionalAll(io, block[0..want], at);
-            if (std.mem.indexOfScalar(u8, block[0..read], 0) != null) return true;
+            if (std.mem.findScalar(u8, block[0..read], 0) != null) return true;
             if (read < want) return false;
             at += read;
         }

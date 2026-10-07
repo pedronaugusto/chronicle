@@ -10,8 +10,7 @@
 //! blocking until standard input is closed — which is how the test lets them
 //! go. A lock is released by the operating system when the process ends.
 //!
-//! `zig build test` builds this and hands the test binary its path in
-//! `CHRONICLE_LOCK_HELPER`; the tests that need it are skipped without that.
+//! `zig build test` builds this and compiles its path into the suite.
 
 const std = @import("std");
 const chronicle = @import("chronicle");
@@ -53,7 +52,7 @@ pub fn main(init: std.process.Init) !void {
     if (crash_mode) {
         const seed = if (args.len > 3) try std.fmt.parseInt(u64, args[3], 10) else 0;
         var random: std.Random.DefaultPrng = .init(seed);
-        const backup_path = try std.fmt.allocPrint(init.gpa, "{s}.backup", .{args[1]});
+        const backup_path = try init.gpa.print("{s}.backup", .{args[1]});
         defer init.gpa.free(backup_path);
         try out.interface.writeAll("mutating\n");
         try out.interface.flush();

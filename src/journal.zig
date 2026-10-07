@@ -473,15 +473,11 @@ pub fn Journal(comptime Event: type) type {
         const event_parse: strand.ParseOptions = .{ .ignore_unknown_fields = false };
 
         const unknown_arm: ?UnknownArm = blk: {
-            const info = @typeInfo(Event);
-            if (info != .@"union") break :blk null;
-            for (info.@"union".fields) |field| {
-                if (!std.mem.eql(u8, field.name, "unknown")) continue;
-                if (field.type == void) break :blk .empty;
-                if (field.type == Raw) break :blk .raw;
-                if (field.type == std.json.Value) break :blk .json_value;
-                break :blk null;
-            }
+            if (@typeInfo(Event) != .@"union" or !@hasField(Event, "unknown")) break :blk null;
+            const Arm = @FieldType(Event, "unknown");
+            if (Arm == void) break :blk .empty;
+            if (Arm == Raw) break :blk .raw;
+            if (Arm == std.json.Value) break :blk .json_value;
             break :blk null;
         };
 

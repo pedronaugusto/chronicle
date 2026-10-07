@@ -1,20 +1,20 @@
 .{
     .name = .chronicle,
     .version = "0.6.0",
-    .minimum_zig_version = "0.16.0",
+    .minimum_zig_version = "0.17.0",
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
         .preflight = .{
-            .url = "https://codeload.github.com/pedronaugusto/preflight/tar.gz/3d9e5f165c4e317d3414679b4308a2ebf7c7fec5",
-            .hash = "preflight-0.1.0-LX1Zwjm0AwAi9oFgblqE7NEb2CbnqK-SjMW5fUjJ0Qht",
+            .url = "git+https://github.com/pedronaugusto/preflight#260ed79cf626e7ab8fb05039db476bb680b4a653",
+            .hash = "preflight-0.1.0-LX1ZwjvuBADAj7ukyFSK8YT0EXBlwN8CZkprUGIpFE2u",
             .lazy = true,
         },
 
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#a8c5e8384b4c0c2a65c86b87f0386dbd0c0db0f4",
-            .hash = "strand-0.7.0-8LNWVhDDDgAV5weSbC9j2nA_4JIl-k_xFYe2HDMlwMBs",
+            .url = "git+https://github.com/pedronaugusto/strand#792fb2d13de3e31cc28fd5b9ae917e2ca6f47a82",
+            .hash = "strand-0.7.0-8LNWVqMHDwDc1uIXrrhqTSDlNP53Dxlc8U6Iw8rJbYe8",
         },
     },
     .paths = .{

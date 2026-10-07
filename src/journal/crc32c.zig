@@ -1,6 +1,6 @@
 //! CRC32C, through the instruction for it where the machine has one.
 //!
-//! The value is the one `std.hash.crc.Crc32Iscsi` produces — same polynomial,
+//! The value is the one `std.hash.crc.@"CRC-32/ISCSI"` produces — same polynomial,
 //! same reflection, same initial and final words — and the suite asserts that
 //! over every length up to a segment's read buffer. What differs is how it is
 //! computed: the table version steps one byte at a time, and both aarch64 and
@@ -158,8 +158,19 @@ const Shift = struct {
 /// CRC32C's polynomial, bit-reflected.
 const polynomial: u32 = 0x82f6_3b78;
 
+/// std's table version, named by its parameters: std's own `CRC-32/ISCSI`
+/// is the instruction on x86-64, whose state does not continue from a
+/// running checksum.
+const Table = std.hash.crc.Generic(u32, .{
+    .polynomial = 0x1edc_6f41,
+    .initial = 0xffff_ffff,
+    .reflect_input = true,
+    .reflect_output = true,
+    .xor_output = 0xffff_ffff,
+});
+
 fn table(from: u32, bytes: []const u8) u32 {
-    var state: std.hash.crc.Crc32Iscsi = .{ .crc = from };
+    var state: Table = .{ .crc = from };
     state.update(bytes);
     return state.crc;
 }
@@ -186,8 +197,8 @@ inline fn eight(crc: u32, value: u64) u32 {
 test "the checksum carries the iSCSI test vectors" {
     // RFC 3720, B.4, and the check value of the CRC catalogue.
     try std.testing.expectEqual(@as(u32, 0xe306_9283), hash("123456789"));
-    try std.testing.expectEqual(@as(u32, 0x8a91_36aa), hash(&(.{0x00} ** 32)));
-    try std.testing.expectEqual(@as(u32, 0x62a8_ab43), hash(&(.{0xff} ** 32)));
+    try std.testing.expectEqual(@as(u32, 0x8a91_36aa), hash(&@as([32]u8, @splat(0x00))));
+    try std.testing.expectEqual(@as(u32, 0x62a8_ab43), hash(&@as([32]u8, @splat(0xff))));
     var up: [32]u8 = undefined;
     var down: [32]u8 = undefined;
     for (&up, &down, 0..) |*u, *d, i| {
@@ -207,7 +218,7 @@ test "the checksum agrees with the table over the lengths the chains change at" 
         for (edge - 9..edge + 10) |length| {
             for (0..3) |start| {
                 const slice = bytes[start..][0..length];
-                try std.testing.expectEqual(std.hash.crc.Crc32Iscsi.hash(slice), hash(slice));
+                try std.testing.expectEqual(std.hash.crc.@"CRC-32/ISCSI".hash(slice), hash(slice));
             }
         }
     }
@@ -224,7 +235,7 @@ fn fuzzChecksum(_: void, smith: *std.testing.Smith) anyerror!void {
     const length = smith.slice(&buf);
     const bytes = buf[0..length];
     const cut = @min(smith.valueRangeAtMost(u16, 0, buf.len), length);
-    try std.testing.expectEqual(std.hash.crc.Crc32Iscsi.hash(bytes), hash(bytes));
+    try std.testing.expectEqual(std.hash.crc.@"CRC-32/ISCSI".hash(bytes), hash(bytes));
     try std.testing.expectEqual(hash(bytes), ~update(update(initial, bytes[0..cut]), bytes[cut..]));
 }
 
