@@ -8,7 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
-- chronicle requires Zig 0.17.0, and builds against strand 792fb2d, strand's Zig 0.17 line.
+- chronicle requires Zig 0.17.0, and builds against strand cfa22bb, strand's Zig 0.17 line.
 - `close` is `finish`, and `CloseError` is `FinishError`. `finish` flushes the active segment, trims what was reserved past its records, syncs it and seals its index as `close` did, and leaves the journal open whether it succeeds or not: `deinit` is still owed, so `finish` sits beside `defer journal.deinit(io)`, and an append after it carries on. `close` released the journal even when it failed.
 - `subscribeFrom` and `subscribeAllFrom` refuse a cursor below `oldestSeq() - 1` with `error.HistoryDropped` and register nothing, so a fold restored from a snapshot older than a `compact` or `dropSegmentsBefore` is told it would skip records. A cursor of zero still means everything the log holds.
 - tailer names are lowercase letters, digits, `-` and `_`. On a filesystem that folds case, as macOS and Windows do by default, two names differing only in case shared one cursor file.
