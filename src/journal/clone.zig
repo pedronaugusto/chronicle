@@ -28,7 +28,7 @@ extern "c" fn clonefileat(
 ) c_int;
 
 /// Whether this platform has anything to try.
-pub const available = switch (builtin.os.tag) {
+pub const available = switch (builtin.target.os.tag) {
     .macos, .ios, .tvos, .watchos, .visionos, .linux => true,
     else => false,
 };
@@ -41,7 +41,7 @@ pub const available = switch (builtin.os.tag) {
 /// that exists, and the caller removes it first.
 pub fn whole(io: Io, source: Io.Dir, dest: Io.Dir, name: [:0]const u8) bool {
     if (!available) return false;
-    switch (builtin.os.tag) {
+    switch (builtin.target.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => {
             return clonefileat(source.handle, name, dest.handle, name, 0) == 0;
         },
@@ -60,7 +60,7 @@ pub fn whole(io: Io, source: Io.Dir, dest: Io.Dir, name: [:0]const u8) bool {
 /// Copy the first `length` bytes of one open file into another, from offset
 /// zero, and report whether the platform did all of it.
 pub fn range(to: Io.File, from: Io.File, length: u64) bool {
-    if (builtin.os.tag != .linux) return false;
+    if (builtin.target.os.tag != .linux) return false;
     var at: u64 = 0;
     while (at < length) {
         var in: i64 = @intCast(at);

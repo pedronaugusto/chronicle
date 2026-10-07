@@ -158,7 +158,7 @@ fn created(id: u32, name: []const u8) Event {
 /// This process's identifier — the one thing a worker forked from the test
 /// runner does not share with the runner or with its siblings.
 fn processId() u64 {
-    if (builtin.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
+    if (builtin.target.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
     return @intCast(std.posix.system.getpid());
 }
 
@@ -1209,7 +1209,7 @@ test "the durable write is the one this platform needs" {
     // This is the assertion behind README.md's durability table: if the
     // platform row changes, this fails rather than the document going quietly
     // out of date.
-    const expected: chronicle.Flush = switch (builtin.os.tag) {
+    const expected: chronicle.Flush = switch (builtin.target.os.tag) {
         .macos, .ios, .tvos, .watchos, .visionos => .full,
         else => .plain,
     };
@@ -3556,7 +3556,7 @@ test "a backup refuses its own directory reached through a symbolic link" {
     cwd.symLink(io, ws.path, link, .{ .is_directory = true }) catch |err| switch (err) {
         // Windows lets a process make a symbolic link only with the
         // privilege for it or in developer mode.
-        error.AccessDenied, error.PermissionDenied => if (builtin.os.tag == .windows)
+        error.AccessDenied, error.PermissionDenied => if (builtin.target.os.tag == .windows)
             return error.SkipZigTest
         else
             return err,
@@ -3613,7 +3613,7 @@ test "a backup shares the bytes of a sealed segment where the filesystem can" {
     const clones = journalState(journal).log.clones;
     _ = try journal.backup(io, dest);
     // APFS clones whole files: the two sealed segments and their indexes.
-    if (builtin.os.tag.isDarwin()) {
+    if (builtin.target.os.tag.isDarwin()) {
         try testing.expectEqual(clones + 4, journalState(journal).log.clones);
     }
     try testing.expectEqual(@as(u64, 12), try journal.backup(io, dest));
@@ -4039,7 +4039,7 @@ fn openDescriptors() !usize {
 }
 
 test "an open that refuses the log closes every file it opened" {
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    if (builtin.target.os.tag == .windows) return error.SkipZigTest;
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -6099,7 +6099,7 @@ fn fuzzStrayName(_: void, smith: *testing.Smith) anyerror!void {
         std.mem.endsWith(u8, name, ".tmp") or std.mem.eql(u8, name, chronicle.lock_name) or
         std.mem.eql(u8, name, chronicle.snapshot_name)) return;
     if (std.mem.findScalar(u8, name, '/') != null) return;
-    if (builtin.os.tag == .windows and (std.mem.endsWith(u8, name, ".") or std.mem.endsWith(u8, name, " "))) return;
+    if (builtin.target.os.tag == .windows and (std.mem.endsWith(u8, name, ".") or std.mem.endsWith(u8, name, " "))) return;
 
     // Its contents are a copy of one of the log's own segments, the shape
     // most likely to be mistaken for one.

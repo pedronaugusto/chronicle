@@ -5,8 +5,8 @@
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight#260ed79cf626e7ab8fb05039db476bb680b4a653",
-            .hash = "preflight-0.1.0-LX1ZwjvuBADAj7ukyFSK8YT0EXBlwN8CZkprUGIpFE2u",
+            .url = "git+https://github.com/pedronaugusto/preflight#f6a5191c42d8de76ab758465bf897e7acee931d9",
+            .hash = "preflight-0.1.0-LX1Zwv2WBQABkEzFUf5-MzYCtr0SSYHZrV097Vir7DYQ",
             .lazy = true,
         },
 

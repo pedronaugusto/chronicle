@@ -15,9 +15,9 @@ const builtin = @import("builtin");
 const std = @import("std");
 
 /// Whether this target has the instruction.
-pub const hardware = switch (builtin.cpu.arch) {
-    .aarch64, .aarch64_be => std.Target.aarch64.featureSetHas(builtin.cpu.features, .crc),
-    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .sse4_2),
+pub const hardware = switch (builtin.target.cpu.arch) {
+    .aarch64, .aarch64_be => std.Target.aarch64.featureSetHas(builtin.target.cpu.features, .crc),
+    .x86_64 => std.Target.x86.featureSetHas(builtin.target.cpu.features, .sse4_2),
     else => false,
 };
 
@@ -176,7 +176,7 @@ fn table(from: u32, bytes: []const u8) u32 {
 }
 
 inline fn eight(crc: u32, value: u64) u32 {
-    switch (builtin.cpu.arch) {
+    switch (builtin.target.cpu.arch) {
         .aarch64, .aarch64_be => return asm ("crc32cx %[out:w], %[in:w], %[value]"
             : [out] "=r" (-> u32),
             : [in] "r" (crc),
