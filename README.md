@@ -88,12 +88,17 @@ and otherwise return `error.WrongExpectedSeq` with the newest sequence number.
 `.on_segment` policy syncs at sealing and at `finish`; `.never` leaves record writeback to the
 operating system. Structural replacement flushes still apply under both policies.
 
-Durable writes use `fcntl(F_FULLFSYNC)` on macOS, `fsync` on Linux with `fdatasync` for
-writes into reserved space, and `NtFlushBuffersFile` on Windows: strand's `syncFile`. A
-macOS filesystem that declines `F_FULLFSYNC` gets `fsync`, and `status().flushed` says
-which call the records got. The implementation
-syncs directory changes on POSIX. Windows cannot provide that directory-sync guarantee,
-so record flushing does not guarantee a new filename survives power loss.
+Durable writes are [airlock](https://github.com/pedronaugusto/airlock)'s: `fcntl(F_FULLFSYNC)`
+on macOS, `fsync` on Linux and `NtFlushBuffersFile` on Windows, with the data-only sync
+(`fdatasync`, `NtFlushBuffersFileEx(DATA_SYNC_ONLY)` on NTFS) for writes into reserved
+space. A filesystem that declines the call gets the strongest one it takes, and
+`status().flushed` says what the records reached (`chronicle.flush` where nothing
+declined). A new segment, a compaction, a snapshot and a cursor are each made durable
+under their name, the directory included, on every platform: Windows flushes the
+directory too. A snapshot, a cursor and a compacted segment are written under a
+temporary name drawn at random and renamed into place; a writer's open removes the
+temporaries a crash left once they are an hour old. A backup makes its copies durable
+together, a writeout of each and one flush of the device on macOS and Windows.
 
 Opening repairs an unfinished final record by default: a line with no newline, or one
 whose newline reached the disk without all of its bytes, as a power cut can leave it.
@@ -130,6 +135,12 @@ exercises schema migration.
 - [Zig](https://ziglang.org) 0.17.0 and its standard library; nothing is linked.
 - [strand](https://github.com/pedronaugusto/strand) reads and writes each record's
   line.
+- [airlock](https://github.com/pedronaugusto/airlock) makes the files durable: every
+  sync, atomic replace and backup batch, and the identity that tells two directories
+  apart.
+- [shakedown](https://github.com/pedronaugusto/shakedown) supplies the tests' doubles:
+  faulted and counted `Io` calls and allocators. Only the tests import it, so a project
+  depending on chronicle never fetches it.
 - [preflight](https://github.com/pedronaugusto/preflight) runs the source checks,
   the tests and CI.
 

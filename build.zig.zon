@@ -13,8 +13,22 @@
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#cfa22bbff1e804487aca8c2ae8b5d0fbac1055e3",
-            .hash = "strand-0.7.0-8LNWVlTLDgBWT5HzHKcNnY9xlapSBKP560HYZXdjxQWU",
+            .url = "git+https://github.com/pedronaugusto/strand#c37ca7a619a16e804b60b9ef1b63f690956edcd0",
+            .hash = "strand-0.7.0-8LNWVtOaDgAtCYE4p0etPu9mABLlsq5cpFCuD1g7B8OE",
+        },
+
+        // Durable files: every sync, atomic replace, batch and file identity.
+        .airlock = .{
+            .url = "git+https://github.com/pedronaugusto/airlock#652b0e4f73a909d6876841d63ce997d496cae6c0",
+            .hash = "airlock-0.1.0-rfvu6J-8BABiFpUiwfGRVNjVLnwb0LEm3iFQlf3QCigU",
+        },
+
+        // Test doubles, for the tests alone: no module a consumer builds
+        // imports it, and a consumer never fetches it.
+        .shakedown = .{
+            .url = "git+https://github.com/pedronaugusto/shakedown#4f590164cf91ef9f244ee26b0a20444b9ecdcdae",
+            .hash = "shakedown-0.1.0-BR8U47zBAwCoNKX4gYuShFo5o5tCR_GSyQ3PVjzPDoPw",
+            .lazy = true,
         },
     },
     .paths = .{

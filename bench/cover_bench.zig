@@ -16,7 +16,7 @@
 //! byte and synced, the floor) and `finish SCRATCH`.
 const std = @import("std");
 const chronicle = @import("chronicle");
-const strand = @import("strand");
+const airlock = @import("airlock");
 const smoke = @import("bench_options").smoke;
 const Io = std.Io;
 
@@ -523,9 +523,9 @@ fn backupCopy(io: Io, data: []const u8, dest: []const u8) !void {
             offset += n;
             if (n < buffer.len) break;
         }
-        _ = try strand.syncFile(io, copy, .all);
+        _ = try airlock.syncFile(io, copy, .{ .level = .full });
     }
-    _ = try strand.syncDir(io, to);
+    _ = try airlock.syncDir(io, to, .{ .level = .full });
     const elapsed = since(io, started);
     try row("backup", "elapsed", @as(f64, @floatFromInt(elapsed)) / 1e6, "ms");
     try check("backup", "segments_complete", @intFromBool(try treeBytes(io, dest) == try treeBytes(io, data)));

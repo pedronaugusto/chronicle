@@ -5,20 +5,28 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     //=====================================================================
-    // The module. Pure Zig, one dependency, nothing to configure: the
+    // The module. Pure Zig, two dependencies, nothing to configure: the
     // package's only knobs are the `Options` a caller passes to `open`, so
     // there is no build option to forward and no way for a consumer's build
     // graph to disagree with this one. strand reads and writes a record's
-    // line; this package keeps the lines.
+    // line and airlock makes files durable; this package keeps the lines.
     //=====================================================================
 
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
+    const airlock = b.dependency("airlock", .{ .target = target, .optimize = optimize }).module("airlock");
     const module = b.addModule("chronicle", .{
         .root_source_file = b.path("src/chronicle.zig"),
         .target = target,
         .optimize = optimize,
-        .imports = &.{.{ .name = "strand", .module = strand }},
+        .imports = &.{
+            .{ .name = "strand", .module = strand },
+            .{ .name = "airlock", .module = airlock },
+        },
     });
+
+    // Everything below is chronicle's own: a project depending on chronicle
+    // neither builds nor fetches its tests, examples, benchmarks or CI.
+    if (b.pkg_hash.len != 0) return;
 
     //=====================================================================
     // Tests.
@@ -61,10 +69,16 @@ pub fn build(b: *std.Build) void {
             .sanitize_thread = if (thread_sanitizer) true else null,
             .imports = &.{
                 .{ .name = "strand", .module = strand },
+                .{ .name = "airlock", .module = airlock },
                 .{ .name = "chronicle_test_options", .module = test_options.createModule() },
             },
         }),
     });
+    // shakedown is a lazy, test-only dependency: no module a consumer
+    // builds imports it.
+    if (b.lazyDependency("shakedown", .{ .target = target, .optimize = optimize })) |shakedown| {
+        tests.root_module.addImport("shakedown", shakedown.module("shakedown"));
+    }
     const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run chronicle tests");
@@ -108,20 +122,9 @@ pub fn build(b: *std.Build) void {
     if (test_filter == null) test_step.dependOn(examples_step);
 
     //=====================================================================
-    // CI wiring
-    //
-    // Only in chronicle's own tree. preflight is a lazy dependency, and a
-    // lazy package's build.zig can only be reached through `lazyImport`: a
-    // plain `@import` of it fails to compile in any project that depends on
-    // chronicle and has not fetched preflight, which is every such project.
-    //=====================================================================
-
-    if (b.pkg_hash.len != 0) return;
-
-    //=====================================================================
     // Benchmarks
     //
-    // Only in chronicle's own tree, and never part of `zig build test`: a
+    // Never part of `zig build test`: a
     // number that varies with the machine is not a thing to fail a build
     // over. `check` compiles them so they keep up with the API; `bench`
     // installs them under zig-out/bench, and each says at its top how it is
@@ -145,6 +148,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "chronicle", .module = module },
                     .{ .name = "strand", .module = strand },
+                    .{ .name = "airlock", .module = airlock },
                 },
             }),
         });
@@ -153,14 +157,23 @@ pub fn build(b: *std.Build) void {
         check_step.dependOn(&bench.step);
     }
 
+    //=====================================================================
+    // CI wiring
+    //
+    // preflight is a lazy dependency, and a lazy package's build.zig can
+    // only be reached through `lazyImport`: a plain `@import` of it fails to
+    // compile in any project that depends on chronicle and has not fetched
+    // preflight, which is every such project.
+    //=====================================================================
+
     if (b.lazyImport(@This(), "preflight")) |preflight| {
         preflight.addCi(b, .{ .tests = test_step });
         // A project that depends on chronicle by path, with strand and
-        // nothing else to fetch: the build a consumer gets.
+        // airlock and nothing else to fetch: the build a consumer gets.
         preflight.addConsumerCheck(b, .{
             .package = "chronicle",
             .program = b.path("ci/consumer.zig"),
-            .packages = &.{b.dependency("strand", .{})},
+            .packages = &.{ b.dependency("strand", .{}), b.dependency("airlock", .{}) },
         });
     }
 }

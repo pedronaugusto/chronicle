@@ -6,6 +6,10 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const chronicle = @import("chronicle.zig");
+const airlock = @import("airlock");
+const shakedown = @import("shakedown");
+const seam = @import("testing/seam.zig");
+const Seam = seam.Seam;
 /// The lock helper's path, from the build: `zig build test` compiles it
 /// beside this suite.
 const test_options = @import("chronicle_test_options");
@@ -19,6 +23,13 @@ const Event = union(enum) {
 };
 
 const Journal = chronicle.Journal(Event);
+
+/// The start of the name of every temporary the journal writes beside its files.
+const temporary_prefix = ".chronicle-tmp-";
+/// A temporary's name as the journal draws one: the prefix and 26 base32
+/// characters.
+const temporary_name = temporary_prefix ++ shakedown.corpus.repeat("a", 26);
+
 const implementation = @import("journal.zig");
 
 fn journalState(owner: anytype) *implementation.Journal(@FieldType(@typeInfo(@TypeOf(owner)).pointer.child.Record, "event")) {
@@ -71,68 +82,11 @@ fn expectNoLeak(gpa: *std.heap.SafeAllocator) void {
     if (gpa.deinit() != 0) @panic("the fixture allocator found a leak");
 }
 
-/// An allocator that refuses to hold more than `limit` live bytes at once,
-/// over `testing.allocator`: what a test that bounds a peak needs.
-const Budget = struct {
-    child: std.mem.Allocator,
-    /// Live bytes: what was allocated and not yet freed.
-    live: std.atomic.Value(usize) = .init(0),
-    /// The most `live` may reach; past it, an allocation fails.
-    limit: std.atomic.Value(usize) = .init(std.math.maxInt(usize)),
-
-    fn allocator(budget: *Budget) std.mem.Allocator {
-        return .{ .ptr = budget, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
-    }
-
-    /// Allow `extra` bytes beyond what is live now.
-    fn allow(budget: *Budget, extra: usize) void {
-        budget.limit.store(budget.live.load(.monotonic) + extra, .monotonic);
-    }
-
-    fn take(budget: *Budget, len: usize) bool {
-        const before = budget.live.fetchAdd(len, .monotonic);
-        if (before + len <= budget.limit.load(.monotonic)) return true;
-        _ = budget.live.fetchSub(len, .monotonic);
-        return false;
-    }
-
-    fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const budget: *Budget = @ptrCast(@alignCast(context));
-        if (!budget.take(len)) return null;
-        return budget.child.rawAlloc(len, alignment, ret_addr) orelse {
-            _ = budget.live.fetchSub(len, .monotonic);
-            return null;
-        };
-    }
-
-    fn resize(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const budget: *Budget = @ptrCast(@alignCast(context));
-        if (new_len > memory.len and !budget.take(new_len - memory.len)) return false;
-        if (!budget.child.rawResize(memory, alignment, new_len, ret_addr)) {
-            if (new_len > memory.len) _ = budget.live.fetchSub(new_len - memory.len, .monotonic);
-            return false;
-        }
-        if (new_len < memory.len) _ = budget.live.fetchSub(memory.len - new_len, .monotonic);
-        return true;
-    }
-
-    fn remap(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const budget: *Budget = @ptrCast(@alignCast(context));
-        if (new_len > memory.len and !budget.take(new_len - memory.len)) return null;
-        const moved = budget.child.rawRemap(memory, alignment, new_len, ret_addr) orelse {
-            if (new_len > memory.len) _ = budget.live.fetchSub(new_len - memory.len, .monotonic);
-            return null;
-        };
-        if (new_len < memory.len) _ = budget.live.fetchSub(memory.len - new_len, .monotonic);
-        return moved;
-    }
-
-    fn free(context: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const budget: *Budget = @ptrCast(@alignCast(context));
-        budget.child.rawFree(memory, alignment, ret_addr);
-        _ = budget.live.fetchSub(memory.len, .monotonic);
-    }
-};
+/// Every time an allocator was asked for memory it did not already hold: an
+/// allocation, a remap, or a resize in place.
+fn grown(counting: *const shakedown.alloc.Counting) u64 {
+    return counting.allocations + counting.remaps + counting.resizes;
+}
 
 /// Append the records `first` through `last`, each stamped with its own
 /// number, in batches: a fixture of tens of thousands of records written one
@@ -258,6 +212,18 @@ const Workspace = struct {
     fn write(self: *Workspace, sub_path: []const u8, data: []const u8) !void {
         try self.root.createDirPath(testing.io, self.name);
         return self.root.writeFile(testing.io, .{ .sub_path = sub_path, .data = data });
+    }
+
+    /// How many temporaries the journal's own writes left in its directory.
+    fn temporaries(self: *Workspace) !usize {
+        var dir = try self.root.openDir(testing.io, self.name, .{ .iterate = true });
+        defer dir.close(testing.io);
+        var count: usize = 0;
+        var it = dir.iterate();
+        while (try it.next(testing.io)) |entry| {
+            if (std.mem.startsWith(u8, entry.name, temporary_prefix)) count += 1;
+        }
+        return count;
     }
 
     fn exists(self: *Workspace, sub_path: []const u8) bool {
@@ -956,8 +922,9 @@ test "a gap between two segments is refused" {
 }
 
 test "a write that does not reach the disk publishes nothing and latches" {
-    var vtable: Io.VTable = undefined;
-    const io = failingIo(&vtable);
+    const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{});
+    defer fio.deinit();
+    const io = fio.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
@@ -967,8 +934,7 @@ test "a write that does not reach the disk publishes nothing and latches" {
 
     // Refuse an unbuffered write before any bytes reach disk. No staged
     // bytes remain for the reopen to flush after the seam is restored.
-    fail_writes.store(true, .release);
-    defer fail_writes.store(false, .release);
+    try fio.setPlan(&.{writes_fail});
     try testing.expectError(error.WriteFailed, journal.append(io, 2, created(2, "lost")));
     try testing.expect((try journal.status(io)).persistence_failed);
     try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
@@ -980,15 +946,15 @@ test "a write that does not reach the disk publishes nothing and latches" {
 
     // Reconciliation reopens the authoritative bytes, clears the latch and
     // tells the caller whether the attempted sequence actually survived.
-    fail_writes.store(false, .release);
+    try fio.setPlan(&.{});
     try testing.expectEqual(@as(u64, 1), try journal.reconcile(io));
     try testing.expect(!(try journal.status(io)).persistence_failed);
     try testing.expectEqual(@as(u64, 2), try journal.append(io, 2, created(2, "retried")));
 }
 
 test "reconcile hands a sink the record that survived a failed write" {
-    var vtable: Io.VTable = undefined;
-    const io = failingIo(&vtable);
+    var lost: LostAnswer = .init(testing.io, .{});
+    const io = lost.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
@@ -999,10 +965,9 @@ test "reconcile hands a sink the record that survived a failed write" {
     _ = try journal.append(io, 1, created(1, "one"));
 
     // The record reaches the file and the answer saying so is lost.
-    fail_after_writes.store(true, .release);
-    defer fail_after_writes.store(false, .release);
+    lost.state.lose = true;
     try testing.expectError(error.WriteFailed, journal.append(io, 2, created(2, "two")));
-    fail_after_writes.store(false, .release);
+    lost.state.lose = false;
     try testing.expectEqual(@as(u64, 1), fold.last);
 
     try testing.expectEqual(@as(u64, 2), try journal.reconcile(io));
@@ -1058,46 +1023,44 @@ test "refresh wakes a waiter and hands a read journal's sinks what arrived" {
     try testing.expectEqual(@as(u64, 1), fold.last);
 }
 
-/// Inject a failed write through the same seam every real file write uses.
-var fail_writes: std.atomic.Value(bool) = .init(false);
-/// Report a write as failed after it reached the file: the append the
-/// operating system took and whose answer was lost.
-var fail_after_writes: std.atomic.Value(bool) = .init(false);
+/// Every file write fails before any byte reaches the disk, through the same
+/// seam every real file write uses.
+const writes_fail: shakedown.IoPlan.Entry = .{
+    .at = .{ .nth = .{ .call = .fileWritePositional, .n = 1 } },
+    .fault = .{ .fail = error.InputOutput },
+    .times = 0,
+};
 
-fn failingIo(vtable: *Io.VTable) Io {
-    vtable.* = testing.io.vtable.*;
-    vtable.fileWritePositional = struct {
-        fn write(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
-            if (fail_writes.load(.acquire)) return error.InputOutput;
-            const written = try testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
-            if (fail_after_writes.load(.acquire)) return error.InputOutput;
-            return written;
-        }
-    }.write;
-    return .{ .userdata = testing.io.userdata, .vtable = vtable };
+/// An `Io` whose file writes reach the file and then report failure while
+/// `lose` is set: the append the operating system took and whose answer was
+/// lost. A layer, because shakedown's `FaultIo` fails a call in place of
+/// making it, and this one has to be made.
+const LostAnswer = shakedown.Layer(LostAnswerState, .{ .fileWritePositional = lostAnswerWrite });
+const LostAnswerState = struct { lose: bool = false };
+
+fn lostAnswerWrite(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
+    const layer = LostAnswer.of(userdata);
+    const written = try layer.base.vtable.fileWritePositional(layer.base.userdata, file, header, data, splat, offset);
+    if (layer.state.lose) return error.InputOutput;
+    return written;
 }
 
-/// Whether a file write made with cancelation not blocked is to be the
-/// cancel point a cancel lands on: `cancelingIo`'s one knob.
-var cancel_writes: std.atomic.Value(bool) = .init(false);
+/// An `Io` with every file write a cancel point that fires while `on` is
+/// set: the write a cancel would interrupt returns `error.Canceled`, unless
+/// the task has blocked cancelation, exactly as a cancel landing on it does.
+/// A layer, because shakedown's `FaultIo` lands its cancel whatever the
+/// task's cancel protection says.
+const CancelingWrites = shakedown.Layer(CancelingWritesState, .{ .fileWritePositional = cancelingWrite });
+const CancelingWritesState = struct { on: std.atomic.Value(bool) = .init(false) };
 
-/// `testing.io`, with every file write a cancel point that fires while
-/// `cancel_writes` is set: the write a cancel would interrupt returns
-/// `error.Canceled`, unless the task has blocked cancelation, exactly as a
-/// cancel landing on it does. Everything else is `testing.io`'s own.
-fn cancelingIo(vtable: *Io.VTable) Io {
-    vtable.* = testing.io.vtable.*;
-    vtable.fileWritePositional = struct {
-        fn write(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
-            if (cancel_writes.load(.acquire)) {
-                const protection = testing.io.swapCancelProtection(.blocked);
-                _ = testing.io.swapCancelProtection(protection);
-                if (protection == .unblocked) return error.Canceled;
-            }
-            return testing.io.vtable.fileWritePositional(userdata, file, header, data, splat, offset);
-        }
-    }.write;
-    return .{ .userdata = testing.io.userdata, .vtable = vtable };
+fn cancelingWrite(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
+    const layer = CancelingWrites.of(userdata);
+    if (layer.state.on.load(.acquire)) {
+        const protection = layer.base.swapCancelProtection(.blocked);
+        _ = layer.base.swapCancelProtection(protection);
+        if (protection == .unblocked) return error.Canceled;
+    }
+    return layer.base.vtable.fileWritePositional(layer.base.userdata, file, header, data, splat, offset);
 }
 
 /// The writes of a journal's life, each one a cancel point that fires: on a
@@ -1121,8 +1084,8 @@ fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
 }
 
 test "a cancel that lands on a write is not a failed write" {
-    var vtable: Io.VTable = undefined;
-    const io = cancelingIo(&vtable);
+    var canceling: CancelingWrites = .init(testing.io, .{});
+    const io = canceling.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
@@ -1135,8 +1098,8 @@ test "a cancel that lands on a write is not a failed write" {
         // Every write from here is where a cancel would land. Each record
         // still goes down whole, the journal is not latched, and the sink
         // sees each once: a write that has begun runs to its end.
-        cancel_writes.store(true, .release);
-        defer cancel_writes.store(false, .release);
+        canceling.state.on.store(true, .release);
+        defer canceling.state.on.store(false, .release);
         var task = try io.concurrent(writeThroughCancels, .{ io, journal, &fold });
         try task.await(io);
     }
@@ -1204,18 +1167,15 @@ test "every fsync policy writes a log that opens with the same records" {
 }
 
 test "the durable write is the one this platform needs" {
-    // `fsync` on Darwin returns when the bytes are in the drive's write
-    // cache, so a promise about a power cut there has to be `F_FULLFSYNC`.
-    // This is the assertion behind README.md's durability table: if the
-    // platform row changes, this fails rather than the document going quietly
-    // out of date.
-    const expected: chronicle.Flush = switch (builtin.target.os.tag) {
-        .macos, .ios, .tvos, .watchos, .visionos => .full,
-        else => .plain,
-    };
-    try testing.expectEqual(expected, chronicle.flush);
-    // And it is strand's answer, not one restated here.
-    try testing.expectEqual(chronicle.Flush.asked(.all), chronicle.flush);
+    // A durable write reaches everything, timestamps included, on every
+    // platform: `F_FULLFSYNC` on Darwin, where `fsync` returns with the bytes
+    // still in the drive's cache, `fsync` on Linux and the full flush on
+    // Windows. This is the assertion behind README.md's durability rules: if
+    // the platform row changes, this fails rather than the document going
+    // quietly out of date.
+    try testing.expectEqual(chronicle.Flush.full, chronicle.flush);
+    // And it is airlock's answer, not one restated here.
+    try testing.expectEqual(airlock.Reached.expected(.full), chronicle.flush);
 
     // What a record got is what the filesystem answered: the call asked for
     // where it takes it, which the one under the suite does.
@@ -1227,6 +1187,105 @@ test "the durable write is the one this platform needs" {
     try testing.expectEqual(@as(?chronicle.Flush, null), (try journal.status(io)).flushed);
     _ = try journal.append(io, 1, created(1, "n"));
     try testing.expectEqual(@as(?chronicle.Flush, chronicle.flush), (try journal.status(io)).flushed);
+}
+
+test "a sync that fails on an append latches the journal, and nothing is synced past it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const hooked = try Seam.create(testing.allocator, io, &.{});
+    defer hooked.destroy();
+    const journal = try Journal.open(testing.allocator, hooked.io(), ws.path, .{});
+    defer journal.deinit(hooked.io());
+    _ = try journal.append(hooked.io(), 1, created(1, "durable"));
+
+    // The disk loses the next record's sync, whichever level it asks for.
+    const failed = [_]seam.Plan.Entry{ seam.fail(.sync_full, 1, seam.io_error), seam.fail(.sync_data, 1, seam.io_error) };
+    hooked.setPlan(&failed);
+    const before = hooked.syncs();
+    try testing.expectError(error.InputOutput, journal.append(hooked.io(), 2, created(2, "lost")));
+    try testing.expect((try journal.status(hooked.io())).persistence_failed);
+    // A second sync could come back clean over the lost record: there is none.
+    try testing.expectError(error.PersistenceFailed, journal.append(hooked.io(), 3, created(3, "refused")));
+    try testing.expectEqual(before + 1, hooked.syncs());
+}
+
+test "a backup makes every copy durable, a clone too, with one flush of the device" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const copy_path = try ws.beside("copy");
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(4, 1024));
+    defer journal.deinit(io);
+    for (1..14) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    try journal.snapshot(io, "state");
+
+    const hooked = try Seam.create(testing.allocator, io, &.{});
+    defer hooked.destroy();
+    _ = try journal.backup(hooked.io(), copy_path);
+
+    var copied: u32 = 0;
+    var listing = try ws.root.openDir(io, "copy", .{ .iterate = true });
+    defer listing.close(io);
+    var walk = listing.iterate();
+    while (try walk.next(io)) |_| copied += 1;
+    try testing.expect(copied >= 4);
+
+    // Each file is synced once, shared extents or not: a writeout of each
+    // and one flush of the device where the platform has a cheaper call
+    // than the flush (macOS, Windows), a data sync of each on Linux.
+    const per_file: seam.Call = if (builtin.target.os.tag == .linux) .sync_data else .sync_writeout;
+    try testing.expect(hooked.count(per_file) >= copied);
+    try testing.expectEqual(@as(u32, if (builtin.target.os.tag == .linux) 0 else 1), hooked.count(.sync_full));
+}
+
+test "writing a file beside the log never writes into another writer's temporary" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+
+    // The name a fixed suffix would give every writer of the snapshot, held
+    // by someone part-way through writing it.
+    try ws.write(try ws.sub(chronicle.snapshot_name ++ ".tmp"), "someone else's");
+    try journal.snapshot(io, "state");
+    try testing.expectEqualStrings("someone else's", try ws.read(try ws.sub(chronicle.snapshot_name ++ ".tmp")));
+    try testing.expect(std.mem.endsWith(u8, try ws.read(try ws.sub(chronicle.snapshot_name)), "\"state\":\"c3RhdGU=\"}"));
+    try testing.expectEqual(@as(usize, 0), try ws.temporaries());
+}
+
+test "a writer's open removes the temporaries a crash left, and none still being written" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "n"));
+    }
+    const stale = temporary_prefix ++ shakedown.corpus.repeat("b", 26);
+    try ws.write(try ws.sub(stale), "half a snapshot");
+    try ws.write(try ws.sub(temporary_name), "a cursor a reader is writing now");
+    {
+        // Left two hours ago, by a writer that crashed before its rename.
+        const file = try ws.root.openFile(io, try ws.sub(stale), .{ .mode = .write_only });
+        defer file.close(io);
+        const now = Io.Timestamp.now(io, .real);
+        try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = now.nanoseconds - 2 * std.time.ns_per_hour } } });
+    }
+
+    // A reader removes nothing: it writes nothing at all to the log.
+    {
+        const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
+        defer reader.deinit(io);
+    }
+    try testing.expectEqual(@as(usize, 2), try ws.temporaries());
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    try testing.expect(!ws.exists(try ws.sub(stale)));
+    try testing.expect(ws.exists(try ws.sub(temporary_name)));
 }
 
 test "a reserved segment is written into rather than extended, and reserves nothing when closed" {
@@ -2260,7 +2319,7 @@ test "a tailer remembers where it got to, in a file of its own" {
     }
     try testing.expectEqual(@as(u64, 4), (try reports.cursor(io)));
     try testing.expectEqualStrings("{\"fmt\":1,\"seq\":4}", try ws.read(try ws.sub("reports.cursor")));
-    try testing.expect(!ws.exists(try ws.sub("reports.cursor.tmp")));
+    try testing.expectEqual(@as(usize, 0), try ws.temporaries());
 
     // A tailer opened again under the same name is that reader again, and it
     // reads on from where it stopped.
@@ -2397,23 +2456,6 @@ test "retention can see what its readers have consumed" {
     try testing.expectEqual(@as(u64, 5), (try journal.oldestSeq(io)));
 }
 
-/// An `Io` whose open of a cursor file finds it forgotten first: what a
-/// `forget` from another process looks like when it lands between the
-/// directory listing `readers` reads and the open of the file it listed.
-const ForgottenMidList = struct {
-    var real: std.Io.VTable = undefined;
-
-    fn openFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
-        if (std.mem.eql(u8, sub_path, "gone" ++ chronicle.cursor_extension)) {
-            real.dirDeleteFile(userdata, dir, sub_path) catch |err| {
-                // A fixture operation must fail the test when it cannot complete.
-                std.log.err("fixture operation: {t}", .{err});
-            };
-        }
-        return real.dirOpenFile(userdata, dir, sub_path, options);
-    }
-};
-
 test "a reader forgotten while the readers are listed is not listed at cursor zero" {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -2428,10 +2470,23 @@ test "a reader forgotten while the readers are listed is not listed at cursor ze
         try tail.commit(io, reader[1]);
     }
 
-    ForgottenMidList.real = testing.io.vtable.*;
-    var vtable = testing.io.vtable.*;
-    vtable.dirOpenFile = ForgottenMidList.openFile;
-    const racing: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    // The open of the cursor `gone` finds it forgotten first: what a `forget`
+    // from another process looks like when it lands between the directory
+    // listing `readers` reads and the open of the file it listed.
+    const Forget = struct {
+        fn run(inner: Io, context: *anyopaque) void {
+            const dir: *const Io.Dir = @ptrCast(@alignCast(context)); // safe: the plan below hands this callback the journal directory
+            dir.deleteFile(inner, "gone" ++ chronicle.cursor_extension) catch @panic("could not forget the cursor");
+        }
+    };
+    var dir = try Io.Dir.cwd().openDir(io, ws.path, .{});
+    defer dir.close(io);
+    const fio = try shakedown.FaultIo.init(testing.allocator, io, .{ .plan = &.{.{
+        .at = .{ .nth = .{ .call = .dirOpenFile, .n = 1, .path = .{ .suffix = "gone" ++ chronicle.cursor_extension } } },
+        .fault = .{ .call = .{ .ctx = &dir, .f = Forget.run } },
+    }} });
+    defer fio.deinit();
+    const racing = fio.io();
 
     // A cursor that is not there has consumed nothing a retention decision
     // can wait for; listing it at zero would hold every record back.
@@ -3212,7 +3267,7 @@ test "compact can cut inside the segment being written to" {
     try testing.expectEqual(@as(u64, 6), try journal.append(io, 6, created(6, "n")));
     try testing.expect(ws.exists(try ws.segment(5)));
     try testing.expect(!ws.exists(try ws.segment(1)));
-    try testing.expect(!ws.exists(try ws.sub("00000000000000000005.tmp")));
+    try testing.expectEqual(@as(usize, 0), try ws.temporaries());
 }
 
 test "the tail gives way by bytes as well as by count" {
@@ -3413,7 +3468,7 @@ test "a temporary file a crash left behind is ignored" {
         defer journal.deinit(io);
         for (1..6) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
 
-        try ws.write(try ws.sub("00000000000000000003.tmp"), "half a segment, no newline");
+        try ws.write(try ws.sub(temporary_name), "half a segment, no newline");
         try ws.write(try ws.sub(chronicle.snapshot_name ++ ".tmp"), "{ not a snapshot");
         try journal.refresh(io);
         try testing.expectEqual(@as(u64, 5), try journal.lastSeq(io));
@@ -4741,7 +4796,7 @@ test "an append that keeps no record allocates nothing" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
-    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var counting: shakedown.alloc.Counting = .init(testing.allocator);
     const journal = try Journal.open(counting.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 0,
@@ -4754,11 +4809,11 @@ test "an append that keeps no record allocates nothing" {
     var batch: [10]Journal.Entry = undefined;
     for (&batch, 0..) |*entry, i| entry.* = .{ .at = @intCast(i), .event = created(@intCast(i), "a name of some length") };
     _ = try journal.appendAll(io, &batch, .group);
-    const settled = counting.allocations;
+    const settled = grown(&counting);
 
     for (0..200) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "a name of some length"));
     for (0..20) |_| _ = try journal.appendAll(io, &batch, .group);
-    try testing.expectEqual(settled, counting.allocations);
+    try testing.expectEqual(settled, grown(&counting));
 
     // And what it wrote is what a reader reads.
     const reader = try Journal.open(testing.allocator, io, ws.path, .{ .access = .read });
@@ -4815,9 +4870,6 @@ test "two hundred thousand records open and replay within bounded memory" {
 // explores from there.
 //========================================================================
 
-/// One corpus entry for a test whose first call is `Smith.slice`: a
-/// little-endian byte count and then the bytes, which is how that call reads
-/// one byte string out of the fuzzer's input.
 /// `std.testing.io` around one input of `zig build test --fuzz`.
 ///
 /// The test runner sets it up around each test of an ordinary run, and not
@@ -4830,16 +4882,6 @@ fn fuzzingIo() void {
 
 fn fuzzedIo() void {
     if (builtin.fuzz) testing.io_instance.deinit();
-}
-
-fn seeded(comptime body: []const u8) []const u8 {
-    comptime {
-        var entry: [4 + body.len]u8 = undefined;
-        std.mem.writeInt(u32, entry[0..4], body.len, .little);
-        @memcpy(entry[4..], body);
-        const frozen = entry;
-        return &frozen;
-    }
 }
 
 /// The line that starts a segment file, in front of everything the fuzzer
@@ -4857,29 +4899,29 @@ const a_second_record = "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"
 /// Inputs worth starting from: the empty file, a whole record, a record cut
 /// off mid-write, and the shapes that have to be refused by name.
 const open_corpus = [_][]const u8{
-    seeded(""),
-    seeded("\n"),
-    seeded("\n\n"),
-    seeded("{"),
-    seeded(a_record),
-    seeded(a_record ++ a_second_record),
-    seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"crea"),
+    shakedown.corpus.entry(""),
+    shakedown.corpus.entry("\n"),
+    shakedown.corpus.entry("\n\n"),
+    shakedown.corpus.entry("{"),
+    shakedown.corpus.entry(a_record),
+    shakedown.corpus.entry(a_record ++ a_second_record),
+    shakedown.corpus.entry(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"crea"),
     // The zeros a writer's reservation leaves, after a whole record and
     // after half of one.
-    seeded(a_record ++ @as([64]u8, @splat(0))),
-    seeded(a_record ++ "{\"seq\":2,\"at\":2" ++ @as([64]u8, @splat(0))),
+    shakedown.corpus.entry(a_record ++ @as([64]u8, @splat(0))),
+    shakedown.corpus.entry(a_record ++ "{\"seq\":2,\"at\":2" ++ @as([64]u8, @splat(0))),
     // A record whose checksum is not its own, and one that does not link to
     // the record before it.
-    seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":0}\n"),
-    seeded(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":7,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":2105350390}\n"),
-    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":null,\"c\":4294967296}\n"),
-    seeded("{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"p\":0,\"ev\":null}\n"),
-    seeded("{\"seq\":0,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n"),
-    seeded("{\"seq\":9223372036854775807,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n"),
-    seeded("{\"seq\":1,\"at\":1,\"v\":4294967296,\"p\":0,\"ev\":null}\n"),
-    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":{\"created\":{\"id\":-1,\"name\":null}}}\n"),
-    seeded("[[[[[[[[[[[[[[[[[[[[\n"),
-    seeded("\x00\xff\xfe\n"),
+    shakedown.corpus.entry(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":0}\n"),
+    shakedown.corpus.entry(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":7,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":2105350390}\n"),
+    shakedown.corpus.entry("{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":null,\"c\":4294967296}\n"),
+    shakedown.corpus.entry("{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"p\":0,\"ev\":null}\n"),
+    shakedown.corpus.entry("{\"seq\":0,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n"),
+    shakedown.corpus.entry("{\"seq\":9223372036854775807,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n"),
+    shakedown.corpus.entry("{\"seq\":1,\"at\":1,\"v\":4294967296,\"p\":0,\"ev\":null}\n"),
+    shakedown.corpus.entry("{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":{\"created\":{\"id\":-1,\"name\":null}}}\n"),
+    shakedown.corpus.entry("[[[[[[[[[[[[[[[[[[[[\n"),
+    shakedown.corpus.entry("\x00\xff\xfe\n"),
 };
 
 /// Every record a walk from `position` hands on, by sequence number, each
@@ -4980,7 +5022,7 @@ test "a re-armed replay allocates nothing on follow-up passes" {
     defer writer.deinit(io);
     _ = try writer.append(io, 1, created(1, "a follower record"));
 
-    var counting: std.testing.FailingAllocator = .init(testing.allocator, .{});
+    var counting: shakedown.alloc.Counting = .init(testing.allocator);
     const reader = try Journal.open(counting.allocator(), io, ws.path, .{ .access = .read });
     defer reader.deinit(io);
     const walk = try reader.replayAt(io, .after(0));
@@ -4993,7 +5035,7 @@ test "a re-armed replay allocates nothing on follow-up passes" {
     try walk.rearmAt(io, walk.position());
     try testing.expectEqual(@as(u64, 2), (try walk.next(io)).?.seq);
     try testing.expectEqual(null, try walk.next(io));
-    const settled = counting.allocations;
+    const settled = grown(&counting);
 
     for (3..67) |i| {
         _ = try writer.append(io, @intCast(i), created(@intCast(i), "a follower record"));
@@ -5004,7 +5046,7 @@ test "a re-armed replay allocates nothing on follow-up passes" {
         try walk.rearmAt(io, walk.position());
         try testing.expectEqual(null, try walk.next(io));
     }
-    try testing.expectEqual(settled, counting.allocations);
+    try testing.expectEqual(settled, grown(&counting));
 }
 
 test "a replay that stopped at an unfinished record reads it once it is whole" {
@@ -5230,14 +5272,14 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
 
 /// Arbitrary bytes where the line that says what the file is should be.
 const framing_corpus = [_][]const u8{
-    seeded(""),
-    seeded("\n"),
-    seeded("{\"chronicle\":1,\"base\":1,\"root\":0}\n"),
-    seeded("{\"chronicle\":2,\"base\":1,\"root\":0}\n"),
-    seeded("{\"chronicle\":1,\"base\":9,\"root\":0}\n"),
-    seeded("{\"chronicle\":1,\"base\":1}\n"),
-    seeded("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{}}\n"),
-    seeded("chronicle\n"),
+    shakedown.corpus.entry(""),
+    shakedown.corpus.entry("\n"),
+    shakedown.corpus.entry("{\"chronicle\":1,\"base\":1,\"root\":0}\n"),
+    shakedown.corpus.entry("{\"chronicle\":2,\"base\":1,\"root\":0}\n"),
+    shakedown.corpus.entry("{\"chronicle\":1,\"base\":9,\"root\":0}\n"),
+    shakedown.corpus.entry("{\"chronicle\":1,\"base\":1}\n"),
+    shakedown.corpus.entry("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{}}\n"),
+    shakedown.corpus.entry("chronicle\n"),
 };
 
 test "fuzz: a segment whose first line is arbitrary" {
@@ -5276,14 +5318,14 @@ fn fuzzFraming(_: void, smith: *testing.Smith) anyerror!void {
 }
 
 const index_corpus = [_][]const u8{
-    seeded(""),
-    seeded("chridx\x02\n"),
-    seeded("chridx\x03\n"),
-    seeded("chridx\x03\n" ++ @as([88]u8, @splat(0))),
-    seeded("chridx\x03\n" ++ @as([88]u8, @splat(0)) ++ @as([24]u8, @splat(0))),
-    seeded("chridx\x03\n" ++ @as([88]u8, @splat(0xff))),
-    seeded("not an index at all"),
-    seeded("chridx\x03\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ @as([80]u8, @splat(0))),
+    shakedown.corpus.entry(""),
+    shakedown.corpus.entry("chridx\x02\n"),
+    shakedown.corpus.entry("chridx\x03\n"),
+    shakedown.corpus.entry("chridx\x03\n" ++ @as([88]u8, @splat(0))),
+    shakedown.corpus.entry("chridx\x03\n" ++ @as([88]u8, @splat(0)) ++ @as([24]u8, @splat(0))),
+    shakedown.corpus.entry("chridx\x03\n" ++ @as([88]u8, @splat(0xff))),
+    shakedown.corpus.entry("not an index at all"),
+    shakedown.corpus.entry("chridx\x03\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ @as([80]u8, @splat(0))),
 };
 
 test "fuzz: an arbitrary index file is a cache, never an answer" {
@@ -5337,14 +5379,14 @@ test "fuzz: a sequence of calls, cut off part-way through" {
 
 /// Seeds for different operation orders and kill delays.
 const crash_corpus = [_][]const u8{
-    seeded("\x00"),
-    seeded("\x00\x00\x00"),
-    seeded("\x01\x01\x01"),
-    seeded("\x02\x00\x03"),
-    seeded("\x03\x04\x00\x00"),
-    seeded("\x04\x02\x01\x05"),
-    seeded("\x05\x05\x05\x05"),
-    seeded("\x00\x01\x02\x03\x04\x05"),
+    shakedown.corpus.entry("\x00"),
+    shakedown.corpus.entry("\x00\x00\x00"),
+    shakedown.corpus.entry("\x01\x01\x01"),
+    shakedown.corpus.entry("\x02\x00\x03"),
+    shakedown.corpus.entry("\x03\x04\x00\x00"),
+    shakedown.corpus.entry("\x04\x02\x01\x05"),
+    shakedown.corpus.entry("\x05\x05\x05\x05"),
+    shakedown.corpus.entry("\x00\x01\x02\x03\x04\x05"),
 };
 
 fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
@@ -5463,17 +5505,17 @@ test "a sequence of calls cut off part-way through leaves a log that opens" {
 /// A named reader's cursor is the one file a journal opened for reading
 /// writes, and the only one whose contents come from outside the log.
 const cursor_corpus = [_][]const u8{
-    seeded(""),
-    seeded("{}"),
-    seeded("{\"fmt\":1,\"seq\":0}"),
-    seeded("{\"fmt\":1,\"seq\":4}"),
-    seeded("{\"fmt\":1,\"seq\":-1}"),
-    seeded("{\"fmt\":1,\"seq\":18446744073709551615}"),
-    seeded("{\"fmt\":1,\"seq\":\"four\"}"),
-    seeded("{\"fmt\":2,\"seq\":4}"),
-    seeded("{\"seq\":4}"),
-    seeded("not json"),
-    seeded("[4]"),
+    shakedown.corpus.entry(""),
+    shakedown.corpus.entry("{}"),
+    shakedown.corpus.entry("{\"fmt\":1,\"seq\":0}"),
+    shakedown.corpus.entry("{\"fmt\":1,\"seq\":4}"),
+    shakedown.corpus.entry("{\"fmt\":1,\"seq\":-1}"),
+    shakedown.corpus.entry("{\"fmt\":1,\"seq\":18446744073709551615}"),
+    shakedown.corpus.entry("{\"fmt\":1,\"seq\":\"four\"}"),
+    shakedown.corpus.entry("{\"fmt\":2,\"seq\":4}"),
+    shakedown.corpus.entry("{\"seq\":4}"),
+    shakedown.corpus.entry("not json"),
+    shakedown.corpus.entry("[4]"),
 };
 
 test "fuzz: an arbitrary cursor file names a place in the log or an error" {
@@ -5524,14 +5566,14 @@ fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
 }
 
 const snapshot_corpus = [_][]const u8{
-    seeded(""),
-    seeded("{}"),
-    seeded("{\"seq\":1,\"state\":\"\"}"),
-    seeded("{\"seq\":1,\"state\":\"aGk=\"}"),
-    seeded("{\"seq\":1,\"state\":\"not base64!\"}"),
-    seeded("{\"seq\":-1,\"state\":\"aGk=\"}"),
-    seeded("{\"state\":\"aGk=\"}"),
-    seeded("[1,2,3]"),
+    shakedown.corpus.entry(""),
+    shakedown.corpus.entry("{}"),
+    shakedown.corpus.entry("{\"seq\":1,\"state\":\"\"}"),
+    shakedown.corpus.entry("{\"seq\":1,\"state\":\"aGk=\"}"),
+    shakedown.corpus.entry("{\"seq\":1,\"state\":\"not base64!\"}"),
+    shakedown.corpus.entry("{\"seq\":-1,\"state\":\"aGk=\"}"),
+    shakedown.corpus.entry("{\"state\":\"aGk=\"}"),
+    shakedown.corpus.entry("[1,2,3]"),
 };
 
 test "fuzz: openWithSnapshot over an arbitrary snapshot file" {
@@ -6096,7 +6138,7 @@ fn fuzzStrayName(_: void, smith: *testing.Smith) anyerror!void {
     len += extension.len;
     const name = buf[0..len];
     if (name.len == 0 or isLogName(name) or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..") or
-        std.mem.endsWith(u8, name, ".tmp") or std.mem.eql(u8, name, chronicle.lock_name) or
+        std.mem.eql(u8, name, chronicle.lock_name) or
         std.mem.eql(u8, name, chronicle.snapshot_name)) return;
     if (std.mem.findScalar(u8, name, '/') != null) return;
     if (builtin.target.os.tag == .windows and (std.mem.endsWith(u8, name, ".") or std.mem.endsWith(u8, name, " "))) return;
@@ -6427,7 +6469,8 @@ test "copySince releases partial copies on every allocation failure" {
             try testing.expectEqual(@as(u64, 2), batch.records()[1].seq);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Copy.f, .{ io, journal });
+    var no_resize: shakedown.alloc.NoResize = .init(testing.allocator);
+    try testing.checkAllAllocationFailures(no_resize.allocator(), Copy.f, .{ io, journal });
     try testing.expectEqual(@as(u64, 3), try journal.append(io, 3, created(3, "after")));
 }
 
@@ -6620,46 +6663,43 @@ test "replacing a backup releases its inventory on every allocation failure" {
             try testing.expectEqual(@as(u64, 1), try journal.backup(inner, target));
         }
     };
-    // Nothing grows in place: whether `testing.allocator` can extend a
-    // block depends on what earlier attempts left in its heap, and an
-    // arena that grew in place on one attempt and asked for a new block
-    // on the next would count a different number of allocations.
-    var fixed: testing.FailingAllocator = .init(testing.allocator, .{ .resize_fail_index = 0 });
-    try testing.checkAllAllocationFailures(fixed.allocator(), Copy.f, .{ io, ws.root, ws.path, dest });
+    var no_resize: shakedown.alloc.NoResize = .init(testing.allocator);
+    try testing.checkAllAllocationFailures(no_resize.allocator(), Copy.f, .{ io, ws.root, ws.path, dest });
 }
 
 test "a larger batch nobody keeps needs no larger working memory" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var counting: testing.FailingAllocator = .init(testing.allocator, .{});
+    var counting: shakedown.alloc.Counting = .init(testing.allocator);
     const journal = try Journal.open(counting.allocator(), io, ws.path, .{ .sync = .never, .tail_records = 0 });
     defer journal.deinit(io);
     var entries: [1024]Journal.Entry = @splat(.{ .at = 0, .event = created(1, "one line") });
     _ = try journal.appendAll(io, entries[0..1], .group);
-    const settled = counting.allocations;
+    const settled = grown(&counting);
     try testing.expectEqual(@as(u64, 1025), try journal.appendAll(io, &entries, .group));
-    try testing.expectEqual(settled, counting.allocations);
+    try testing.expectEqual(settled, grown(&counting));
 }
 
 test "checking a batch nobody keeps holds only one parsed record at a time" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    var budget: Budget = .{ .child = testing.allocator };
-    const journal = try Journal.open(budget.allocator(), io, ws.path, .{
+    var counting: shakedown.alloc.Counting = .init(testing.allocator);
+    const journal = try Journal.open(counting.allocator(), io, ws.path, .{
         .sync = .never,
         .tail_records = 0,
         .verify_round_trip = true,
     });
     defer journal.deinit(io);
     // A fixed allowance for one record, independent of the batch's length.
-    budget.allow(64 * 1024);
+    counting.resetPeak();
+    const before = counting.live_bytes;
     const name: [2048]u8 = @splat('n');
     const entries: [128]Journal.Entry = @splat(.{ .at = 0, .event = created(1, &name) });
     try testing.expectEqual(@as(u64, 128), try journal.appendAll(io, &entries, .group));
+    try testing.expect(counting.peak_bytes - before <= 64 * 1024);
     // Replaying has its own read buffer; the allowance above is for writes.
-    budget.limit.store(std.math.maxInt(usize), .monotonic);
     try testing.expectEqual(@as(u64, 128), try journal.verify(io));
 }
 
@@ -6764,61 +6804,53 @@ test "a tail keeps the allocator carried by a JSON value at its owner" {
     try testing.expectEqualStrings("next", array.items[1].string);
 }
 
+/// Whether a journal's lock was free at the calls a plan runs it at: test
+/// code a `FaultIo` runs before each call it is planned for.
+const LockProbe = struct {
+    journal: *Journal,
+    calls: usize = 0,
+    unlocked: bool = false,
+
+    fn check(io: Io, context: *anyopaque) void {
+        const probe: *LockProbe = @ptrCast(@alignCast(context)); // safe: the plans below hand this callback a *LockProbe
+        probe.calls += 1;
+        if (journalState(probe.journal).mutex.tryLock()) {
+            journalState(probe.journal).mutex.unlock(io);
+            probe.unlocked = true;
+        }
+    }
+
+    /// The plan entry that runs `check` before every `call`.
+    fn at(probe: *LockProbe, call: shakedown.IoCall) shakedown.IoPlan.Entry {
+        return .{ .at = .{ .nth = .{ .call = call, .n = 1 } }, .fault = .{ .call = .{ .ctx = probe, .f = check } }, .times = 0 };
+    }
+};
+
 test "starting a positioned replay observes its journal only under the lock" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    const Probe = struct {
-        var journal: ?*Journal = null;
-        var unlocked: bool = false;
-        fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-            if (journal) |j| {
-                if (journalState(j).mutex.tryLock()) {
-                    journalState(j).mutex.unlock(testing.io);
-                    unlocked = true;
-                }
-            }
-            return testing.allocator.vtable.alloc(ctx, len, alignment, ret_addr);
-        }
-    };
-    var vtable = testing.allocator.vtable.*;
-    vtable.alloc = Probe.alloc;
-    const gpa: std.mem.Allocator = .{ .ptr = testing.allocator.ptr, .vtable = &vtable };
-    const journal = try Journal.open(gpa, io, ws.path, .{ .sync = .never });
+    const fio = try shakedown.FaultIo.init(testing.allocator, io, .{});
+    defer fio.deinit();
+    const journal = try Journal.open(try fio.allocator(testing.allocator), io, ws.path, .{ .sync = .never });
     defer journal.deinit(io);
     _ = try journal.append(io, 1, created(1, "one"));
-    Probe.unlocked = false;
-    Probe.journal = journal;
-    const walk = journal.replayAt(io, .after(0)) catch |err| {
-        Probe.journal = null;
-        return err;
-    };
-    Probe.journal = null;
+    var probe: LockProbe = .{ .journal = journal };
+    try fio.setPlan(&.{probe.at(.alloc)});
+    const started = journal.replayAt(io, .after(0));
+    try fio.setPlan(&.{});
+    const walk = try started;
     defer walk.deinit(io);
     // Even an idle scan reads the journal's allocator and read limits.
-    try testing.expect(!Probe.unlocked);
+    try testing.expect(probe.calls > 0);
+    try testing.expect(!probe.unlocked);
     try testing.expectEqualStrings("one", (try walk.next(io)).?.event.created.name);
 }
 
 fn finalizingUnderLock(comptime best_effort: bool) !void {
-    var vtable = testing.io.vtable.*;
-    const Probe = struct {
-        var journal: ?*Journal = null;
-        var unlocked: bool = false;
-        var calls: usize = 0;
-        fn setLength(ctx: ?*anyopaque, file: Io.File, length: u64) Io.File.SetLengthError!void {
-            if (journal) |j| {
-                calls += 1;
-                if (journalState(j).mutex.tryLock()) {
-                    journalState(j).mutex.unlock(testing.io);
-                    unlocked = true;
-                }
-            }
-            return testing.io.vtable.fileSetLength(ctx, file, length);
-        }
-    };
-    vtable.fileSetLength = Probe.setLength;
-    const io: Io = .{ .userdata = testing.io.userdata, .vtable = &vtable };
+    const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{});
+    defer fio.deinit();
+    const io = fio.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .preallocate_bytes = 4096 });
@@ -6826,18 +6858,18 @@ fn finalizingUnderLock(comptime best_effort: bool) !void {
         journal.deinit(io);
         return err;
     };
-    Probe.unlocked = false;
-    Probe.calls = 0;
-    Probe.journal = journal;
-    defer Probe.journal = null;
+    var probe: LockProbe = .{ .journal = journal };
+    fio.setPlan(&.{probe.at(.fileSetLength)}) catch |err| {
+        journal.deinit(io);
+        return err;
+    };
     if (!best_effort) journal.finish(io) catch |err| {
         journal.deinit(io);
         return err;
     };
     journal.deinit(io);
-    Probe.journal = null;
-    try testing.expect(Probe.calls > 0);
-    try testing.expect(!Probe.unlocked);
+    try testing.expect(probe.calls > 0);
+    try testing.expect(!probe.unlocked);
 }
 
 test "finishing a journal finalizes its owned state under the lock" {
@@ -6898,7 +6930,8 @@ test "replay creation releases its scan and stable arena on every allocation fai
             try testing.expectEqual(@as(?Journal.Record, null), try positioned.next(inner));
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Reader.read, .{ io, ws.path });
+    var no_resize: shakedown.alloc.NoResize = .init(testing.allocator);
+    try testing.checkAllAllocationFailures(no_resize.allocator(), Reader.read, .{ io, ws.path });
 }
 
 test "observing configuration waits for the journal lock" {
@@ -7071,43 +7104,50 @@ test "a failed restart releases each file only once after a torn header" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     try ws.write(try ws.segment(1), "{\"chronicle\":");
-    const Probe = struct {
-        var live: std.ArrayList(Io.File.Handle) = .empty;
-        var duplicate: usize = 0;
-        fn opened(file: Io.File) Io.File {
-            live.append(testing.allocator, file.handle) catch unreachable;
+    // Every file the journal opens and every close of one, over a `FaultIo`
+    // that fails each write: a close of a handle not open is counted and
+    // not made, since the number may be someone else's by then.
+    const Handles = struct {
+        live: std.ArrayList(Io.File.Handle) = .empty,
+        duplicate: usize = 0,
+
+        const Layer = shakedown.Layer(@This(), .{ .dirCreateFile = create, .dirOpenFile = open, .fileClose = close });
+
+        fn opened(u: ?*anyopaque, file: Io.File) Io.File.OpenError!Io.File {
+            const layer = Layer.of(u);
+            layer.state.live.append(testing.allocator, file.handle) catch {
+                layer.base.vtable.fileClose(layer.base.userdata, &.{file});
+                return error.SystemResources;
+            };
             return file;
         }
-        fn create(ctx: ?*anyopaque, dir: Io.Dir, path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
-            return opened(try testing.io.vtable.dirCreateFile(ctx, dir, path, opts));
+        fn create(u: ?*anyopaque, dir: Io.Dir, path: []const u8, opts: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
+            const base = Layer.of(u).base;
+            return opened(u, try base.vtable.dirCreateFile(base.userdata, dir, path, opts));
         }
-        fn open(ctx: ?*anyopaque, dir: Io.Dir, path: []const u8, opts: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
-            return opened(try testing.io.vtable.dirOpenFile(ctx, dir, path, opts));
+        fn open(u: ?*anyopaque, dir: Io.Dir, path: []const u8, opts: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
+            const base = Layer.of(u).base;
+            return opened(u, try base.vtable.dirOpenFile(base.userdata, dir, path, opts));
         }
-        fn close(ctx: ?*anyopaque, files: []const Io.File) void {
+        fn close(u: ?*anyopaque, files: []const Io.File) void {
+            const layer = Layer.of(u);
             for (files) |file| {
-                const slot = std.mem.findScalar(Io.File.Handle, live.items, file.handle) orelse {
-                    duplicate += 1;
+                const slot = std.mem.findScalar(Io.File.Handle, layer.state.live.items, file.handle) orelse {
+                    layer.state.duplicate += 1;
                     continue;
                 };
-                _ = live.swapRemove(slot);
-                testing.io.vtable.fileClose(ctx, &.{file});
+                _ = layer.state.live.swapRemove(slot);
+                layer.base.vtable.fileClose(layer.base.userdata, &.{file});
             }
         }
     };
-    Probe.live = .empty;
-    Probe.duplicate = 0;
-    defer Probe.live.deinit(testing.allocator);
-    var vtable: Io.VTable = undefined;
-    const failing = failingIo(&vtable);
-    vtable.dirCreateFile = Probe.create;
-    vtable.dirOpenFile = Probe.open;
-    vtable.fileClose = Probe.close;
-    fail_writes.store(true, .release);
-    defer fail_writes.store(false, .release);
-    try testing.expectError(error.WriteFailed, Journal.open(testing.allocator, failing, ws.path, .{ .sync = .never }));
-    try testing.expectEqual(@as(usize, 0), Probe.live.items.len);
-    try testing.expectEqual(@as(usize, 0), Probe.duplicate);
+    const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{ .plan = &.{writes_fail} });
+    defer fio.deinit();
+    var handles: Handles.Layer = .init(fio.io(), .{});
+    defer handles.state.live.deinit(testing.allocator);
+    try testing.expectError(error.WriteFailed, Journal.open(testing.allocator, handles.io(), ws.path, .{ .sync = .never }));
+    try testing.expectEqual(@as(usize, 0), handles.state.live.items.len);
+    try testing.expectEqual(@as(usize, 0), handles.state.duplicate);
 }
 
 test "reading escaped metadata propagates every allocation failure" {
@@ -7131,7 +7171,8 @@ test "reading escaped metadata propagates every allocation failure" {
             try testing.expectEqualStrings("one", (try walk.next(inner)).?.event.created.name);
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Reader.read, .{ io, ws.path });
+    var no_resize: shakedown.alloc.NoResize = .init(testing.allocator);
+    try testing.checkAllAllocationFailures(no_resize.allocator(), Reader.read, .{ io, ws.path });
 }
 
 test "a rotation reserves its inventory before publishing a new active file" {
@@ -7211,7 +7252,8 @@ test "encoding owns the cause of every allocation failure with and without a tai
         }
     };
     for ([_]usize{ 0, 2 }) |tail_records| {
-        try testing.checkAllAllocationFailures(testing.allocator, Case.append, .{ testing.io, tail_records });
+        var no_resize: shakedown.alloc.NoResize = .init(testing.allocator);
+        try testing.checkAllAllocationFailures(no_resize.allocator(), Case.append, .{ testing.io, tail_records });
     }
 }
 
@@ -7291,7 +7333,8 @@ test "managed result readers release every construction allocation" {
         const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
     }
-    try testing.checkAllAllocationFailures(testing.allocator, Construct.run, .{ io, ws.path, @as(usize, 0) });
+    var no_resize: shakedown.alloc.NoResize = .init(testing.allocator);
+    try testing.checkAllAllocationFailures(no_resize.allocator(), Construct.run, .{ io, ws.path, @as(usize, 0) });
     {
         const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
@@ -7304,7 +7347,7 @@ test "managed result readers release every construction allocation" {
             try tail.commit(io, 3);
         }
     }
-    try testing.checkAllAllocationFailures(testing.allocator, Construct.run, .{ io, ws.path, @as(usize, 40) });
+    try testing.checkAllAllocationFailures(no_resize.allocator(), Construct.run, .{ io, ws.path, @as(usize, 40) });
 }
 
 test "managed owners release every construction allocation" {
@@ -7340,7 +7383,8 @@ test "managed owners release every construction allocation" {
             try testing.expectEqual(null, try at.next(inner));
         }
     };
-    try testing.checkAllAllocationFailures(testing.allocator, Construct.run, .{ io, ws.path });
+    var no_resize: shakedown.alloc.NoResize = .init(testing.allocator);
+    try testing.checkAllAllocationFailures(no_resize.allocator(), Construct.run, .{ io, ws.path });
 }
 
 test "a zero read buffer still opens replays and backs up whole records" {

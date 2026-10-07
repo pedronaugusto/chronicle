@@ -27,6 +27,7 @@ const crc32c = @import("crc32c.zig");
 const clone = @import("clone.zig");
 const envelopes = @import("envelope.zig");
 const strand = @import("jsonl.zig").strand;
+const airlock = @import("airlock");
 
 const Self = @This();
 
@@ -34,8 +35,7 @@ const Self = @This();
 /// locking a data file instead would mean the lock changed identity every time
 /// a segment rotated.
 pub const lock_name = "lock";
-/// The snapshot `Journal.snapshot` writes. A file with the temporary name
-/// beside it is stale and is never read.
+/// The snapshot `Journal.snapshot` writes.
 pub const snapshot_name = "snapshot";
 
 /// A named reader's cursor: `<name>` plus this. It is written beside the log
@@ -46,9 +46,11 @@ pub const cursor_extension = ".cursor";
 /// that the directory sorts in sequence order, plus one of these.
 pub const segment_extension = ".log";
 pub const index_extension = ".idx";
-/// A segment `compact` is building. It is renamed into place once it is whole;
-/// one left behind by a crash is stale and is never read.
-const temporary_extension = ".tmp";
+/// The start of every temporary name: a segment `compact` is building, a
+/// snapshot or a cursor on its way in. Each is renamed into place once it is
+/// whole; one a crash left behind is never read, and a writer's `open`
+/// removes it once it is old enough that nobody can still be writing it.
+const temp_prefix = ".chronicle-tmp-";
 
 /// Digits in a segment's name. The largest sequence number a record can carry
 /// is `maxInt(i64)`, nineteen digits, and twenty leaves the padding visibly
@@ -150,52 +152,38 @@ pub const Sync = enum {
     never,
 };
 
-/// The call a durable write makes: strand's, since strand makes it.
-/// `.full` is `fcntl(F_FULLFSYNC)`, the bytes on the drive's media and not
-/// only in its write cache; `.data` is `fdatasync(2)`, for a write that did
-/// not change the file's length; `.plain` is `fsync(2)`, or on Windows
-/// `NtFlushBuffersFile`.
-pub const Flush = strand.SyncKind;
+/// What a durable write reached: airlock's `Reached`, weakest first. `.full`
+/// is the contents and every piece of metadata on the drive's media and not
+/// only in its write cache; `.data` is the contents and the length that finds
+/// them; `.written` is handed to a drive that may still hold it in its cache,
+/// which is what a filesystem that declines the full flush leaves.
+pub const Flush = airlock.Reached;
 
-/// What `Sync.always` asks for here: `F_FULLFSYNC` on Darwin, where `fsync`
-/// promises the weaker thing, and the ordinary call elsewhere. A filesystem
-/// that declines `F_FULLFSYNC` gets `fsync`, which is then the strongest it
-/// has; `Status.flushed` says which call a journal's records actually got.
-/// `chronicle.flush` re-exports it, and README.md's durability rules are
-/// written per platform from it.
-pub const flush: Flush = Flush.asked(.all);
+/// What `Sync.always` reaches here when the filesystem takes the call:
+/// airlock's full sync, `F_FULLFSYNC` on Darwin, where `fsync` promises the
+/// weaker thing, `fsync` on Linux and the full flush on Windows. A filesystem
+/// that declines it gets the strongest call it takes, and `Status.flushed`
+/// says what a journal's records actually reached. `chronicle.flush`
+/// re-exports it, and README.md's durability rules are written from it.
+pub const flush: Flush = airlock.Reached.expected(.full);
 
-/// How much of a file has to reach the disk.
-const Level = enum {
-    /// The contents and whatever metadata a reader needs to find them. What
-    /// an append that extended the file asks for.
-    whole,
-    /// The contents only. Sufficient — and only sufficient — when the write
-    /// went into space the file already had, which is what preallocation
-    /// arranges.
-    contents,
-};
-
-/// Make `file`'s bytes durable, as far as this platform can be asked: the
-/// call strand makes for a sync (`strand.syncFile`), `F_FULLFSYNC` on Darwin,
-/// and on Linux `fsync` for `.whole` and `fdatasync` for `.contents`. It
-/// blocks the calling thread, as `Io.File.sync` does. An interrupted call is
-/// made again; a failure is reported, never answered with a weaker call.
-fn syncFile(io: Io, file: Io.File, level: Level) Io.File.SyncError!void {
-    _ = try syncKind(io, file, level);
+/// Make `file`'s bytes durable at `level` (airlock's `syncFile`): `.full`
+/// for a write that extended the file, `.data` for one into space the file
+/// already had, which is what preallocation arranges. It blocks the calling
+/// thread, as `Io.File.sync` does. An interrupted call is made again; a
+/// failure is reported, never answered with a weaker call. A filesystem that
+/// declines the call gets the strongest one it takes, and the answer says so.
+fn syncFile(io: Io, file: Io.File, level: airlock.Level) Io.File.SyncError!Flush {
+    return airlock.syncFile(io, file, .{ .level = level }) catch |err| switch (err) {
+        // unreachable: only `Fallback.refuse` turns a declined call into an error
+        error.LevelUnavailable => unreachable,
+        else => |e| return e,
+    };
 }
 
-/// `syncFile`, saying which call did it.
-fn syncKind(io: Io, file: Io.File, level: Level) Io.File.SyncError!Flush {
-    return strand.syncFile(io, file, switch (level) {
-        .whole => .all,
-        .contents => .data,
-    });
-}
-
-/// `syncFile` for the active segment, noting which call its records got.
-fn syncActiveFile(log: *Self, io: Io, level: Level) Io.File.SyncError!void {
-    log.flushed = try syncKind(io, log.active.?.file, level);
+/// `syncFile` for the active segment, noting what its records reached.
+fn syncActiveFile(log: *Self, io: Io, level: airlock.Level) Io.File.SyncError!void {
+    log.flushed = try syncFile(io, log.active.?.file, level);
 }
 
 /// Whether this process may write to the log.
@@ -327,7 +315,7 @@ pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
 
 pub const OpenError = ReadError || Io.File.SetLengthError || Io.File.SyncError ||
     Io.File.WritePositionalError || Io.Dir.OpenError || Io.Dir.CreateDirPathError ||
-    Io.Dir.DeleteFileError || error{ Locked, DiscontinuousSeq, IndexIntervalTooLarge, ReadOnly };
+    Io.Dir.DeleteFileError || airlock.PruneError || error{ Locked, DiscontinuousSeq, IndexIntervalTooLarge, ReadOnly };
 
 pub const AppendError = Io.Cancelable || Io.Writer.Error || Io.File.OpenError ||
     Io.File.SyncError || Io.File.WritePositionalError || Io.File.SetLengthError ||
@@ -335,12 +323,15 @@ pub const AppendError = Io.Cancelable || Io.Writer.Error || Io.File.OpenError ||
 
 pub const ScanError = ReadError;
 
-pub const CompactError = OpenError || AppendError || Io.Dir.RenameError;
+pub const CompactError = OpenError || AppendError || airlock.CreateError || airlock.Pending.CommitError;
 
 pub const TruncateError = CompactError || error{SeqTooOld};
 
-pub const WriteFileError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
-    Io.Writer.Error || Io.File.SyncError || Io.Dir.RenameError || Io.Dir.DeleteFileError;
+/// A directory sync's failures: a sync's, and reopening the directory for it
+/// where its handle cannot be synced as it is.
+pub const SyncDirError = Io.File.SyncError || Io.Dir.OpenError;
+
+pub const WriteFileError = airlock.WriteFileError;
 
 pub const SnapshotError = WriteFileError || Io.Writer.Error || Io.File.SyncError || error{ReadOnly};
 
@@ -483,6 +474,12 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Self.Ope
         };
     }
     errdefer if (lock_file) |file| file.close(io);
+    if (options.access == .write) {
+        // The temporaries a crash left behind, old enough that nobody can
+        // still be writing one: a reader beside this writer may be part-way
+        // through its cursor.
+        _ = try airlock.pruneTemps(io, dir, temp_prefix, .{});
+    }
 
     var log: Self = .{
         .gpa = gpa,
@@ -784,7 +781,7 @@ fn describeSealed(log: *Self, io: Io, segment: *Segment) OpenError!void {
             const repair_file = try log.dir.createFile(io, &segmentName(segment_extension, segment.base_seq), .{ .truncate = false });
             defer repair_file.close(io);
             try repair_file.setLength(io, scanned.complete_bytes);
-            if (log.options.sync != .never) try syncFile(io, repair_file, .whole);
+            if (log.options.sync != .never) _ = try syncFile(io, repair_file, .full);
             log.dir.deleteFile(io, &segmentName(index_extension, segment.base_seq)) catch |err| {
                 // The index is a rebuildable cache; record durability is handled separately.
                 std.log.debug("optional index maintenance: {t}", .{err});
@@ -1255,7 +1252,7 @@ fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync) SealError!v
     // Under `.never` the log itself is not asked to reach the drive, and a
     // seal that outlives its segment is one the next open checks against the
     // segment and rebuilds; so the index is held to the log's own level.
-    if (sync != .never) try syncFile(io, file, .whole);
+    if (sync != .never) _ = try syncFile(io, file, .full);
 }
 
 /// The active segment's index, reopened for appending, when the one on the
@@ -2264,7 +2261,7 @@ pub fn discardStaged(log: *Self, io: Io, at: Mark) Self.TruncateError!void {
 fn syncActive(log: *Self, io: Io) Io.File.SyncError!void {
     const active = &log.active.?;
     const segment = log.segments.items[log.segments.items.len - 1];
-    const level: Level = if (segment.bytes <= active.preallocated) .contents else .whole;
+    const level: airlock.Level = if (segment.bytes <= active.preallocated) .data else .full;
     return log.syncActiveFile(io, level);
 }
 
@@ -2279,7 +2276,7 @@ fn rotate(log: *Self, io: Io) AppendError!void {
         const active = &log.active.?;
         try active.writer.interface.flush();
         try log.trimPreallocation(io);
-        if (log.options.sync != .never) try log.syncActiveFile(io, .whole);
+        if (log.options.sync != .never) try log.syncActiveFile(io, .full);
         try active.index_writer.interface.flush();
         // A seal that cannot be written leaves an index the next open reads
         // as stale and rebuilds, which is a cost and not a wrong answer -- but
@@ -2329,7 +2326,7 @@ fn startSegment(log: *Self, io: Io, base_seq: u64, root: u32) AppendError!Starte
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
     if (log.options.sync != .never) {
-        try syncFile(io, file, .whole);
+        _ = try syncFile(io, file, .full);
         try log.syncDir(io);
     }
     const header_bytes = writer.pos;
@@ -2495,7 +2492,7 @@ fn resumeActive(log: *Self, io: Io, segment: *Segment) OpenError!?Active {
         // way. The segment, as it then is, is read again.
         const dropped = scanned.complete_bytes - start + scanned.partial_bytes;
         try file.setLength(io, start);
-        if (log.options.sync != .never) try syncFile(io, file, .whole);
+        if (log.options.sync != .never) _ = try syncFile(io, file, .full);
         segment.bytes = start;
         file.close(io);
         index_file.close(io);
@@ -2519,7 +2516,7 @@ fn resumeActive(log: *Self, io: Io, segment: *Segment) OpenError!?Active {
                 // The index just built names records of the batch that was
                 // dropped: the segment, as it now is, is read again for one
                 // that does not. Once, after a crash inside a batch.
-                if (log.options.sync != .never) try syncFile(io, file, .whole);
+                if (log.options.sync != .never) _ = try syncFile(io, file, .full);
                 segment.bytes = scanned.complete_bytes;
                 const dropped = log.dropped_bytes;
                 file.close(io);
@@ -2661,16 +2658,19 @@ fn closeActive(log: *Self, io: Io) void {
     }
 }
 
-/// Sync the log's directory, so that a file this process created or renamed
-/// is still named after a power cut: `strand.syncDir`, the call a file's sync
-/// is on POSIX. Windows has no equivalent; there the call is nothing, and
-/// README.md says so.
-pub fn syncDir(log: *Self, io: Io) Io.File.SyncError!void {
+/// Sync the log's directory, so that a file this process created, renamed
+/// or removed is still named that way after a power cut: airlock's `syncDir`,
+/// on Windows as everywhere else.
+pub fn syncDir(log: *Self, io: Io) Self.SyncDirError!void {
     return syncDirHandle(io, log.dir);
 }
 
-fn syncDirHandle(io: Io, dir: Io.Dir) Io.File.SyncError!void {
-    _ = try strand.syncDir(io, dir);
+fn syncDirHandle(io: Io, dir: Io.Dir) SyncDirError!void {
+    _ = airlock.syncDir(io, dir, .{ .level = .full }) catch |err| switch (err) {
+        // unreachable: only `Fallback.refuse` turns a declined call into an error
+        error.LevelUnavailable => unreachable,
+        else => |e| return e,
+    };
 }
 
 fn deleteSegmentFiles(log: *Self, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {
@@ -2745,7 +2745,7 @@ pub fn truncateAfter(log: *Self, io: Io, seq: u64) Self.TruncateError!void {
         const file = try log.dir.createFile(io, &segmentName(segment_extension, holder.base_seq), .{ .truncate = false });
         defer file.close(io);
         try file.setLength(io, offset);
-        if (log.options.sync != .never) try syncFile(io, file, .whole);
+        if (log.options.sync != .never) _ = try syncFile(io, file, .full);
         // The index describes bytes that are no longer there. Removing it is
         // cheaper than leaving one the next open has to reject and rebuild.
         log.dir.deleteFile(io, &segmentName(index_extension, holder.base_seq)) catch |err| {
@@ -2823,89 +2823,70 @@ pub fn compact(log: *Self, io: Io, keep_after_seq: u64) Self.CompactError!void {
 /// Copy the records of `segment` from `keep_from` onward into a new segment
 /// named for `keep_from`, durably, without holding the whole segment.
 fn rewriteSegment(log: *Self, io: Io, segment: Segment, keep_from: u64) CompactError!void {
-    const temporary = segmentName(temporary_extension, keep_from);
-    errdefer log.dir.deleteFile(io, &temporary) catch |err| {
-        // Rollback must preserve the original failure even if removing the temporary file fails.
-        std.log.debug("temporary-file rollback: {t}", .{err});
-    };
+    const name = segmentName(segment_extension, keep_from);
+    var pending = try airlock.create(io, log.dir, &name, .{ .temp = .{ .random = temp_prefix } });
+    // Before the publish this removes the temporary; after it, nothing.
+    defer pending.discard(io);
+    const writer = pending.writer(io, log.write_buf);
 
-    {
-        const out = try log.dir.createFile(io, &temporary, .{ .truncate = true });
-        var closed = false;
-        errdefer if (!closed) out.close(io);
-        var writer = out.writer(io, log.write_buf);
-
-        // From the start of the segment, so that the copy never depends on an
-        // index: compaction is rare and one segment is bounded.
-        var scan = try log.scanOver(&.{segment}, 0, .live);
-        defer scan.deinit(io);
-        var seq = segment.base_seq;
-        var wrote_header = false;
-        while (try scan.next(io)) |line| : (seq += 1) {
-            if (seq < keep_from) continue;
-            if (!wrote_header) {
-                // Records are copied byte for byte, so the new file's chain
-                // has to root where the first of them links back to. That
-                // number is in the record itself.
-                const root = (try envelopes.backLink(log.gpa, line)) orelse return error.CorruptRecord;
-                var buffer: [96]u8 = undefined;
-                const header: SegmentHeader = .{
-                    .version = log_format,
-                    .base_seq = keep_from,
-                    .root = root,
-                };
-                try writer.interface.writeAll(header.line(&buffer));
-                try writer.interface.writeByte('\n');
-                wrote_header = true;
-            }
-            try writer.interface.writeAll(line);
-            try writer.interface.writeByte('\n');
+    // From the start of the segment, so that the copy never depends on an
+    // index: compaction is rare and one segment is bounded.
+    var scan = try log.scanOver(&.{segment}, 0, .live);
+    defer scan.deinit(io);
+    var seq = segment.base_seq;
+    var wrote_header = false;
+    while (try scan.next(io)) |line| : (seq += 1) {
+        if (seq < keep_from) continue;
+        if (!wrote_header) {
+            // Records are copied byte for byte, so the new file's chain has
+            // to root where the first of them links back to. That number is
+            // in the record itself.
+            const root = (try envelopes.backLink(log.gpa, line)) orelse return error.CorruptRecord;
+            var buffer: [96]u8 = undefined;
+            const header: SegmentHeader = .{
+                .version = log_format,
+                .base_seq = keep_from,
+                .root = root,
+            };
+            try writer.writeAll(header.line(&buffer));
+            try writer.writeByte('\n');
+            wrote_header = true;
         }
-        try writer.interface.flush();
-        try syncFile(io, out, .whole);
-        out.close(io);
-        closed = true;
+        try writer.writeAll(line);
+        try writer.writeByte('\n');
     }
 
     // Let go of the active segment before anything is renamed: Windows refuses
     // to replace a file this process still has open. Its reservation must be
     // trimmed first, because after the rename this formerly active segment is
-    // no longer newest and a crash must leave it looking sealed.
+    // no longer newest and a crash must leave it looking sealed. The commit
+    // flushes the writer, makes the copy durable, renames it over the segment
+    // (retrying on Windows while a scanner holds the name) and makes the
+    // rename durable.
     try log.trimPreallocation(io);
     log.closeActive(io);
-    try log.dir.rename(&temporary, log.dir, &segmentName(segment_extension, keep_from), io);
-    try log.syncDir(io);
+    _ = try pending.commit(io, .{ .level = .full });
 }
 
 //========================================================================
 // Whole files beside the log.
 //========================================================================
 
-/// Write `bytes` to a neighbouring file, `fsync` it, rename it over `name` and
-/// `fsync` the directory, so a reader sees either the whole old file or the
-/// whole new one.
+/// Write `bytes` under a temporary name beside `name`, make them durable,
+/// rename them over `name` and make the rename durable (airlock's
+/// `writeFile`), so a reader sees either the whole old file or the whole new
+/// one. The temporary name is drawn at random, so two processes writing the
+/// same file never write into one temporary; `open` removes the ones a crash
+/// left behind.
 ///
 /// This checks nothing about `Options.access`: whether a file is part of the
 /// log is the caller's to know. A snapshot is; a named reader's cursor is not,
 /// which is what lets a `.read` log keep one.
 pub fn writeAtomic(log: *Self, io: Io, name: []const u8, bytes: []const u8) Self.WriteFileError!void {
-    const temporary = try std.mem.concat(log.gpa, u8, &.{ name, temporary_extension });
-    defer log.gpa.free(temporary);
-    errdefer log.dir.deleteFile(io, temporary) catch |err| {
-        // Rollback must preserve the original failure even if removing the temporary file fails.
-        std.log.debug("temporary-file rollback: {t}", .{err});
-    };
-    {
-        const file = try log.dir.createFile(io, temporary, .{ .truncate = true });
-        defer file.close(io);
-        var buffer: [4096]u8 = undefined;
-        var writer = file.writer(io, &buffer);
-        try writer.interface.writeAll(bytes);
-        try writer.interface.flush();
-        try syncFile(io, file, .whole);
-    }
-    try log.dir.rename(temporary, log.dir, name, io);
-    try log.syncDir(io);
+    _ = try airlock.writeFile(io, log.dir, name, bytes, .{
+        .create = .{ .temp = .{ .random = temp_prefix } },
+        .commit = .{ .level = .data },
+    });
 }
 
 /// `writeAtomic` over `<path>/snapshot`, which only a writer may replace.
@@ -2916,7 +2897,7 @@ pub fn writeSnapshot(log: *Self, io: Io, bytes: []const u8) Self.SnapshotError!v
 
 /// Remove `<path>/snapshot` and make its going durable: a snapshot that
 /// describes records about to be cut must be gone before they are.
-pub fn removeSnapshot(log: *Self, io: Io) (Io.Dir.DeleteFileError || Io.File.SyncError || error{ReadOnly})!void {
+pub fn removeSnapshot(log: *Self, io: Io) (Io.Dir.DeleteFileError || SyncDirError || error{ReadOnly})!void {
     if (log.options.access == .read) return error.ReadOnly;
     log.dir.deleteFile(io, snapshot_name) catch |err| switch (err) {
         error.FileNotFound => return,
@@ -2931,14 +2912,14 @@ pub fn syncBeforeSnapshot(log: *Self, io: Io) Self.SnapshotError!void {
     if (log.active == null) return error.ReadOnly;
     const active = &log.active.?;
     try active.writer.interface.flush();
-    try log.syncActiveFile(io, .whole);
+    try log.syncActiveFile(io, .full);
 }
 
 //========================================================================
 // Copying a running log.
 //========================================================================
 
-pub const BackupError = OpenError || strand.FileId.Error || error{BackupInPlace};
+pub const BackupError = OpenError || airlock.FileId.Error || airlock.Batch.Error || error{BackupInPlace};
 
 /// Copy a consistent view of the log into the directory `dest_path`, creating
 /// it if it is not there, and report the newest sequence number the copy
@@ -2987,10 +2968,14 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!u64 {
     defer dest.close(io);
     // Copying a directory over itself would truncate the segments it was
     // reading. Nothing else here can tell the two apart.
-    if (try log.sameDirectory(dest)) return error.BackupInPlace;
+    if (try sameDirectory(io, log.dir, dest)) return error.BackupInPlace;
     try log.clearBackup(io, dest);
+
+    var copies: Copies = undefined;
+    copies.init(dest);
+    defer copies.release(io);
     if (log.segments.items.len == 0) {
-        try syncDirHandle(io, dest);
+        try copies.finish(io);
         return 0;
     }
 
@@ -3002,7 +2987,7 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!u64 {
     }
 
     if (log.options.access == .write) {
-        _ = try log.copyFile(io, dest, snapshot_name, null);
+        _ = try log.copyFile(io, &copies, snapshot_name, null);
     } else {
         // A reader cannot hold a concurrent writer still between observing a
         // snapshot and measuring the copied log. Leaving this optional cache
@@ -3020,8 +3005,8 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!u64 {
         // the file is exactly them and goes whole, which is what lets the
         // filesystem clone it. One that is longer is copied as far as they go.
         const whole_file = try log.fileLength(io, &name) == segment.bytes;
-        if (!try log.copyFile(io, dest, &name, if (whole_file) null else segment.bytes)) return error.FileNotFound;
-        _ = try log.copyFile(io, dest, &segmentName(index_extension, segment.base_seq), null);
+        if (!try log.copyFile(io, &copies, &name, if (whole_file) null else segment.bytes)) return error.FileNotFound;
+        _ = try log.copyFile(io, &copies, &segmentName(index_extension, segment.base_seq), null);
     }
 
     // The newest segment, measured now: a writer in another process may be
@@ -3033,20 +3018,106 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!u64 {
     // A batch the writer has not finished is not copied: the backup ends
     // where its last whole batch does.
     const scanned = (try log.scanSegment(io, last, null)).withoutOpenBatch();
-    if (!try log.copyFile(io, dest, &name, scanned.complete_bytes)) return error.FileNotFound;
+    if (!try log.copyFile(io, &copies, &name, scanned.complete_bytes)) return error.FileNotFound;
 
-    try syncDirHandle(io, dest);
+    try copies.finish(io);
     if (scanned.lines == 0) return last.base_seq - 1;
     return last.base_seq + scanned.lines - 1;
 }
 
-/// Copy `name` into `dest`, either the first `bytes` of it or all of it.
+/// How many copies a backup makes durable together, and so how many files it
+/// holds open at once: well inside the 256 descriptors macOS gives a process
+/// by default.
+const backup_batch = 64;
+
+/// The longest name a backup copies: a segment or an index.
+const backup_name_bytes = name_digits + index_extension.len;
+
+/// A backup's copies, made durable together through one airlock `Batch`: a
+/// writeout per file and one flush of the device, where a sync per file would
+/// flush it once per file. A copy is synced through the handle that wrote it,
+/// which sees its writeback errors; a clone, which nothing here wrote, by
+/// name. The batch is committed a chunk at a time, so the copies held open
+/// never pass `backup_batch`, and the last commit also syncs the destination
+/// directory, which makes every name created or removed there durable.
+const Copies = struct {
+    dest: Io.Dir,
+    batch: airlock.Batch,
+    slots: [backup_batch + 1]airlock.Batch.Slot,
+    /// Copies the batch syncs through their own handles, closed once it has.
+    open: [backup_batch]Io.File,
+    open_len: usize,
+    /// The names of clones the batch syncs by name.
+    names: [backup_batch][backup_name_bytes]u8,
+    names_len: usize,
+
+    /// In place: the batch keeps a pointer to `slots`.
+    fn init(c: *Copies, dest: Io.Dir) void {
+        c.dest = dest;
+        c.batch = .init(&c.slots);
+        c.open_len = 0;
+        c.names_len = 0;
+    }
+
+    /// A copy, written through `file`, which the batch now owns.
+    fn addCopy(c: *Copies, io: Io, file: Io.File) BackupError!void {
+        if (c.open_len + c.names_len == backup_batch) c.flush(io, .files) catch |err| {
+            file.close(io);
+            return err;
+        };
+        c.batch.addFile(file) catch |err| {
+            file.close(io);
+            return err;
+        };
+        c.open[c.open_len] = file;
+        c.open_len += 1;
+    }
+
+    /// A clone, synced by name.
+    fn addClone(c: *Copies, io: Io, name: []const u8) BackupError!void {
+        if (c.open_len + c.names_len == backup_batch) try c.flush(io, .files);
+        const stored = c.names[c.names_len][0..name.len];
+        @memcpy(stored, name);
+        try c.batch.addPath(c.dest, stored);
+        c.names_len += 1;
+    }
+
+    /// The files added so far made durable, and with `.directory` the
+    /// destination's names too.
+    fn flush(c: *Copies, io: Io, what: enum { files, directory }) BackupError!void {
+        if (what == .directory) try c.batch.addDir(c.dest);
+        _ = try c.batch.commit(io, .{ .level = .data });
+        c.closeOpen(io);
+        c.names_len = 0;
+    }
+
+    /// Every copy and the destination directory made durable.
+    fn finish(c: *Copies, io: Io) BackupError!void {
+        return c.flush(io, .directory);
+    }
+
+    /// After a failure: whatever the batch still holds, let go.
+    fn release(c: *Copies, io: Io) void {
+        c.batch.reset(io);
+        c.closeOpen(io);
+        c.names_len = 0;
+    }
+
+    fn closeOpen(c: *Copies, io: Io) void {
+        for (c.open[0..c.open_len]) |file| file.close(io);
+        c.open_len = 0;
+    }
+};
+
+/// Copy `name` into the backup, either the first `bytes` of it or all of it.
 /// False when there is no such file, which is not an error for a snapshot or
 /// an index — neither is part of the log.
-fn copyFile(log: *Self, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) OpenError!bool {
+fn copyFile(log: *Self, io: Io, copies: *Copies, name: [:0]const u8, bytes: ?u64) BackupError!bool {
+    const dest = copies.dest;
     // The filesystem's own copy first, where there is one. A sealed segment
     // is bytes that will never change again, and sharing their extents makes
-    // a backup of a year of them the size of a directory entry.
+    // a backup of a year of them the size of a directory entry. The clone is
+    // made durable with the copies, as a copy would be.
     if (bytes == null and clone.available) {
         dest.deleteFile(io, name) catch |err| switch (err) {
             error.FileNotFound => {}, // A new destination needs no removal.
@@ -3057,6 +3128,7 @@ fn copyFile(log: *Self, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) O
         };
         if (clone.whole(io, log.dir, dest, name)) {
             log.clones += 1;
+            try copies.addClone(io, name);
             return true;
         }
     }
@@ -3069,30 +3141,29 @@ fn copyFile(log: *Self, io: Io, dest: Io.Dir, name: [:0]const u8, bytes: ?u64) O
     const length = bytes orelse try from.length(io);
 
     const to = try dest.createFile(io, name, .{ .truncate = true });
-    defer to.close(io);
+    var handed = false;
+    errdefer if (!handed) to.close(io);
 
     // A prefix of a file -- the newest segment, up to its last whole record
     // -- can still go through the filesystem where the platform takes a
     // length.
-    if (clone.range(to, from, length)) {
-        try syncFile(io, to, .whole);
-        return true;
-    }
+    if (!clone.range(to, from, length)) {
+        const chunk = try log.allocateReadBuffer();
+        defer log.gpa.free(chunk);
 
-    const chunk = try log.allocateReadBuffer();
-    defer log.gpa.free(chunk);
-
-    var at: u64 = 0;
-    while (at < length) {
-        const want: usize = @intCast(@min(chunk.len, length - at));
-        const read = try from.readPositionalAll(io, chunk[0..want], at);
-        // The file was longer a moment ago. Something is rewriting the
-        // directory underneath this copy.
-        if (read == 0) return error.TruncatedRecord;
-        try to.writePositionalAll(io, chunk[0..read], at);
-        at += read;
+        var at: u64 = 0;
+        while (at < length) {
+            const want: usize = @intCast(@min(chunk.len, length - at));
+            const read = try from.readPositionalAll(io, chunk[0..want], at);
+            // The file was longer a moment ago. Something is rewriting the
+            // directory underneath this copy.
+            if (read == 0) return error.TruncatedRecord;
+            try to.writePositionalAll(io, chunk[0..read], at);
+            at += read;
+        }
     }
-    try syncFile(io, to, .whole);
+    handed = true;
+    try copies.addCopy(io, to);
     return true;
 }
 
@@ -3123,10 +3194,10 @@ fn clearBackup(log: *Self, io: Io, dest: Io.Dir) OpenError!void {
 /// caught where a comparison of paths would miss it. Failure to establish
 /// identity stops the copy: treating an unknown destination as different can
 /// open a source segment through the destination handle with truncation.
-fn sameDirectory(log: *Self, dest: Io.Dir) strand.FileId.Error!bool {
-    const here = try strand.FileId.of(log.dir.handle);
-    const there = try strand.FileId.of(dest.handle);
-    return here.eql(there);
+fn sameDirectory(io: Io, here: Io.Dir, there: Io.Dir) airlock.FileId.Error!bool {
+    const a = try airlock.FileId.of(io, .{ .handle = here.handle, .flags = .{ .nonblocking = false } });
+    const b = try airlock.FileId.of(io, .{ .handle = there.handle, .flags = .{ .nonblocking = false } });
+    return a.eql(b);
 }
 
 //========================================================================
@@ -3141,7 +3212,7 @@ pub fn finish(log: *Self, io: Io) Self.FinishError!void {
     if (log.active) |*active| {
         try active.writer.interface.flush();
         try log.trimPreallocation(io);
-        if (log.options.sync != .never) try syncFile(io, active.file, .whole);
+        if (log.options.sync != .never) _ = try syncFile(io, active.file, .full);
 
         // The index is only a cache. Failure to finish it costs the next open
         // a scan and does not change whether the log itself was closed durably.
@@ -3174,10 +3245,12 @@ pub fn deinit(log: *Self, io: Io) void {
             // Best-effort resource release cannot return errors; finish reports durability failures.
             std.log.debug("best-effort log release: {t}", .{err});
         };
-        if (log.options.sync != .never) syncFile(io, active.file, .whole) catch |err| {
-            // Best-effort resource release cannot return errors; finish reports durability failures.
-            std.log.debug("best-effort log release: {t}", .{err});
-        };
+        if (log.options.sync != .never) {
+            if (syncFile(io, active.file, .full)) |_| {} else |err| {
+                // Best-effort resource release cannot return errors; finish reports durability failures.
+                std.log.debug("best-effort log release: {t}", .{err});
+            }
+        }
         active.index_writer.interface.flush() catch |err| {
             // The index is a rebuildable cache; record durability is handled separately.
             std.log.debug("optional index maintenance: {t}", .{err});

@@ -8,13 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
-- chronicle requires Zig 0.17.0, and builds against strand cfa22bb, strand's Zig 0.17 line.
+- chronicle requires Zig 0.17.0, and builds against strand c37ca7a, strand's Zig 0.17 line, and [airlock](https://github.com/pedronaugusto/airlock) 652b0e4, which makes every sync, atomic replace and backup batch.
 - `close` is `finish`, and `CloseError` is `FinishError`. `finish` flushes the active segment, trims what was reserved past its records, syncs it and seals its index as `close` did, and leaves the journal open whether it succeeds or not: `deinit` is still owed, so `finish` sits beside `defer journal.deinit(io)`, and an append after it carries on. `close` released the journal even when it failed.
 - `subscribeFrom` and `subscribeAllFrom` refuse a cursor below `oldestSeq() - 1` with `error.HistoryDropped` and register nothing, so a fold restored from a snapshot older than a `compact` or `dropSegmentsBefore` is told it would skip records. A cursor of zero still means everything the log holds.
 - tailer names are lowercase letters, digits, `-` and `_`. On a filesystem that folds case, as macOS and Windows do by default, two names differing only in case shared one cursor file.
 - `readers` takes the allocator its list is owned through, as `copySince` does. `Snapshot.deinit()` frees a snapshot's state, through the allocator `openWithSnapshot` was given, which the snapshot keeps.
 - `appendAll` takes a `Commit`. `.group` is what it did: one sync, and a crash may leave a prefix. `.atomic` writes the batch's first and last sequence numbers (`"bf"`, `"bl"`) into each of its records and keeps it in one segment; an open drops a batch the log ends inside whole, as it drops a torn line, a reader beside the writer reads a batch once it is whole, and a walk refuses a batch that does not run from its first record to its last with `error.BrokenBatch`.
-- `Flush` is `strand.SyncKind` and `flush` is what strand asks for at the whole-file level (`SyncKind.asked(.all)`): `.full` on Darwin and `.plain` elsewhere, replacing `.full_fsync`, `.fsync` and `.flush_buffers`. `Status.flushed` is the call a journal's records last got, which on a Darwin filesystem that declines `F_FULLFSYNC` is `.plain` rather than the `flush` the constant names.
+- `Flush` is airlock's `Reached`, what a sync reached, and `flush` is `.full` on every platform (`Reached.expected(.full)`), replacing `.full_fsync`, `.fsync` and `.flush_buffers`. `Status.flushed` is what the records' last sync reached: `.data` for a write into reserved space on Linux and Windows, and `.written` on a macOS filesystem that declines `F_FULLFSYNC`.
+- Errors carry airlock's names: `BackupError` gains airlock's batch errors, `PublishedNotDurable` among them; `SnapshotError` and a tailer's `commit` take airlock's `WriteFileError` (`PublishedNotDurable`, `Busy`) in place of the rename and delete errors; `CompactError` gains airlock's create and commit errors; `OpenError` gains `airlock.PruneError`.
 - `copySince` and `readers` return opaque `*Batch` and `*Readers` owners; replace direct fields with `records()`, `complete()` and `items()`, keep their pointers instead of values, and release each owner exactly once before its allocator.
 - Journal, Replay and Tailer are opaque managed owners returned by pointer, including `Opened.journal`; keep their pointers, use methods to observe state (`Tailer.name()` borrows its name), and release each owner exactly once before its allocator, with replays and tailers released before their journal.
 - `copySince` copies events through `strand.copyOwned`, preserving Raw bytes and dynamic values without hooks; events must meet its finite-data-tree contract and `CopyError` no longer includes `NotRoundTrippable`.
@@ -70,6 +71,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- A snapshot, a cursor and a compacted segment are written under a temporary name drawn at random (`.chronicle-tmp-` and 26 characters) and renamed into place, so two readers committing the same cursor never write into one temporary. A writer's `open` removes those temporaries once they are an hour old; a `<name>.tmp` left by an earlier version is not touched.
+- Windows flushes the directory after a name changes, so a new segment, a compaction, a snapshot and a cursor survive a power cut under their names there too.
+- A backup makes its copies durable together: on macOS and Windows a writeout of each file and one flush of the device, where it flushed the device once per file.
+- A compaction's rename is retried on Windows while a scanner or indexer holds the segment.
 - The fetched package holds the build files, `src`, `examples` and the three documents; `ci/` and `.github/` stay in the repository.
 - Builds against strand a8c5e83, whose reads reach chronicle's events. An event type that reaches itself is held to 512 levels of arrays and objects, and a record nested deeper reads as `error.CorruptRecord`, where it overflowed the stack. A `Raw` in an event where no value starts is `error.CorruptRecord`, where it panicked. A union event that declares `jsonl_tag` is written and read tagged inside its object (`{"type":"...",...}`).
 - `backup` has the filesystem clone a sealed segment where it can (APFS); only indexes and the snapshot were cloned.
@@ -143,6 +148,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A backup on a filesystem that clones (APFS) synced none of the segments it cloned; they are now made durable with the copies.
 - A project that depends on chronicle builds: `build.zig` reaches the lazy `preflight` dependency through `b.lazyImport`, and only in chronicle's own tree.
 - A batch refused part-way (`RecordTooLarge`, `NotRoundTrippable`) is taken back to where it started, without a rescan. Records longer than the write buffer had already reached the file; the journal latched as failed, and a reopen or `reconcile` returned them as committed.
 - `append` parses its round trip with the options every read uses. An event that writes a member it does not read back is refused with `NotRoundTrippable`; it was written, and verify, replay and every open then refused the journal.

@@ -1107,10 +1107,11 @@ pub fn Journal(comptime Event: type) type {
             /// How many unterminated bytes were dropped from the newest
             /// segment during opening or recovery. Zero when none were dropped.
             dropped_bytes: usize,
-            /// The call the records last got when they were made durable:
-            /// `flush`, or on Linux `.data` for a write into reserved space,
-            /// and `.plain` where the filesystem declined the stronger call
-            /// — `F_FULLFSYNC` on a network mount. Null before a sync.
+            /// What the records' last sync reached: `flush`, or `.data` on
+            /// Linux and Windows for a write into reserved space, and less
+            /// where the filesystem declined the call — `.written` from a
+            /// network mount on macOS, which declines `F_FULLFSYNC`. Null
+            /// before a sync.
             flushed: ?Flush,
         };
 

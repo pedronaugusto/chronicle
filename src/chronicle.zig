@@ -54,12 +54,13 @@ pub const Access = Log.Access;
 /// promise each level carries, per platform.
 pub const Sync = Log.Sync;
 
-/// The call a durable write makes on a platform.
+/// What a durable write reached: airlock's `Reached`, weakest first.
 pub const Flush = Log.Flush;
 
-/// What `Options.sync = .always` issues here, which is what a returned
-/// sequence number survives here. README.md's durability rules are the same
-/// three answers in words.
+/// What `Options.sync = .always` reaches here when the filesystem takes the
+/// call, which is what a returned sequence number survives: `.full`, the
+/// contents and the metadata on the drive's media. README.md's durability
+/// rules say the same in words.
 pub const flush: Flush = Log.flush;
 
 /// The file inside a journal directory that a writer holds its advisory lock
@@ -976,9 +977,9 @@ pub fn Journal(comptime Event: type) type {
         /// A document larger than `Options.max_snapshot_bytes` is refused
         /// with `error.SnapshotTooLarge` before it replaces the old snapshot.
         ///
-        /// The replacement is written to a neighbouring temporary file, flushed
-        /// and `fsync`ed, and then renamed over the destination, so a reader
-        /// never sees a half-written snapshot. A snapshot is only ever an
+        /// The replacement is written to a neighbouring temporary file under a
+        /// name drawn at random, made durable, and then renamed over the
+        /// destination, so a reader never sees a half-written snapshot. A snapshot is only ever an
         /// optimisation: deleting it costs replay time and nothing else.
         ///
         /// Safe to call from any task or thread.
@@ -1077,6 +1078,11 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// The lock is not copied, and neither are the cursor files of named
         /// readers: those belong to the readers of *this* directory.
+        ///
+        /// The copies are made durable together, a shared clone as much as a
+        /// copied file, with the destination directory: one airlock batch, a
+        /// writeout of each file and one flush of the device on macOS and
+        /// Windows, where a sync of each would flush it once per file.
         ///
         /// Safe to call from any task or thread.
         pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!u64 {

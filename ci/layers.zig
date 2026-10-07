@@ -29,13 +29,16 @@ pub const entries: []const []const u8 = &.{};
 pub const modules: []const gantry.NamedModule = &.{.{ .name = "chronicle", .path = "src/chronicle.zig", .from = "src/testing/lock_helper.zig" }};
 pub const references: []const gantry.rules.ReferenceRule = &.{
     .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{
+        "airlock",
         "builtin",
         "chronicle_test_options",
+        "shakedown",
         "std",
         "strand",
     } },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
     .{ .name = "strand owner", .target = "strand", .except_from = &.{"src/journal/jsonl.zig"} },
+    .{ .name = "airlock owner", .target = "airlock", .except_from = &.{ "src/journal/Log.zig", "src/journal_test.zig", "src/testing/**" } },
 };
 
 pub const required = [_][]const u8{
@@ -54,10 +57,22 @@ pub const required = [_][]const u8{
     "src/tests.zig",
 };
 
-/// Tokens only their owners may spell: durability, file identity and the
-/// JSON codec are strand's; tests may check against `std.json`.
+/// Tokens only their owners may spell: durability and file identity are
+/// airlock's, so nothing here spells them; the JSON codec is strand's, and
+/// tests may check against `std.json`.
 pub const owned: []const gantry.rules.TokenRule = &.{
-    .{ .name = "sync owner", .tokens = &.{ "fsync", "fdatasync", "F_FULLFSYNC", "FlushFileBuffers" } },
-    .{ .name = "file identity owner", .tokens = &.{ "statx", "fstat" } },
+    .{ .name = "durability belongs to airlock", .tokens = &.{
+        "fsync",
+        "fdatasync",
+        "F_FULLFSYNC",
+        "FULLFSYNC",
+        "F_BARRIERFSYNC",
+        "BARRIERFSYNC",
+        "FlushFileBuffers",
+        "NtFlushBuffersFile",
+        "NtFlushBuffersFileEx",
+        "createFileAtomic",
+    } },
+    .{ .name = "file identity belongs to airlock", .tokens = &.{ "statx", "fstat", "fstatat", "FILE_ID_INFO" } },
     .{ .name = "json owner", .tokens = &.{ "Stringify", "parseFromSlice", "parseFromSliceLeaky" }, .owners = &.{"src/*_test.zig"} },
 };
