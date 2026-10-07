@@ -117,6 +117,42 @@ pub fn build(b: *std.Build) void {
     //=====================================================================
 
     if (b.pkg_hash.len != 0) return;
+
+    //=====================================================================
+    // Benchmarks
+    //
+    // Only in chronicle's own tree, and never part of `zig build test`: a
+    // number that varies with the machine is not a thing to fail a build
+    // over. `check` compiles them so they keep up with the API; `bench`
+    // installs them, and each says at its top how it is run. Numbers worth
+    // reading come from -Doptimize=ReleaseFast.
+    //=====================================================================
+
+    const bench_options = b.addOptions();
+    bench_options.addOption(bool, "smoke", b.option(
+        bool,
+        "bench-smoke",
+        "Build the benchmarks to run once over tiny inputs, without reading a clock",
+    ) orelse false);
+    const bench_step = b.step("bench", "Build the benchmarks into zig-out/bin");
+    for (bench_sources) |source| {
+        const bench = b.addExecutable(.{
+            .name = source.name,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(source.path),
+                .target = target,
+                .optimize = optimize,
+                .imports = &.{
+                    .{ .name = "chronicle", .module = module },
+                    .{ .name = "strand", .module = strand },
+                },
+            }),
+        });
+        bench.root_module.addOptions("bench_options", bench_options);
+        bench_step.dependOn(&b.addInstallArtifact(bench, .{}).step);
+        check_step.dependOn(&bench.step);
+    }
+
     if (b.lazyImport(@This(), "preflight")) |preflight| {
         preflight.addCi(b, .{ .tests = test_step });
         // A project that depends on chronicle by path, with strand and
@@ -128,6 +164,13 @@ pub fn build(b: *std.Build) void {
         });
     }
 }
+
+/// The benchmarks, each a program of its own.
+const bench_sources = [_]struct { name: []const u8, path: []const u8 }{
+    .{ .name = "chronicle-bench", .path = "bench/chronicle_bench.zig" },
+    .{ .name = "work-bench", .path = "bench/work_bench.zig" },
+    .{ .name = "cover-bench", .path = "bench/cover_bench.zig" },
+};
 
 /// Every example, listed rather than globbed: a build graph that scans a
 /// directory is not reproducible from the manifest alone.

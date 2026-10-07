@@ -4,11 +4,13 @@ const Io = std.Io;
 
 pub fn ReplayOwner(comptime State: type, comptime PositionType: type) type {
     return opaque {
+        /// Where a walk is, for `rearmAt` and `Journal.replayAt`.
         pub const Position = PositionType;
         const Self = @This();
         fn inner(self: *Self) *State.Replay {
             return @ptrCast(@alignCast(self)); // safe: construction retains this allocated state until deinit.
         }
+        /// Private: the owner over the walk a journal built.
         pub fn from(state: *State.Replay) *Self {
             return @ptrCast(state); // safe: hides the stable allocation without copying it.
         }
@@ -51,11 +53,13 @@ pub fn ReplayOwner(comptime State: type, comptime PositionType: type) type {
 
 pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
     return opaque {
+        /// The walk `replay` returns.
         pub const Replay = ReplayType;
         const Self = @This();
         fn inner(self: *Self) *State.Tailer {
             return @ptrCast(@alignCast(self)); // safe: construction retains this allocated state until deinit.
         }
+        /// Private: the owner over the reader a journal built.
         pub fn from(state: *State.Tailer) *Self {
             return @ptrCast(state); // safe: hides the stable allocation without copying it.
         }

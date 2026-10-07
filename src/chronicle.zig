@@ -67,8 +67,9 @@ pub const flush: Flush = Log.flush;
 pub const lock_name = Log.lock_name;
 /// The file inside a journal directory that `Journal.snapshot` writes.
 pub const snapshot_name = Log.snapshot_name;
-/// The extensions of the two files that make up one segment.
+/// The extension of a segment's file of records.
 pub const segment_extension = Log.segment_extension;
+/// The extension of the index beside a segment.
 pub const index_extension = Log.index_extension;
 /// A named reader's cursor file is its name plus this. See `Journal.Tailer`.
 pub const cursor_extension = Log.cursor_extension;
@@ -127,8 +128,8 @@ pub const Position = implementation.Position;
 ///
 /// The returned type owns a directory, the newest segment's files, an advisory
 /// lock, a bounded tail of records in memory and one mutex. Create it with
-/// `open` or `openWithSnapshot` and release it with `close`, or with the
-/// best-effort `deinit` where an error cannot be returned.
+/// `open` or `openWithSnapshot` and release it with `deinit`, after `finish`
+/// where the shutdown write must be known to have happened.
 ///
 /// Construction returns a pointer to an opaque owner. Its state stays at one
 /// address; keep and pass that pointer, and release the owner exactly once.
@@ -146,7 +147,7 @@ pub fn Journal(comptime Event: type) type {
         const State = implementation.Journal(Event);
 
         fn inner(self: *Self) *State {
-            return @ptrCast(@alignCast(self)); // safe: open returns this allocated State, retained until close or deinit.
+            return @ptrCast(@alignCast(self)); // safe: open returns this allocated State, retained until deinit.
         }
         fn from(state: *State) *Self {
             return @ptrCast(state); // safe: hides the same stable State allocation without copying it.
@@ -357,8 +358,9 @@ pub fn Journal(comptime Event: type) type {
         /// Errors from `snapshot`.
         pub const SnapshotError = State.SnapshotError;
 
-        /// Errors from durably closing the active segment.
-        pub const CloseError = State.CloseError;
+        /// Errors from `finish`: flushing, trimming and syncing the active
+        /// segment.
+        pub const FinishError = State.FinishError;
 
         /// Errors from `tailer` and from a `Tailer`'s own calls.
         ///
@@ -458,8 +460,8 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// `path` may be relative to the current directory or absolute. Release
         /// with `deinit`.
-        pub fn open(gpa: Allocator, io: Io, path: []const u8, settings: Options) OpenError!*Self {
-            return from(try State.open(gpa, io, path, settings));
+        pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!*Self {
+            return from(try State.open(gpa, io, path, options));
         }
 
         /// `open`, plus the snapshot written beside the journal by a previous
@@ -467,24 +469,34 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// A caller that restores `Opened.snapshot.?.state` into its fold then
         /// needs only the records after `Opened.snapshot.?.seq`; hand that
-        /// number to `subscribeFrom`. The state is the caller's to free.
-        pub fn openWithSnapshot(gpa: Allocator, io: Io, path: []const u8, settings: Options) OpenWithSnapshotError!Opened {
-            const opened = try State.openWithSnapshot(gpa, io, path, settings);
+        /// number to `subscribeFrom`. The snapshot is the caller's to release with
+        /// `Snapshot.deinit`.
+        pub fn openWithSnapshot(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenWithSnapshotError!Opened {
+            const opened = try State.openWithSnapshot(gpa, io, path, options);
             return .{ .journal = from(opened.journal), .snapshot = opened.snapshot };
         }
 
-        /// Flush and durably close the active segment, then release the lock
-        /// and every allocation. The journal is consumed even when an error
-        /// is returned. Call only after every caller and replay has stopped;
-        /// owned batches, reader lists and snapshot state remain valid.
-        pub fn close(self: *Self, io: Io) CloseError!void {
-            return State.close(self.inner(), io);
+        /// Make everything appended so far durable, and report it: flush the
+        /// active segment, trim the space reserved past its records, sync it
+        /// at the journal's `Options.sync` level and seal its index, so the
+        /// next open takes the index rather than rebuild it. This is the
+        /// shutdown write `.on_segment` relies on.
+        ///
+        /// The journal stays open whether or not it succeeds: `deinit` is
+        /// still owed, which makes `finish` safe beside `defer
+        /// journal.deinit(io)`. An append after it carries on as before.
+        /// A `.read` journal has nothing to finish.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn finish(self: *Self, io: Io) FinishError!void {
+            return State.finish(self.inner(), io);
         }
 
-        /// Best-effort fallback for scopes that cannot return a close error.
-        /// Prefer `close` when `.on_segment` relies on shutdown for its final
-        /// durable write. Call only after every caller and replay has stopped;
-        /// owned batches, reader lists and snapshot state remain valid.
+        /// Release the lock and every allocation. It writes what `finish`
+        /// would, as best it can, and reports nothing; call `finish` first
+        /// where the shutdown write must be known to have happened. Call
+        /// only after every caller and replay has stopped; owned batches,
+        /// reader lists and snapshot state remain valid.
         pub fn deinit(self: *Self, io: Io) void {
             return State.deinit(self.inner(), io);
         }
@@ -522,7 +534,7 @@ pub fn Journal(comptime Event: type) type {
         /// published — the sinks called, the waiters woken — at once, and
         /// made durable with whatever makes the file durable next: an
         /// `append` or `appendAll` under `Options.sync = .always`, a
-        /// rotation, a snapshot, `close`. This is group commit asked for
+        /// rotation, a snapshot, `finish`. This is group commit asked for
         /// record by record, where the caller knows which of its records
         /// must be on the disk before it acts and which may ride with the
         /// next one that must.
@@ -822,10 +834,10 @@ pub fn Journal(comptime Event: type) type {
             return State.oldestSeq(self.inner(), io);
         }
 
-        /// Copy the configuration supplied at open under the journal's lock.
+        /// The `Options` the journal was opened with, copied under its lock.
         /// Safe to call from any task or thread, except from inside a sink.
-        pub fn options(self: *Self, io: Io) Io.Cancelable!Options {
-            return State.options(self.inner(), io);
+        pub fn openedWith(self: *Self, io: Io) Io.Cancelable!Options {
+            return State.openedWith(self.inner(), io);
         }
 
         /// Copy the recovery and persistence state under the journal's lock.

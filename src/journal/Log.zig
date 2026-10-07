@@ -346,7 +346,7 @@ pub const SnapshotError = WriteFileError || Io.Writer.Error || Io.File.SyncError
 
 pub const SealError = Io.File.WritePositionalError || Io.File.SyncError;
 
-pub const CloseError = Io.Writer.Error || Io.File.SetLengthError || Io.File.SyncError;
+pub const FinishError = Io.Writer.Error || Io.File.SetLengthError || Io.File.SyncError;
 
 gpa: Allocator,
 /// The log's directory, as given to `open`. Owned.
@@ -2648,7 +2648,7 @@ fn freshRoot(io: Io) u32 {
 fn closeActive(log: *Self, io: Io) void {
     if (log.active) |*active| {
         active.writer.interface.flush() catch |err| {
-            // Best-effort resource release cannot return errors; close reports durability failures.
+            // Best-effort resource release cannot return errors; finish reports durability failures.
             std.log.debug("best-effort log release: {t}", .{err});
         };
         active.index_writer.interface.flush() catch |err| {
@@ -3133,10 +3133,11 @@ fn sameDirectory(log: *Self, dest: Io.Dir) strand.FileId.Error!bool {
 // Teardown.
 //========================================================================
 
-/// Flush and durably close the active segment, then release every resource.
-/// The log is consumed even when durability fails.
-pub fn close(log: *Self, io: Io) Self.CloseError!void {
-    defer log.release(io);
+/// Flush the active segment, trim what was reserved past its records, make
+/// it durable at the log's level and seal its index. The log stays open
+/// whether or not this succeeds: `deinit` is still owed, and an append after
+/// it carries on, reserving again.
+pub fn finish(log: *Self, io: Io) Self.FinishError!void {
     if (log.active) |*active| {
         try active.writer.interface.flush();
         try log.trimPreallocation(io);
@@ -3166,15 +3167,15 @@ pub fn close(log: *Self, io: Io) Self.CloseError!void {
 pub fn deinit(log: *Self, io: Io) void {
     if (log.active) |*active| {
         active.writer.interface.flush() catch |err| {
-            // Best-effort resource release cannot return errors; close reports durability failures.
+            // Best-effort resource release cannot return errors; finish reports durability failures.
             std.log.debug("best-effort log release: {t}", .{err});
         };
         log.trimPreallocation(io) catch |err| {
-            // Best-effort resource release cannot return errors; close reports durability failures.
+            // Best-effort resource release cannot return errors; finish reports durability failures.
             std.log.debug("best-effort log release: {t}", .{err});
         };
         if (log.options.sync != .never) syncFile(io, active.file, .whole) catch |err| {
-            // Best-effort resource release cannot return errors; close reports durability failures.
+            // Best-effort resource release cannot return errors; finish reports durability failures.
             std.log.debug("best-effort log release: {t}", .{err});
         };
         active.index_writer.interface.flush() catch |err| {

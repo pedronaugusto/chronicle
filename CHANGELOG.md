@@ -6,130 +6,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-- **Breaking:** chronicle requires Zig 0.17.0, and builds against strand 792fb2d, strand's Zig 0.17 line.
+### Breaking
 
-- Builds against strand a8c5e83, whose reads reach chronicle's events. An event type that reaches itself is held to 512 levels of arrays and objects, and a record nested deeper reads as `error.CorruptRecord`, where it overflowed the stack. A `Raw` in an event where no value starts is `error.CorruptRecord`, where it panicked. A union event that declares `jsonl_tag` is written and read tagged inside its object (`{"type":"...",...}`).
+- chronicle requires Zig 0.17.0, and builds against strand 792fb2d, strand's Zig 0.17 line.
+- `close` is `finish`, and `CloseError` is `FinishError`. `finish` flushes the active segment, trims what was reserved past its records, syncs it and seals its index as `close` did, and leaves the journal open whether it succeeds or not: `deinit` is still owed, so `finish` sits beside `defer journal.deinit(io)`, and an append after it carries on. `close` released the journal even when it failed.
+- `subscribeFrom` and `subscribeAllFrom` refuse a cursor below `oldestSeq() - 1` with `error.HistoryDropped` and register nothing, so a fold restored from a snapshot older than a `compact` or `dropSegmentsBefore` is told it would skip records. A cursor of zero still means everything the log holds.
+- tailer names are lowercase letters, digits, `-` and `_`. On a filesystem that folds case, as macOS and Windows do by default, two names differing only in case shared one cursor file.
+- `readers` takes the allocator its list is owned through, as `copySince` does. `Snapshot.deinit()` frees a snapshot's state, through the allocator `openWithSnapshot` was given, which the snapshot keeps.
+- `appendAll` takes a `Commit`. `.group` is what it did: one sync, and a crash may leave a prefix. `.atomic` writes the batch's first and last sequence numbers (`"bf"`, `"bl"`) into each of its records and keeps it in one segment; an open drops a batch the log ends inside whole, as it drops a torn line, a reader beside the writer reads a batch once it is whole, and a walk refuses a batch that does not run from its first record to its last with `error.BrokenBatch`.
+- `Flush` is `strand.SyncKind` and `flush` is what strand asks for at the whole-file level (`SyncKind.asked(.all)`): `.full` on Darwin and `.plain` elsewhere, replacing `.full_fsync`, `.fsync` and `.flush_buffers`. `Status.flushed` is the call a journal's records last got, which on a Darwin filesystem that declines `F_FULLFSYNC` is `.plain` rather than the `flush` the constant names.
+- `copySince` and `readers` return opaque `*Batch` and `*Readers` owners; replace direct fields with `records()`, `complete()` and `items()`, keep their pointers instead of values, and release each owner exactly once before its allocator.
+- Journal, Replay and Tailer are opaque managed owners returned by pointer, including `Opened.journal`; keep their pointers, use methods to observe state (`Tailer.name()` borrows its name), and release each owner exactly once before its allocator, with replays and tailers released before their journal.
+- `copySince` copies events through `strand.copyOwned`, preserving Raw bytes and dynamic values without hooks; events must meet its finite-data-tree contract and `CopyError` no longer includes `NotRoundTrippable`.
+- pin strand at `3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0`; `Raw.encode` adds `WriteFailed`, byte vectors accept strings and arrays, and framing bounds count payload bytes.
+- `Tailer.cursor(io)` observes the committed cursor under the journal lock, replacing the mutable `Tailer.cursor` field.
+- `openedWith(io)` returns the `Options` the journal was opened with, under the journal lock, replacing the public `options` field.
+- `status(io)` returns a locked `Status` observation in place of the mutable `persistence_failed` and `dropped_bytes` fields.
+- `oldestSeq(io)` and `segmentCount(io)` take the journal lock and return a cancelable observation of its inventory.
+- `waitPast` returns the newest sequence number; `copySince(gpa, io, cursor)` replaces `records`, `since` and `Window` with an owned `Batch`, including every event reference, released with `deinit`.
+- the `migrate` hook takes an allocator and the record's
+  event as its bytes:
+  `fn (arena: Allocator, from_version: u32, event: chronicle.Raw)`. `event`
+  is checked as JSON and is a slice of the record's line, and
+  `event.parse(Old, arena, .{})` reads the old shape as a type, its strings
+  borrowed from the line where they need no unescaping; the hook used to be
+  handed a `std.json.Value` tree built for it. `arena` is the arena that owns
+  the record being built, so what the hook parses and allocates lives as
+  long as the record. `examples/migrate.zig` reads version 1 records at
+  version 2. An `Event` arm named `unknown` may be a `chronicle.Raw` as well
+  as `void` or a `std.json.Value`, and then holds the older record's event
+  as its bytes.
 
-- A project that depends on chronicle builds: `build.zig` reaches the lazy `preflight` dependency through `b.lazyImport`, and only in chronicle's own tree.
-
-- A batch refused part-way (`RecordTooLarge`, `NotRoundTrippable`) is taken back to where it started, without a rescan. Records longer than the write buffer had already reached the file; the journal latched as failed, and a reopen or `reconcile` returned them as committed.
-
-- `append` parses its round trip with the options every read uses. An event that writes a member it does not read back is refused with `NotRoundTrippable`; it was written, and verify, replay and every open then refused the journal.
-
-- `reconcile` and `refresh` hand the records they find after the newest one the journal knew to every subscribed sink, and wake every `waitPast`. A fold missed the record that survived a failed write, and a `.read` journal's waiters slept through a `refresh` until a `nudge`.
-
-- `truncateAfter` removes a snapshot taken after the cut before cutting. Appends that passed the snapshot's number again made `openWithSnapshot` restore state folded from history that no longer exists.
-
-- Under `on_truncated = .drop`, `open` drops a final record that kept its newline but not all of its bytes (a zero byte, or a checksum that does not match), as a power cut can leave it, and counts it in `dropped_bytes`. It refused the journal with `ChecksumMismatch`. Damage before the final record is still refused.
-
-- A `.read` open of a journal whose writer has created the first segment and not yet written its header finds it empty; it was `UnsupportedFormat`.
-
-- `backup` has the filesystem clone a sealed segment where it can (APFS); only indexes and the snapshot were cloned.
-
-- **Breaking:** `subscribeFrom` and `subscribeAllFrom` refuse a cursor below `oldestSeq() - 1` with `error.HistoryDropped` and register nothing, so a fold restored from a snapshot older than a `compact` or `dropSegmentsBefore` is told it would skip records. A cursor of zero still means everything the log holds.
-
-- **Breaking:** tailer names are lowercase letters, digits, `-` and `_`. On a filesystem that folds case, as macOS and Windows do by default, two names differing only in case shared one cursor file.
-
-- **Breaking:** `readers` takes the allocator its list is owned through, as `copySince` does. `Snapshot.deinit(gpa)` frees a snapshot's state.
-
-- Name the existing replay position and reader replay types as `Journal.Replay.Position` and `Journal.Tailer.Replay` when separating their facades.
-
-- Handle cleanup failures explicitly and propagate record-header flush failures.
+### Added
 
 - `appendIf` and `appendAllIf` append only while the newest record is still the one the caller expected, as an event store's expected revision; otherwise they return `error.WrongExpectedSeq` with the newest sequence number in `Expected.found`, and write nothing.
-
-- **Breaking:** `appendAll` takes a `Commit`. `.group` is what it did: one sync, and a crash may leave a prefix. `.atomic` writes the batch's first and last sequence numbers (`"bf"`, `"bl"`) into each of its records and keeps it in one segment; an open drops a batch the log ends inside whole, as it drops a torn line, a reader beside the writer reads a batch once it is whole, and a walk refuses a batch that does not run from its first record to its last with `error.BrokenBatch`.
-
-- `readers` and `minCursor` leave out a reader whose cursor file is deleted between the directory listing and its read, as a `forget` from another process can do; it was listed at cursor 0, which held every record back from retention.
-
-- `checksum` runs three CRC32C instruction chains side by side over a buffer of 768 bytes or more and joins them with a shift table, as zlib-ng and the crc32c crates do; the value is unchanged.
-
-- An open that refuses the log closes the index file it was reading; each such refusal used to keep one descriptor open.
-
-- An empty segment with segments after it is refused as `UnsupportedFormat` and left in place. Only the newest can be a rotation that crashed before its header; open removed one in the middle as if it were, and then refused the log anyway.
-
-- A record's checksum is read only as a JSON integer: one written with a `0` in front of its digits made a line that is not JSON, and it was accepted as a record and handed out as its bytes.
-
-- A file in the journal's directory is a segment or an index only under the twenty digits its name is written with. A name with a sign or a `_` among them, which `parseInt` reads as the same number, was taken for a second copy of that segment, and an open deleted the real one.
-
-- **Breaking:** `Flush` is `strand.SyncKind` and `flush` is what strand asks for at the whole-file level (`SyncKind.asked(.all)`): `.full` on Darwin and `.plain` elsewhere, replacing `.full_fsync`, `.fsync` and `.flush_buffers`. `Status.flushed` is the call a journal's records last got, which on a Darwin filesystem that declines `F_FULLFSYNC` is `.plain` rather than the `flush` the constant names.
-
-- Sync the journal's directory with `strand.syncDir` rather than a file handle borrowed from it: the same calls as before — `F_FULLFSYNC` on macOS, `fsync` on Linux, nothing on Windows.
-
 - `indexName`, the name of the index file beside a segment, next to `segmentName`, for a caller that removes or inspects it.
-
-- Write a record open and its checksum as a member through strand, and read the envelope's and the segment header's leading integers with strand, rather than trimming a brace and scanning digits here. The bytes on disk are unchanged; a journal written before is read and its records written again byte for byte. A leading integer with a zero in front of its digits, which is not JSON, is no longer read off the bytes and is refused as the parser refuses it.
-
-### Changed
-
-- **Breaking:** `copySince` and `readers` return opaque `*Batch` and `*Readers` owners; replace direct fields with `records()`, `complete()` and `items()`, keep their pointers instead of values, and release each owner exactly once before its allocator.
-
-- A zero read-buffer size uses the one byte needed for lookahead, so opening, replaying and backing up a journal make progress instead of aborting.
-
-- **Breaking:** Journal, Replay and Tailer are opaque managed owners returned by pointer, including `Opened.journal`; keep their pointers, use methods to observe state (`Tailer.name()` borrows its name), and release each owner exactly once before its allocator, with replays and tailers released before their journal.
-
-- The record byte limit counts the exact encoded line and checksum, so a record at the ceiling is accepted and one above it is refused before any file write.
-
-- Encoding keeps its allocation-failure cause with its writer, so a custom stringify refusal returns `WriteFailed` rather than `OutOfMemory` without latching persistence failure.
-
-- A rotation reserves segment inventory before changing files, so allocation failure cannot publish an active file with no matching segment owner.
-
-- Segment-header, timestamp and back-link probes propagate allocation failure instead of treating valid bytes as missing or corrupt metadata.
-
-- A torn-header recovery closes the files of its first attempt before restarting, so a failed replacement releases each file only once.
-
-- The shared document reader preserves read-bound failures, so an oversized stored snapshot returns `SnapshotTooLarge` while an oversized cursor remains `CorruptCursor`.
-
-- **Breaking:** `copySince` copies events through `strand.copyOwned`, preserving Raw bytes and dynamic values without hooks; events must meet its finite-data-tree contract and `CopyError` no longer includes `NotRoundTrippable`.
-
-- **Breaking:** pin strand at `3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0`; `Raw.encode` adds `WriteFailed`, byte vectors accept strings and arrays, and framing bounds count payload bytes.
-
-- **Breaking:** `Tailer.cursor(io)` observes the committed cursor under the journal lock, replacing the mutable `Tailer.cursor` field.
-
-- **Breaking:** `options(io)` returns the configuration supplied at open under the journal lock, replacing the public `options` field.
-
-- A replay keeps its record arena at a stable address, so a returned or moved walk preserves allocator contexts retained by its last event.
-
-- Opening, snapshot restoration and final release observe and change journal state under its lock, including cleanup after an error.
-
-- A positioned replay initializes under the journal lock, and independent readers own the decoding configuration and allocator they need without observing journal fields between calls.
-
-- Tail records and staged writes keep their arenas at stable addresses, so allocator contexts retained by events survive publication, growth and eviction.
-
-- **Breaking:** `status(io)` returns a locked `Status` observation in place of the mutable `persistence_failed` and `dropped_bytes` fields.
-
-- **Breaking:** `oldestSeq(io)` and `segmentCount(io)` take the journal lock and return a cancelable observation of its inventory.
-
-- An owned batch keeps its arena at a stable address, so allocator contexts retained by managed JSON containers survive returning and moving the batch.
-
-- A batch with no tail or sink reserves no record storage and holds only one parsed record at a time when round-trip checks are enabled.
-
-- A read-only tail rebuild reads only the complete boundaries its inventory measured, so an external append cannot make a healthy journal look discontinuous.
-
-- Replacing a backup owns its old-file inventory in one temporary arena, so a failed insertion cannot leak a copied filename.
-
-- `replay`, `verify` and `Tailer.replay` choose their scans under the journal lock, so writers and other readers cannot race the segment inventory or shared index state.
-
-- Opening or refreshing a journal works when the tail byte limit keeps no record; sequence continuity is checked by the walk, independent of cache eviction.
-
-- A rebuilt tail is published only after the whole pass succeeds; a failed refresh leaves no partial batch claiming to be complete.
-
-- A tail entry owns its record and arena together, so a refresh that runs out of memory cannot leave an unowned record behind.
-
-- **Breaking:** `waitPast` returns the newest sequence number; `copySince(gpa, io, cursor)` replaces `records`, `since` and `Window` with an owned `Batch`, including every event reference, released with `deinit`.
-
 - `Replay.rearmAt(io, position)` starts another pass on the same walk. A
   follower keeps one scan buffer, segment storage, line buffer and two record
   arenas across wakes; after the first pass, following one new record in the
   same segment allocates nothing. The position is checked again on every pass,
   with the same `error.StalePosition` contract as `Journal.replayAt`.
-
-- Measured on a million 200-byte events, best of seven runs interleaved
-  with the previous release's code: an append without `fsync` from 603,000
-  to 745,000 records a second, a replay of all of them from 2.60 to 7.32
-  million a second, a replay of the last hundred thousand from 38.4 to
-  13.8 ms.
-
 - `Journal.replayAt(io, position)` and `Replay.position()`: a walk that
   starts where an earlier one stopped. A reader that follows a log keeps the
   `chronicle.Position` its last pass ended at — the last record it read,
@@ -143,7 +59,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   A follower waking for one new record in a million-record log: 17.7 µs a
   wake with `replay(cursor)`, 13.2 µs with `replayAt` (best of seven,
   interleaved).
+- `appendDeferred(io, at, event)`: a record written, handed to the operating
+  system and published at once, and made durable with the next flush of the
+  file — an `append` or `appendAll` under `Sync.always`, a rotation, a
+  snapshot, a close. Group commit asked for record by record: a process
+  crash loses none of them, and a power cut at most the deferred records
+  since the last flush, a suffix and never a gap.
+- Name the existing replay position and reader replay types as `Journal.Replay.Position` and `Journal.Tailer.Replay` when separating their facades.
+- `zig build bench` builds chronicle's own benchmarks in `bench/` (`chronicle-bench`, `work-bench` and `cover-bench`), in chronicle's own tree only; CI compiles them.
 
+### Changed
+
+- Builds against strand a8c5e83, whose reads reach chronicle's events. An event type that reaches itself is held to 512 levels of arrays and objects, and a record nested deeper reads as `error.CorruptRecord`, where it overflowed the stack. A `Raw` in an event where no value starts is `error.CorruptRecord`, where it panicked. A union event that declares `jsonl_tag` is written and read tagged inside its object (`{"type":"...",...}`).
+- `backup` has the filesystem clone a sealed segment where it can (APFS); only indexes and the snapshot were cloned.
+- `checksum` runs three CRC32C instruction chains side by side over a buffer of 768 bytes or more and joins them with a shift table, as zlib-ng and the crc32c crates do; the value is unchanged.
+- Sync the journal's directory with `strand.syncDir` rather than a file handle borrowed from it: the same calls as before — `F_FULLFSYNC` on macOS, `fsync` on Linux, nothing on Windows.
+- Write a record open and its checksum as a member through strand, and read the envelope's and the segment header's leading integers with strand, rather than trimming a brace and scanning digits here. The bytes on disk are unchanged; a journal written before is read and its records written again byte for byte. A leading integer with a zero in front of its digits, which is not JSON, is no longer read off the bytes and is refused as the parser refuses it.
+- A batch with no tail or sink reserves no record storage and holds only one parsed record at a time when round-trip checks are enabled.
+- Measured on a million 200-byte events, best of seven runs interleaved
+  with the previous release's code: an append without `fsync` from 603,000
+  to 745,000 records a second, a replay of all of them from 2.60 to 7.32
+  million a second, a replay of the last hundred thousand from 38.4 to
+  13.8 ms.
 - A record's line is written and read by strand, which is now this
   package's one dependency, pinned by commit. strand writes the bytes
   `std.json` writes and reads what `std.json` reads, and the lines are the
@@ -166,26 +103,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - Written and read faster than the codec this package carried until now
     (`stringify.zig`, `parse.zig`, gone), whose fast paths and guard went
     to strand.
-
 - An `append` or `appendAll` on a journal that keeps no record — no tail,
   no sink, no round-trip check — allocates nothing once the journal's line
   buffer has grown to the record's size. The line was a fresh allocation
   per record, freed as soon as the log had copied it.
-
 - An append nobody is waiting on no longer makes a system call to wake
   one. `waitPast` counts itself in under the journal's lock before it
   sleeps, and a record or a nudge asks the operating system to wake
   readers only when one has; every `append` used to pay for a futex wake
   whether anyone waited or not.
-
-- One reader for a record's envelope and a segment's first line, where the
-  journal and the segment store each had their own: the shape this package
-  writes read off the bytes, any other shape read by strand as its members'
-  bytes, an integer only where it is written as one. The segment store's
-  reader of a record's back-link found the first `,"p":` anywhere in the
-  line; a record written by hand with its event before its envelope, and a
-  member named `p` in its event, read the event's. It reads the envelope's.
-
 - A sync is strand's (`strand.syncFile`): the same calls — `F_FULLFSYNC` on
   Darwin, `fsync` or `fdatasync` on Linux as the write needs, the system's
   flush on Windows — with two differences where the copy here had drifted.
@@ -195,7 +121,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   declines the stronger call gets `fsync`. Which directory a backup is
   going to is asked of strand's `FileId`, which is this package's directory
   identity moved there.
-
 - A segment's lines are framed by strand's `LineReader` and `Tail`, where
   the segment store had readers of its own: a replay's walk, the scan an
   open makes of the newest segment, the read of a segment's first line and
@@ -206,20 +131,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   buffer is handed to the replay where it lies instead of being copied out
   of it, and the last line of a segment is found reading back a block at a
   time instead of reading a window twice as large again at each step.
-
-- **Breaking:** the `migrate` hook takes an allocator and the record's
-  event as its bytes:
-  `fn (arena: Allocator, from_version: u32, event: chronicle.Raw)`. `event`
-  is checked as JSON and is a slice of the record's line, and
-  `event.parse(Old, arena, .{})` reads the old shape as a type, its strings
-  borrowed from the line where they need no unescaping; the hook used to be
-  handed a `std.json.Value` tree built for it. `arena` is the arena that owns
-  the record being built, so what the hook parses and allocates lives as
-  long as the record. `examples/migrate.zig` reads version 1 records at
-  version 2. An `Event` arm named `unknown` may be a `chronicle.Raw` as well
-  as `void` or a `std.json.Value`, and then holds the older record's event
-  as its bytes.
-
 - `backup` knows its own directory by what the filesystem calls it — device
   and inode on POSIX, volume serial and file id on Windows — and no longer by
   its resolved path. A destination that reaches the journal's directory
@@ -229,13 +140,46 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   itself a symbolic link to a directory is now that directory, where it was
   refused with `NotDir`.
 
-- `appendDeferred(io, at, event)`: a record written, handed to the operating
-  system and published at once, and made durable with the next flush of the
-  file — an `append` or `appendAll` under `Sync.always`, a rotation, a
-  snapshot, a close. Group commit asked for record by record: a process
-  crash loses none of them, and a power cut at most the deferred records
-  since the last flush, a suffix and never a gap.
+### Fixed
 
+- A project that depends on chronicle builds: `build.zig` reaches the lazy `preflight` dependency through `b.lazyImport`, and only in chronicle's own tree.
+- A batch refused part-way (`RecordTooLarge`, `NotRoundTrippable`) is taken back to where it started, without a rescan. Records longer than the write buffer had already reached the file; the journal latched as failed, and a reopen or `reconcile` returned them as committed.
+- `append` parses its round trip with the options every read uses. An event that writes a member it does not read back is refused with `NotRoundTrippable`; it was written, and verify, replay and every open then refused the journal.
+- `reconcile` and `refresh` hand the records they find after the newest one the journal knew to every subscribed sink, and wake every `waitPast`. A fold missed the record that survived a failed write, and a `.read` journal's waiters slept through a `refresh` until a `nudge`.
+- `truncateAfter` removes a snapshot taken after the cut before cutting. Appends that passed the snapshot's number again made `openWithSnapshot` restore state folded from history that no longer exists.
+- Under `on_truncated = .drop`, `open` drops a final record that kept its newline but not all of its bytes (a zero byte, or a checksum that does not match), as a power cut can leave it, and counts it in `dropped_bytes`. It refused the journal with `ChecksumMismatch`. Damage before the final record is still refused.
+- A `.read` open of a journal whose writer has created the first segment and not yet written its header finds it empty; it was `UnsupportedFormat`.
+- Handle cleanup failures explicitly and propagate record-header flush failures.
+- `readers` and `minCursor` leave out a reader whose cursor file is deleted between the directory listing and its read, as a `forget` from another process can do; it was listed at cursor 0, which held every record back from retention.
+- An open that refuses the log closes the index file it was reading; each such refusal used to keep one descriptor open.
+- An empty segment with segments after it is refused as `UnsupportedFormat` and left in place. Only the newest can be a rotation that crashed before its header; open removed one in the middle as if it were, and then refused the log anyway.
+- A record's checksum is read only as a JSON integer: one written with a `0` in front of its digits made a line that is not JSON, and it was accepted as a record and handed out as its bytes.
+- A file in the journal's directory is a segment or an index only under the twenty digits its name is written with. A name with a sign or a `_` among them, which `parseInt` reads as the same number, was taken for a second copy of that segment, and an open deleted the real one.
+- A zero read-buffer size uses the one byte needed for lookahead, so opening, replaying and backing up a journal make progress instead of aborting.
+- The record byte limit counts the exact encoded line and checksum, so a record at the ceiling is accepted and one above it is refused before any file write.
+- Encoding keeps its allocation-failure cause with its writer, so a custom stringify refusal returns `WriteFailed` rather than `OutOfMemory` without latching persistence failure.
+- A rotation reserves segment inventory before changing files, so allocation failure cannot publish an active file with no matching segment owner.
+- Segment-header, timestamp and back-link probes propagate allocation failure instead of treating valid bytes as missing or corrupt metadata.
+- A torn-header recovery closes the files of its first attempt before restarting, so a failed replacement releases each file only once.
+- The shared document reader preserves read-bound failures, so an oversized stored snapshot returns `SnapshotTooLarge` while an oversized cursor remains `CorruptCursor`.
+- A replay keeps its record arena at a stable address, so a returned or moved walk preserves allocator contexts retained by its last event.
+- Opening, snapshot restoration and final release observe and change journal state under its lock, including cleanup after an error.
+- A positioned replay initializes under the journal lock, and independent readers own the decoding configuration and allocator they need without observing journal fields between calls.
+- Tail records and staged writes keep their arenas at stable addresses, so allocator contexts retained by events survive publication, growth and eviction.
+- An owned batch keeps its arena at a stable address, so allocator contexts retained by managed JSON containers survive returning and moving the batch.
+- A read-only tail rebuild reads only the complete boundaries its inventory measured, so an external append cannot make a healthy journal look discontinuous.
+- Replacing a backup owns its old-file inventory in one temporary arena, so a failed insertion cannot leak a copied filename.
+- `replay`, `verify` and `Tailer.replay` choose their scans under the journal lock, so writers and other readers cannot race the segment inventory or shared index state.
+- Opening or refreshing a journal works when the tail byte limit keeps no record; sequence continuity is checked by the walk, independent of cache eviction.
+- A rebuilt tail is published only after the whole pass succeeds; a failed refresh leaves no partial batch claiming to be complete.
+- A tail entry owns its record and arena together, so a refresh that runs out of memory cannot leave an unowned record behind.
+- One reader for a record's envelope and a segment's first line, where the
+  journal and the segment store each had their own: the shape this package
+  writes read off the bytes, any other shape read by strand as its members'
+  bytes, an integer only where it is written as one. The segment store's
+  reader of a record's back-link found the first `,"p":` anywhere in the
+  line; a record written by hand with its event before its envelope, and a
+  member named `p` in its event, read the event's. It reads the envelope's.
 - A cancel that lands on a write is no longer a failed write. `append`,
   `appendAll`, `snapshot`, `compact`, `truncateAfter`, `dropSegmentsBefore`,
   `reconcile`, `refresh`, `close` and `deinit` block the task's cancelation
@@ -244,7 +188,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refused it; the cancel is reported by the task's next cancelation point. A
   cancel while one of them waits for the lock still returns `error.Canceled`
   with nothing written.
-
 - A reader canceled as a record or a nudge arrives is canceled. `waitPast`
   waited on an `Io.Condition`, and Zig 0.16.0's condition lets a broadcast
   swallow a cancel that lands in the same instant: the wait takes the
@@ -252,7 +195,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the reader's next wait never returned and whatever canceled it waited on
   it. `waitPast` now waits on a futex word the appends and nudges bump, and
   returns `error.Canceled` whichever wins.
-
 - A cancel that lands on an index read is a cancel. The lookups an index
   only speeds up — where a walk starts, `seqAtOrAfter`, a clean open's
   inspection, resuming an index — took any failed read as "no index" and
@@ -267,9 +209,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 A clean reopen proved rather than scanned, an append that costs one
 allocation, and the crash and backup cases a second reading found.
 
+### Changed
+
 - Under `sync = .never`, sealing a segment's index and starting a new segment no longer flush to the drive: the index is held to the log's own level, and an index a power cut left ahead of its segment is checked against the segment and rebuilt on the next open, as before.
 - `append` writes a record's envelope by hand into the one buffer that becomes the stored bytes, sized from the record before it, so a record costs one allocation instead of three and no copy; the bytes are unchanged.
 - Clean reopening a million-record journal is 5.6 times faster, measured from 5.768 ms to 1.035 ms, by proving clean indexes without scanning the newest segment.
+- The memory contract now names the fixed metadata held per segment.
+
+### Fixed
+
 - Backup stops when it cannot prove the destination differs from the source.
 - Dropping segments evicts the same records from the in-memory tail.
 - A snapshot newer than a truncated log is ignored instead of restoring rolled-back state.
@@ -286,7 +234,6 @@ allocation, and the crash and backup cases a second reading found.
 - Writing a snapshot enforces the same size limit used to read it.
 - `reconcile` reports what survived an indeterminate append failure and clears the write latch.
 - Falling back from a sealed index closes the abandoned file handle.
-- The memory contract now names the fixed metadata held per segment.
 - Empty compacted logs report both sequence bounds as zero in `stats`.
 - Interrupted compaction and segment creation recover after a writer is killed at an operation boundary.
 - A compaction killed after its rename no longer leaves the segments before the cut standing as a hole in front of the rewrite; the next open removes them with the segment it replaced.
@@ -668,6 +615,8 @@ back.
 - Fuzz tests over arbitrary journal and snapshot file contents, because the
   file shapes this package exists to survive are the ones nobody chose.
 
+[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.6.0
 [0.5.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.5.0
 [0.4.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.4.0
 [0.3.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.3.0

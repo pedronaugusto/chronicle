@@ -97,7 +97,7 @@ pub fn main() !void {
     var restored: Balances = .{};
     var from: u64 = 0;
     if (opened.snapshot) |snapshot| {
-        defer snapshot.deinit(gpa);
+        defer snapshot.deinit();
         restored = std.mem.bytesToValue(Balances, snapshot.state[0..@sizeOf(Balances)]);
         from = snapshot.seq;
     }

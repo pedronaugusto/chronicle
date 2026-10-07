@@ -58,7 +58,7 @@ defer reopened.deinit(io);
 var restored: Balances = .{};
 var from: u64 = 0;
 if (opened.snapshot) |snapshot| {
-    defer snapshot.deinit(gpa);
+    defer snapshot.deinit();
     restored = std.mem.bytesToValue(Balances, snapshot.state[0..@sizeOf(Balances)]);
     from = snapshot.seq;
 }
@@ -72,8 +72,9 @@ chronicle depends on a pinned strand package for record encoding and decoding. A
 takes an allocator that must outlive it and owns a directory, active segment files, a
 bounded in-memory tail and a mutex. Journal, replay, tailer, copied batch and
 reader-list results are opaque pointer owners: release each exactly once. Release
-replays and tailers before the journal. `close` reports finalization errors; `deinit`
-provides best-effort cleanup.
+replays and tailers before the journal. `finish` makes the active segment durable and
+reports what failed, leaving the journal open; `deinit` releases it, writing the same as
+best it can.
 
 `append` takes the timestamp from the caller. With the default `sync = .always`, it
 syncs the record before publishing it or returning its sequence number; `appendAll`
@@ -84,7 +85,7 @@ beside the writer read an atomic batch only once it is whole. `appendIf` and
 `appendAllIf` append only while the newest record is still the one the caller expected,
 and otherwise return `error.WrongExpectedSeq` with the newest sequence number.
 `appendDeferred` publishes before durability and requires a later flush. The
-`.on_segment` policy syncs at sealing and close; `.never` leaves record writeback to the
+`.on_segment` policy syncs at sealing and at `finish`; `.never` leaves record writeback to the
 operating system. Structural replacement flushes still apply under both policies.
 
 Durable writes use `fcntl(F_FULLFSYNC)` on macOS, `fsync` on Linux with `fdatasync` for
@@ -134,12 +135,15 @@ running them. CI also runs `zig build docs -- usage --check`, and
 `zig build check-consumer` builds a project that depends on chronicle with only strand
 fetched.
 
-[CI](.github/workflows/ci.yml) runs tests and examples in Debug and ReleaseSafe on
-`ubuntu-latest`, `macos-latest` and `windows-latest`, plus ReleaseFast on Ubuntu.
-ReleaseSmall is compile-only on Ubuntu. Separate Ubuntu jobs run ThreadSanitizer in
-Debug and check formatting and cast reasons.
+[CI](.github/workflows/ci.yml) has three tiers. The fast tier runs the source checks and
+the Debug suite with the examples on `ubuntu-latest`. The merge tier also runs the Debug
+suite on `macos-latest` and `windows-latest`. The release tier runs Debug and ReleaseSafe
+on all three hosts, ReleaseFast on Ubuntu, ReleaseSmall compile-only, every cross target
+and ThreadSanitizer.
 
-Compile-only jobs cover `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`,
+`zig build bench` builds the benchmarks in [bench/](bench/); CI only compiles them.
+
+The release tier's compile-only jobs cover `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`,
 `x86_64-windows-gnu`, `aarch64-windows-gnu`, `x86_64-macos` and `aarch64-macos`.
 Additional Linux builds select `x86_64_v2` and `cortex_a72` CPUs to compile the checksum
 instruction paths.

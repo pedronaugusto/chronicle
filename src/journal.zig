@@ -87,7 +87,7 @@ pub fn Journal(comptime Event: type) type {
 
         // Only the opaque journal facade hands out access to this state.
 
-        /// The configuration supplied at open. Read through `options`.
+        /// The configuration supplied at open. Read through `openedWith`.
         config: Options,
 
         //-------------------------------------------------------------- internals
@@ -222,11 +222,11 @@ pub fn Journal(comptime Event: type) type {
                 tail.bytes += owned.record.bytes.len;
             }
 
-            fn trim(tail: *Tail, settings: Options) void {
+            fn trim(tail: *Tail, options: Options) void {
                 var drop: usize = 0;
                 var held = tail.bytes;
-                while (tail.entries.items.len - drop > settings.tail_records or
-                    (held > settings.tail_bytes and drop < tail.entries.items.len))
+                while (tail.entries.items.len - drop > options.tail_records or
+                    (held > options.tail_bytes and drop < tail.entries.items.len))
                 {
                     held -= tail.entries.items[drop].record.bytes.len;
                     drop += 1;
@@ -366,10 +366,13 @@ pub fn Journal(comptime Event: type) type {
         pub const Snapshot = struct {
             seq: u64,
             state: []const u8,
+            /// Private: the allocator `openWithSnapshot` was given, which
+            /// owns `state`.
+            gpa: Allocator,
 
-            /// Free `state`, through the allocator `openWithSnapshot` was given.
-            pub fn deinit(found: Snapshot, gpa: Allocator) void {
-                gpa.free(found.state);
+            /// Free `state`.
+            pub fn deinit(found: Snapshot) void {
+                found.gpa.free(found.state);
             }
         };
 
@@ -424,7 +427,7 @@ pub fn Journal(comptime Event: type) type {
 
         pub const SnapshotError = Allocator.Error || Log.SnapshotError || error{SnapshotTooLarge};
 
-        pub const CloseError = Log.CloseError;
+        pub const FinishError = Log.FinishError;
 
         pub const TailerError = Allocator.Error || Io.Cancelable ||
             Log.WriteFileError || error{ InvalidName, CorruptCursor, UnsupportedFormat };
@@ -485,26 +488,26 @@ pub fn Journal(comptime Event: type) type {
         // Opening.
         //====================================================================
 
-        pub fn open(gpa: Allocator, io: Io, path: []const u8, settings: Options) OpenError!*Self {
+        pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             const log = try Log.open(gpa, io, path, .{
-                .access = settings.access,
-                .on_truncated = settings.on_truncated,
-                .sync = settings.sync,
-                .write_buffer_size = settings.write_buffer_size,
-                .read_buffer_size = settings.read_buffer_size,
-                .max_segment_bytes = settings.max_segment_bytes,
-                .max_segment_records = settings.max_segment_records,
-                .preallocate_bytes = settings.preallocate_bytes,
-                .index_interval_bytes = settings.index_interval_bytes,
-                .max_record_bytes = settings.max_record_bytes,
+                .access = options.access,
+                .on_truncated = options.on_truncated,
+                .sync = options.sync,
+                .write_buffer_size = options.write_buffer_size,
+                .read_buffer_size = options.read_buffer_size,
+                .max_segment_bytes = options.max_segment_bytes,
+                .max_segment_records = options.max_segment_records,
+                .preallocate_bytes = options.preallocate_bytes,
+                .index_interval_bytes = options.index_interval_bytes,
+                .max_record_bytes = options.max_record_bytes,
             });
 
             self.* = .{
                 .gpa = gpa,
                 .log = log,
-                .config = settings,
+                .config = options,
                 .tail = .{},
                 .record_hint = 256,
                 .line = .empty,
@@ -527,7 +530,7 @@ pub fn Journal(comptime Event: type) type {
                 defer self.mutex.unlock(io);
                 try self.fillTail(io);
             }
-            if (settings.verify == .full) _ = try self.verify(io);
+            if (options.verify == .full) _ = try self.verify(io);
             return self;
         }
 
@@ -535,9 +538,9 @@ pub fn Journal(comptime Event: type) type {
             gpa: Allocator,
             io: Io,
             path: []const u8,
-            settings: Options,
+            options: Options,
         ) OpenWithSnapshotError!Opened {
-            const self = try open(gpa, io, path, settings);
+            const self = try open(gpa, io, path, options);
             errdefer self.deinit(io);
             const found = snapshot_read: {
                 try self.mutex.lock(io);
@@ -547,18 +550,14 @@ pub fn Journal(comptime Event: type) type {
             return .{ .journal = self, .snapshot = found };
         }
 
-        pub fn close(self: *Self, io: Io) CloseError!void {
-            // A close that has begun flushes and seals to its end, whatever
+        pub fn finish(self: *Self, io: Io) FinishError!void {
+            // A finish that has begun flushes and seals to its end, whatever
             // a cancel asks of the task meanwhile.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
             self.mutex.lockUncancelable(io);
-            defer {
-                self.mutex.unlock(io);
-                self.gpa.destroy(self);
-            }
-            defer self.release();
-            try self.log.close(io);
+            defer self.mutex.unlock(io);
+            try self.log.finish(io);
         }
 
         pub fn deinit(self: *Self, io: Io) void {
@@ -1095,7 +1094,7 @@ pub fn Journal(comptime Event: type) type {
             return self.log.baseSeq() + 1;
         }
 
-        pub fn options(self: *Self, io: Io) Io.Cancelable!Options {
+        pub fn openedWith(self: *Self, io: Io) Io.Cancelable!Options {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             return self.config;
@@ -1921,7 +1920,7 @@ pub fn Journal(comptime Event: type) type {
             const state = try self.gpa.alloc(u8, size);
             errdefer self.gpa.free(state);
             decoder.decode(state, document.state) catch return error.CorruptSnapshot;
-            return .{ .seq = document.seq, .state = state };
+            return .{ .seq = document.seq, .state = state, .gpa = self.gpa };
         }
     };
 }

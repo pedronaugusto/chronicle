@@ -1504,7 +1504,7 @@ test "without a migrate hook and without an unknown arm an older record is refus
     );
 }
 
-test "close reports a failure while finalizing the active segment" {
+test "finish reports a failure while finalizing the active segment and leaves the journal to deinit" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -1515,9 +1515,9 @@ test "close reports a failure while finalizing the active segment" {
     });
     _ = try journal.append(io, 1, created(1, "one"));
 
-    // Leave close a read-only handle to the still-preallocated segment. Its
-    // mandatory trim cannot succeed, and the error must reach the caller even
-    // though close still releases the journal and its lock.
+    // Leave finish a read-only handle to the still-preallocated segment. Its
+    // mandatory trim cannot succeed, and the error must reach the caller,
+    // with the journal still whole for `deinit` to release with its lock.
     const active = &journalState(journal).log.active.?;
     const position = active.writer.pos;
     active.file.close(io);
@@ -1526,10 +1526,18 @@ test "close reports a failure while finalizing the active segment" {
     active.writer.pos = position;
     // Which error names the refusal is the platform's: POSIX says the file
     // cannot be resized, Windows that the handle may not do it.
-    if (journal.close(io)) |_| return error.TestExpectedError else |err| switch (err) {
+    if (journal.finish(io)) |_| {
+        journal.deinit(io);
+        return error.TestExpectedError;
+    } else |err| switch (err) {
         error.NonResizable, error.AccessDenied => {},
-        else => return err,
+        else => {
+            journal.deinit(io);
+            return err;
+        },
     }
+    try testing.expectEqual(@as(u64, 1), try journal.lastSeq(io));
+    journal.deinit(io);
 
     const reopened = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
     defer reopened.deinit(io);
@@ -2986,7 +2994,7 @@ test "a snapshot plus the records after it folds to the whole log" {
     defer reopened.deinit(io);
 
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
     try testing.expectEqual(@as(u64, 10), snapshot.seq);
     var restored: Registry = std.mem.bytesToValue(Registry, snapshot.state[0..@sizeOf(Registry)]);
     try reopened.subscribeFrom(io, restored.sink(), snapshot.seq);
@@ -3084,7 +3092,7 @@ test "a truncation that keeps a snapshot's records keeps the snapshot" {
     const reopened = opened.journal;
     defer reopened.deinit(io);
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
     try testing.expectEqual(@as(u64, 5), snapshot.seq);
 }
 
@@ -3106,7 +3114,7 @@ test "snapshot refuses a document larger than its read limit" {
     const reopened = opened.journal;
     defer reopened.deinit(io);
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
     try testing.expectEqualStrings("ok", snapshot.state);
 }
 
@@ -3515,7 +3523,7 @@ test "a backup is a whole journal, snapshot and indexes and all" {
     const copy = opened.journal;
     defer copy.deinit(io);
     const snapshot = opened.snapshot orelse return error.TestExpectedSnapshot;
-    defer snapshot.deinit(testing.allocator);
+    defer snapshot.deinit();
     try testing.expectEqual(@as(u64, 11), snapshot.seq);
 
     try testing.expectEqual(copied, try copy.lastSeq(io));
@@ -4502,7 +4510,8 @@ test "a journal written before reads as written, and its records are written aga
         for (written_before.events[2..], 2..) |event, i| {
             _ = try journal.append(io, written_before.first_at + @as(i64, @intCast(i)), event);
         }
-        try journal.close(io);
+        try journal.finish(io);
+        journal.deinit(io);
     }
     for (written_before.segments) |segment| {
         try testing.expectEqualStrings(segment.bytes, try ws.read(try ws.segment(segment.base)));
@@ -4784,7 +4793,7 @@ test "two hundred thousand records open and replay within bounded memory" {
 
     // Loose on purpose: record-sized working memory is the newest segment and
     // the tail. Fixed-size segment metadata is accounted separately.
-    try testing.expect(journalState(journal).tail.entries.items.len <= (try journal.options(io)).tail_records);
+    try testing.expect(journalState(journal).tail.entries.items.len <= (try journal.openedWith(io)).tail_records);
     var held: usize = journalState(journal).scratch.queryCapacity();
     for (journalState(journal).tail.entries.items) |*owned| held += owned.arena.queryCapacity();
     try testing.expect(held < 4 * 1024 * 1024);
@@ -5553,7 +5562,7 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
     defer copied_tail_37.deinit();
     try testing.expectEqual(@as(usize, 1), copied_tail_37.records().len);
     if (opened.snapshot) |snapshot| {
-        defer snapshot.deinit(testing.allocator);
+        defer snapshot.deinit();
         // Whatever sequence number the file claimed, a cursor is clamped to
         // what the journal holds rather than indexing past it.
         const copied_tail_38 = try journal.copySince(testing.allocator, io, snapshot.seq);
@@ -6821,13 +6830,17 @@ fn finalizingUnderLock(comptime best_effort: bool) !void {
     Probe.calls = 0;
     Probe.journal = journal;
     defer Probe.journal = null;
-    if (best_effort) journal.deinit(io) else try journal.close(io);
+    if (!best_effort) journal.finish(io) catch |err| {
+        journal.deinit(io);
+        return err;
+    };
+    journal.deinit(io);
     Probe.journal = null;
     try testing.expect(Probe.calls > 0);
     try testing.expect(!Probe.unlocked);
 }
 
-test "closing a journal finalizes its owned state under the lock" {
+test "finishing a journal finalizes its owned state under the lock" {
     try finalizingUnderLock(false);
 }
 
@@ -6894,7 +6907,7 @@ test "observing configuration waits for the journal lock" {
     defer ws.deinit();
     const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = 7 });
     defer journal.deinit(io);
-    const observed = try journal.options(io);
+    const observed = try journal.openedWith(io);
     try testing.expectEqual(@as(usize, 7), observed.tail_records);
     journalState(journal).mutex.lockUncancelable(io);
     defer journalState(journal).mutex.unlock(io);
@@ -6902,7 +6915,7 @@ test "observing configuration waits for the journal lock" {
     const Reader = struct {
         fn read(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
             ready.store(true, .release);
-            const config = try j.options(inner);
+            const config = try j.openedWith(inner);
             try testing.expectEqual(@as(usize, 7), config.tail_records);
         }
     };
@@ -7312,7 +7325,7 @@ test "managed owners release every construction allocation" {
             const opened = try Journal.openWithSnapshot(gpa, inner, path, .{ .access = .read, .verify = .full });
             const journal = opened.journal;
             defer journal.deinit(inner);
-            if (opened.snapshot) |snapshot| snapshot.deinit(gpa);
+            if (opened.snapshot) |snapshot| snapshot.deinit();
             const tail = try journal.tailer(inner, "reports");
             defer tail.deinit();
             try testing.expectEqualStrings("reports", tail.name());
