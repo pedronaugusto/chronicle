@@ -8,7 +8,7 @@ const Io = std.Io;
 const chronicle = @import("chronicle.zig");
 const airlock = @import("airlock");
 const shakedown = @import("shakedown");
-const seam = @import("testing/seam.zig");
+const seam = @import("airlock.testing");
 const Seam = seam.Seam;
 /// The lock helper's path, from the build: `zig build test` compiles it
 /// beside this suite.
@@ -1193,7 +1193,7 @@ test "a sync that fails on an append latches the journal, and nothing is synced 
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
-    const hooked = try Seam.create(testing.allocator, io, &.{});
+    const hooked = try Seam.create(testing.allocator, io, .{});
     defer hooked.destroy();
     const journal = try Journal.open(testing.allocator, hooked.io(), ws.path, .{});
     defer journal.deinit(hooked.io());
@@ -1220,7 +1220,7 @@ test "a backup makes every copy durable, a clone too, with one flush of the devi
     for (1..14) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
     try journal.snapshot(io, "state");
 
-    const hooked = try Seam.create(testing.allocator, io, &.{});
+    const hooked = try Seam.create(testing.allocator, io, .{});
     defer hooked.destroy();
     _ = try journal.backup(hooked.io(), copy_path);
 

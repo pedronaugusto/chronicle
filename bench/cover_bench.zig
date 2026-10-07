@@ -1,4 +1,7 @@
-//! The public operations the throughput jobs do not time, one mode each.
+//! The public operations the throughput jobs do not time. With no
+//! arguments it prepares a million-record journal in the working directory
+//! and runs every mode in turn; `--smoke` runs them all at their smallest.
+//! One mode alone:
 //!
 //!   cover-bench MODE [DATA] [SCRATCH]
 //!
@@ -17,7 +20,9 @@
 const std = @import("std");
 const chronicle = @import("chronicle");
 const airlock = @import("airlock");
-const smoke = @import("bench_options").smoke;
+/// Set once by `main` from `--smoke`: every mode once, at its smallest,
+/// reading no clock, as `zig build test` runs it to keep it working.
+var smoke = false;
 const Io = std.Io;
 
 const Event = struct { value: u64, padding: []const u8 };
@@ -85,7 +90,11 @@ pub fn main(init: std.process.Init) !void {
     out_writer = Io.File.stdout().writer(io, &out_buffer);
     out = &out_writer.interface;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 2) return error.Usage;
+    if (args.len == 1 or (args.len == 2 and std.mem.eql(u8, args[1], "--smoke"))) {
+        smoke = args.len == 2;
+        try everyMode(io, gpa);
+        return out.flush();
+    }
     const Mode = enum { checksum, @"checksum-std", verify, @"reopen-full", seek, @"seq-at", @"subscribe-from", @"copy-since", refresh, @"wait-past", deferred, tailer, snapshot, retention, backup, @"backup-copy", finish };
     const mode = std.meta.stringToEnum(Mode, args[1]) orelse return error.Usage;
     switch (mode) {
@@ -108,6 +117,35 @@ pub fn main(init: std.process.Init) !void {
         .finish => try finish(io, gpa, args[2]),
     }
     try out.flush();
+}
+
+/// Every mode in turn, in the working directory: the data journal written
+/// first, each scratch mode in a fresh directory of its own.
+fn everyMode(io: Io, gpa: std.mem.Allocator) !void {
+    const data = "data";
+    const cwd = Io.Dir.cwd();
+    cwd.deleteTree(io, data) catch {};
+    {
+        const journal = try J.open(gpa, io, data, options(.never, .write));
+        defer journal.deinit(io);
+        try fill(journal, io, if (smoke) 20 else 1_000_000);
+    }
+    try checksums(io, gpa, false);
+    try checksums(io, gpa, true);
+    try verify(io, gpa, data);
+    try reopenFull(io, gpa, data, if (smoke) 1 else 20);
+    try seek(io, gpa, data);
+    try seqAt(io, gpa, data);
+    try subscribeFrom(io, gpa, data);
+    inline for (.{ copySince, refresh, waitPast, deferred, tailers, snapshots, retention, finish }) |mode| {
+        const scratch = "scratch";
+        cwd.deleteTree(io, scratch) catch {};
+        try mode(io, gpa, scratch);
+        cwd.deleteTree(io, scratch) catch {};
+    }
+    try backup(io, gpa, data, "backup");
+    try backupCopy(io, data, "backup-copy");
+    cwd.deleteTree(io, data) catch {};
 }
 
 /// The record checksum over buffers of three sizes, 256 MiB of each.

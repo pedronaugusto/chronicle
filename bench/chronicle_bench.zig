@@ -1,4 +1,7 @@
-//! The journal's throughput jobs, one workload per invocation:
+//! The journal's throughput jobs. With no arguments it runs every workload
+//! in turn in the working directory, a million records each (ten thousand
+//! for the per-record fsync); `--smoke` runs them all at their smallest. One
+//! workload alone:
 //!
 //!   chronicle-bench WORKLOAD INPUT PATH COUNT [MORE]
 //!
@@ -15,7 +18,9 @@
 //! `replay_from_n FROM [REPETITIONS]`, `follow_replay`, `follow_resume` and
 //! `follow_rearm` `[WAKES]`, `clean_reopen [REPETITIONS]`, `raw_prepare`,
 //! `raw_append` and `raw_replay_all`.
-const smoke = @import("bench_options").smoke;
+/// Set once by `main` from `--smoke`: every workload once, at its smallest,
+/// reading no clock, as `zig build test` runs it to keep it working.
+var smoke = false;
 const std = @import("std");
 const chronicle = @import("chronicle");
 const strand = @import("strand");
@@ -332,6 +337,11 @@ fn rawWorkload(io: std.Io, gpa: std.mem.Allocator, corpus_path: []const u8, path
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
+    const all = try init.minimal.args.toSlice(init.arena.allocator());
+    if (all.len == 1 or (all.len == 2 and std.mem.eql(u8, all[1], "--smoke"))) {
+        smoke = all.len == 2;
+        return everyWorkload(io, gpa);
+    }
     var args = try init.minimal.args.iterateAllocator(init.arena.allocator());
     _ = args.next();
     const workload = args.next() orelse return error.MissingWorkload;
@@ -374,9 +384,39 @@ pub fn main(init: std.process.Init) !void {
     return error.UnknownWorkload;
 }
 
+/// Every workload in turn, in the working directory: the input, each append
+/// into a fresh journal, then the reads over one prepared journal, and the
+/// raw-event case over the same input.
+fn everyWorkload(io: std.Io, gpa: std.mem.Allocator) !void {
+    const count: usize = if (smoke) 10 else 1_000_000;
+    const synced: usize = if (smoke) 2 else 10_000;
+    const input = "input.jsonl";
+    const scratch = "append";
+    const prepared = "journal";
+    try writeInput(io, input, count);
+    try appendWorkload(io, gpa, input, scratch, count, "append_no_fsync");
+    try appendWorkload(io, gpa, input, scratch, synced, "append_fsync");
+    inline for (.{ "group_commit", "atomic_commit", "atomic_commit_baseline", "append_if", "append_if_baseline" }) |workload| {
+        try appendWorkload(io, gpa, input, scratch, count, workload);
+    }
+    try prepare(io, gpa, input, prepared, count);
+    try replay(io, gpa, prepared, count, 1, "replay_all", 1);
+    try replay(io, gpa, prepared, count, count - count / 10, "replay_from_n", if (smoke) 1 else 20);
+    try reopen(io, gpa, prepared, if (smoke) 1 else 100);
+    inline for (.{ "follow_replay", "follow_resume", "follow_rearm" }) |workload| {
+        try follow(io, gpa, input, scratch, count, if (smoke) 2 else 10_000, workload);
+    }
+    const raw = "raw";
+    try rawWorkload(io, gpa, input, raw, count, "raw_append");
+    try rawWorkload(io, gpa, input, raw, count, "raw_replay_all");
+    reset(io, scratch);
+    reset(io, prepared);
+    reset(io, raw);
+}
+
 // Smoke exercises correctness without sampling a benchmark clock.
 var smoke_ticks = std.atomic.Value(i64).init(0);
 fn benchmarkNow(io: std.Io) std.Io.Timestamp {
-    if (@import("bench_options").smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
+    if (smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
     return std.Io.Clock.awake.now(io);
 }

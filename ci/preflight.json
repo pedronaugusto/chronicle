@@ -8,6 +8,10 @@
   "test_support": [
     "src/testing/**"
   ],
+  "test_dependencies": [
+    "shakedown",
+    "airlock.testing"
+  ],
   "function_exceptions": {},
   "layout_exceptions": {},
   "docs": {

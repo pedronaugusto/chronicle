@@ -30,6 +30,7 @@ pub const modules: []const gantry.NamedModule = &.{.{ .name = "chronicle", .path
 pub const references: []const gantry.rules.ReferenceRule = &.{
     .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{
         "airlock",
+        "airlock.testing",
         "builtin",
         "chronicle_test_options",
         "shakedown",

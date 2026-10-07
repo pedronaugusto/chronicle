@@ -139,8 +139,9 @@ exercises schema migration.
   sync, atomic replace and backup batch, and the identity that tells two directories
   apart.
 - [shakedown](https://github.com/pedronaugusto/shakedown) supplies the tests' doubles:
-  faulted and counted `Io` calls and allocators. Only the tests import it, so a project
-  depending on chronicle never fetches it.
+  faulted and counted `Io` calls and allocators, and airlock's syncs through
+  `airlock.testing`, its test seam. Only the tests import them, so a project depending
+  on chronicle never fetches them.
 - [preflight](https://github.com/pedronaugusto/preflight) runs the source checks,
   the tests and CI.
 
@@ -161,8 +162,10 @@ on all three hosts, ReleaseFast on Ubuntu, ReleaseSmall compile-only, every cros
 and ThreadSanitizer. The merge and release tiers also run the Debug suite on Ubuntu with
 Zig master, a job that reports and never blocks.
 
-`zig build bench -Doptimize=fast` installs the benchmarks in [bench/](bench/) under
-`zig-out/bench`, and each says at its top how it is run; CI only compiles them.
+`zig build bench` builds the benchmarks in [bench/](bench/) in ReleaseFast under
+`zig-out/bench` and runs each, one after another, over every workload it has; each says
+at its top how to run one workload alone. `zig build test` runs each once with
+`--smoke`; CI times nothing.
 
 The release tier's compile-only jobs cover `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`,
 `x86_64-windows-gnu`, `aarch64-windows-gnu`, `x86_64-macos` and `aarch64-macos`.

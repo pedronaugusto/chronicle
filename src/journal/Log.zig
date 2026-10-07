@@ -174,11 +174,7 @@ pub const flush: Flush = airlock.Reached.expected(.full);
 /// failure is reported, never answered with a weaker call. A filesystem that
 /// declines the call gets the strongest one it takes, and the answer says so.
 fn syncFile(io: Io, file: Io.File, level: airlock.Level) Io.File.SyncError!Flush {
-    return airlock.syncFile(io, file, .{ .level = level }) catch |err| switch (err) {
-        // unreachable: only `Fallback.refuse` turns a declined call into an error
-        error.LevelUnavailable => unreachable,
-        else => |e| return e,
-    };
+    return airlock.syncFile(io, file, .{ .level = level });
 }
 
 /// `syncFile` for the active segment, noting what its records reached.
@@ -2666,11 +2662,7 @@ pub fn syncDir(log: *Self, io: Io) Self.SyncDirError!void {
 }
 
 fn syncDirHandle(io: Io, dir: Io.Dir) SyncDirError!void {
-    _ = airlock.syncDir(io, dir, .{ .level = .full }) catch |err| switch (err) {
-        // unreachable: only `Fallback.refuse` turns a declined call into an error
-        error.LevelUnavailable => unreachable,
-        else => |e| return e,
-    };
+    _ = try airlock.syncDir(io, dir, .{ .level = .full });
 }
 
 fn deleteSegmentFiles(log: *Self, io: Io, base_seq: u64) Io.Dir.DeleteFileError!void {

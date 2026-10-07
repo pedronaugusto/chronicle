@@ -3,14 +3,18 @@
 //! durable appends one at a time and batched, and opening a 200,000-record
 //! journal with the default tail.
 //!
-//!   work-bench SCRATCH
+//!   work-bench [SCRATCH | --smoke]
 //!
-//! SCRATCH is a directory this invocation creates, owns and removes. Every
+//! SCRATCH is a directory this invocation creates, owns and removes;
+//! `scratch` in the working directory when none is named. `--smoke` runs
+//! each job once at its smallest. Every
 //! row is tab-separated: `chronicle`, the job, `elapsed` or `ratio`, the
 //! value and its unit.
 const std = @import("std");
 const chronicle = @import("chronicle");
-const smoke = @import("bench_options").smoke;
+/// Set once by `main` from `--smoke`: every workload once, at its smallest,
+/// reading no clock, as `zig build test` runs it to keep it working.
+var smoke = false;
 const Io = std.Io;
 const Event = struct { id: u32, name: []const u8 };
 const J = chronicle.Journal(Event);
@@ -158,14 +162,16 @@ fn largeOpen(io: Io, a: std.mem.Allocator, path: []const u8) !void {
 
 pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 2) return error.ExpectedNewScratchDirectory;
+    smoke = args.len == 2 and std.mem.eql(u8, args[1], "--smoke");
+    // A scratch named on the command line, or one in the working directory.
+    const scratch = if (args.len == 2 and !smoke) args[1] else if (args.len <= 2) "scratch" else return error.ExpectedNewScratchDirectory;
     const io = init.io;
     const a = init.gpa;
     // Exclusive creation makes each invocation own all of its scratch.
-    try Io.Dir.cwd().createDir(io, args[1], .default_dir);
-    defer Io.Dir.cwd().deleteTree(io, args[1]) catch {};
+    try Io.Dir.cwd().createDir(io, scratch, .default_dir);
+    defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
     inline for (.{ .{ "seek", seeks }, .{ "fold", folds }, .{ "rates", rates }, .{ "batch", batches }, .{ "large", largeOpen } }) |work| {
-        const path = try std.Io.Dir.path.join(a, &.{ args[1], work[0] });
+        const path = try std.Io.Dir.path.join(a, &.{ scratch, work[0] });
         defer a.free(path);
         try work[1](io, a, path);
     }
@@ -174,6 +180,6 @@ pub fn main(init: std.process.Init) !void {
 // Smoke exercises correctness without sampling a benchmark clock.
 var smoke_ticks = std.atomic.Value(i64).init(0);
 fn benchmarkNow(io: std.Io) std.Io.Timestamp {
-    if (@import("bench_options").smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
+    if (smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
     return std.Io.Clock.awake.now(io);
 }

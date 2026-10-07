@@ -75,7 +75,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Windows flushes the directory after a name changes, so a new segment, a compaction, a snapshot and a cursor survive a power cut under their names there too.
 - A backup makes its copies durable together: on macOS and Windows a writeout of each file and one flush of the device, where it flushed the device once per file.
 - A compaction's rename is retried on Windows while a scanner or indexer holds the segment.
-- The fetched package holds the build files, `src`, `examples` and the three documents; `ci/` and `.github/` stay in the repository.
+- The fetched package holds the build files, `src` and the three documents; the examples, benchmarks, `ci/` and `.github/` stay in the repository.
 - Builds against strand a8c5e83, whose reads reach chronicle's events. An event type that reaches itself is held to 512 levels of arrays and objects, and a record nested deeper reads as `error.CorruptRecord`, where it overflowed the stack. A `Raw` in an event where no value starts is `error.CorruptRecord`, where it panicked. A union event that declares `jsonl_tag` is written and read tagged inside its object (`{"type":"...",...}`).
 - `backup` has the filesystem clone a sealed segment where it can (APFS); only indexes and the snapshot were cloned.
 - `checksum` runs three CRC32C instruction chains side by side over a buffer of 768 bytes or more and joins them with a shift table, as zlib-ng and the crc32c crates do; the value is unchanged.
