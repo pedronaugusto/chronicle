@@ -25,8 +25,8 @@ const Fold = struct {
     }
     fn accept(ctx: *anyopaque, record: J.Record) void {
         const fold: *Fold = @ptrCast(@alignCast(ctx)); // safe: sink passes the live Fold pointer supplied as its context.
-        std.debug.assert(record.seq == fold.seen + 1);
-        fold.seen = record.seq;
+        std.debug.assert(record.seq == chronicle.Seq.fromRaw(fold.seen + 1));
+        fold.seen = record.seq.raw();
     }
 };
 
@@ -53,9 +53,9 @@ fn fill(journal: *J, io: Io, count: usize) !void {
 fn seek(journal: *J, io: Io, cursor: u64, rounds: usize) !f64 {
     const start = benchmarkNow(io);
     for (0..rounds) |_| {
-        const walk = try journal.replay(io, cursor);
+        const walk = try journal.replay(io, .fromRaw(cursor));
         defer walk.deinit(io);
-        if ((try walk.next(io)).?.seq != cursor + 1) return error.WrongSequence;
+        if ((try walk.next(io)).?.seq != chronicle.Seq.fromRaw(cursor + 1)) return error.WrongSequence;
     }
     return elapsed(io, start) / @as(f64, @floatFromInt(rounds));
 }
@@ -63,9 +63,9 @@ fn seeks(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const count: usize = if (smoke) 20 else 20_000;
     const journal = try J.open(a, io, path, .{
         .sync = .never,
-        .tail_records = 4,
-        .max_segment_records = count,
-        .max_segment_bytes = 1 << 30,
+        .tail_records = .fromRaw(4),
+        .max_segment_records = .fromRaw(count),
+        .max_segment_bytes = .fromRaw(1 << 30),
     });
     defer journal.deinit(io);
     try fill(journal, io, 2 * count - 1);
@@ -77,7 +77,7 @@ fn seeks(io: Io, a: std.mem.Allocator, path: []const u8) !void {
 }
 fn folds(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const count: usize = if (smoke) 20 else 20_000;
-    const journal = try J.open(a, io, path, .{ .sync = .never, .tail_records = 4 });
+    const journal = try J.open(a, io, path, .{ .sync = .never, .tail_records = .fromRaw(4) });
     defer journal.deinit(io);
     try fill(journal, io, count);
     var one: Fold = .{};
@@ -98,7 +98,7 @@ fn folds(io: Io, a: std.mem.Allocator, path: []const u8) !void {
 }
 fn rates(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const count: usize = if (smoke) 20 else 50_000;
-    const journal = try J.open(a, io, path, .{ .sync = .never, .tail_records = 4 });
+    const journal = try J.open(a, io, path, .{ .sync = .never, .tail_records = .fromRaw(4) });
     defer journal.deinit(io);
     const start = benchmarkNow(io);
     for (0..count) |i| _ = try journal.append(io, @intCast(i), .{ .id = @intCast(i), .name = "a name" });
@@ -114,7 +114,7 @@ fn rates(io: Io, a: std.mem.Allocator, path: []const u8) !void {
 }
 fn batches(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const count: usize = if (smoke) 3 else 300;
-    const journal = try J.open(a, io, path, .{ .sync = .always, .tail_records = 4 });
+    const journal = try J.open(a, io, path, .{ .sync = .always, .tail_records = .fromRaw(4) });
     defer journal.deinit(io);
     const start = benchmarkNow(io);
     for (0..count) |i| _ = try journal.append(io, @intCast(i), .{ .id = @intCast(i), .name = "a name" });
@@ -122,7 +122,7 @@ fn batches(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const batch_start = benchmarkNow(io);
     try fill(journal, io, count);
     const batched = elapsed(io, batch_start);
-    if (try journal.lastSeq(io) != 2 * count) return error.WrongCount;
+    if (try journal.lastSeq(io) != chronicle.Seq.fromRaw(2 * count)) return error.WrongCount;
     try metric(io, "durable_singly", single, "ns");
     try metric(io, "durable_batched", batched, "ns");
     try metric(io, "single_over_batch", single / batched, "ratio");
@@ -135,7 +135,7 @@ fn largeOpen(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const LargeJournal = chronicle.Journal(LargeEvent);
     const count: usize = if (smoke) 20 else 200_000;
     {
-        const journal = try LargeJournal.open(a, io, path, .{ .sync = .never, .tail_records = 0 });
+        const journal = try LargeJournal.open(a, io, path, .{ .sync = .never, .tail_records = chronicle.Records.fromRaw(0) });
         defer journal.deinit(io);
         var entries: [500]LargeJournal.Entry = undefined;
         var offset: usize = 0;
@@ -155,7 +155,7 @@ fn largeOpen(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const journal = try LargeJournal.open(a, io, path, .{});
     defer journal.deinit(io);
     const elapsed_ms = started.durationTo(benchmarkNow(io)).toMilliseconds();
-    if (try journal.lastSeq(io) != count) return error.WrongCount;
+    if (try journal.lastSeq(io) != chronicle.Seq.fromRaw(count)) return error.WrongCount;
     try metric(io, "large_open", @floatFromInt(elapsed_ms), "ms");
     if (!smoke and elapsed_ms >= 30_000) return error.OpenTooSlow;
 }

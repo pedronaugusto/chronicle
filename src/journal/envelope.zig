@@ -13,8 +13,12 @@
 //! This file is internal. `chronicle.zig` is the package.
 
 const std = @import("std");
+const aegis = @import("aegis");
 const Allocator = std.mem.Allocator;
 const strand = @import("jsonl.zig").strand;
+const values = @import("values.zig");
+
+const Seq = values.Seq;
 
 /// A member's value as an integer when it is one written as one — no
 /// fraction, no exponent, not a string — and within an `i64`. Null for
@@ -61,8 +65,8 @@ pub const Span = struct { from: usize, to: usize };
 /// segments, so a log that ends with a record of a batch whose `last` it does
 /// not hold ends inside that batch, and the batch is dropped whole.
 pub const Batch = struct {
-    first: u64,
-    last: u64,
+    first: Seq,
+    last: Seq,
 };
 
 /// A record's envelope: everything in its line but the event and the
@@ -70,7 +74,7 @@ pub const Batch = struct {
 pub const Head = struct {
     /// From 1 to `maxInt(i64)`, which is as far as a record's `seq` is
     /// read as an integer.
-    seq: u64,
+    seq: Seq,
     at: i64,
     v: u32,
     /// The checksum of the record before this one.
@@ -87,7 +91,7 @@ pub fn quick(covered: []const u8) ?Head {
     const Envelope = struct { seq: i64, at: i64, v: u32, p: u32 };
     const read = strand.leadingIntMembers(Envelope, covered) orelse return null;
     if (read.value.seq < 1) return null;
-    const seq: u64 = @intCast(read.value.seq);
+    const seq = Seq.fromRaw(aegis.int.cast(u64, read.value.seq) catch return null);
     var at = read.end;
     var batch: ?Batch = null;
     const bf_prefix = ",\"bf\":";
@@ -124,10 +128,13 @@ fn digitsAt(bytes: []const u8, at: *usize) ?i64 {
 
 /// The batch a record of sequence number `seq` names, when it is one that
 /// record can be in.
-fn checkedBatch(seq: u64, first: i64, last: i64) ?Batch {
+fn checkedBatch(seq: Seq, first: i64, last: i64) ?Batch {
     if (first < 1 or last < 1) return null;
-    const batch: Batch = .{ .first = @intCast(first), .last = @intCast(last) };
-    if (batch.first > seq or seq > batch.last) return null;
+    const batch: Batch = .{
+        .first = .fromRaw(aegis.int.cast(u64, first) catch return null),
+        .last = .fromRaw(aegis.int.cast(u64, last) catch return null),
+    };
+    if (batch.first.compare(seq) == .gt or seq.compare(batch.last) == .gt) return null;
     return batch;
 }
 
@@ -160,18 +167,19 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
     };
     const seq = integerOf(found.seq) orelse return error.Corrupt;
     if (seq < 1) return error.Corrupt;
+    const number: Seq = .fromRaw(aegis.int.cast(u64, seq) catch return error.Corrupt);
     const from = @intFromPtr(found.ev.bytes.ptr) - @intFromPtr(line.ptr); // safe: parseLine without copy_strings hands back a view into line; numbers only
     std.debug.assert(from <= line.len);
     std.debug.assert(found.ev.bytes.len <= line.len - from);
     // Both members of a batch or neither, and one the record can be in.
     if ((found.bf == null) != (found.bl == null)) return error.Corrupt;
     const batch: ?Batch = if (found.bf) |bf| checkedBatch(
-        @intCast(seq),
+        number,
         integerOf(bf) orelse return error.Corrupt,
         integerOf(found.bl.?) orelse return error.Corrupt,
     ) orelse return error.Corrupt else null;
     return .{
-        .seq = @intCast(seq),
+        .seq = number,
         .batch = batch,
         .at = integerOf(found.at) orelse return error.Corrupt,
         .v = std.math.cast(u32, integerOf(found.v) orelse return error.Corrupt) orelse return error.Corrupt,
@@ -183,7 +191,7 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
 /// What the segment layer reads of a line: where the record sits in the
 /// sequence, and when the caller said it happened.
 pub const Stamp = struct {
-    seq: u64,
+    seq: Seq,
     /// Null when the line carries no `at`, or one that is not an integer.
     at: ?i64,
 };
@@ -200,7 +208,7 @@ pub fn stamp(gpa: Allocator, line: []const u8) Allocator.Error!?Stamp {
         // A record goes on past its stamp.
         if (line[read.end] != ',') break :quick;
         if (read.value.seq < 1) return null;
-        return .{ .seq = @intCast(read.value.seq), .at = read.value.at };
+        return .{ .seq = .fromRaw(aegis.int.cast(u64, read.value.seq) catch return null), .at = read.value.at };
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
@@ -211,7 +219,7 @@ pub fn stamp(gpa: Allocator, line: []const u8) Allocator.Error!?Stamp {
     };
     const seq = integerOf(found.seq) orelse return null;
     if (seq < 1) return null;
-    return .{ .seq = @intCast(seq), .at = integerOf(found.at) };
+    return .{ .seq = .fromRaw(aegis.int.cast(u64, seq) catch return null), .at = integerOf(found.at) };
 }
 
 /// The `p` a line carries: the checksum of the record before it. Read off
@@ -246,7 +254,7 @@ test "the written shape and any other read as the same envelope" {
     const t = trailer(written).?;
     try testing.expectEqual(@as(u32, 42), t.c);
     const head = quick(t.covered).?;
-    try testing.expectEqual(Head{ .seq = 7, .at = -3, .v = 2, .p = 11, .ev = .{ .from = 35, .to = 42 } }, head);
+    try testing.expectEqual(Head{ .seq = .fromRaw(7), .at = -3, .v = 2, .p = 11, .ev = .{ .from = 35, .to = 42 } }, head);
     try testing.expectEqualStrings("{\"x\":1}", written[head.ev.from..head.ev.to]);
 
     // Reordered and spaced, the same envelope out of its members.
@@ -260,8 +268,8 @@ test "the written shape and any other read as the same envelope" {
     try testing.expectEqualStrings("{\"x\":1}", by_hand[other.ev.from..other.ev.to]);
     try testing.expectEqual(@as(?u32, 11), (try backLink(testing.allocator, by_hand)));
     try testing.expectEqual(@as(?u32, 11), (try backLink(testing.allocator, written)));
-    try testing.expectEqual(Stamp{ .seq = 7, .at = -3 }, (try stamp(testing.allocator, by_hand)).?);
-    try testing.expectEqual(Stamp{ .seq = 7, .at = -3 }, (try stamp(testing.allocator, written)).?);
+    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(7), .at = -3 }, (try stamp(testing.allocator, by_hand)).?);
+    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(7), .at = -3 }, (try stamp(testing.allocator, written)).?);
 
     // An integer only when written as one, within an `i64`, and a sequence
     // number from 1.
@@ -287,7 +295,7 @@ test "the written shape and any other read as the same envelope" {
     const shadowed = "{\"ev\":{\"q\":1,\"p\":99},\"seq\":1,\"at\":1,\"v\":1,\"p\":5,\"c\":3}";
     try testing.expectEqual(@as(?u32, 5), (try backLink(testing.allocator, shadowed)));
     // A timestamp that is not an integer is no timestamp, not a bad line.
-    try testing.expectEqual(Stamp{ .seq = 3, .at = null }, (try stamp(testing.allocator, "{\"at\":\"x\",\"seq\":3}")).?);
+    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(3), .at = null }, (try stamp(testing.allocator, "{\"at\":\"x\",\"seq\":3}")).?);
     try testing.expectEqual(@as(?Stamp, null), (try stamp(testing.allocator, "{\"seq\":0,\"at\":1,\"v\":1}")));
     try testing.expectEqual(@as(?Trailer, null), trailer("{\"seq\":1,\"c\":}"));
     try testing.expectEqual(@as(?Trailer, null), trailer("{\"seq\":1,\"c\":4294967296}"));
@@ -404,7 +412,7 @@ fn checkEnvelope(line: []const u8) !void {
 
     // `stamp` never reads past the line, whatever it holds, and a stamp is
     // a sequence number from 1.
-    if (try stamp(testing.allocator, line)) |found| try testing.expect(found.seq >= 1);
+    if (try stamp(testing.allocator, line)) |found| try testing.expect(values.below(values.beginning, found.seq));
 }
 
 fn fuzzEnvelope(_: void, smith: *testing.Smith) anyerror!void {
@@ -453,7 +461,7 @@ test "the envelope properties hold on a table of awkward lines" {
 test "a record of an atomic batch names a batch it can be in" {
     const covered = "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"bl\":5,\"ev\":{}";
     const head = quick(covered).?;
-    try testing.expectEqual(Batch{ .first = 3, .last = 5 }, head.batch.?);
+    try testing.expectEqual(Batch{ .first = .fromRaw(3), .last = .fromRaw(5) }, head.batch.?);
     try testing.expectEqualStrings("{}", covered[head.ev.from..head.ev.to]);
     for ([_][]const u8{
         "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":5,\"bl\":6,\"ev\":{}",
@@ -465,7 +473,7 @@ test "a record of an atomic batch names a batch it can be in" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     // As members, both or neither, and in range.
-    try testing.expectEqual(Batch{ .first = 3, .last = 5 }, (try members(arena.allocator(), "{\"bl\":5,\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"ev\":{}}")).batch.?);
+    try testing.expectEqual(Batch{ .first = Seq.fromRaw(3), .last = Seq.fromRaw(5) }, (try members(arena.allocator(), "{\"bl\":5,\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"ev\":{}}")).batch.?);
     try testing.expectError(error.Corrupt, members(arena.allocator(), "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bl\":5,\"ev\":{}}"));
     try testing.expectError(error.Corrupt, members(arena.allocator(), "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":5,\"bl\":9,\"ev\":{}}"));
 }

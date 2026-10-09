@@ -61,7 +61,7 @@ pub fn main() !void {
     // --- README:usage ---
 
     var balances: Balances = .{};
-    var last: u64 = 0;
+    var last: chronicle.Seq = chronicle.beginning;
     {
         const ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
         defer ledger.deinit(io);
@@ -71,7 +71,7 @@ pub fn main() !void {
         const now = std.Io.Clock.real.now(io).toMilliseconds();
         _ = try ledger.append(io, now, .{ .account_opened = .{ .id = 1, .owner = "ada" } });
 
-        const follower = try ledger.replayAt(io, .after(0));
+        const follower = try ledger.replayAt(io, .after(chronicle.beginning));
         defer follower.deinit(io);
         _ = (try follower.next(io)).?;
 
@@ -95,7 +95,7 @@ pub fn main() !void {
     defer reopened.deinit(io);
 
     var restored: Balances = .{};
-    var from: u64 = 0;
+    var from: chronicle.Seq = chronicle.beginning;
     if (opened.snapshot) |snapshot| {
         defer snapshot.deinit();
         restored = std.mem.bytesToValue(Balances, snapshot.state[0..@sizeOf(Balances)]);
@@ -104,8 +104,8 @@ pub fn main() !void {
     try reopened.subscribeFrom(io, restored.sink(), from);
     // --- README:usage ---
 
-    try output.print("snapshot: seq {}, {} cents\n", .{ from, balances.cents });
-    try output.print("restored: {} accounts, {} cents, seq {}\n", .{ restored.accounts, restored.cents, try reopened.lastSeq(io) });
+    try output.print("snapshot: seq {}, {} cents\n", .{ from.raw(), balances.cents });
+    try output.print("restored: {} accounts, {} cents, seq {}\n", .{ restored.accounts, restored.cents, (try reopened.lastSeq(io)).raw() });
     const batch = try reopened.copySince(gpa, io, from);
     defer batch.deinit();
     if (!batch.complete()) return error.IncompleteTail;
@@ -114,6 +114,6 @@ pub fn main() !void {
     defer readers.deinit();
     if (readers.items().len != 0) return error.UnexpectedReader;
     if (restored.cents != balances.cents) return error.FoldMismatch;
-    if (last != 3) return error.UnexpectedSequence;
+    if (last != chronicle.Seq.fromRaw(3)) return error.UnexpectedSequence;
     try output.flush();
 }

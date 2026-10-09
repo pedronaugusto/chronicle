@@ -1,6 +1,7 @@
 //! Opaque owners for replay walks and named readers.
 const std = @import("std");
 const Io = std.Io;
+const Seq = @import("values.zig").Seq;
 
 pub fn ReplayOwner(comptime State: type, comptime PositionType: type) type {
     return opaque {
@@ -65,7 +66,7 @@ pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
         }
         /// Where this reader has got to, copied under the journal lock.
         /// Safe to call from any task or thread, except from inside a sink.
-        pub fn cursor(tail: *Self, io: Io) Io.Cancelable!u64 {
+        pub fn cursor(tail: *Self, io: Io) Io.Cancelable!Seq {
             return State.Tailer.cursor(tail.inner(), io);
         }
 
@@ -91,7 +92,7 @@ pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
         /// never a number that was never reached.
         ///
         /// Safe to call from any task or thread.
-        pub fn commit(tail: *Self, io: Io, seq: u64) State.TailerError!void {
+        pub fn commit(tail: *Self, io: Io, seq: Seq) State.TailerError!void {
             return State.Tailer.commit(tail.inner(), io, seq);
         }
 

@@ -84,7 +84,7 @@ pub fn main() !void {
     _ = try ledger.append(io, 0, .{ .deposited = .{ .id = 1, .cents = 700 } });
 
     var cents: i64 = 0;
-    const batch = try ledger.copySince(gpa, io, 0);
+    const batch = try ledger.copySince(gpa, io, chronicle.beginning);
     defer batch.deinit();
     for (batch.records()) |record| {
         switch (record.event) {

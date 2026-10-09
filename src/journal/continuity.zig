@@ -1,6 +1,9 @@
 //! Sequence, checksum and atomic-batch continuity across segment boundaries.
-const std = @import("std");
+const aegis = @import("aegis");
 const envelope = @import("envelope.zig");
+const values = @import("values.zig");
+
+const Seq = values.Seq;
 
 pub fn State(comptime Header: type, comptime ReadError: type, comptime Boundary: type) type {
     return struct {
@@ -8,8 +11,8 @@ pub fn State(comptime Header: type, comptime ReadError: type, comptime Boundary:
         pub const Error = ReadError;
         pub const SegmentBoundary = Boundary;
         pub const RecordHeader = Header;
-        cursor: u64,
-        expected: ?u64 = null,
+        cursor: Seq,
+        expected: ?Seq = null,
         link: ?u32 = null,
         /// The atomic batch the walk is inside, from its first record to
         /// its last.
@@ -35,11 +38,14 @@ pub fn State(comptime Header: type, comptime ReadError: type, comptime Boundary:
         /// Whether this record is one to hand on. False means it is at or
         /// behind the cursor and has been stepped over.
         pub fn accept(walk: *Self, header: RecordHeader) Error!bool {
-            std.debug.assert(header.seq > 0);
-            std.debug.assert(header.seq <= std.math.maxInt(i64));
+            // The header comes off a disk by way of the envelope reader, which
+            // refuses anything else; a walk that is handed one that is not has
+            // a broken reader, and stops rather than number records from it.
+            aegis.assert.pre(header.seq != values.beginning, "a record is numbered from one");
+            aegis.assert.pre(header.seq.compare(values.newest_possible) != .gt, "a record is numbered no higher than an i64");
             if (header.batch) |batch| {
-                std.debug.assert(batch.first <= header.seq);
-                std.debug.assert(header.seq <= batch.last);
+                aegis.assert.pre(batch.first.compare(header.seq) != .gt, "a batch starts at or before its record");
+                aegis.assert.pre(header.seq.compare(batch.last) != .gt, "a batch ends at or after its record");
             }
             if (walk.expected) |want| {
                 if (header.seq != want) return error.DiscontinuousSeq;
@@ -48,9 +54,9 @@ pub fn State(comptime Header: type, comptime ReadError: type, comptime Boundary:
                 if (header.p != previous) return error.BrokenChain;
             }
             try walk.acceptBatch(header);
-            walk.expected = header.seq + 1;
+            walk.expected = values.following(header.seq);
             walk.link = header.c;
-            return header.seq > walk.cursor;
+            return header.seq.compare(walk.cursor) == .gt;
         }
 
         /// A batch's records come one after another, each naming the

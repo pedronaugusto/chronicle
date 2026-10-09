@@ -5,8 +5,8 @@
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight#77f962bc4c0fbbbb50d396fd5178aa1c53b47dd9",
-            .hash = "preflight-0.1.0-LX1ZwipfBgC2uEmcxnCJlGRQqWyGA4XVgSEBDBETBT6F",
+            .url = "git+https://github.com/pedronaugusto/preflight#387e188a9b8e9f0a157d528606cc2db4175db7de",
+            .hash = "preflight-0.1.0-LX1ZwgwgCQAGeK4DZqDnyq6HZfbJkupClWp56O8kY_Db",
             .lazy = true,
         },
 
@@ -26,14 +26,18 @@
         // Test doubles, for the tests alone: no module a consumer builds
         // imports it, and a consumer never fetches it.
         .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown#1bb13e70ed64563d8bce33ed507ffa450f135769",
-            .hash = "shakedown-0.1.0-BR8U4wZFCADbHwHZYu07dR4hVzc_JjeTiZy8phJDromo",
+            .url = "git+https://github.com/pedronaugusto/shakedown#e99eccb269dfeeb4569bce843743ec80c6e094c3",
+            .hash = "shakedown-0.1.0-BR8U4-XJEAB46Facu1RERO-yErm9BwNcJGUxxk9vMLQv",
             .lazy = true,
         },
         // Record and index CRC-32C, with runtime CPU dispatch.
         .warp = .{
             .url = "git+https://github.com/pedronaugusto/warp#e607c194f837fa0a7a8c08914495d4cc0202eb91",
             .hash = "warp-0.1.0-JASxFYjCAwAP0PAOtv3qiGkW9TIRI_Wwg0jwlH8FhtSZ",
+        },
+        .aegis = .{
+            .url = "git+https://github.com/pedronaugusto/aegis#f199c0d7004cf022026b6d3933543665fd35a994",
+            .hash = "aegis-0.0.0-rsxouoQPBAA-wTYL0qWzpqy-1nrKc3R3Ze5Cl_S2HKse",
         },
     },
     .paths = .{

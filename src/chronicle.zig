@@ -43,6 +43,31 @@ const implementation = @import("journal.zig");
 /// slice of the record's line; `Raw.parse` reads it as a type.
 pub const Raw = strand.Raw;
 
+/// Where a record sits in the sequence, and so where a reader has got to.
+/// The first record of a journal that has never been compacted is 1, and each
+/// one after it is the next. Zero is the place before the first record, which
+/// is what a reader that has handled nothing stands at, and `beginning` names
+/// it.
+///
+/// It is an aegis id: it has equality and an order and cannot be added to or
+/// mixed with a count of records or of bytes. A number read from elsewhere
+/// comes in with `Seq.fromRaw`, and `raw` hands it back out.
+pub const Seq = implementation.Seq;
+
+/// The place before the first record: what `replay`, `subscribe` and a new
+/// `tailer` start from to read everything the log holds.
+pub const beginning: Seq = implementation.beginning;
+
+/// A length or an offset in bytes: how large a segment may grow, how large a
+/// record may be, how many bytes a journal dropped or holds. An aegis count,
+/// kept apart from every other kind of number; `Bytes.fromRaw(n)` makes one.
+pub const Bytes = implementation.Bytes;
+
+/// A number of records: how many a segment may hold, how many a journal's
+/// tail keeps, how many a `verify` walked. An aegis count, kept apart from
+/// bytes and from sequence numbers; `Records.fromRaw(n)` makes one.
+pub const Records = implementation.Records;
+
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
 pub const OnTruncated = Log.OnTruncated;
@@ -81,14 +106,14 @@ pub const Verify = implementation.Verify;
 /// The name of the segment file whose first record is `base_seq`, relative to
 /// the journal's directory. Exposed because a journal's directory is meant to
 /// be read with `tail -f` and with your eyes.
-pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len:0]u8 {
+pub fn segmentName(base_seq: Seq) [Log.name_digits + segment_extension.len:0]u8 {
     return implementation.segmentName(base_seq);
 }
 
 /// The name of the index beside the segment `segmentName(base_seq)` names:
 /// a cache of where its records are, which `open` rebuilds when it is gone
 /// or does not describe the segment.
-pub fn indexName(base_seq: u64) [Log.name_digits + index_extension.len:0]u8 {
+pub fn indexName(base_seq: Seq) [Log.name_digits + index_extension.len:0]u8 {
     return implementation.indexName(base_seq);
 }
 
@@ -526,7 +551,7 @@ pub fn Journal(comptime Event: type) type {
         /// the cancel is the caller's next cancelation point's to report.
         ///
         /// Safe to call from any task or thread.
-        pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
+        pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!Seq {
             return State.append(self.inner(), io, at, event);
         }
 
@@ -551,7 +576,7 @@ pub fn Journal(comptime Event: type) type {
         /// Under `.on_segment` and `.never` it is `append`.
         ///
         /// Safe to call from any task or thread.
-        pub fn appendDeferred(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
+        pub fn appendDeferred(self: *Self, io: Io, at: i64, event: Event) AppendError!Seq {
             return State.appendDeferred(self.inner(), io, at, event);
         }
 
@@ -597,7 +622,7 @@ pub fn Journal(comptime Event: type) type {
         /// An empty slice writes nothing and returns `lastSeq`.
         ///
         /// Safe to call from any task or thread.
-        pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!u64 {
+        pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!Seq {
             return State.appendAll(self.inner(), io, entries, commit);
         }
 
@@ -615,7 +640,7 @@ pub fn Journal(comptime Event: type) type {
         /// by a failed write — says that first.
         ///
         /// Safe to call from any task or thread.
-        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: i64, event: Event) AppendIfError!u64 {
+        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: i64, event: Event) AppendIfError!Seq {
             return State.appendIf(self.inner(), io, expected, at, event);
         }
 
@@ -624,7 +649,7 @@ pub fn Journal(comptime Event: type) type {
         /// writes nothing.
         ///
         /// Safe to call from any task or thread.
-        pub fn appendAllIf(self: *Self, io: Io, expected: Expected, entries: []const Entry, commit: Commit) AppendIfError!u64 {
+        pub fn appendAllIf(self: *Self, io: Io, expected: Expected, entries: []const Entry, commit: Commit) AppendIfError!Seq {
             return State.appendAllIf(self.inner(), io, expected, entries, commit);
         }
 
@@ -639,7 +664,7 @@ pub fn Journal(comptime Event: type) type {
         /// before deciding whether to retry it. A record that survived is
         /// handed to every subscribed sink and wakes every `waitPast`, as
         /// an append would have.
-        pub fn reconcile(self: *Self, io: Io) ReconcileError!u64 {
+        pub fn reconcile(self: *Self, io: Io) ReconcileError!Seq {
             return State.reconcile(self.inner(), io);
         }
 
@@ -671,7 +696,7 @@ pub fn Journal(comptime Event: type) type {
         /// must be finite trees of data accepted by `strand.copyOwned`. The exact
         /// stored bytes and original schema versions are preserved separately.
         /// Safe to call from any task or thread, except from inside a sink.
-        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: u64) CopyError!*Batch {
+        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: Seq) CopyError!*Batch {
             return Batch.from(try State.copySince(self.inner(), gpa, io, cursor));
         }
 
@@ -683,7 +708,7 @@ pub fn Journal(comptime Event: type) type {
         /// The tail may move between waiting and reading; `Batch.complete()`
         /// tells a reader whether it needs the disk to cover the gap.
         /// Safe to call from any task or thread, including several at once.
-        pub fn waitPast(self: *Self, io: Io, cursor: u64) Io.Cancelable!u64 {
+        pub fn waitPast(self: *Self, io: Io, cursor: Seq) Io.Cancelable!Seq {
             return State.waitPast(self.inner(), io, cursor);
         }
 
@@ -713,7 +738,7 @@ pub fn Journal(comptime Event: type) type {
         /// index handle and live index buffer belong to the journal. The
         /// returned walk owns its scan metadata and reads without that lock.
         /// Safe to call from any task or thread, except from inside a sink.
-        pub fn replay(self: *Self, io: Io, cursor: u64) ReplayError!*Replay {
+        pub fn replay(self: *Self, io: Io, cursor: Seq) ReplayError!*Replay {
             return Replay.from(try State.replay(self.inner(), io, cursor));
         }
 
@@ -760,14 +785,14 @@ pub fn Journal(comptime Event: type) type {
         /// lock and read without it; retention beside it may remove a file
         /// it needs, which is reported as an error.
         /// Safe to call from any task or thread, except from inside a sink.
-        pub fn verify(self: *Self, io: Io) ReplayError!u64 {
+        pub fn verify(self: *Self, io: Io) ReplayError!Records {
             return State.verify(self.inner(), io);
         }
 
         /// The newest sequence number, or zero on an empty journal.
         ///
         /// Safe to call from any task or thread.
-        pub fn lastSeq(self: *Self, io: Io) Io.Cancelable!u64 {
+        pub fn lastSeq(self: *Self, io: Io) Io.Cancelable!Seq {
             return State.lastSeq(self.inner(), io);
         }
 
@@ -797,7 +822,7 @@ pub fn Journal(comptime Event: type) type {
         /// record that has no time.
         ///
         /// Safe to call from any task or thread.
-        pub fn seqAtOrAfter(self: *Self, io: Io, at: i64) SeekError!?u64 {
+        pub fn seqAtOrAfter(self: *Self, io: Io, at: i64) SeekError!?Seq {
             return State.seqAtOrAfter(self.inner(), io, at);
         }
 
@@ -831,7 +856,7 @@ pub fn Journal(comptime Event: type) type {
         /// a log with no records in it. Compare it against a cursor to see what
         /// a reader has missed for good.
         /// Safe to call from any task or thread, except from inside a sink.
-        pub fn oldestSeq(self: *Self, io: Io) Io.Cancelable!u64 {
+        pub fn oldestSeq(self: *Self, io: Io) Io.Cancelable!Seq {
             return State.oldestSeq(self.inner(), io);
         }
 
@@ -881,7 +906,7 @@ pub fn Journal(comptime Event: type) type {
         /// not the year. The journal's lock is held for the whole replay: an
         /// `append` from another task waits for it, which is what makes the
         /// hand-over from the disk to the live records seamless.
-        pub fn subscribeFrom(self: *Self, io: Io, sink: Sink, cursor: u64) SubscribeError!void {
+        pub fn subscribeFrom(self: *Self, io: Io, sink: Sink, cursor: Seq) SubscribeError!void {
             return State.subscribeFrom(self.inner(), io, sink, cursor);
         }
 
@@ -904,7 +929,7 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// The sinks are registered in the order given and are called in that
         /// order for every record afterwards.
-        pub fn subscribeAllFrom(self: *Self, io: Io, sinks: []const Sink, cursor: u64) SubscribeError!void {
+        pub fn subscribeAllFrom(self: *Self, io: Io, sinks: []const Sink, cursor: Seq) SubscribeError!void {
             return State.subscribeAllFrom(self.inner(), io, sinks, cursor);
         }
 
@@ -951,7 +976,7 @@ pub fn Journal(comptime Event: type) type {
         /// nothing beside the log says it exists.
         ///
         /// Safe to call from any task or thread.
-        pub fn minCursor(self: *Self, io: Io) TailerError!?u64 {
+        pub fn minCursor(self: *Self, io: Io) TailerError!?Seq {
             return State.minCursor(self.inner(), io);
         }
 
@@ -1000,7 +1025,7 @@ pub fn Journal(comptime Event: type) type {
         /// reader notices.
         ///
         /// Safe to call from any task or thread.
-        pub fn dropSegmentsBefore(self: *Self, io: Io, seq: u64) DropError!u64 {
+        pub fn dropSegmentsBefore(self: *Self, io: Io, seq: Seq) DropError!u64 {
             return State.dropSegmentsBefore(self.inner(), io, seq);
         }
 
@@ -1031,7 +1056,7 @@ pub fn Journal(comptime Event: type) type {
         /// Owned batches remain valid; subscribed sinks are not called again.
         ///
         /// Safe to call from any task or thread.
-        pub fn truncateAfter(self: *Self, io: Io, seq: u64) TruncateError!void {
+        pub fn truncateAfter(self: *Self, io: Io, seq: Seq) TruncateError!void {
             return State.truncateAfter(self.inner(), io, seq);
         }
 
@@ -1053,7 +1078,7 @@ pub fn Journal(comptime Event: type) type {
         /// Owned batches remain valid; subscribed sinks are not called again.
         ///
         /// Safe to call from any task or thread.
-        pub fn compact(self: *Self, io: Io, keep_after_seq: u64) CompactError!void {
+        pub fn compact(self: *Self, io: Io, keep_after_seq: Seq) CompactError!void {
             return State.compact(self.inner(), io, keep_after_seq);
         }
 
@@ -1085,7 +1110,7 @@ pub fn Journal(comptime Event: type) type {
         /// Windows, where a sync of each would flush it once per file.
         ///
         /// Safe to call from any task or thread.
-        pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!u64 {
+        pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!Seq {
             return State.backup(self.inner(), io, dest);
         }
 
@@ -1095,7 +1120,7 @@ pub fn Journal(comptime Event: type) type {
         /// An opaque, allocated named reader and the cursor it has committed.
         /// Keep its pointer and release it exactly once, before the journal.
         ///
-        /// A cursor is a `u64` — the sequence number a reader has finished
+        /// A cursor is a `Seq` — the sequence number a reader has finished
         /// with — and this is that number with a name and somewhere to live:
         /// `<path>/<name>.cursor`, replaced whole the way a snapshot is, so a
         /// reader that restarts picks up where it left off without the program

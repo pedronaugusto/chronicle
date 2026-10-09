@@ -58,7 +58,7 @@ fn check(workload: []const u8, metric: []const u8, value: u64) !void {
 }
 
 fn options(sync: chronicle.Sync, access: chronicle.Access) J.Options {
-    return .{ .access = access, .sync = sync, .tail_records = 0, .tail_bytes = 0, .max_segment_bytes = 8 * 1024 * 1024, .verify_round_trip = false };
+    return .{ .access = access, .sync = sync, .tail_records = .fromRaw(0), .tail_bytes = .fromRaw(0), .max_segment_bytes = .fromRaw(8 * 1024 * 1024), .verify_round_trip = false };
 }
 
 /// Pseudo-random cursors, the same on every run: an LCG, high bits.
@@ -176,8 +176,8 @@ fn verify(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const started = now(io);
     const records = try journal.verify(io);
     const elapsed = since(io, started);
-    try rate("verify", records, elapsed);
-    try check("verify", "records", records);
+    try rate("verify", records.raw(), elapsed);
+    try check("verify", "records", records.raw());
 }
 
 /// `open` with `verify = .full`: the work of a recovery that reads every
@@ -191,7 +191,7 @@ fn reopenFull(io: Io, gpa: std.mem.Allocator, data: []const u8, repetitions: usi
         const started = now(io);
         const journal = try J.open(gpa, io, data, o);
         total += since(io, started);
-        last = try journal.lastSeq(io);
+        last = (try journal.lastSeq(io)).raw();
         journal.deinit(io);
     }
     try row("clean_reopen", "elapsed", @as(f64, @floatFromInt(total)) / 1e6 / @as(f64, @floatFromInt(repetitions)), "ms");
@@ -202,18 +202,18 @@ fn reopenFull(io: Io, gpa: std.mem.Allocator, data: []const u8, repetitions: usi
 fn seek(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const journal = try J.open(gpa, io, data, options(.never, .read));
     defer journal.deinit(io);
-    const count = try journal.lastSeq(io);
+    const count = (try journal.lastSeq(io)).raw();
     const rounds: usize = if (smoke) 1 else 2_000;
     var cursors: Cursors = .{};
     var sum: u64 = 0;
     const started = now(io);
     for (0..rounds) |_| {
         const cursor = cursors.next(count);
-        const walk = try journal.replay(io, cursor);
+        const walk = try journal.replay(io, .fromRaw(cursor));
         defer walk.deinit(io);
         const record = (try walk.next(io)) orelse return error.NoRecord;
-        if (record.seq != cursor + 1) return error.WrongSequence;
-        sum += record.seq;
+        if (record.seq != chronicle.Seq.fromRaw(cursor + 1)) return error.WrongSequence;
+        sum += record.seq.raw();
     }
     const elapsed = since(io, started);
     try rate("seek", rounds, elapsed);
@@ -224,14 +224,14 @@ fn seek(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
 fn seqAt(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const journal = try J.open(gpa, io, data, options(.never, .read));
     defer journal.deinit(io);
-    const count = try journal.lastSeq(io);
+    const count = (try journal.lastSeq(io)).raw();
     const rounds: usize = if (smoke) 1 else 10_000;
     var cursors: Cursors = .{};
     var sum: u64 = 0;
     const started = now(io);
     for (0..rounds) |_| {
         const at = cursors.next(count) + 1;
-        sum += (try journal.seqAtOrAfter(io, @intCast(at))) orelse return error.NoRecord;
+        sum += ((try journal.seqAtOrAfter(io, @intCast(at))) orelse return error.NoRecord).raw();
     }
     const elapsed = since(io, started);
     try rate("seq-at", rounds, elapsed);
@@ -253,12 +253,12 @@ const Fold = struct {
 fn subscribeFrom(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const journal = try J.open(gpa, io, data, options(.never, .read));
     defer journal.deinit(io);
-    const count = try journal.lastSeq(io);
+    const count = (try journal.lastSeq(io)).raw();
     const from = count - count / 10;
     {
         var one: Fold = .{};
         const started = now(io);
-        try journal.subscribeFrom(io, one.sink(), from);
+        try journal.subscribeFrom(io, one.sink(), .fromRaw(from));
         const elapsed = since(io, started);
         _ = try journal.unsubscribe(io, one.sink());
         try rate("subscribe-from", count - from, elapsed);
@@ -269,7 +269,7 @@ fn subscribeFrom(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
         var sinks: [5]J.Sink = undefined;
         for (&five, &sinks) |*fold, *s| s.* = fold.sink();
         const started = now(io);
-        try journal.subscribeAllFrom(io, &sinks, from);
+        try journal.subscribeAllFrom(io, &sinks, .fromRaw(from));
         const elapsed = since(io, started);
         var seen: u64 = 0;
         for (five) |fold| seen += fold.seen;
@@ -287,7 +287,7 @@ fn copySince(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     var records: u64 = 0;
     const started = now(io);
     for (0..rounds) |_| {
-        const batch = try journal.copySince(gpa, io, 10_000 - 100);
+        const batch = try journal.copySince(gpa, io, .fromRaw(10_000 - 100));
         defer batch.deinit();
         if (!batch.complete()) return error.Incomplete;
         records += batch.records().len;
@@ -312,7 +312,7 @@ fn refresh(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
         try reader.refresh(io);
         total += since(io, started);
     }
-    const last = try reader.lastSeq(io);
+    const last = (try reader.lastSeq(io)).raw();
     try rate("refresh", rounds, total);
     try check("refresh", "last", last);
 }
@@ -334,14 +334,14 @@ fn stamp(io: Io) i64 {
 /// `copySince`.
 fn wait(io: Io, gpa: std.mem.Allocator, journal: *J, rounds: u64, waiter: *Waiter) !void {
     defer waiter.ended.store(true, .release);
-    var cursor: u64 = 1000;
+    var cursor: chronicle.Seq = .fromRaw(1000);
     for (0..rounds) |i| {
         while (true) {
             _ = try journal.waitPast(io, cursor);
             const batch = try journal.copySince(gpa, io, cursor);
             defer batch.deinit();
             const newest = if (batch.records().len == 0) cursor else batch.records()[batch.records().len - 1].seq;
-            if (newest > cursor) {
+            if (newest.compare(cursor) == .gt) {
                 cursor = newest;
                 break;
             }
@@ -383,11 +383,11 @@ fn deferred(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     const last = try journal.append(io, @intCast(count), .{ .value = 1, .padding = padding });
     const elapsed = since(io, started);
     try rate("append-deferred", count, elapsed);
-    try check("append-deferred", "last", last);
+    try check("append-deferred", "last", last.raw());
     // `reconcile` on a healthy journal: the tail rebuilt from the disk.
     const rounds: usize = if (smoke) 1 else 100;
     const reconcile_started = now(io);
-    for (0..rounds) |_| if (try journal.reconcile(io) != count) return error.WrongSequence;
+    for (0..rounds) |_| if (try journal.reconcile(io) != chronicle.Seq.fromRaw(count)) return error.WrongSequence;
     try rate("reconcile", rounds, since(io, reconcile_started));
 }
 
@@ -407,7 +407,7 @@ fn tailers(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
         for (0..commits) |c| {
             const seq: u64 = 100 * (k + 1) + c;
             const started = now(io);
-            try t.commit(io, seq);
+            try t.commit(io, chronicle.Seq.fromRaw(seq));
             commit_ns += since(io, started);
             committed += 1;
         }
@@ -424,7 +424,7 @@ fn tailers(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     try rate("readers", rounds, since(io, list_started));
     var lowest: u64 = 0;
     const min_started = now(io);
-    for (0..rounds) |_| lowest += (try journal.minCursor(io)) orelse return error.NoCursor;
+    for (0..rounds) |_| lowest += ((try journal.minCursor(io)) orelse return error.NoCursor).raw();
     try rate("min-cursor", rounds, since(io, min_started));
     var replayed: u64 = 0;
     const replay_started = now(io);
@@ -462,7 +462,7 @@ fn snapshots(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
         const opened = try J.openWithSnapshot(gpa, io, scratch, .{ .sync = .never });
         defer opened.journal.deinit(io);
         const taken = opened.snapshot orelse return error.NoSnapshot;
-        seq += taken.seq;
+        seq += taken.seq.raw();
         taken.deinit();
     }
     try rate("open-with-snapshot", rounds, since(io, started));
@@ -482,25 +482,25 @@ fn retention(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
         defer gpa.free(path);
         Io.Dir.cwd().deleteTree(io, path) catch {};
         {
-            const filling = try J.open(gpa, io, path, .{ .sync = .never, .max_segment_bytes = segment });
+            const filling = try J.open(gpa, io, path, .{ .sync = .never, .max_segment_bytes = chronicle.Bytes.fromRaw(segment) });
             defer filling.deinit(io);
             try fill(filling, io, count);
         }
-        const journal = try J.open(gpa, io, path, .{ .sync = .always, .max_segment_bytes = segment });
+        const journal = try J.open(gpa, io, path, .{ .sync = .always, .max_segment_bytes = chronicle.Bytes.fromRaw(segment) });
         defer journal.deinit(io);
         const started = now(io);
         switch (op) {
-            .drop => _ = try journal.dropSegmentsBefore(io, half),
-            .truncate => try journal.truncateAfter(io, three_quarters),
-            .compact => try journal.compact(io, half),
+            .drop => _ = try journal.dropSegmentsBefore(io, .fromRaw(half)),
+            .truncate => try journal.truncateAfter(io, .fromRaw(three_quarters)),
+            .compact => try journal.compact(io, .fromRaw(half)),
         }
         const elapsed = since(io, started);
         try row(work, "elapsed", @as(f64, @floatFromInt(elapsed)) / 1e6, "ms");
-        try check(work, "last", try journal.lastSeq(io));
+        try check(work, "last", (try journal.lastSeq(io)).raw());
         // Where whole segments are dropped, the oldest left depends on where
         // segments end, which depends on the encoding: it is only bounded.
         const oldest = try journal.oldestSeq(io);
-        try check(work, if (op == .drop) "oldest_after_drop" else "oldest", if (op == .drop) @intFromBool(oldest <= half) else oldest);
+        try check(work, if (op == .drop) "oldest_after_drop" else "oldest", if (op == .drop) @intFromBool(oldest.compare(.fromRaw(half)) != .gt) else oldest.raw());
     }
 }
 
@@ -515,7 +515,7 @@ fn backup(io: Io, gpa: std.mem.Allocator, data: []const u8, dest: []const u8) !v
     try row("backup", "elapsed", @as(f64, @floatFromInt(elapsed)) / 1e6, "ms");
     // What is checked is that every segment byte arrived.
     try check("backup", "segments_complete", @intFromBool(try treeBytes(io, dest) == try treeBytes(io, data)));
-    try check("backup-records", "records", records);
+    try check("backup-records", "records", records.raw());
     Io.Dir.cwd().deleteTree(io, dest) catch {};
 }
 

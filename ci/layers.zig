@@ -6,6 +6,7 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/journal/clone.zig",
         "src/journal/Encoding.zig",
         "src/journal/jsonl.zig",
+        "src/journal/values.zig",
     } },
     .{ .name = "envelopes", .patterns = &.{
         "src/journal/envelope.zig",
@@ -28,6 +29,7 @@ pub const entries: []const []const u8 = &.{};
 pub const modules: []const gantry.NamedModule = &.{.{ .name = "chronicle", .path = "src/chronicle.zig", .from = "src/testing/lock_helper.zig" }};
 pub const references: []const gantry.rules.ReferenceRule = &.{
     .{ .name = "named dependencies", .unresolved_only = true, .except_targets = &.{
+        "aegis",
         "airlock",
         "airlock.testing",
         "builtin",
@@ -47,6 +49,7 @@ pub const required = [_][]const u8{
     "src/journal/clone.zig",
     "src/journal/Encoding.zig",
     "src/journal/jsonl.zig",
+    "src/journal/values.zig",
     "src/journal/envelope.zig",
     "src/journal/continuity.zig",
     "src/journal/facade.zig",

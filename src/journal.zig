@@ -8,9 +8,16 @@ const Io = std.Io;
 const continuity = @import("journal/continuity.zig");
 const Log = @import("journal/Log.zig");
 const Crc32c = @import("warp").Crc32c;
+const aegis = @import("aegis");
 const strand = @import("journal/jsonl.zig").strand;
 const envelope = @import("journal/envelope.zig");
 const Encoding = @import("journal/Encoding.zig");
+const values = @import("journal/values.zig");
+
+pub const Seq = values.Seq;
+pub const Bytes = values.Bytes;
+pub const Records = values.Records;
+pub const beginning = values.beginning;
 
 pub const Raw = strand.Raw;
 
@@ -41,11 +48,11 @@ pub const Verify = enum {
     full,
 };
 
-pub fn segmentName(base_seq: u64) [Log.name_digits + segment_extension.len:0]u8 {
+pub fn segmentName(base_seq: Seq) [Log.name_digits + segment_extension.len:0]u8 {
     return Log.segmentName(segment_extension, base_seq);
 }
 
-pub fn indexName(base_seq: u64) [Log.name_digits + index_extension.len:0]u8 {
+pub fn indexName(base_seq: Seq) [Log.name_digits + index_extension.len:0]u8 {
     return Log.segmentName(index_extension, base_seq);
 }
 
@@ -58,25 +65,25 @@ pub fn checksum(covered: []const u8) u32 {
 pub const Position = struct {
     /// The reader has every record up to and including this sequence
     /// number: what it would pass to `replay`.
-    cursor: u64,
+    cursor: Seq,
     /// The last record the walk read, handed on or stepped over; null when
     /// it read none, in which case `replayAt` is `replay` from `cursor`.
     last: ?Last = null,
 
     pub const Last = struct {
-        seq: u64,
+        seq: Seq,
         /// The segment holding it, by the sequence number it is named after.
-        segment: u64,
+        segment: Seq,
         /// Where its line starts in the segment's file, and where the next
         /// one starts.
-        start: u64,
-        end: u64,
+        start: Bytes,
+        end: Bytes,
         /// Its checksum, which the record after it carries as its back-link.
         checksum: u32,
     };
 
     /// A position that is only a cursor: `replayAt` from it is `replay`.
-    pub fn after(cursor: u64) Position {
+    pub fn after(cursor: Seq) Position {
         return .{ .cursor = cursor };
     }
 };
@@ -137,14 +144,14 @@ pub fn Journal(comptime Event: type) type {
         futex_wakes: u64,
         /// The sequence number of the newest record, or zero. Read it with
         /// `lastSeq`, which takes the lock.
-        seq: u64,
+        seq: Seq,
 
         pub const Record = struct {
             /// Position in the log. The first record of a journal that has
             /// never been compacted is 1, and it rises by one per record. It is
             /// written as a JSON integer, so `maxInt(i64)` is the last one a
             /// journal can hold; see `AppendError.SequenceExhausted`.
-            seq: u64,
+            seq: Seq,
             /// Whatever the appender passed as `at`. chronicle never reads a
             /// clock; milliseconds since the Unix epoch is the intended unit.
             at: i64,
@@ -216,7 +223,7 @@ pub fn Journal(comptime Event: type) type {
             fn appendAssumeCapacity(tail: *Tail, owned: OwnedRecord) void {
                 std.debug.assert(tail.entries.items.len < tail.entries.capacity);
                 if (tail.entries.items.len != 0) {
-                    std.debug.assert(tail.entries.items[tail.entries.items.len - 1].record.seq < owned.record.seq);
+                    std.debug.assert(values.below(tail.entries.items[tail.entries.items.len - 1].record.seq, owned.record.seq));
                 }
                 tail.entries.appendAssumeCapacity(owned);
                 tail.bytes += owned.record.bytes.len;
@@ -225,8 +232,8 @@ pub fn Journal(comptime Event: type) type {
             fn trim(tail: *Tail, options: Options) void {
                 var drop: usize = 0;
                 var held = tail.bytes;
-                while (tail.entries.items.len - drop > options.tail_records or
-                    (held > options.tail_bytes and drop < tail.entries.items.len))
+                while (tail.entries.items.len - drop > values.limit(options.tail_records) or
+                    (held > values.limit(options.tail_bytes) and drop < tail.entries.items.len))
                 {
                     held -= tail.entries.items[drop].record.bytes.len;
                     drop += 1;
@@ -298,15 +305,15 @@ pub fn Journal(comptime Event: type) type {
             /// How many of the newest records to keep in memory for
             /// `copySince` and subscriptions. Older ones come from the disk.
             /// Zero is allowed: then `replay` and `subscribe` are the ways to read.
-            tail_records: usize = 1024,
+            tail_records: Records = .fromRaw(1024),
             /// A second ceiling on the tail, over the records' bytes, for a
             /// journal whose records are large. Whichever bites first wins.
-            tail_bytes: usize = 1024 * 1024,
+            tail_bytes: Bytes = .fromRaw(1024 * 1024),
             /// How large a segment may grow before the next `append` starts a
             /// new one. It is also how much of the log `open` reads.
-            max_segment_bytes: u64 = 8 * 1024 * 1024,
+            max_segment_bytes: Bytes = .fromRaw(8 * 1024 * 1024),
             /// A second ceiling on a segment, over records. Null is none.
-            max_segment_records: ?u64 = null,
+            max_segment_records: ?Records = null,
             /// How far ahead of the records the active segment is kept
             /// zero-filled, so that an append writes into space the file
             /// already has instead of extending it. Zero, the default,
@@ -319,7 +326,7 @@ pub fn Journal(comptime Event: type) type {
             /// written once as zeros and once as records — so it is worth
             /// setting on a journal whose `sync` is `.always` and whose
             /// records are small, and worth leaving alone otherwise.
-            preallocate_bytes: u64 = 0,
+            preallocate_bytes: Bytes = .fromRaw(0),
             /// How many bytes of segment one index entry covers.
             ///
             /// The index is a cache that turns a cursor into a seek. One
@@ -332,25 +339,25 @@ pub fn Journal(comptime Event: type) type {
             /// makes `seqAtOrAfter` read the segment where a smaller one
             /// would have answered from the index alone. Values above
             /// `maxInt(u32)` are refused with `error.IndexIntervalTooLarge`.
-            index_interval_bytes: u64 = 4096,
+            index_interval_bytes: Bytes = .fromRaw(4096),
             /// How long a record's line may be.
             ///
             /// `append` refuses a longer one, and a read refuses a segment
             /// with no newline within that many bytes — which is what stops
             /// a damaged segment being taken into memory whole to find out
             /// that it holds no record.
-            max_record_bytes: usize = 1024 * 1024,
+            max_record_bytes: Bytes = .fromRaw(1024 * 1024),
             /// How large a snapshot file may be to be written or read back. It holds
             /// whatever a fold serialises to, so this is the caller's number
             /// and not the package's; a larger one is
             /// `error.SnapshotTooLarge`.
-            max_snapshot_bytes: usize = 64 * 1024 * 1024,
+            max_snapshot_bytes: Bytes = .fromRaw(64 * 1024 * 1024),
             /// Size of the journal's write buffer. One `append` of a record
             /// larger than this costs an extra write syscall, nothing more.
-            write_buffer_size: usize = 64 * 1024,
+            write_buffer_size: Bytes = .fromRaw(64 * 1024),
             /// Size of the buffer a read from the disk streams through.
             /// Zero uses one byte, the lookahead needed to recognize a line.
-            read_buffer_size: usize = 64 * 1024,
+            read_buffer_size: Bytes = .fromRaw(64 * 1024),
             /// Whether `append` parses every record back out of the bytes it
             /// is about to write, to prove the `Event` survives the round
             /// trip, and answers `error.NotRoundTrippable` when it does not.
@@ -364,7 +371,7 @@ pub fn Journal(comptime Event: type) type {
         };
 
         pub const Snapshot = struct {
-            seq: u64,
+            seq: Seq,
             state: []const u8,
             /// Private: the allocator `openWithSnapshot` was given, which
             /// owns `state`.
@@ -388,19 +395,19 @@ pub fn Journal(comptime Event: type) type {
 
         pub const OpenWithSnapshotError = OpenError || error{ CorruptSnapshot, SnapshotTooLarge };
 
-        pub const AppendError = Allocator.Error || Log.AppendError ||
-            error{ PersistenceFailed, NotRoundTrippable, SequenceExhausted, RecordTooLarge };
+        pub const AppendError = Allocator.Error || Log.StageError ||
+            error{ PersistenceFailed, NotRoundTrippable, RecordTooLarge };
 
         pub const AppendIfError = AppendError || error{WrongExpectedSeq};
 
         pub const Expected = struct {
             /// The sequence number the newest record must still have: zero
             /// for a journal that must still be empty.
-            last: u64,
+            last: Seq,
             /// Where `error.WrongExpectedSeq` leaves the sequence number the
             /// newest record has instead, read under the same lock as the
             /// comparison. Not written when the append goes ahead.
-            found: ?*u64 = null,
+            found: ?*Seq = null,
         };
 
         pub const Commit = enum {
@@ -518,7 +525,7 @@ pub fn Journal(comptime Event: type) type {
                 .nudges = 0,
                 .waiters = 0,
                 .futex_wakes = 0,
-                .seq = 0,
+                .seq = values.beginning,
                 .write_failed = false,
             };
             errdefer {
@@ -584,21 +591,21 @@ pub fn Journal(comptime Event: type) type {
         // Writing.
         //====================================================================
 
-        pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
+        pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!Seq {
             return self.appendOne(io, null, at, event, .now) catch |err| switch (err) {
                 error.WrongExpectedSeq => unreachable,
                 else => |e| return e,
             };
         }
 
-        pub fn appendDeferred(self: *Self, io: Io, at: i64, event: Event) AppendError!u64 {
+        pub fn appendDeferred(self: *Self, io: Io, at: i64, event: Event) AppendError!Seq {
             return self.appendOne(io, null, at, event, .deferred) catch |err| switch (err) {
                 error.WrongExpectedSeq => unreachable,
                 else => |e| return e,
             };
         }
 
-        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: i64, event: Event) AppendIfError!u64 {
+        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: i64, event: Event) AppendIfError!Seq {
             return self.appendOne(io, expected, at, event, .now);
         }
 
@@ -612,7 +619,7 @@ pub fn Journal(comptime Event: type) type {
             return error.WrongExpectedSeq;
         }
 
-        fn appendOne(self: *Self, io: Io, expected: ?Expected, at: i64, event: Event, durability: enum { now, deferred }) AppendIfError!u64 {
+        fn appendOne(self: *Self, io: Io, expected: ?Expected, at: i64, event: Event, durability: enum { now, deferred }) AppendIfError!Seq {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -627,9 +634,7 @@ pub fn Journal(comptime Event: type) type {
             if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
             try self.expect(expected);
-            if (self.seq >= std.math.maxInt(i64)) return error.SequenceExhausted;
-
-            const next = self.seq + 1;
+            const next = try values.successor(self.seq);
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
             var built = try self.encode(next, at, self.log.chainTip(), event, null);
@@ -659,18 +664,18 @@ pub fn Journal(comptime Event: type) type {
             return next;
         }
 
-        pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!u64 {
+        pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!Seq {
             return self.appendBatch(io, null, entries, commit) catch |err| switch (err) {
                 error.WrongExpectedSeq => unreachable,
                 else => |e| return e,
             };
         }
 
-        pub fn appendAllIf(self: *Self, io: Io, expected: Expected, entries: []const Entry, commit: Commit) AppendIfError!u64 {
+        pub fn appendAllIf(self: *Self, io: Io, expected: Expected, entries: []const Entry, commit: Commit) AppendIfError!Seq {
             return self.appendBatch(io, expected, entries, commit);
         }
 
-        fn appendBatch(self: *Self, io: Io, expected: ?Expected, entries: []const Entry, commit: Commit) AppendIfError!u64 {
+        fn appendBatch(self: *Self, io: Io, expected: ?Expected, entries: []const Entry, commit: Commit) AppendIfError!Seq {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -683,7 +688,7 @@ pub fn Journal(comptime Event: type) type {
             if (self.write_failed) return error.PersistenceFailed;
             try self.expect(expected);
             if (entries.len == 0) return self.seq;
-            if (entries.len > std.math.maxInt(i64) - self.seq) return error.SequenceExhausted;
+            const last = try values.advance(self.seq, .fromRaw(entries.len));
 
             // Reserved before anything is written: after the bytes are
             // durable nothing may fail, or the disk would hold records
@@ -704,13 +709,14 @@ pub fn Journal(comptime Event: type) type {
             // open that finds the log ending inside one drops it whole; a
             // batch of one record is whole or absent anyway, and says nothing.
             const batch: ?envelope.Batch = if (commit == .atomic and entries.len > 1)
-                .{ .first = before + 1, .last = before + entries.len }
+                .{ .first = try values.successor(before), .last = last }
             else
                 null;
             var link = self.log.chainTip();
             const staged_from = self.log.mark();
             for (entries, 0..) |entry, i| {
-                var item = self.encode(self.seq + i + 1, entry.at, link, entry.event, batch) catch |err| {
+                const numbered = values.advance(before, .fromRaw(i + 1)) catch unreachable; // unreachable: the last of them, `last`, was numbered above
+                var item = self.encode(numbered, entry.at, link, entry.event, batch) catch |err| {
                     self.unstage(io, staged_from);
                     return err;
                 };
@@ -738,13 +744,13 @@ pub fn Journal(comptime Event: type) type {
                 _ = self.publish(item.*);
             }
             // A batch of records nothing keeps still moved the sequence.
-            self.seq = before + entries.len;
+            self.seq = last;
             self.wake(io);
             self.trimTail();
-            return self.seq;
+            return last;
         }
 
-        pub fn reconcile(self: *Self, io: Io) ReconcileError!u64 {
+        pub fn reconcile(self: *Self, io: Io) ReconcileError!Seq {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -794,7 +800,7 @@ pub fn Journal(comptime Event: type) type {
         // Reading.
         //====================================================================
 
-        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: u64) CopyError!*Batch {
+        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: Seq) CopyError!*Batch {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             const window = self.tailSince(cursor);
@@ -815,20 +821,24 @@ pub fn Journal(comptime Event: type) type {
 
         /// The tail after a cursor. The caller holds the journal's lock for
         /// the whole lifetime of this borrow.
-        fn tailSince(self: *const Self, cursor: u64) TailWindow {
+        fn tailSince(self: *const Self, cursor: Seq) TailWindow {
             const items = self.tail.entries.items;
-            if (items.len == 0) return .{ .records = items, .complete = cursor >= self.seq };
-            const tail_base = items[0].record.seq - 1;
-            if (cursor < tail_base) return .{ .records = items, .complete = false };
-            const skip: usize = @intCast(@min(cursor - tail_base, items.len));
+            if (items.len == 0) return .{ .records = items, .complete = !values.below(cursor, self.seq) };
+            const first = items[0].record.seq;
+            // The tail starts one record after `tail_base`; a cursor behind
+            // that has fallen off the front of it.
+            if (values.below(cursor, values.predecessor(first) orelse values.beginning)) return .{ .records = items, .complete = false };
+            // The records the cursor has already passed, counted from the first.
+            const passed = values.span(first, cursor) orelse Records.fromRaw(items.len);
+            const skip = @min(values.limit(passed), items.len);
             return .{ .records = items[skip..], .complete = true };
         }
 
-        pub fn waitPast(self: *Self, io: Io, cursor: u64) Io.Cancelable!u64 {
+        pub fn waitPast(self: *Self, io: Io, cursor: Seq) Io.Cancelable!Seq {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             const nudged = self.nudges;
-            while (self.seq <= cursor and self.nudges == nudged) {
+            while (values.atMost(self.seq, cursor) and self.nudges == nudged) {
                 // read under the lock: whatever wakes this reader bumps the
                 // word under the same lock, after this, so the wait returns
                 const seen = self.changed.load(.acquire);
@@ -887,7 +897,7 @@ pub fn Journal(comptime Event: type) type {
             /// when the walk was chosen, and the last record of every batch
             /// found whole since. A record of a batch past it is handed on
             /// only once the batch's last record is in the file.
-            whole_through: u64,
+            whole_through: Seq,
 
             pub fn deinit(walk: *Replay, io: Io) void {
                 const gpa = walk.scan.gpa;
@@ -940,7 +950,7 @@ pub fn Journal(comptime Event: type) type {
                         else => return error.StalePosition,
                     };
                     if (header.seq != last.seq or header.c != last.checksum) return error.StalePosition;
-                    walk.run.expected = last.seq + 1;
+                    walk.run.expected = values.following(last.seq);
                     walk.run.link = last.checksum;
                     walk.last = last;
                 }
@@ -951,11 +961,11 @@ pub fn Journal(comptime Event: type) type {
                     if (walk.scan.takeBoundary()) |boundary| try walk.run.beginSegment(boundary);
                     _ = walk.scratch.reset(.retain_capacity);
                     const header = try parseHeader(walk.scratch.allocator(), line);
-                    if (header.batch) |batch| if (batch.last > walk.whole_through) {
+                    if (header.batch) |batch| if (values.below(walk.whole_through, batch.last)) {
                         // A batch being written beside this walk, or one a
                         // crash cut: none of it until all of it is there.
                         if (!try walk.scan.holds(io, batch.last)) {
-                            try walk.scan.rewind(io, line.len + 1);
+                            try walk.scan.rewind(io, .fromRaw(line.len + 1));
                             return null;
                         }
                         walk.whole_through = batch.last;
@@ -977,7 +987,7 @@ pub fn Journal(comptime Event: type) type {
 
             pub fn position(walk: *const Replay) Position {
                 const last = walk.last orelse return .{ .cursor = walk.run.cursor };
-                return .{ .cursor = @max(walk.run.cursor, last.seq), .last = last };
+                return .{ .cursor = values.greater(walk.run.cursor, last.seq), .last = last };
             }
 
             /// The record just read, where it lies in its file.
@@ -985,14 +995,14 @@ pub fn Journal(comptime Event: type) type {
                 return .{
                     .seq = header.seq,
                     .segment = walk.scan.bases[walk.scan.at],
-                    .start = walk.scan.position - line.len - 1,
+                    .start = values.minus(walk.scan.position, .fromRaw(line.len + 1)),
                     .end = walk.scan.position,
                     .checksum = header.c,
                 };
             }
         };
 
-        pub fn replay(self: *Self, io: Io, cursor: u64) ReplayError!*Replay {
+        pub fn replay(self: *Self, io: Io, cursor: Seq) ReplayError!*Replay {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             return self.replayFrom(io, cursor, false);
@@ -1001,7 +1011,7 @@ pub fn Journal(comptime Event: type) type {
         /// `replay`, saying whether the walk may build an index it finds
         /// missing. The caller holds the journal's lock while choosing the
         /// scan, whether or not it may build an index.
-        fn replayFrom(self: *Self, io: Io, cursor: u64, may_write: bool) ReplayError!*Replay {
+        fn replayFrom(self: *Self, io: Io, cursor: Seq, may_write: bool) ReplayError!*Replay {
             const walk = try self.gpa.create(Replay);
             errdefer self.gpa.destroy(walk);
             var scan = try self.log.scanFrom(io, cursor, .{ .may_write = may_write });
@@ -1042,25 +1052,25 @@ pub fn Journal(comptime Event: type) type {
             return walk;
         }
 
-        pub fn verify(self: *Self, io: Io) ReplayError!u64 {
+        pub fn verify(self: *Self, io: Io) ReplayError!Records {
             var walk = chosen: {
                 try self.mutex.lock(io);
                 defer self.mutex.unlock(io);
                 break :chosen try self.replayFrom(io, self.log.baseSeq(), false);
             };
             defer walk.deinit(io);
-            var seen: u64 = 0;
-            while (try walk.next(io)) |_| seen += 1;
+            var seen = values.no_records;
+            while (try walk.next(io)) |_| seen = values.plus(seen, .fromRaw(1));
             return seen;
         }
 
-        pub fn lastSeq(self: *Self, io: Io) Io.Cancelable!u64 {
+        pub fn lastSeq(self: *Self, io: Io) Io.Cancelable!Seq {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             return self.seq;
         }
 
-        pub fn seqAtOrAfter(self: *Self, io: Io, at: i64) SeekError!?u64 {
+        pub fn seqAtOrAfter(self: *Self, io: Io, at: i64) SeekError!?Seq {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             return self.log.seqAtOrAfter(io, at);
@@ -1088,10 +1098,10 @@ pub fn Journal(comptime Event: type) type {
             return self.log.segments.items.len;
         }
 
-        pub fn oldestSeq(self: *Self, io: Io) Io.Cancelable!u64 {
+        pub fn oldestSeq(self: *Self, io: Io) Io.Cancelable!Seq {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
-            return self.log.baseSeq() + 1;
+            return values.following(self.log.baseSeq());
         }
 
         pub fn openedWith(self: *Self, io: Io) Io.Cancelable!Options {
@@ -1106,7 +1116,7 @@ pub fn Journal(comptime Event: type) type {
             persistence_failed: bool,
             /// How many unterminated bytes were dropped from the newest
             /// segment during opening or recovery. Zero when none were dropped.
-            dropped_bytes: usize,
+            dropped_bytes: Bytes,
             /// What the records' last sync reached: `flush`, or `.data` on
             /// Linux and Windows for a write into reserved space, and less
             /// where the filesystem declined the call — `.written` from a
@@ -1129,52 +1139,54 @@ pub fn Journal(comptime Event: type) type {
             /// How many segment files it is spread over.
             segments: usize,
             /// How many records they hold.
-            records: u64,
+            records: Records,
             /// The bytes of those records, over every segment. The line at
             /// the head of each segment file is not counted, and neither are
             /// the index sidecars, the lock and the snapshot: those are the
             /// framing, a cache and a copy of a fold, not the log.
-            bytes: u64,
+            bytes: Bytes,
             /// The oldest sequence number still held and the newest. Both are
             /// zero on a log with no records in it.
-            oldest_seq: u64,
-            newest_seq: u64,
+            oldest_seq: Seq,
+            newest_seq: Seq,
         };
 
         pub fn stats(self: *Self, io: Io) Io.Cancelable!Stats {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
-            var bytes: u64 = 0;
-            for (self.log.segments.items) |segment| bytes += segment.bytes - segment.header_bytes;
-            const oldest = self.log.baseSeq() + 1;
-            const empty = self.seq == 0 or oldest > self.seq;
+            var bytes = values.no_bytes;
+            for (self.log.segments.items) |segment| {
+                bytes = values.plus(bytes, values.minus(segment.bytes, segment.header_bytes));
+            }
+            const oldest = values.following(self.log.baseSeq());
+            const empty = self.seq == values.beginning or values.below(self.seq, oldest);
             return .{
                 .segments = self.log.segments.items.len,
-                .records = self.seq + 1 -| oldest,
+                .records = if (empty) values.no_records else values.span(oldest, self.seq) orelse values.no_records,
                 .bytes = bytes,
-                .oldest_seq = if (empty) 0 else oldest,
-                .newest_seq = if (empty) 0 else self.seq,
+                .oldest_seq = if (empty) values.beginning else oldest,
+                .newest_seq = if (empty) values.beginning else self.seq,
             };
         }
 
         pub fn subscribe(self: *Self, io: Io, sink: Sink) SubscribeError!void {
-            return self.subscribeAllFrom(io, &.{sink}, 0);
+            return self.subscribeAllFrom(io, &.{sink}, values.beginning);
         }
 
-        pub fn subscribeFrom(self: *Self, io: Io, sink: Sink, cursor: u64) SubscribeError!void {
+        pub fn subscribeFrom(self: *Self, io: Io, sink: Sink, cursor: Seq) SubscribeError!void {
             return self.subscribeAllFrom(io, &.{sink}, cursor);
         }
 
         pub fn subscribeAll(self: *Self, io: Io, sinks: []const Sink) SubscribeError!void {
-            return self.subscribeAllFrom(io, sinks, 0);
+            return self.subscribeAllFrom(io, sinks, values.beginning);
         }
 
-        pub fn subscribeAllFrom(self: *Self, io: Io, sinks: []const Sink, cursor: u64) SubscribeError!void {
+        pub fn subscribeAllFrom(self: *Self, io: Io, sinks: []const Sink, cursor: Seq) SubscribeError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A fold restored to `cursor` needs the record after it. Zero
             // asks for whatever the log holds, which is no promise to miss.
-            if (cursor != 0 and cursor < self.log.baseSeq()) return error.HistoryDropped;
+            if (cursor != values.beginning and values.below(cursor, self.log.baseSeq())) return error.HistoryDropped;
             const before = self.sinks.items.len;
             try self.sinks.appendSlice(self.gpa, sinks);
             errdefer self.sinks.shrinkRetainingCapacity(before);
@@ -1189,8 +1201,8 @@ pub fn Journal(comptime Event: type) type {
         /// Hand `sinks` every record after `cursor` up to the newest: from
         /// the tail where it reaches back that far, from the disk where it
         /// does not. Called under the journal's lock.
-        fn deliver(self: *Self, io: Io, sinks: []const Sink, cursor: u64) ReplayError!void {
-            if (sinks.len == 0 or cursor >= self.seq) return;
+        fn deliver(self: *Self, io: Io, sinks: []const Sink, cursor: Seq) ReplayError!void {
+            if (sinks.len == 0 or !values.below(cursor, self.seq)) return;
             var delivered = cursor;
             if (!self.tailSince(cursor).complete) {
                 var walk = try self.replayFrom(io, cursor, true);
@@ -1208,7 +1220,7 @@ pub fn Journal(comptime Event: type) type {
         /// After the files were read again: wake every `waitPast` if the
         /// newest record moved, and hand the sinks the records that arrived
         /// after `previous`, so a fold misses none of them.
-        fn caughtUp(self: *Self, io: Io, previous: u64) ReplayError!void {
+        fn caughtUp(self: *Self, io: Io, previous: Seq) ReplayError!void {
             if (self.seq != previous) self.wake(io);
             try self.deliver(io, self.sinks.items, previous);
         }
@@ -1232,9 +1244,9 @@ pub fn Journal(comptime Event: type) type {
             /// Where it has got to. Zero for a name that has never committed
             /// one, and left where it was by a `compact` that dropped past
             /// it — compare it against `oldestSeq` to see what has gone.
-            committed: u64,
+            committed: Seq,
 
-            pub fn cursor(tail: *Tailer, io: Io) Io.Cancelable!u64 {
+            pub fn cursor(tail: *Tailer, io: Io) Io.Cancelable!Seq {
                 const self = tail.journal;
                 try self.mutex.lock(io);
                 defer self.mutex.unlock(io);
@@ -1255,14 +1267,14 @@ pub fn Journal(comptime Event: type) type {
                 return self.replayFrom(io, tail.committed, false);
             }
 
-            pub fn commit(tail: *Tailer, io: Io, seq: u64) TailerError!void {
+            pub fn commit(tail: *Tailer, io: Io, seq: Seq) TailerError!void {
                 const self = tail.journal;
                 try self.mutex.lock(io);
                 defer self.mutex.unlock(io);
 
                 var document: std.Io.Writer.Allocating = .init(self.gpa);
                 defer document.deinit();
-                strand.writeValue(&document.writer, .{ .fmt = document_format, .seq = seq }, .{}) catch
+                strand.writeValue(&document.writer, .{ .fmt = document_format, .seq = seq.raw() }, .{}) catch
                     return error.OutOfMemory;
 
                 const file = try cursorName(self.gpa, tail.name);
@@ -1289,7 +1301,7 @@ pub fn Journal(comptime Event: type) type {
         pub const Reader = struct {
             /// Owned by the `Readers` it came in.
             name: []const u8,
-            cursor: u64,
+            cursor: Seq,
         };
 
         /// Only the opaque readers facade hands out access to this state.
@@ -1330,12 +1342,12 @@ pub fn Journal(comptime Event: type) type {
             return list;
         }
 
-        pub fn minCursor(self: *Self, io: Io) TailerError!?u64 {
+        pub fn minCursor(self: *Self, io: Io) TailerError!?Seq {
             const list = try self.readers(self.gpa, io);
             defer list.deinit();
-            var lowest: ?u64 = null;
+            var lowest: ?Seq = null;
             for (list.items) |reader| {
-                lowest = if (lowest) |value| @min(value, reader.cursor) else reader.cursor;
+                lowest = if (lowest) |value| values.lesser(value, reader.cursor) else reader.cursor;
             }
             return lowest;
         }
@@ -1416,13 +1428,13 @@ pub fn Journal(comptime Event: type) type {
 
         /// Where the named reader has got to: zero for a name with no
         /// cursor file, which is a reader that has never committed.
-        fn readCursor(self: *Self, io: Io, name: []const u8) TailerError!u64 {
-            return try self.committedCursor(io, name) orelse 0;
+        fn readCursor(self: *Self, io: Io, name: []const u8) TailerError!Seq {
+            return try self.committedCursor(io, name) orelse values.beginning;
         }
 
         /// The named reader's committed cursor, or null when there is no
         /// cursor file for it.
-        fn committedCursor(self: *Self, io: Io, name: []const u8) TailerError!?u64 {
+        fn committedCursor(self: *Self, io: Io, name: []const u8) TailerError!?Seq {
             const file = try cursorName(self.gpa, name);
             defer self.gpa.free(file);
 
@@ -1443,7 +1455,9 @@ pub fn Journal(comptime Event: type) type {
                 error.UnsupportedFormat => return error.UnsupportedFormat,
                 else => return error.CorruptCursor,
             } orelse return null;
-            return document.seq;
+            // Any number is a place to have got to, so this is a position
+            // read off a disk and not a record to look up.
+            return .fromRaw(document.seq);
         }
 
         //====================================================================
@@ -1464,11 +1478,10 @@ pub fn Journal(comptime Event: type) type {
             const encoded_size = encoder.calcSize(state_bytes.len);
             const framing_size = std.fmt.count(
                 "{{\"fmt\":{d},\"seq\":{d},\"state\":\"\"}}",
-                .{ document_format, self.seq },
+                .{ document_format, self.seq.raw() },
             );
-            if (encoded_size > self.config.max_snapshot_bytes or
-                framing_size > self.config.max_snapshot_bytes - encoded_size)
-            {
+            const largest = values.limit(self.config.max_snapshot_bytes);
+            if (encoded_size > largest or framing_size > largest - encoded_size) {
                 return error.SnapshotTooLarge;
             }
             const b64 = try self.gpa.alloc(u8, encoded_size);
@@ -1477,14 +1490,14 @@ pub fn Journal(comptime Event: type) type {
 
             var document: std.Io.Writer.Allocating = .init(self.gpa);
             defer document.deinit();
-            strand.writeValue(&document.writer, .{ .fmt = document_format, .seq = self.seq, .state = b64 }, .{}) catch
+            strand.writeValue(&document.writer, .{ .fmt = document_format, .seq = self.seq.raw(), .state = b64 }, .{}) catch
                 return error.OutOfMemory;
 
             try self.log.syncBeforeSnapshot(io);
             try self.log.writeSnapshot(io, document.written());
         }
 
-        pub fn dropSegmentsBefore(self: *Self, io: Io, seq: u64) DropError!u64 {
+        pub fn dropSegmentsBefore(self: *Self, io: Io, seq: Seq) DropError!u64 {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -1494,11 +1507,11 @@ pub fn Journal(comptime Event: type) type {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
             const dropped = try self.log.dropSegmentsBefore(io, seq);
-            if (dropped != 0) self.dropTailBefore(self.log.baseSeq() + 1);
+            if (dropped != 0) self.dropTailBefore(values.following(self.log.baseSeq()));
             return dropped;
         }
 
-        pub fn truncateAfter(self: *Self, io: Io, seq: u64) TruncateError!void {
+        pub fn truncateAfter(self: *Self, io: Io, seq: Seq) TruncateError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -1509,7 +1522,7 @@ pub fn Journal(comptime Event: type) type {
             defer _ = io.swapCancelProtection(protection);
             if (self.config.access == .read) return error.ReadOnly;
             if (self.write_failed) return error.PersistenceFailed;
-            if (seq < self.seq) try self.retireSnapshotAfter(io, seq);
+            if (values.below(seq, self.seq)) try self.retireSnapshotAfter(io, seq);
             try self.log.truncateAfter(io, seq);
             self.clearTail();
             try self.fillTail(io);
@@ -1522,7 +1535,7 @@ pub fn Journal(comptime Event: type) type {
         /// snapshot, which replays from the start, never a stale one. A
         /// snapshot that cannot be read is left for `openWithSnapshot` to
         /// report.
-        fn retireSnapshotAfter(self: *Self, io: Io, seq: u64) TruncateError!void {
+        fn retireSnapshotAfter(self: *Self, io: Io, seq: Seq) TruncateError!void {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
             const Document = struct { seq: u64 };
@@ -1531,16 +1544,16 @@ pub fn Journal(comptime Event: type) type {
                 arena.allocator(),
                 Document,
                 Log.snapshot_name,
-                self.config.max_snapshot_bytes,
+                values.limit(self.config.max_snapshot_bytes),
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
                 else => return,
             } orelse return;
-            if (document.seq > seq) try self.log.removeSnapshot(io);
+            if (values.below(seq, .fromRaw(document.seq))) try self.log.removeSnapshot(io);
         }
 
-        pub fn compact(self: *Self, io: Io, keep_after_seq: u64) CompactError!void {
+        pub fn compact(self: *Self, io: Io, keep_after_seq: Seq) CompactError!void {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             // A change to the files, once begun, runs to its end: a cancel
@@ -1556,7 +1569,7 @@ pub fn Journal(comptime Event: type) type {
             try self.fillTail(io);
         }
 
-        pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!u64 {
+        pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!Seq {
             try self.mutex.lock(io);
             defer self.mutex.unlock(io);
             if (self.config.access == .read) {
@@ -1586,7 +1599,7 @@ pub fn Journal(comptime Event: type) type {
         const Built = struct {
             arena: ?*std.heap.ArenaAllocator,
             bytes: []const u8,
-            seq: u64,
+            seq: Seq,
             at: i64,
             /// This record's checksum, which the next one links back to.
             checksum: u32,
@@ -1600,7 +1613,7 @@ pub fn Journal(comptime Event: type) type {
         /// Whether a record needs an owner after the write, for the cache or
         /// for callbacks. Verification alone reads it before the write.
         fn keepsRecords(self: *const Self) bool {
-            return self.config.tail_records != 0 or self.sinks.items.len != 0;
+            return self.config.tail_records != values.no_records or self.sinks.items.len != 0;
         }
 
         /// Whether encoding must parse its result, for a reader or a check.
@@ -1616,12 +1629,14 @@ pub fn Journal(comptime Event: type) type {
         /// would produce: an `Event` whose slices point at a stack buffer is
         /// safe to append. Where nothing will, that parse would build a record
         /// and drop it unread, so it is not done.
-        fn encode(self: *Self, seq: u64, at: i64, back_link: u32, event: Event, batch: ?envelope.Batch) AppendError!Built {
-            std.debug.assert(seq > 0);
-            std.debug.assert(seq <= std.math.maxInt(i64));
+        fn encode(self: *Self, seq: Seq, at: i64, back_link: u32, event: Event, batch: ?envelope.Batch) AppendError!Built {
+            // A record numbered outside what a reader accepts would be durable
+            // before anything noticed, so these hold in every build.
+            aegis.assert.pre(seq != values.beginning, "a record is numbered from one");
+            aegis.assert.pre(values.atMost(seq, values.newest_possible), "a record is numbered no higher than an i64");
             if (batch) |bounds| {
-                std.debug.assert(bounds.first <= seq);
-                std.debug.assert(seq <= bounds.last);
+                aegis.assert.pre(values.atMost(bounds.first, seq), "a batch starts at or before its record");
+                aegis.assert.pre(values.atMost(seq, bounds.last), "a batch ends at or after its record");
             }
             const needs_record = self.needsRecord();
             const arena: ?*std.heap.ArenaAllocator = if (needs_record) try createArena(self.gpa) else null;
@@ -1651,15 +1666,15 @@ pub fn Journal(comptime Event: type) type {
             // default has it), left open: the checksum is its last member.
             const value_options: strand.ValueOptions = .{ .emit_null_optional_fields = true };
             var record = if (batch) |b| strand.writeObjectOpen(&out.writer, LineInBatch{
-                .seq = seq,
+                .seq = seq.raw(),
                 .at = at,
                 .v = self.config.schema_version,
                 .p = back_link,
-                .bf = b.first,
-                .bl = b.last,
+                .bf = b.first.raw(),
+                .bl = b.last.raw(),
                 .ev = event,
             }, value_options) catch |err| return encoding.diagnose(err) else strand.writeObjectOpen(&out.writer, Line{
-                .seq = seq,
+                .seq = seq.raw(),
                 .at = at,
                 .v = self.config.schema_version,
                 .p = back_link,
@@ -1674,7 +1689,7 @@ pub fn Journal(comptime Event: type) type {
             record.close() catch return error.OutOfMemory;
             // The bound counts the exact stored line, the checksum's digits
             // included, before any file write.
-            if (out.written().len > self.config.max_record_bytes) return error.RecordTooLarge;
+            if (out.written().len > values.limit(self.config.max_record_bytes)) return error.RecordTooLarge;
 
             if (!needs_record) {
                 const stored = out.written();
@@ -1740,8 +1755,7 @@ pub fn Journal(comptime Event: type) type {
             self.seq = self.log.lastSeq();
             var rebuilt: Tail = .{};
             errdefer rebuilt.deinit(self.gpa);
-            const want = self.config.tail_records;
-            const from = if (self.seq > want) self.seq - want else self.log.baseSeq();
+            const from = values.back(self.seq, self.config.tail_records) orelse self.log.baseSeq();
 
             var scan = try self.log.scanFrom(io, from, .{ .may_write = true, .extent = .known });
             defer scan.deinit(io);
@@ -1765,7 +1779,7 @@ pub fn Journal(comptime Event: type) type {
             // Continuity belongs to the walk, not the cache: either tail
             // ceiling may evict even the newest record while it is read.
             if (run.expected) |next| {
-                if (next != self.seq + 1) return error.DiscontinuousSeq;
+                if (next != values.following(self.seq)) return error.DiscontinuousSeq;
             } else if (self.log.baseSeq() != self.seq) {
                 return error.DiscontinuousSeq;
             }
@@ -1785,16 +1799,16 @@ pub fn Journal(comptime Event: type) type {
         }
 
         /// Evict records whose segment retention just removed from the log.
-        fn dropTailBefore(self: *Self, first_seq: u64) void {
+        fn dropTailBefore(self: *Self, first_seq: Seq) void {
             var drop: usize = 0;
-            while (drop < self.tail.entries.items.len and self.tail.entries.items[drop].record.seq < first_seq) : (drop += 1) {}
+            while (drop < self.tail.entries.items.len and values.below(self.tail.entries.items[drop].record.seq, first_seq)) : (drop += 1) {}
             self.tail.removePrefix(drop);
         }
 
         /// Everything in a line except the event: what a reader needs to decide
         /// whether the event is worth parsing at all.
         const Header = struct {
-            seq: u64,
+            seq: Seq,
             at: i64,
             version: u32,
             /// The checksum of the record before this one.
@@ -1904,7 +1918,7 @@ pub fn Journal(comptime Event: type) type {
                 arena.allocator(),
                 Document,
                 Log.snapshot_name,
-                self.config.max_snapshot_bytes,
+                values.limit(self.config.max_snapshot_bytes),
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
@@ -1915,13 +1929,14 @@ pub fn Journal(comptime Event: type) type {
             // A truncation can move the log behind a snapshot that was
             // already published. The log is authoritative; restoring state
             // from beyond its newest record would resurrect the cut history.
-            if (document.seq > self.seq) return null;
+            const through: Seq = .fromRaw(document.seq);
+            if (values.below(self.seq, through)) return null;
             const decoder = std.base64.standard.Decoder;
             const size = decoder.calcSizeForSlice(document.state) catch return error.CorruptSnapshot;
             const state = try self.gpa.alloc(u8, size);
             errdefer self.gpa.free(state);
             decoder.decode(state, document.state) catch return error.CorruptSnapshot;
-            return .{ .seq = document.seq, .state = state, .gpa = self.gpa };
+            return .{ .seq = through, .state = state, .gpa = self.gpa };
         }
     };
 }

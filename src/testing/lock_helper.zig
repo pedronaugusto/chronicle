@@ -37,10 +37,10 @@ pub fn main(init: std.process.Init) !void {
     // fsync, because what is being proved here is about locking and about what
     // a second process can see, not about power cuts.
     var journal = try chronicle.Journal(Event).open(init.gpa, io, args[1], .{
-        .tail_records = 0,
+        .tail_records = .fromRaw(0),
         .sync = .never,
-        .max_segment_records = if (crash_mode) 4 else null,
-        .preallocate_bytes = if (crash_mode) 512 else 0,
+        .max_segment_records = if (crash_mode) .fromRaw(4) else null,
+        .preallocate_bytes = if (crash_mode) .fromRaw(512) else .fromRaw(0),
     });
     defer journal.deinit(io);
 
@@ -71,17 +71,18 @@ pub fn main(init: std.process.Init) !void {
                     };
                     _ = try journal.appendAll(io, &batch, .group);
                 },
-                2 => try journal.compact(io, random.random().intRangeAtMost(u64, 0, newest)),
+                2 => try journal.compact(io, .fromRaw(random.random().intRangeAtMost(u64, 0, newest.raw()))),
                 3 => journal.truncateAfter(
                     io,
-                    random.random().intRangeAtMost(u64, oldest -| 1, newest),
+                    // glint-ignore: A004 -- no-danger: docs/design.md#raw-sites; the chaos helper draws a position from raw bounds it was just handed, and an out-of-range one is the error it tolerates
+                    .fromRaw(random.random().intRangeAtMost(u64, oldest.raw() -| 1, newest.raw())),
                 ) catch |err| switch (err) {
                     error.SeqTooOld => {},
                     else => return err,
                 },
                 4 => _ = try journal.dropSegmentsBefore(
                     io,
-                    random.random().intRangeAtMost(u64, 0, newest),
+                    .fromRaw(random.random().intRangeAtMost(u64, 0, newest.raw())),
                 ),
                 5 => _ = try journal.backup(io, backup_path),
                 else => try journal.snapshot(io, "a fold"),

@@ -11,10 +11,11 @@ pub fn build(b: *std.Build) !void {
     // package's only knobs are the `Options` a caller passes to `open`, so
     // there is no build option to forward and no way for a consumer's build
     // graph to disagree with this one. strand reads and writes a record's
-    // line, airlock makes files durable and warp owns checksums; this
-    // package keeps the lines.
+    // line, airlock makes files durable, warp owns checksums and aegis owns
+    // the kinds of number; this package keeps the lines.
     //=====================================================================
 
+    const aegis = b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis");
     const warp = b.dependency("warp", .{ .target = target, .optimize = optimize }).module("warp");
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const airlock_dependency = b.dependency("airlock", .{ .target = target, .optimize = optimize });
@@ -24,6 +25,7 @@ pub fn build(b: *std.Build) !void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "aegis", .module = aegis },
             .{ .name = "warp", .module = warp },
             .{ .name = "strand", .module = strand },
             .{ .name = "airlock", .module = airlock },
@@ -74,6 +76,7 @@ pub fn build(b: *std.Build) !void {
             .optimize = optimize,
             .sanitize_thread = if (thread_sanitizer) true else null,
             .imports = &.{
+                .{ .name = "aegis", .module = aegis },
                 .{ .name = "warp", .module = warp },
                 .{ .name = "strand", .module = strand },
                 .{ .name = "airlock", .module = airlock },
@@ -164,16 +167,17 @@ pub fn build(b: *std.Build) !void {
         preflight.addConsumerCheck(b, .{
             .package = "chronicle",
             .program = b.path("ci/consumer.zig"),
-            .packages = &.{ b.dependency("strand", .{}), b.dependency("airlock", .{}), b.dependency("warp", .{}) },
+            .packages = &.{ b.dependency("aegis", .{}), b.dependency("strand", .{}), b.dependency("airlock", .{}), b.dependency("warp", .{}) },
         });
     }
     return needed;
 }
 
-/// chronicle, strand, airlock and warp again, in the mode a benchmark builds in:
+/// chronicle, aegis, strand, airlock and warp again, in the mode a benchmark builds in:
 /// an imported module keeps its own mode, so a ReleaseFast benchmark over
 /// the Debug module would time the Debug module.
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
+    const aegis = b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis");
     const warp = b.dependency("warp", .{ .target = target, .optimize = optimize }).module("warp");
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const airlock = b.dependency("airlock", .{ .target = target, .optimize = optimize }).module("airlock");
@@ -182,6 +186,7 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "aegis", .module = aegis },
             .{ .name = "warp", .module = warp },
             .{ .name = "strand", .module = strand },
             .{ .name = "airlock", .module = airlock },

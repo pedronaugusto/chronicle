@@ -22,7 +22,7 @@ at `path` with the supplied allocator and `std.Io`.
 const chronicle = @import("chronicle");
 
 var balances: Balances = .{};
-var last: u64 = 0;
+var last: chronicle.Seq = chronicle.beginning;
 {
     const ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 1 });
     defer ledger.deinit(io);
@@ -32,7 +32,7 @@ var last: u64 = 0;
     const now = std.Io.Clock.real.now(io).toMilliseconds();
     _ = try ledger.append(io, now, .{ .account_opened = .{ .id = 1, .owner = "ada" } });
 
-    const follower = try ledger.replayAt(io, .after(0));
+    const follower = try ledger.replayAt(io, .after(chronicle.beginning));
     defer follower.deinit(io);
     _ = (try follower.next(io)).?;
 
@@ -56,7 +56,7 @@ const reopened = opened.journal;
 defer reopened.deinit(io);
 
 var restored: Balances = .{};
-var from: u64 = 0;
+var from: chronicle.Seq = chronicle.beginning;
 if (opened.snapshot) |snapshot| {
     defer snapshot.deinit();
     restored = std.mem.bytesToValue(Balances, snapshot.state[0..@sizeOf(Balances)]);

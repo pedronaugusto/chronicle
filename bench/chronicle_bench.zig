@@ -81,9 +81,9 @@ fn options(sync: chronicle.Sync, access: chronicle.Access) Journal.Options {
     return .{
         .access = access,
         .sync = sync,
-        .tail_records = 0,
-        .tail_bytes = 0,
-        .max_segment_bytes = 8 * 1024 * 1024,
+        .tail_records = .fromRaw(0),
+        .tail_bytes = .fromRaw(0),
+        .max_segment_bytes = .fromRaw(8 * 1024 * 1024),
         .verify_round_trip = false,
     };
 }
@@ -168,7 +168,7 @@ fn appendWorkload(
     } else if (std.mem.eql(u8, workload, "append_if")) {
         // One writer, its expectation always met: what the comparison under
         // the lock costs beside `append_no_fsync`.
-        for (0..count) |i| _ = try journal.appendIf(io, .{ .last = i }, @intCast(i + 1), input.event);
+        for (0..count) |i| _ = try journal.appendIf(io, .{ .last = .fromRaw(i) }, @intCast(i + 1), input.event);
     } else {
         for (0..count) |i| _ = try journal.append(io, @intCast(i + 1), input.event);
     }
@@ -200,7 +200,7 @@ fn replay(io: std.Io, gpa: std.mem.Allocator, path: []const u8, count: usize, fr
     var elapsed: f64 = 0;
     for (0..repetitions) |_| {
         const started = benchmarkNow(io);
-        const walk = try journal.replay(io, @intCast(from - 1));
+        const walk = try journal.replay(io, .fromRaw(from - 1));
         var seen: usize = 0;
         var sum: u64 = 0;
         while (try walk.next(io)) |record| {
@@ -233,11 +233,11 @@ fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []co
     try writeBatches(journal, io, input, 1000);
     const rearm_at = std.mem.eql(u8, workload, "follow_rearm");
     const resume_at = std.mem.eql(u8, workload, "follow_resume");
-    const reusable: ?*Journal.Replay = if (rearm_at) try journal.replayAt(io, .after(count)) else null;
+    const reusable: ?*Journal.Replay = if (rearm_at) try journal.replayAt(io, .after(.fromRaw(count))) else null;
     defer if (reusable) |walk| walk.deinit(io);
 
-    var cursor: u64 = count;
-    var position: chronicle.Position = .after(count);
+    var cursor: chronicle.Seq = .fromRaw(count);
+    var position: chronicle.Position = .after(cursor);
     var elapsed: f64 = 0;
     var seen: usize = 0;
     for (0..wakes) |i| {
@@ -261,7 +261,7 @@ fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []co
         }
         elapsed += seconds(started, io);
     }
-    if (seen != wakes or cursor != count + wakes) return error.FoldMismatch;
+    if (seen != wakes or cursor != chronicle.Seq.fromRaw(count + wakes)) return error.FoldMismatch;
     try printMetric(io, workload, "per_wake", elapsed * 1_000_000.0 / @as(f64, @floatFromInt(wakes)), "us");
 }
 
@@ -271,7 +271,7 @@ fn reopen(io: std.Io, gpa: std.mem.Allocator, path: []const u8, repetitions: usi
         const started = benchmarkNow(io);
         const journal = try Journal.open(gpa, io, path, options(.never, .read));
         elapsed += seconds(started, io);
-        if (try journal.lastSeq(io) == 0) return error.EmptyJournal;
+        if (try journal.lastSeq(io) == chronicle.beginning) return error.EmptyJournal;
         journal.deinit(io);
     }
     try printMetric(io, "clean_reopen", "elapsed", elapsed * 1000.0 / @as(f64, @floatFromInt(repetitions)), "ms");
@@ -284,9 +284,9 @@ fn rawOptions(sync: chronicle.Sync, access: chronicle.Access) RawJournal.Options
     return .{
         .access = access,
         .sync = sync,
-        .tail_records = 0,
-        .tail_bytes = 0,
-        .max_segment_bytes = 8 * 1024 * 1024,
+        .tail_records = .fromRaw(0),
+        .tail_bytes = .fromRaw(0),
+        .max_segment_bytes = .fromRaw(8 * 1024 * 1024),
         .verify_round_trip = false,
     };
 }
@@ -308,7 +308,7 @@ fn rawWorkload(io: std.Io, gpa: std.mem.Allocator, corpus_path: []const u8, path
         const journal = try RawJournal.open(gpa, io, path, rawOptions(.never, .read));
         defer journal.deinit(io);
         const started = benchmarkNow(io);
-        const walk = try journal.replay(io, 0);
+        const walk = try journal.replay(io, chronicle.beginning);
         var seen: usize = 0;
         var bytes: usize = 0;
         while (try walk.next(io)) |record| {
