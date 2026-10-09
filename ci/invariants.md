@@ -8,6 +8,10 @@
   integers, advance without gaps, and link each CRC32C checksum to the preceding
   record or segment root. Atomic batch bounds contain the record's sequence and
   remain within one segment. Envelope spans stay within the covered bytes.
+- Sequence numbers (`Seq`), byte counts (`Bytes`) and record counts (`Records`) are
+  distinct aegis types; arithmetic on them is checked in every build, and a number
+  from outside the process is range-checked where it enters (a segment name from 1
+  to `maxInt(i64)`, an index header's record count that must end at or below it).
 - A segment has a positive base and `last_seq >= base_seq - 1`. Its header lies
   before its records. Known timestamp ranges contain the last timestamp; an
   unknown range is explicitly empty. Segments are ordered by increasing base.
@@ -16,12 +20,15 @@
   segment's sequence, byte count and chain tip together. Index errors cannot
   change the record durability promise: indexes are rebuildable caches.
 - Index headers contain 96 bytes and entries contain 24 bytes, with fixed
-  little-endian integer fields and CRC32C checks. Entry offsets refer to complete
+  little-endian integer fields and CRC32C checks. An index whose header does not
+  describe its segment, including a record count no record number can end, is stale
+  and rebuilt. Entry offsets refer to complete
   record starts; index length is header length plus whole entries. Writers and
   readers agree on field offsets and widths.
 - Scan base and limit slices have equal length and fit their retained storage;
   the current segment index never exceeds their length. Readers hand out one
-  bounded line at a time and validate continuity before handing on a record.
+  bounded line at a time, as bytes nothing has parsed, and validate continuity
+  before handing on a record.
 - A retained tail is ordered by sequence; its live window fits its allocation.
   A record and the arena owning its bytes enter and leave it together. Replay
   positions carry a positive sequence and an increasing byte range, checked

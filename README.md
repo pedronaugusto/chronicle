@@ -115,6 +115,13 @@ and `rearmAt` resume a replay after validating its prior record; changed history
 yield `StalePosition`. `copySince` returns an independent owned batch from the memory
 tail; check `complete()` before treating it as the whole interval.
 
+A sequence number is a `chronicle.Seq`, a size is a `chronicle.Bytes` and a count of
+records is a `chronicle.Records`: [aegis](https://github.com/pedronaugusto/aegis) types
+that cannot be mixed or added across kinds. `Seq.fromRaw(n)` and `raw()` cross to a plain
+integer, and `chronicle.beginning` is the place before the first record, which a cursor
+that has handled nothing stands at. Arithmetic on them is checked in every build. What the
+package reads raw, and why, is in [docs/design.md](docs/design.md).
+
 Snapshots store caller-supplied state bytes and the sequence they cover. Restore the
 bytes, then replay after that sequence. Named tailers persist committed cursors.
 Compaction, segment removal and backup are explicit calls; the journal does not decide
@@ -133,6 +140,8 @@ exercises schema migration.
 ## Built with
 
 - [Zig](https://ziglang.org) 0.17.0 and its standard library; nothing is linked.
+- [aegis](https://github.com/pedronaugusto/aegis) supplies the types that keep sequence
+  numbers, byte counts and record counts apart, and the checked arithmetic on them.
 - [strand](https://github.com/pedronaugusto/strand) reads and writes each record's
   line.
 - [airlock](https://github.com/pedronaugusto/airlock) makes the files durable: every
@@ -152,8 +161,8 @@ default. Tests cover crash prefixes, checksum and chain failures, recovery, repl
 snapshots, retention, concurrency and allocation cleanup. `zig build examples` runs the
 examples separately; `zig build check` compiles the suite, helper and examples without
 running them. CI also runs `zig build docs -- usage --check`, and
-`zig build check-consumer` builds a project that depends on chronicle with only strand
-fetched.
+`zig build check-consumer` builds a project that depends on chronicle with only aegis,
+strand, airlock and warp fetched.
 
 [CI](.github/workflows/ci.yml) has three tiers. The fast tier runs the source checks and
 the Debug suite with the examples on `ubuntu-latest`. The merge tier also runs the Debug

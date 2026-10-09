@@ -20,6 +20,13 @@ const values = @import("values.zig");
 
 const Seq = values.Seq;
 
+/// A line as it lies in a file: bytes nothing has read yet, which are a record,
+/// a segment's first line or damage until one of the readers in this file or in
+/// `Log.zig` has said which. Everything that comes off a disk is one of these,
+/// and `parse` hands it to a reader whose answer is a refined value or a named
+/// refusal.
+pub const Unparsed = aegis.input.Untrusted([]const u8);
+
 /// A member's value as an integer when it is one written as one — no
 /// fraction, no exponent, not a string — and within an `i64`. Null for
 /// anything else.
@@ -169,8 +176,7 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
     if (seq < 1) return error.Corrupt;
     const number: Seq = .fromRaw(aegis.int.cast(u64, seq) catch return error.Corrupt);
     const from = @intFromPtr(found.ev.bytes.ptr) - @intFromPtr(line.ptr); // safe: parseLine without copy_strings hands back a view into line; numbers only
-    std.debug.assert(from <= line.len);
-    std.debug.assert(found.ev.bytes.len <= line.len - from);
+    aegis.assert.invariant(from <= line.len and found.ev.bytes.len <= line.len - from, "a member read without a copy is a view into the line it was read from");
     // Both members of a batch or neither, and one the record can be in.
     if ((found.bf == null) != (found.bl == null)) return error.Corrupt;
     const batch: ?Batch = if (found.bf) |bf| checkedBatch(

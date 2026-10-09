@@ -33,5 +33,13 @@
   ],
   "unreachable_exceptions": "ci/unreachable-exceptions.json",
   "debug_print_exceptions": "ci/debug-print-exceptions.json",
-  "file_name_exceptions": "ci/file-name-exceptions.json"
+  "file_name_exceptions": "ci/file-name-exceptions.json",
+  "glint": {
+    "rules": [
+      {
+        "id": "A004",
+        "level": "gate"
+      }
+    ]
+  }
 }

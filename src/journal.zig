@@ -945,7 +945,7 @@ pub fn Journal(comptime Event: type) type {
                         else => |e| return e,
                     }) orelse return error.StalePosition;
                     if (walk.scan.at != 0 or walk.scan.position != last.end) return error.StalePosition;
-                    const header = parseHeader(walk.scratch.allocator(), line) catch |err| switch (err) {
+                    const header = line.parse(walk.scratch.allocator(), parseHeader) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.StalePosition,
                     };
@@ -960,12 +960,12 @@ pub fn Journal(comptime Event: type) type {
                 while (try walk.scan.next(io)) |line| {
                     if (walk.scan.takeBoundary()) |boundary| try walk.run.beginSegment(boundary);
                     _ = walk.scratch.reset(.retain_capacity);
-                    const header = try parseHeader(walk.scratch.allocator(), line);
+                    const header = try line.parse(walk.scratch.allocator(), parseHeader);
                     if (header.batch) |batch| if (values.below(walk.whole_through, batch.last)) {
                         // A batch being written beside this walk, or one a
                         // crash cut: none of it until all of it is there.
                         if (!try walk.scan.holds(io, batch.last)) {
-                            try walk.scan.rewind(io, .fromRaw(line.len + 1));
+                            try walk.scan.rewind();
                             return null;
                         }
                         walk.whole_through = batch.last;
@@ -974,12 +974,14 @@ pub fn Journal(comptime Event: type) type {
                     // what lets a reader hold a cursor into a log whose
                     // events it does not know.
                     if (!try walk.run.accept(header)) {
-                        walk.last = walk.lastRead(header, line);
+                        walk.last = walk.lastRead(header);
                         continue;
                     }
                     _ = walk.arena.reset(.retain_capacity);
-                    const record = try recordFrom(walk.decoder, walk.arena.allocator(), header, line);
-                    walk.last = walk.lastRead(header, line);
+                    // The envelope has read and checked this line; what is left
+                    // is its event, which is the header's span of the same bytes.
+                    const record = try recordFrom(walk.decoder, walk.arena.allocator(), header, line.readForParse());
+                    walk.last = walk.lastRead(header);
                     return record;
                 }
                 return null;
@@ -991,11 +993,11 @@ pub fn Journal(comptime Event: type) type {
             }
 
             /// The record just read, where it lies in its file.
-            fn lastRead(walk: *const Replay, header: Header, line: []const u8) Position.Last {
+            fn lastRead(walk: *const Replay, header: Header) Position.Last {
                 return .{
                     .seq = header.seq,
                     .segment = walk.scan.bases[walk.scan.at],
-                    .start = values.minus(walk.scan.position, .fromRaw(line.len + 1)),
+                    .start = walk.scan.line_start,
                     .end = walk.scan.position,
                     .checksum = header.c,
                 };
@@ -1764,12 +1766,12 @@ pub fn Journal(comptime Event: type) type {
             while (try scan.next(io)) |line| {
                 if (scan.takeBoundary()) |boundary| try run.beginSegment(boundary);
                 _ = self.scratch.reset(.retain_capacity);
-                const header = try parseHeader(self.scratch.allocator(), line);
+                const header = try line.parse(self.scratch.allocator(), parseHeader);
                 if (!try run.accept(header)) continue;
 
                 const arena = try createArena(self.gpa);
                 errdefer destroyArena(arena);
-                const stored = try arena.allocator().dupe(u8, line);
+                const stored = try arena.allocator().dupe(u8, line.readForParse());
                 const record = try recordFrom(self.captureDecoder(), arena.allocator(), header, stored);
                 try rebuilt.entries.ensureUnusedCapacity(self.gpa, 1);
                 rebuilt.appendAssumeCapacity(.{ .record = record, .arena = arena });
@@ -1870,8 +1872,10 @@ pub fn Journal(comptime Event: type) type {
             ev: Span,
             line: []const u8,
         ) ReadError!Event {
-            std.debug.assert(ev.from <= ev.to);
-            std.debug.assert(ev.to <= line.len);
+            // The span came out of reading a line, and is cut from the bytes
+            // it is handed here; a pair that do not belong together would slice
+            // past the line in a build that does not check.
+            aegis.assert.pre(ev.from <= ev.to and ev.to <= line.len, "an event's span lies inside the line it was read from");
             if (version == decoding.schema_version) {
                 return strand.parseLine(Event, arena, line[ev.from..ev.to], event_parse) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,

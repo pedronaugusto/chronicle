@@ -77,8 +77,9 @@ pub fn successor(seq: Seq) SequenceError!Seq {
 /// `seq` moved on by `records`. `error.SequenceExhausted` past `newest_possible`.
 pub fn advance(seq: Seq, records: Records) SequenceError!Seq {
     const moved = aegis.int.Checked(u64).init(seq.raw()).add(records.raw()) catch return error.SequenceExhausted;
-    if (moved.raw() > newest_possible.raw()) return error.SequenceExhausted;
-    return .fromRaw(moved.raw());
+    const next: Seq = .fromRaw(moved.raw());
+    if (next.compare(newest_possible) == .gt) return error.SequenceExhausted;
+    return next;
 }
 
 /// How many records `first` through `last` are, both counted. `last` one
@@ -107,8 +108,9 @@ pub fn lastOf(first: Seq, records: Records) ?Seq {
     const Checked = aegis.int.Checked(u64);
     const end = Checked.init(first.raw()).add(records.raw()) catch return null;
     const last = end.sub(1) catch return null;
-    if (last.raw() > newest_possible.raw()) return null;
-    return .fromRaw(last.raw());
+    const found: Seq = .fromRaw(last.raw());
+    if (found.compare(newest_possible) == .gt) return null;
+    return found;
 }
 
 /// The position `records` records before `seq`, when that is a record's:

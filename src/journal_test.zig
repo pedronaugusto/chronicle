@@ -2753,6 +2753,121 @@ test "an index for the wrong segment length is refused and rebuilt" {
     try testing.expectEqualStrings(good, try ws.read(try ws.index(1)));
 }
 
+test "an index that counts more records than the sequence can number is a stale cache, not a crash" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+        defer journal.deinit(io);
+        for (1..13) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // The header's record count is a word the entries' checksum does not
+    // cover, so a flipped bit leaves an index that every other check passes.
+    // Twelve records are three segments: the first two sealed by a rotation,
+    // the last sealed by the close.
+    const sealed = try ws.read(try ws.index(1));
+    const active = try ws.read(try ws.index(11));
+    for ([_]struct { base: u64, good: []const u8 }{ .{ .base = 1, .good = sealed }, .{ .base = 11, .good = active } }) |each| {
+        const bad = try testing.allocator.dupe(u8, each.good);
+        defer testing.allocator.free(bad);
+        std.mem.writeInt(u64, bad[40..48], std.math.maxInt(u64), .little);
+        try ws.write(try ws.index(each.base), bad);
+    }
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+    defer journal.deinit(io);
+    try testing.expectEqual(Seq.fromRaw(12), try journal.lastSeq(io));
+    try testing.expectEqual(Bytes.fromRaw(0), (try journal.status(io)).dropped_bytes);
+    // A seek into the segment whose index lied reads the records, and rebuilds
+    // the index it did not trust.
+    const walk = try journal.replay(io, Seq.fromRaw(2));
+    defer walk.deinit(io);
+    const record = (try walk.next(io)) orelse return error.TestExpectedRecord;
+    try testing.expectEqual(Seq.fromRaw(3), record.seq);
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(1)), try journal.seqAtOrAfter(io, 1));
+    try testing.expectEqualStrings(sealed, try ws.read(try ws.index(1)));
+}
+
+test "an index whose last entry lies past its segment is a stale cache, not a crash" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const options: Journal.Options = .{ .sync = .never, .index_interval_bytes = Bytes.fromRaw(0) };
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        for (1..4) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+
+    // One entry per record, the last of them moved beyond the end of the
+    // segment, and the checksum over the entries made to agree: every check the
+    // header can make passes.
+    const good = try ws.read(try ws.index(1));
+    const bad = try testing.allocator.dupe(u8, good);
+    defer testing.allocator.free(bad);
+    try testing.expectEqual(@as(usize, 96 + 3 * 24), bad.len);
+    std.mem.writeInt(u64, bad[96 + 2 * 24 + 8 ..][0..8], 1 << 40, .little);
+    std.mem.writeInt(u32, bad[92..96], chronicle.checksum(bad[96..]), .little);
+    try ws.write(try ws.index(1), bad);
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, options);
+    defer journal.deinit(io);
+    try testing.expectEqual(Seq.fromRaw(4), try journal.append(io, 4, created(4, "after")));
+    try testing.expectEqual(Records.fromRaw(4), try journal.verify(io));
+}
+
+test "a preallocation as large as a number can be reserves up to the segment limit" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const options: Journal.Options = .{
+        .sync = .never,
+        .preallocate_bytes = Bytes.fromRaw(std.math.maxInt(u64)),
+        .max_segment_bytes = Bytes.fromRaw(4096),
+    };
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        _ = try journal.append(io, 1, created(1, "one"));
+        _ = try journal.append(io, 2, created(2, "two"));
+        // Reserved to the limit and no further: the zeros are the segment's
+        // whole allowance.
+        try testing.expectEqual(@as(usize, 4096), (try ws.read(try ws.segment(1))).len);
+    }
+    // A close cuts the reservation back to the records.
+    const journal = try Journal.open(testing.allocator, io, ws.path, options);
+    defer journal.deinit(io);
+    try testing.expectEqual(Seq.fromRaw(2), try journal.lastSeq(io));
+    try testing.expectEqual(Records.fromRaw(2), try journal.verify(io));
+}
+
+test "a file named like a segment but past the last sequence number is not one" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+        defer journal.deinit(io);
+        for (1..3) |i| _ = try journal.append(io, @intCast(i), created(@intCast(i), "n"));
+    }
+    // Twenty digits fit the name's width, and neither is a number a record can
+    // carry: one is the first above an i64, the other the largest u64.
+    try ws.write(try ws.sub("09223372036854775808.log"), "not a segment\n");
+    try ws.write(try ws.sub("18446744073709551615.log"), "not a segment\n");
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(5, 1024));
+    defer journal.deinit(io);
+    try testing.expectEqual(Seq.fromRaw(2), try journal.lastSeq(io));
+    try testing.expectEqual(@as(usize, 1), try journal.segmentCount(io));
+    try testing.expectEqual(Records.fromRaw(2), try journal.verify(io));
+}
+
 //========================================================================
 // Lookup by time.
 //========================================================================

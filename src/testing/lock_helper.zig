@@ -74,7 +74,8 @@ pub fn main(init: std.process.Init) !void {
                 2 => try journal.compact(io, .fromRaw(random.random().intRangeAtMost(u64, 0, newest.raw()))),
                 3 => journal.truncateAfter(
                     io,
-                    // glint-ignore: A004 -- no-danger: docs/design.md#raw-sites; the chaos helper draws a position from raw bounds it was just handed, and an out-of-range one is the error it tolerates
+                    // The chaos helper draws from the raw bounds it was just handed;
+                    // a position below the oldest is the error it tolerates.
                     .fromRaw(random.random().intRangeAtMost(u64, oldest.raw() -| 1, newest.raw())),
                 ) catch |err| switch (err) {
                     error.SeqTooOld => {},

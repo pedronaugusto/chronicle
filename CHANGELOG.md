@@ -37,9 +37,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   version 2. An `Event` arm named `unknown` may be a `chronicle.Raw` as well
   as `void` or a `std.json.Value`, and then holds the older record's event
   as its bytes.
+- Sequence numbers, byte counts and record counts are [aegis](https://github.com/pedronaugusto/aegis) types, kept apart so one cannot stand where another is wanted. `chronicle.Seq` is a position in the sequence (equality and an order, no arithmetic; `Seq.fromRaw(n)` and `raw()` cross to a plain integer, and `chronicle.beginning` is the place before the first record), `chronicle.Bytes` a length or offset, `chronicle.Records` a count. Every `u64` sequence number in the API is a `Seq`: the returns of `append`, `appendDeferred`, `appendAll`, `appendIf`, `appendAllIf`, `reconcile`, `lastSeq`, `oldestSeq`, `waitPast`, `backup` and `seqAtOrAfter`; the arguments `cursor`, `seq`, `keep_after_seq` and `Tailer.commit`; `Record.seq`, `Snapshot.seq`, `Expected.last` and `.found`, `Position.cursor` and its `Last`, `Reader.cursor`, `minCursor`, `Stats.oldest_seq` and `newest_seq`, and `segmentName` and `indexName`. `Options.max_segment_bytes`, `max_record_bytes`, `max_snapshot_bytes`, `preallocate_bytes`, `index_interval_bytes`, `tail_bytes`, `write_buffer_size` and `read_buffer_size` are `Bytes`; `max_segment_records` and `tail_records` are `Records`; `Status.dropped_bytes`, `Stats.bytes` and `Position.Last.start` and `.end` are `Bytes`; `Stats.records` and `verify`'s result are `Records`. chronicle adds aegis as a dependency.
+- `SequenceExhausted` can also come from `compact` and the log's own numbering, not only from `append`: a record is never numbered past `maxInt(i64)` by any caller.
 
 ### Changed
 
+- A segment file's name is a sequence number from 1 to `maxInt(i64)`; a file named for a larger number, which no record can carry, is no longer read as a segment.
 - CRC32C is supplied by [warp](https://github.com/pedronaugusto/warp), pinned at `e607c19`, with runtime CPU dispatch and hardware kernels in baseline builds. Record and index checksum values are unchanged.
 
 ### Added
@@ -153,6 +156,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- An index whose header counts more records than the sequence can number (a flipped bit in a word the entries' checksum does not cover) overflowed `base + count - 1` while the journal opened, trapping in Debug and ReleaseSafe and wrapping in ReleaseFast to a segment that ended before it began. It is a stale cache now and is rebuilt.
+- `preallocate_bytes` as large as a number can be (`maxInt(u64)`, meaning "reserve to the limit") overflowed the sum of the segment, the record and the reservation on the first append. The reservation is cut to `max_segment_bytes`, as it always was for any other size.
+- A file in the journal's directory named like a segment for a number past `maxInt(i64)` (`18446744073709551615.log`) failed the open with `error.DiscontinuousSeq`; it is ignored, as every other name that is not a segment's is.
 - A backup on a filesystem that clones (APFS) synced none of the segments it cloned; they are now made durable with the copies.
 - A project that depends on chronicle builds: `build.zig` reaches the lazy `preflight` dependency through `b.lazyImport`, and only in chronicle's own tree.
 - A batch refused part-way (`RecordTooLarge`, `NotRoundTrippable`) is taken back to where it started, without a rescan. Records longer than the write buffer had already reached the file; the journal latched as failed, and a reopen or `reconcile` returned them as committed.
