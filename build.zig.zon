@@ -36,8 +36,8 @@
             .hash = "warp-0.1.0-JASxFYjCAwAP0PAOtv3qiGkW9TIRI_Wwg0jwlH8FhtSZ",
         },
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis#f199c0d7004cf022026b6d3933543665fd35a994",
-            .hash = "aegis-0.0.0-rsxouoQPBAA-wTYL0qWzpqy-1nrKc3R3Ze5Cl_S2HKse",
+            .url = "git+https://github.com/pedronaugusto/aegis#b77c6598dbb5dc614e96b0e0f34f0a34e6e9f659",
+            .hash = "aegis-0.0.0-rsxouq3RBACj3yUWyVoivDKVbhous7EAEWoEe1nyVY3_",
         },
     },
     .paths = .{

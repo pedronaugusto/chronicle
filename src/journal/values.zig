@@ -3,13 +3,12 @@
 //!
 //! All three are aegis types, so a sequence number cannot stand where a byte
 //! count is wanted and a count of records cannot be added to a count of bytes.
-//! aegis gives each its checked arithmetic and its conversions, and gives the
-//! sequence an order and an equality. What it does not give yet are the
-//! relations between the kinds: a sequence number moved by a count of
-//! records, the count between two sequence numbers, and an order on bytes and
-//! counts. They are written once, here, on top of aegis's checked integers;
-//! docs/design.md says why each of the raw reads below is the one place that
-//! needs it.
+//! aegis gives each its checked arithmetic, its conversions, an equality and an
+//! order. What it does not give are the relations between the kinds: a
+//! sequence number moved by a count of records, the count between two
+//! sequence numbers, the sequence number a count of records ends at. They are
+//! written once, here, on top of aegis's checked integers; docs/design.md says
+//! why each of the raw reads below is the one place that needs it.
 //!
 //! This file is internal. `chronicle.zig` names the three types.
 
@@ -141,8 +140,7 @@ pub fn minus(a: anytype, b: @TypeOf(a)) @TypeOf(a) {
 
 /// Where two values of one aegis scalar domain stand to each other.
 pub fn order(a: anytype, b: @TypeOf(a)) std.math.Order {
-    if (comptime @hasDecl(@TypeOf(a), "compare")) return a.compare(b);
-    return std.math.order(a.raw(), b.raw());
+    return a.compare(b);
 }
 
 /// `a` is below `b`.

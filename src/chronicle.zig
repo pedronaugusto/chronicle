@@ -682,7 +682,7 @@ pub fn Journal(comptime Event: type) type {
         }
 
         /// Copy the records after `cursor` that are in the tail, under the
-        /// journal's lock. Pass zero to copy the whole tail.
+        /// journal's lock. Pass `beginning` to copy the whole tail.
         ///
         /// A cursor at or beyond the newest sequence yields an empty, complete
         /// batch. A cursor older than the tail yields the whole tail with
@@ -899,7 +899,7 @@ pub fn Journal(comptime Event: type) type {
         /// A cursor below `oldestSeq() - 1` is `error.HistoryDropped`: the
         /// records after it are gone, and a fold restored to it would skip
         /// them without knowing. A caller who accepts the gap starts from
-        /// `oldestSeq() - 1`; zero means everything the log holds.
+        /// `oldestSeq() - 1`; `beginning` means everything the log holds.
         ///
         /// Records the tail no longer holds are streamed from the disk one at a
         /// time, so a fold over a year of records costs the largest record and

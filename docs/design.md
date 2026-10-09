@@ -23,10 +23,11 @@ number could stand where an offset was wanted and compile. They are
 - `Records` (`aegis.units.Count`): how many records, whether a segment's limit,
   a tail's, a `verify`'s result or the entries an index holds.
 
-The relations between the kinds are not in aegis yet: a sequence number moved by
-a count of records, the count between two sequence numbers, an order on bytes and
-counts. `values.zig` writes them once on aegis's checked integers
-(`successor`, `advance`, `span`, `lastOf`, `back`, `order`, `plus`, `minus`).
+The relations between the kinds are not in aegis: a sequence number moved by
+a count of records, the count between two sequence numbers, the sequence number a
+count of records ends at. `values.zig` writes them once on aegis's checked integers
+(`successor`, `advance`, `span`, `lastOf`, `back`) beside the few helpers that
+read as the code does (`below`, `atMost`, `lesser`, `greater`, `plus`, `minus`).
 Nothing else in the package does arithmetic on a raw sequence number, offset or
 count.
 
@@ -60,10 +61,9 @@ count.
 - **The operating system.** `setLength`, `readPositionalAll`, `seekTo`,
   `writePositionalAll`, `limited`, and the offsets strand's line reader reports
   are `u64`s or `usize`s.
-- **`values.zig`.** `order` compares two raw numbers of one kind, `limit` and
-  `memory` turn a count into a length in memory with a checked cast, and
-  `following` is the saturating place after a number. They are the one place each
-  of those is written.
+- **`values.zig`.** The relations above, `limit` and `memory`, which turn a count
+  into a length in memory with a checked cast, and `following`, the saturating
+  place after a number. They are the one place each of those is written.
 - **Tests and benchmarks.** They build expectations with plain integers and
   turn them into the types at the call, or read an answer back with `raw()` to
   count with it. Neither does arithmetic on a `raw()` of an aegis value inline.
