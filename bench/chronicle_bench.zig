@@ -291,8 +291,11 @@ fn rawOptions(sync: chronicle.Sync, access: chronicle.Access) RawJournal.Options
     };
 }
 
+/// The whole input file as raw events. The file is the caller's own and the
+/// default run's is 200 MB (a million records), so it has no limit: a
+/// 64 MiB one stopped the default run at `raw_append` with `StreamTooLong`.
 fn loadCorpus(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !struct { bytes: []u8, events: []strand.Raw } {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(64 << 20));
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     var events: std.ArrayList(strand.Raw) = .empty;
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |line| if (line.len != 0) try events.append(gpa, .{ .bytes = line });

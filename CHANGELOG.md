@@ -157,6 +157,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - An index whose header counts more records than the sequence can number (a flipped bit in a word the entries' checksum does not cover) overflowed `base + count - 1` while the journal opened, trapping in Debug and ReleaseSafe and wrapping in ReleaseFast to a segment that ended before it began. It is a stale cache now and is rebuilt.
+- `zig build bench` stopped at the raw-event workloads of the default run with `StreamTooLong`: the input they read, 200 MB at a million records, was limited to 64 MiB. The benchmark reads the whole file it is given.
+- An index whose last entry names an offset past the end of its segment, with the checksum over the entries made to agree, resumed the active segment's index and stopped a later append on an assertion in Debug and ReleaseSafe. It is a stale cache now and is rebuilt.
 - `preallocate_bytes` as large as a number can be (`maxInt(u64)`, meaning "reserve to the limit") overflowed the sum of the segment, the record and the reservation on the first append. The reservation is cut to `max_segment_bytes`, as it always was for any other size.
 - A file in the journal's directory named like a segment for a number past `maxInt(i64)` (`18446744073709551615.log`) failed the open with `error.DiscontinuousSeq`; it is ignored, as every other name that is not a segment's is.
 - A backup on a filesystem that clones (APFS) synced none of the segments it cloned; they are now made durable with the copies.
