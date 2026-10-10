@@ -15,8 +15,11 @@
 const std = @import("std");
 const aegis = @import("aegis");
 
-const Position = struct {};
 const Record = struct {};
+const Position = struct {
+    /// What sequence numbers are moved by: a number of records.
+    pub const Step = Records;
+};
 
 /// Where a record sits in the sequence. The first record of a journal that
 /// has never been compacted is 1 and each one after it is the next; zero is
@@ -65,7 +68,7 @@ pub const SequenceError = error{SequenceExhausted};
 /// number again. A position, not a record number: it is what a walk expects
 /// next, and what compares above everything it has passed.
 pub fn following(seq: Seq) Seq {
-    return .fromRaw(aegis.int.Saturating(u64).init(seq.raw()).add(1).raw());
+    return seq.successor() catch seq;
 }
 
 /// The record after `seq`. `error.SequenceExhausted` past `newest_possible`.
@@ -75,8 +78,7 @@ pub fn successor(seq: Seq) SequenceError!Seq {
 
 /// `seq` moved on by `records`. `error.SequenceExhausted` past `newest_possible`.
 pub fn advance(seq: Seq, records: Records) SequenceError!Seq {
-    const moved = aegis.int.Checked(u64).init(seq.raw()).add(records.raw()) catch return error.SequenceExhausted;
-    const next: Seq = .fromRaw(moved.raw());
+    const next = seq.advance(records) catch return error.SequenceExhausted;
     if (next.compare(newest_possible) == .gt) return error.SequenceExhausted;
     return next;
 }
@@ -86,28 +88,20 @@ pub fn advance(seq: Seq, records: Records) SequenceError!Seq {
 /// for two numbers that cannot bound a run: `last` further behind than that,
 /// or a run longer than a count can hold.
 pub fn span(first: Seq, last: Seq) ?Records {
-    const Checked = aegis.int.Checked(u64);
-    switch (first.compare(last)) {
-        .lt, .eq => {
-            const gap = Checked.init(last.raw()).sub(first.raw()) catch return null;
-            const counted = gap.add(1) catch return null;
-            return .fromRaw(counted.raw());
-        },
-        .gt => {
-            const behind = Checked.init(first.raw()).sub(last.raw()) catch return null;
-            return if (behind.raw() == 1) .fromRaw(0) else null;
-        },
-    }
+    const gap = first.distanceTo(last) catch {
+        // `last` is behind: one behind is the empty run.
+        const behind = last.distanceTo(first) catch return null;
+        return if (behind.eql(.fromRaw(1))) no_records else null;
+    };
+    return gap.add(.fromRaw(1)) catch null;
 }
 
 /// The last sequence number of `records` records that start at `first`: the
 /// one below `first` for none. Null when it runs past `newest_possible`, which
 /// is a count that does not belong to that start.
 pub fn lastOf(first: Seq, records: Records) ?Seq {
-    const Checked = aegis.int.Checked(u64);
-    const end = Checked.init(first.raw()).add(records.raw()) catch return null;
-    const last = end.sub(1) catch return null;
-    const found: Seq = .fromRaw(last.raw());
+    const end = first.advance(records) catch return null;
+    const found = end.retreat(.fromRaw(1)) catch return null;
     if (found.compare(newest_possible) == .gt) return null;
     return found;
 }
@@ -115,15 +109,14 @@ pub fn lastOf(first: Seq, records: Records) ?Seq {
 /// The position `records` records before `seq`, when that is a record's:
 /// null if it would be zero or below.
 pub fn back(seq: Seq, records: Records) ?Seq {
-    const gone = aegis.int.Checked(u64).init(seq.raw()).sub(records.raw()) catch return null;
-    if (gone.raw() == 0) return null;
-    return .fromRaw(gone.raw());
+    const gone = seq.retreat(records) catch return null;
+    if (gone.eql(beginning)) return null;
+    return gone;
 }
 
 /// The number before `seq`; null for zero, which has none.
 pub fn predecessor(seq: Seq) ?Seq {
-    const before = aegis.int.Checked(u64).init(seq.raw()).sub(1) catch return null;
-    return .fromRaw(before.raw());
+    return seq.predecessor() catch null;
 }
 
 /// `a` and `b` together, for lengths, offsets and counts that belong to one

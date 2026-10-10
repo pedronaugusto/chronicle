@@ -2104,8 +2104,7 @@ fn indexedSeqAtOrAfter(log: *Self, io: Io, at: usize, want: i64) OpenError!?Seq 
         // some of the records, and any of the others could be the answer.
         return null;
     }
-    var slot: u64 = 0;
-    while (slot < indexed.entries.raw()) : (slot += 1) {
+    for (0..indexed.entries.raw()) |slot| {
         const entry = (try log.indexEntryAt(io, file, slot)) orelse return null;
         if (entry.at >= want) return entry.seq;
     }

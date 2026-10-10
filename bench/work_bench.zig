@@ -30,6 +30,11 @@ const Fold = struct {
     }
 };
 
+/// Removes a scratch directory, whether or not it is there.
+fn scrub(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch {}; // glint-ignore: Z026 -- scratch cleanup between measurements: a directory that stays costs the next run its first step, which clears it again
+}
+
 fn elapsed(io: Io, start: Io.Timestamp) f64 {
     return @floatFromInt(start.durationTo(benchmarkNow(io)).toNanoseconds());
 }
@@ -169,7 +174,7 @@ pub fn main(init: std.process.Init) !void {
     const a = init.gpa;
     // Exclusive creation makes each invocation own all of its scratch.
     try Io.Dir.cwd().createDir(io, scratch, .default_dir);
-    defer Io.Dir.cwd().deleteTree(io, scratch) catch {};
+    defer scrub(io, scratch);
     inline for (.{ .{ "seek", seeks }, .{ "fold", folds }, .{ "rates", rates }, .{ "batch", batches }, .{ "large", largeOpen } }) |work| {
         const path = try std.Io.Dir.path.join(a, &.{ scratch, work[0] });
         defer a.free(path);

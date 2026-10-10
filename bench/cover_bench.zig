@@ -30,6 +30,11 @@ const J = chronicle.Journal(Event);
 const padding: []const u8 = &@as([172]u8, @splat('x'));
 const label = "chronicle";
 
+/// Removes a scratch directory, whether or not it is there.
+fn scrub(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch {}; // glint-ignore: Z026 -- scratch cleanup between measurements: a directory that stays costs the next run its first step, which clears it again
+}
+
 fn now(io: Io) Io.Timestamp {
     if (smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
     return Io.Clock.awake.now(io);
@@ -123,8 +128,7 @@ pub fn main(init: std.process.Init) !void {
 /// first, each scratch mode in a fresh directory of its own.
 fn everyMode(io: Io, gpa: std.mem.Allocator) !void {
     const data = "data";
-    const cwd = Io.Dir.cwd();
-    cwd.deleteTree(io, data) catch {};
+    scrub(io, data);
     {
         const journal = try J.open(gpa, io, data, options(.never, .write));
         defer journal.deinit(io);
@@ -139,13 +143,13 @@ fn everyMode(io: Io, gpa: std.mem.Allocator) !void {
     try subscribeFrom(io, gpa, data);
     inline for (.{ copySince, refresh, waitPast, deferred, tailers, snapshots, retention, finish }) |mode| {
         const scratch = "scratch";
-        cwd.deleteTree(io, scratch) catch {};
+        scrub(io, scratch);
         try mode(io, gpa, scratch);
-        cwd.deleteTree(io, scratch) catch {};
+        scrub(io, scratch);
     }
     try backup(io, gpa, data, "backup");
     try backupCopy(io, data, "backup-copy");
-    cwd.deleteTree(io, data) catch {};
+    scrub(io, data);
 }
 
 /// The record checksum over buffers of three sizes, 256 MiB of each.
@@ -480,7 +484,7 @@ fn retention(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     inline for (.{ Op.drop, Op.truncate, Op.compact }, .{ "drop-before", "truncate-after", "compact" }) |op, work| {
         const path = try join(gpa, scratch, work);
         defer gpa.free(path);
-        Io.Dir.cwd().deleteTree(io, path) catch {};
+        scrub(io, path);
         {
             const filling = try J.open(gpa, io, path, .{ .sync = .never, .max_segment_bytes = chronicle.Bytes.fromRaw(segment) });
             defer filling.deinit(io);
@@ -508,7 +512,7 @@ fn retention(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
 fn backup(io: Io, gpa: std.mem.Allocator, data: []const u8, dest: []const u8) !void {
     const journal = try J.open(gpa, io, data, options(.never, .read));
     defer journal.deinit(io);
-    Io.Dir.cwd().deleteTree(io, dest) catch {};
+    scrub(io, dest);
     const started = now(io);
     const records = try journal.backup(io, dest);
     const elapsed = since(io, started);
@@ -516,7 +520,7 @@ fn backup(io: Io, gpa: std.mem.Allocator, data: []const u8, dest: []const u8) !v
     // What is checked is that every segment byte arrived.
     try check("backup", "segments_complete", @intFromBool(try treeBytes(io, dest) == try treeBytes(io, data)));
     try check("backup-records", "records", records.raw());
-    Io.Dir.cwd().deleteTree(io, dest) catch {};
+    scrub(io, dest);
 }
 
 /// The bytes of the segment files under `path`.
@@ -537,7 +541,7 @@ fn treeBytes(io: Io, path: []const u8) !u64 {
 /// syncs them (`F_FULLFSYNC` on macOS). `cp`, which clones on APFS, would
 /// copy no bytes at all.
 fn backupCopy(io: Io, data: []const u8, dest: []const u8) !void {
-    Io.Dir.cwd().deleteTree(io, dest) catch {};
+    scrub(io, dest);
     var buffer: [1 << 20]u8 = undefined;
     const started = now(io);
     var from = try Io.Dir.cwd().openDir(io, data, .{ .iterate = true });
@@ -567,7 +571,7 @@ fn backupCopy(io: Io, data: []const u8, dest: []const u8) !void {
     const elapsed = since(io, started);
     try row("backup", "elapsed", @as(f64, @floatFromInt(elapsed)) / 1e6, "ms");
     try check("backup", "segments_complete", @intFromBool(try treeBytes(io, dest) == try treeBytes(io, data)));
-    Io.Dir.cwd().deleteTree(io, dest) catch {};
+    scrub(io, dest);
 }
 
 /// `finish` and `deinit` after one durable append: flush, sync, seal,

@@ -12,6 +12,7 @@ const Records = chronicle.Records;
 const scalar = @import("journal/values.zig");
 const airlock = @import("airlock");
 const shakedown = @import("shakedown");
+const aegis = @import("aegis");
 const seam = @import("airlock.testing");
 const Seam = seam.Seam;
 /// The lock helper's path, from the build: `zig build test` compiles it
@@ -5075,7 +5076,7 @@ fn resumeFrom(io: Io, journal: *Journal, position: chronicle.Position, seqs: *st
     const walk = try journal.replayAt(io, position);
     defer walk.deinit(io);
     while (try walk.next(io)) |record| {
-        try testing.expectEqual(@as(u32, @intCast(record.seq.raw())), record.event.created.id);
+        try testing.expectEqual(try aegis.int.cast(u32, record.seq.raw()), record.event.created.id);
         try seqs.append(testing.allocator, record.seq.raw());
     }
     return walk.position();
@@ -7625,7 +7626,7 @@ const Racer = struct {
         while (scalar.below(last, Seq.fromRaw(racer.rounds))) {
             var found: Seq = chronicle.beginning;
             const next = scalar.following(last);
-            if (racer.journal.appendIf(io, .{ .last = last, .found = &found }, @intCast(next.raw()), created(racer.id, "racing"))) |seq| {
+            if (racer.journal.appendIf(io, .{ .last = last, .found = &found }, try aegis.int.cast(i64, next.raw()), created(racer.id, "racing"))) |seq| {
                 if (seq != next) return error.TestNotTheNextRecord;
                 try racer.won.append(testing.allocator, seq.raw());
                 last = seq;

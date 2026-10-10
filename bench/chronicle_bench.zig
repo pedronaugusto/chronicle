@@ -39,6 +39,11 @@ const Journal = chronicle.Journal(Event);
 const input_line = prefix ++ @as([record_bytes - prefix.len - 3]u8, @splat('x')) ++ "\"}\n";
 
 /// Write `count` records to `path`.
+/// Removes a scratch directory, whether or not it is there.
+fn scrub(io: std.Io, path: []const u8) void {
+    std.Io.Dir.cwd().deleteTree(io, path) catch {}; // glint-ignore: Z026 -- scratch cleanup between measurements: a directory that stays costs the next run its first step, which clears it again
+}
+
 fn writeInput(io: std.Io, path: []const u8, count: usize) !void {
     if (count == 0) return error.InvalidCount;
     const file = try std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
@@ -88,10 +93,6 @@ fn options(sync: chronicle.Sync, access: chronicle.Access) Journal.Options {
     };
 }
 
-fn reset(io: std.Io, path: []const u8) void {
-    std.Io.Dir.cwd().deleteTree(io, path) catch {};
-}
-
 fn seconds(started: std.Io.Timestamp, io: std.Io) f64 {
     const ns = started.durationTo(benchmarkNow(io)).toNanoseconds();
     return @as(f64, @floatFromInt(ns)) / 1_000_000_000.0;
@@ -135,7 +136,7 @@ fn writeBatches(journal: *Journal, io: std.Io, input: Input, batch_len: usize) !
 fn prepare(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []const u8, count: usize) !void {
     var input = try Input.load(io, gpa, input_path, count);
     defer input.deinit(gpa);
-    reset(io, path);
+    scrub(io, path);
     const journal = try Journal.open(gpa, io, path, options(.never, .write));
     defer journal.deinit(io);
     try writeBatches(journal, io, input, 1000);
@@ -151,7 +152,7 @@ fn appendWorkload(
 ) !void {
     var input = try Input.load(io, gpa, input_path, count);
     defer input.deinit(gpa);
-    reset(io, path);
+    scrub(io, path);
     // A baseline does the plain operation and is reported under the name of
     // the one it is the baseline of, so the two are compared row for row.
     const baseline = std.mem.endsWith(u8, workload, "_baseline");
@@ -227,7 +228,7 @@ fn replay(io: std.Io, gpa: std.mem.Allocator, path: []const u8, count: usize, fr
 fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []const u8, count: usize, wakes: usize, workload: []const u8) !void {
     var input = try Input.load(io, gpa, input_path, count);
     defer input.deinit(gpa);
-    reset(io, path);
+    scrub(io, path);
     const journal = try Journal.open(gpa, io, path, options(.never, .write));
     defer journal.deinit(io);
     try writeBatches(journal, io, input, 1000);
@@ -325,7 +326,7 @@ fn rawWorkload(io: std.Io, gpa: std.mem.Allocator, corpus_path: []const u8, path
         if (seen != count or bytes != want) return error.FoldMismatch;
         return printMetric(io, workload, "records_per_second", @as(f64, @floatFromInt(count)) / elapsed, "records/s");
     }
-    reset(io, path);
+    scrub(io, path);
     const journal = try RawJournal.open(gpa, io, path, rawOptions(.never, .write));
     defer journal.deinit(io);
     const measuring = std.mem.eql(u8, workload, "raw_append");
@@ -412,9 +413,9 @@ fn everyWorkload(io: std.Io, gpa: std.mem.Allocator) !void {
     const raw = "raw";
     try rawWorkload(io, gpa, input, raw, count, "raw_append");
     try rawWorkload(io, gpa, input, raw, count, "raw_replay_all");
-    reset(io, scratch);
-    reset(io, prepared);
-    reset(io, raw);
+    scrub(io, scratch);
+    scrub(io, prepared);
+    scrub(io, raw);
 }
 
 // Smoke exercises correctness without sampling a benchmark clock.

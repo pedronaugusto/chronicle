@@ -5,39 +5,39 @@
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight#c04e49d329eaa1cb985cdb6ee07f906dd7d84743",
-            .hash = "preflight-0.1.0-LX1ZwjczCQDSSG7aH5c5oWXPdmltZQH2SCPUEKCdr6oG",
+            .url = "git+https://github.com/pedronaugusto/preflight#e3d81b9e477c1c690f1ce03506511935d16035c3",
+            .hash = "preflight-0.1.0-LX1Zwl2HCQB4-h0brJMmXe_1ZA3UoIT6vI9kJ3IE1grE",
             .lazy = true,
         },
 
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#753bfaf82309b760138d1e7f7746c02cdbdcf072",
-            .hash = "strand-0.7.0-8LNWViBGDgBc3vGXqgwl9o0nXWzMkDHeATuqDvGB2svk",
+            .url = "git+https://github.com/pedronaugusto/strand#11276651fabcd1b2c2f220288854f302725ccbe0",
+            .hash = "strand-0.7.0-8LNWVmO_GgCk4aU1EL0fYUZEJW6MB_hIssmINq4m1OlR",
         },
 
         // Durable files: every sync, atomic replace, batch and file identity.
         .airlock = .{
-            .url = "git+https://github.com/pedronaugusto/airlock#7f4add1981b59692b7fd7847f32fa6b32768bd3d",
-            .hash = "airlock-0.1.0-rfvu6NjxBABhOEPDMvXzGDAD-pNwgnBCo8wNfrF2g-EU",
+            .url = "git+https://github.com/pedronaugusto/airlock#a19d4f4e6825a49fc61478c14718414fb190a324",
+            .hash = "airlock-0.1.0-rfvu6JWGBQCN3u7evgacrcGxb7KYWMxQ-cxp8jviJKOD",
         },
 
         // Test doubles, for the tests alone: no module a consumer builds
         // imports it, and a consumer never fetches it.
         .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown#a3db7b9c9b60b76dafe1d6f2fa9aab9a8cde3c95",
-            .hash = "shakedown-0.1.0-BR8U4zMOEgCECMxdaaSV5AdzkdaiM8oJVsq6fb9t6tMo",
+            .url = "git+https://github.com/pedronaugusto/shakedown#caf380381a49ace7c13beba70dd512c4faf24ce7",
+            .hash = "shakedown-0.1.0-BR8U4yVfEgCS2Vw6zWMqw0wRjxct8g3tePy1UKNZ8Q89",
             .lazy = true,
         },
         // Record and index CRC-32C, with runtime CPU dispatch.
         .warp = .{
-            .url = "git+https://github.com/pedronaugusto/warp#e607c194f837fa0a7a8c08914495d4cc0202eb91",
-            .hash = "warp-0.1.0-JASxFYjCAwAP0PAOtv3qiGkW9TIRI_Wwg0jwlH8FhtSZ",
+            .url = "git+https://github.com/pedronaugusto/warp#f446a8b7bf86aef188075a32cc5d42e43eb102e0",
+            .hash = "warp-0.1.0-JASxFaMZEQBWhVdtwJ_gojtCU1nxRcpLj9OX-nlaaSqa",
         },
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis#b77c6598dbb5dc614e96b0e0f34f0a34e6e9f659",
-            .hash = "aegis-0.0.0-rsxouq3RBACj3yUWyVoivDKVbhous7EAEWoEe1nyVY3_",
+            .url = "git+https://github.com/pedronaugusto/aegis#be2523ffd337fa31b5336e6f652f642c43622471",
+            .hash = "aegis-0.0.0-rsxoutrdBgCSI4l3iGMCx8rEymViUGaDM3yuGFI3z01T",
         },
     },
     .paths = .{
