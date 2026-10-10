@@ -326,7 +326,7 @@ pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
 
 pub const OpenError = ReadError || Io.File.SetLengthError || Io.File.SyncError ||
     Io.File.WritePositionalError || Io.Dir.OpenError || Io.Dir.CreateDirPathError ||
-    Io.Dir.DeleteFileError || airlock.PruneError || error{ Locked, DiscontinuousSeq, IndexIntervalTooLarge, ReadOnly };
+    Io.Dir.DeleteFileError || airlock.PruneError || airlock.MakePathError || error{ Locked, DiscontinuousSeq, IndexIntervalTooLarge, ReadOnly };
 
 pub const AppendError = Io.Cancelable || Io.Writer.Error || Io.File.OpenError ||
     Io.File.SyncError || Io.File.WritePositionalError || Io.File.SetLengthError ||
@@ -477,7 +477,7 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Self.Ope
     const index_buf = try gpa.alloc(u8, 4096);
     errdefer gpa.free(index_buf);
 
-    const dir = try openDir(io, path, options.access);
+    const dir = try openDir(io, path, options);
     errdefer dir.close(io);
 
     var lock_file: ?Io.File = null;
@@ -529,12 +529,17 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Self.Ope
     return log;
 }
 
-fn openDir(io: Io, path: []const u8, access: Access) OpenError!Io.Dir {
+/// The journal's directory, created with every missing parent when a writer
+/// opens a journal that is not there. Each new directory's name is made as
+/// durable as the records will be (airlock's `makePath`): a segment synced
+/// into a directory whose own creation a power cut forgets is lost with it.
+fn openDir(io: Io, path: []const u8, options: Options) OpenError!Io.Dir {
     const cwd: Io.Dir = .cwd();
     return cwd.openDir(io, path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => {
-            if (access == .read) return error.FileNotFound;
-            try cwd.createDirPath(io, path);
+            if (options.access == .read) return error.FileNotFound;
+            const level: airlock.Level = if (options.sync == .never) .none else .full;
+            _ = try airlock.makePath(io, cwd, path, .{ .sync = .{ .level = level } });
             return cwd.openDir(io, path, .{ .iterate = true });
         },
         else => |e| return e,
@@ -726,10 +731,7 @@ fn resolveOverlaps(log: *Self, io: Io) OpenError!void {
                 const previous = try log.lastChecksum(io, earlier, earlier_head.root);
                 if (later_head.root != previous) {
                     if (log.options.access == .write) {
-                        for (log.segments.items[0 .. i + 1]) |segment| {
-                            try log.deleteSegmentFiles(io, segment.base_seq);
-                        }
-                        try log.syncDir(io);
+                        for (log.segments.items[0 .. i + 1]) |segment| try log.dropSegment(io, segment.base_seq);
                     }
                     var remove = i + 1;
                     while (remove != 0) : (remove -= 1) _ = log.segments.orderedRemove(0);
@@ -743,10 +745,7 @@ fn resolveOverlaps(log: *Self, io: Io) OpenError!void {
         if (earlier.last_seq.compare(later.base_seq) == .lt) return error.DiscontinuousSeq;
         if (try log.lastSeqOf(io, later) != earlier.last_seq) return error.DiscontinuousSeq;
         if (log.options.access == .write) {
-            for (log.segments.items[0 .. i + 1]) |segment| {
-                try log.deleteSegmentFiles(io, segment.base_seq);
-            }
-            try log.syncDir(io);
+            for (log.segments.items[0 .. i + 1]) |segment| try log.dropSegment(io, segment.base_seq);
         }
         var remove = i + 1;
         while (remove != 0) : (remove -= 1) _ = log.segments.orderedRemove(0);
@@ -2741,6 +2740,16 @@ fn syncDirHandle(io: Io, dir: Io.Dir) SyncDirError!void {
     _ = try airlock.syncDir(io, dir, .{ .level = .full });
 }
 
+/// Unlink a segment's files and make the unlink durable before anything
+/// else is removed. Removals the directory has not been synced after may
+/// reach the disk in any order, or not at all; one at a time, synced, a
+/// crash never keeps a later segment's removal without an earlier one's,
+/// so what the disk holds is always a whole log with no hole in it.
+fn dropSegment(log: *Self, io: Io, base_seq: Seq) (Io.Dir.DeleteFileError || SyncDirError)!void {
+    try log.deleteSegmentFiles(io, base_seq);
+    try log.syncDir(io);
+}
+
 fn deleteSegmentFiles(log: *Self, io: Io, base_seq: Seq) Io.Dir.DeleteFileError!void {
     try log.dir.deleteFile(io, &segmentName(segment_extension, base_seq));
     log.dir.deleteFile(io, &segmentName(index_extension, base_seq)) catch |err| {
@@ -2764,18 +2773,18 @@ pub fn dropSegmentsBefore(log: *Self, io: Io, seq: Seq) Self.CompactError!u64 {
     if (log.options.access == .read) return error.ReadOnly;
     var dropped: u64 = 0;
     while (log.segments.items.len > 1 and log.segments.items[0].last_seq.compare(seq) != .gt) {
-        try log.deleteSegmentFiles(io, log.segments.items[0].base_seq);
+        try log.dropSegment(io, log.segments.items[0].base_seq);
         _ = log.segments.orderedRemove(0);
         dropped += 1;
     }
-    if (dropped != 0) try log.syncDir(io);
     return dropped;
 }
 
 /// Drop every record after `seq`.
 ///
-/// Segments entirely past the cut are unlinked newest first, so what is left
-/// on the disk is always a continuous prefix; the segment holding `seq` is
+/// Segments entirely past the cut are unlinked newest first, each made
+/// durable before the next, so what is left on the disk is always a
+/// continuous prefix; the segment holding `seq` is
 /// then shortened to the byte at which the next record began, which is the
 /// same in-place shortening `open` uses to repair a torn tail. A crash between
 /// the two leaves a log that opens and still holds records this was asked to
@@ -2805,9 +2814,8 @@ pub fn truncateAfter(log: *Self, io: Io, seq: Seq) Self.TruncateError!void {
         i -= 1;
         const segment = log.segments.items[i];
         if (segment.base_seq.compare(holder.base_seq) != .gt) break;
-        try log.deleteSegmentFiles(io, segment.base_seq);
+        try log.dropSegment(io, segment.base_seq);
     }
-    try log.syncDir(io);
 
     if (offset != holder.bytes) {
         const file = try log.dir.createFile(io, &segmentName(segment_extension, holder.base_seq), .{ .truncate = false });
@@ -2885,9 +2893,8 @@ pub fn compact(log: *Self, io: Io, keep_after_seq: Seq) Self.CompactError!void {
 
     for (log.segments.items) |segment| {
         if (segment.base_seq.compare(keep_from) != .lt) continue;
-        try log.deleteSegmentFiles(io, segment.base_seq);
+        try log.dropSegment(io, segment.base_seq);
     }
-    try log.syncDir(io);
     try log.load(io);
 }
 
@@ -3030,11 +3037,12 @@ pub const BackupError = OpenError || airlock.FileId.Error || airlock.Batch.Error
 pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
     const cwd: Io.Dir = .cwd();
     // Opened first, so a destination that is a symbolic link to a directory
-    // is that directory: std's `createDirPath` refuses an existing link with
-    // `NotDir` where `mkdir -p` would follow it.
+    // is that directory: creating the path refuses an existing link with
+    // `NotDir` where `mkdir -p` would follow it. A new destination's
+    // directories are made durable, as the copy in them will be.
     var dest = cwd.openDir(io, dest_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => created: {
-            try cwd.createDirPath(io, dest_path);
+            _ = try airlock.makePath(io, cwd, dest_path, .{ .sync = .{ .level = .full } });
             break :created try cwd.openDir(io, dest_path, .{ .iterate = true });
         },
         else => |e| return e,

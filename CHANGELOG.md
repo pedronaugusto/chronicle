@@ -170,6 +170,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A journal's directory created by a writer's open was not made durable: an append
+  that returned under `Sync.always` could be lost with the directory a power cut
+  forgot. The directory and every parent the open creates are made durable through
+  airlock's `makePath`, as a backup's destination is; `open` can fail with airlock's
+  `MakePathError`.
+- A compaction, a truncation, a retention drop or an open finishing an interrupted
+  compaction removed several segments and synced the directory once: removals the
+  disk may keep in any order could leave a hole, and the next open failed with
+  `DiscontinuousSeq`. Each removal is made durable before the next.
 - An index whose header counts more records than the sequence can number (a flipped bit in a word the entries' checksum does not cover) overflowed `base + count - 1` while the journal opened, trapping in Debug and ReleaseSafe and wrapping in ReleaseFast to a segment that ended before it began. It is a stale cache now and is rebuilt.
 - `zig build bench` stopped at the raw-event workloads of the default run with `StreamTooLong`: the input they read, 200 MB at a million records, was limited to 64 MiB. The benchmark reads the whole file it is given.
 - An index whose last entry names an offset past the end of its segment, with the checksum over the entries made to agree, resumed the active segment's index and stopped a later append on an assertion in Debug and ReleaseSafe. It is a stale cache now and is rebuilt.

@@ -87,12 +87,11 @@ pub fn build(b: *std.Build) !void {
     // shakedown, and airlock's seam on it, are lazy and test-only: no
     // module a consumer builds imports them. Their error is returned last,
     // so one configure pass asks for them and for preflight together.
+    // One shakedown in the graph: the one airlock's seam is built on.
     var needed: error{LazyDependencyNeeded}!void = {};
-    if (b.dependencyLazy("shakedown", .{ .target = target, .optimize = optimize })) |shakedown| {
-        tests.root_module.addImport("shakedown", shakedown.module("shakedown"));
-    } else |err| needed = err;
     if (airlock_build.testing(airlock_dependency)) |seam| {
         tests.root_module.addImport("airlock.testing", seam);
+        tests.root_module.addImport("shakedown", seam.import_table.get("shakedown").?);
     } else |err| needed = err;
     const run_tests = b.addRunArtifact(tests);
 

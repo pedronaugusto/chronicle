@@ -13,31 +13,24 @@
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#dba457548716ac243002f753b8acf6a53904b37d",
-            .hash = "strand-0.7.0-8LNWVhMnFwDALhZ_3rVrAlpKY1255BgGx8Nn5VW7uOGi",
+            .url = "git+https://github.com/pedronaugusto/strand#3e9f34ee257af62769e74970bf5949b95b382c87",
+            .hash = "strand-0.7.0-8LNWVkYnFwAbnspmXHGncit7VYTHxi1m_AeWnaH4sGzy",
         },
 
         // Durable files: every sync, atomic replace, batch and file identity.
         .airlock = .{
-            .url = "git+https://github.com/pedronaugusto/airlock#a19d4f4e6825a49fc61478c14718414fb190a324",
-            .hash = "airlock-0.1.0-rfvu6JWGBQCN3u7evgacrcGxb7KYWMxQ-cxp8jviJKOD",
+            .url = "git+https://github.com/pedronaugusto/airlock#2505fadfad3dcb36137340b3ba731b044c38596c",
+            .hash = "airlock-0.1.0-rfvu6OXqBQDXhoG4omggY-Wdf0mpDIeXBKe4v4FFJA6d",
         },
 
-        // Test doubles, for the tests alone: no module a consumer builds
-        // imports it, and a consumer never fetches it.
-        .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown#caf380381a49ace7c13beba70dd512c4faf24ce7",
-            .hash = "shakedown-0.1.0-BR8U4yVfEgCS2Vw6zWMqw0wRjxct8g3tePy1UKNZ8Q89",
-            .lazy = true,
-        },
         // Record and index CRC-32C, with runtime CPU dispatch.
         .warp = .{
             .url = "git+https://github.com/pedronaugusto/warp#f446a8b7bf86aef188075a32cc5d42e43eb102e0",
             .hash = "warp-0.1.0-JASxFaMZEQBWhVdtwJ_gojtCU1nxRcpLj9OX-nlaaSqa",
         },
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis#be2523ffd337fa31b5336e6f652f642c43622471",
-            .hash = "aegis-0.0.0-rsxoutrdBgCSI4l3iGMCx8rEymViUGaDM3yuGFI3z01T",
+            .url = "git+https://github.com/pedronaugusto/aegis#104b1c07ebc698ec86cb65ca0befa0a63c266e8a",
+            .hash = "aegis-0.0.0-rsxouifgBgBOnC8-wtmFrZSIUjR9aEYPYmZD1G-hASAz",
         },
     },
     .paths = .{

@@ -96,9 +96,10 @@ on macOS, `fsync` on Linux and `NtFlushBuffersFile` on Windows, with the data-on
 (`fdatasync`, `NtFlushBuffersFileEx(DATA_SYNC_ONLY)` on NTFS) for writes into reserved
 space. A filesystem that declines the call gets the strongest one it takes, and
 `status().flushed` says what the records reached (`chronicle.flush` where nothing
-declined). A new segment, a compaction, a snapshot and a cursor are each made durable
-under their name, the directory included, on every platform: Windows flushes the
-directory too. A snapshot, a cursor and a compacted segment are written under a
+declined). A new journal's directory, a new segment, a compaction, a snapshot and a
+cursor are each made durable under their name, the directory included, on every
+platform: Windows flushes the directory too. Segments are removed one at a time, each
+removal durable before the next, so a crash never leaves a hole in the log. A snapshot, a cursor and a compacted segment are written under a
 temporary name drawn at random and renamed into place; a writer's open removes the
 temporaries a crash left once they are an hour old. A backup makes its copies durable
 together, a writeout of each and one flush of the device on macOS and Windows.
@@ -161,7 +162,12 @@ exercises schema migration.
 
 `zig build test` runs the unit suite, writer-lock helper and examples in Debug by
 default. Tests cover crash prefixes, checksum and chain failures, recovery, replay,
-snapshots, retention, concurrency and allocation cleanup. `zig build examples` runs the
+snapshots, retention, concurrency and allocation cleanup. Appends, a group commit, a
+compaction and a truncation also run inside a [shakedown](https://github.com/pedronaugusto/shakedown)
+simulation, airlock's calls routed onto its simulated disk, through `everyCrash`: a
+power loss at every step and every state the disk could come back in, each reopened by
+a writer and checked whole, a prefix of what was appended, holding every append that
+returned. `zig build examples` runs the
 examples separately; `zig build check` compiles the suite, helper and examples without
 running them. CI also runs `zig build docs -- usage --check`, and
 `zig build check-consumer` builds a project that depends on chronicle with only aegis,
