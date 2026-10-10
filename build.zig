@@ -124,7 +124,9 @@ pub fn build(b: *std.Build) !void {
                 .root_source_file = b.path(source),
                 .target = target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "chronicle", .module = module }},
+                // A migration parses an older event out of its bytes with
+                // strand, which a program that keeps events depends on too.
+                .imports = &.{ .{ .name = "chronicle", .module = module }, .{ .name = "strand", .module = strand } },
             }),
         });
         b.installArtifact(example);

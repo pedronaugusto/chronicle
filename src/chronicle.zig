@@ -21,10 +21,9 @@
 //! snapshot bounds how far back a fold has to start.
 //!
 //! Everything here is generic over one `Event` type, which may be any type
-//! `std.json` can both stringify and parse — a tagged union is the expected
+//! strand's JSON can both write and read back: a tagged union is the expected
 //! shape, because it gives each record a name on disk and an exhaustive
-//! `switch` in the fold. A record's line is written and read by strand, which
-//! writes the bytes `std.json` writes and reads what `std.json` reads; this
+//! `switch` in the fold. A record's line is written and read by strand; this
 //! package keeps the lines.
 //!
 //! See `Journal` for the API, and README.md for the durability promises.
@@ -39,9 +38,10 @@ const implementation = @import("journal.zig");
 
 /// An event kept as its bytes: what a `migrate` hook is handed, what an
 /// `unknown` arm of this type holds, and an `Event` of its own for a journal
-/// that carries events it does not read. It is strand's, read back as a
-/// slice of the record's line; `Raw.parse` reads it as a type.
-pub const Raw = strand.Raw;
+/// that carries events it does not read. It is strand's `json.Raw`, read back
+/// as a slice of the record's line; `strand.json.parseLeaky(T, arena,
+/// raw.bytes, .{})` reads it as a type.
+pub const Raw = strand.json.Raw;
 
 /// Where a record sits in the sequence, and so where a reader has got to.
 /// The first record of a journal that has never been compacted is 1, and each
@@ -162,11 +162,13 @@ pub const Position = implementation.Position;
 /// The allocator must outlive it. Finish every replay and tailer operation
 /// before closing the journal; release replays and tailers first.
 ///
-/// `Event` must round-trip through `std.json`: `std.json.Stringify.value` must
-/// accept it and `std.json.parseFromSlice` must read back what was written.
-/// strand does both, in `std.json`'s bytes and with its answers. A tagged
-/// union of structs is the expected shape; a `strand.Raw` is an event kept as
-/// its bytes, read back as a slice of the line.
+/// `Event` must round-trip through strand's JSON: `strand.json.write` must
+/// accept it and `strand.json.parseLeaky` must read back what was written,
+/// strictly, with no member it does not read. A tagged union of structs is the
+/// expected shape; a `Raw` is an event kept as its bytes, read back as a slice
+/// of the line, and a `strand.json.Value` an event of any shape. A type with a
+/// meaning of its own declares strand's `strandSerialize` and
+/// `strandDeserialize`.
 pub fn Journal(comptime Event: type) type {
     return opaque {
         const Self = @This();
@@ -692,8 +694,8 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// The batch owns everything it returns through `gpa`; release it
         /// with `Batch.deinit`. Events and all their storage are copied through
-        /// strand without calling parse, stringify or migration hooks. Events
-        /// must be finite trees of data accepted by `strand.copyOwned`. The exact
+        /// strand's checked `core.cloneLeaky`, without calling parse, write or
+        /// migration hooks. Events must be finite trees of plain data. The exact
         /// stored bytes and original schema versions are preserved separately.
         /// Safe to call from any task or thread, except from inside a sink.
         pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: Seq) CopyError!*Batch {

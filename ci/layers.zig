@@ -64,7 +64,7 @@ pub const required = [_][]const u8{
 
 /// Tokens only their owners may spell: durability and file identity are
 /// airlock's, so nothing here spells them; the JSON codec is strand's, and
-/// tests may check against `std.json`.
+/// only the tests may spell `std.json`'s.
 pub const owned: []const gantry.rules.TokenRule = &.{
     .{ .name = "durability belongs to airlock", .tokens = &.{
         "fsync",

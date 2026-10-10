@@ -6,6 +6,7 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const chronicle = @import("chronicle.zig");
+const strand = @import("journal/jsonl.zig").strand;
 const Seq = chronicle.Seq;
 const Bytes = chronicle.Bytes;
 const Records = chronicle.Records;
@@ -24,7 +25,7 @@ const Event = union(enum) {
     created: struct { id: u32, name: []const u8 },
     renamed: struct { id: u32, name: []const u8 },
     removed: struct { id: u32 },
-    unknown: std.json.Value,
+    unknown: strand.json.Value,
 };
 
 const Journal = chronicle.Journal(Event);
@@ -1420,7 +1421,7 @@ test "a record from an older schema goes through migrate" {
 
         fn f(arena: std.mem.Allocator, from_version: u32, event: chronicle.Raw) Journal.MigrateError!Event {
             if (from_version != 1) return error.Unmigratable;
-            const old = event.parse(V1, arena, .{}) catch |err| switch (err) {
+            const old = strand.json.parseLeaky(V1, arena, event.bytes, .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.Unmigratable,
             };
@@ -1469,7 +1470,7 @@ test "without a migrate hook an older record lands in the unknown arm" {
     const record = copied_tail_13.records()[0];
     try testing.expectEqual(@as(u32, 1), record.version);
     try testing.expect(record.event == .unknown);
-    try testing.expect(record.event.unknown.object.get("retired") != null);
+    try testing.expectEqualStrings("retired", record.event.unknown.object[0].key);
 }
 
 test "an older record kept as its bytes is a slice of its line, and checked" {
@@ -1505,7 +1506,7 @@ test "an older record kept as its bytes is a slice of its line, and checked" {
             fn f(arena: std.mem.Allocator, from_version: u32, event: chronicle.Raw) chronicle.Journal(Keeping).MigrateError!Keeping {
                 if (from_version != 1) return error.Unmigratable;
                 const V1 = union(enum) { created: struct { id: u32, title: []const u8 } };
-                const old = event.parse(V1, arena, .{}) catch return error.Unmigratable;
+                const old = strand.json.parseLeaky(V1, arena, event.bytes, .{}) catch return error.Unmigratable;
                 return .{ .created = .{ .id = old.created.id, .name = old.created.title } };
             }
         }.f;
@@ -2166,16 +2167,25 @@ test "subscribe folds a history longer than the tail, streaming from the disk" {
     try testing.expectEqual(@as(u32, 10), from_forty.events);
 }
 
-/// An event that `std.json` writes and cannot read back: a number member
-/// whose digits are not digits. It is the one shape that tells a record
-/// parsed back out of its own bytes from a record that was not.
+/// An event that writes and cannot read back: written as a string, read as
+/// a number. It is the shape that tells a record parsed back out of its own
+/// bytes from a record that was not.
 const NotRoundTrippable = union(enum) {
-    m: std.json.Value,
+    m: Fickle,
+};
+pub const Fickle = struct {
+    pub fn strandSerialize(_: Fickle, access: anytype) @TypeOf(access.*).Error!void {
+        try access.write(@as([]const u8, "oops"));
+    }
+    pub fn strandDeserialize(access: anytype) @TypeOf(access.*).Error!Fickle {
+        _ = try access.read(u32);
+        return .{};
+    }
 };
 const Fragile = chronicle.Journal(NotRoundTrippable);
 
 fn fragile() NotRoundTrippable {
-    return .{ .m = .{ .number_string = "oops" } };
+    return .{ .m = .{} };
 }
 
 test "a record nothing will read is not parsed back, and one something will read is" {
@@ -2231,13 +2241,12 @@ test "a record nothing will read is not parsed back, and one something will read
 pub const Derived = struct {
     id: u32,
 
-    pub fn jsonStringify(self: Derived, writer: anytype) !void {
-        try writer.beginObject();
-        try writer.objectField("id");
-        try writer.write(self.id);
-        try writer.objectField("note");
-        try writer.write("derived");
-        try writer.endObject();
+    pub fn strandSerialize(self: Derived, access: anytype) @TypeOf(access.*).Error!void {
+        try access.write(struct { id: u32, note: []const u8 }{ .id = self.id, .note = "derived" });
+    }
+    pub fn strandDeserialize(access: anytype) @TypeOf(access.*).Error!Derived {
+        const value = try access.read(struct { id: u32 });
+        return .{ .id = value.id };
     }
 };
 
@@ -4532,23 +4541,19 @@ test "a record longer than a record may be is refused, and so is a segment of on
 //========================================================================
 // The bytes an append writes.
 //
-// A record's line is written by strand, which writes what `std.json`
-// writes: its own suite holds it to that over every shape a value can take.
-// What is on this package's disk is a promise, so the records are held to
-// `std.json`'s bytes here too — the envelope and the event, over every
-// shape, at the edges of the envelope's integers — and a log written before
-// strand wrote the lines is read, and its lines written again, byte for
-// byte.
+// A record's line is written by strand. What is on this package's disk is
+// a promise, so the records are held to the bytes `strand.json.write`
+// writes for a `Line` — the envelope and the event, over every shape, at the
+// edges of the envelope's integers — and a log written by an earlier
+// chronicle is read, and its lines written again, byte for byte.
 //========================================================================
 
 const Hue = enum { red, @"gr\"een", blue };
 
 const Inner = struct { a: ?u8, b: []const []const u8, d: Hue };
 
-/// Every shape an event is made of that reads back as itself: what strand
-/// writes itself, and a float, a tuple and a `std.json.Value`, which it
-/// hands to `std.json`. (A type with its own `jsonStringify` and a `void`
-/// member are in strand's own property; neither reads back.)
+/// Every shape an event is made of that reads back as itself, a float, a
+/// tuple and a `strand.json.Value` among them.
 const Shape = union(enum) {
     empty,
     flag: bool,
@@ -4565,28 +4570,26 @@ const Shape = union(enum) {
     nested: Inner,
     pointer: *const Inner,
     many: []const ?Hue,
-    // handed to `std.json`
     real: f64,
     tuple: struct { u8, bool },
-    value: std.json.Value,
+    value: strand.json.Value,
     @"odd \"tag\"": u8,
 };
 
 /// A string built to be awkward: runs longer than a vector of clean bytes
-/// with the things JSON escapes at every position, and UTF-8 both whole and
-/// broken.
+/// with the things JSON escapes at every position, and UTF-8 of every width.
+/// Bytes that are not UTF-8 are not text strand writes; an event holding them
+/// is refused, which a test of its own says.
 fn awkward(random: std.Random, buffer: []u8) []const u8 {
     const pieces = [_][]const u8{
         "a", "z", " ", "\"", "\\", "\n", "\t", "\x00", "\x1f", "\x7f", "/",
         "\xc3\xa9", "\xe2\x82\xac", "\xf0\x9f\x98\x80", // whole UTF-8
-        "\xff", "\x80", "\xc3", "\xed\xa0\x80", // not UTF-8
         "abcdefghijklmnopqrstuvwxyz0123456789", // longer than a vector
     };
     var len: usize = 0;
     const parts = random.uintLessThan(usize, 12);
     for (0..parts) |_| {
-        // mostly the clean bytes and the escapes, sometimes a byte that is
-        // not UTF-8, which sends the whole string to `std.json`
+        // mostly the clean bytes and the escapes, sometimes a long run
         const pick = if (random.uintLessThan(u8, 8) == 0)
             pieces[random.uintLessThan(usize, pieces.len)]
         else
@@ -4601,24 +4604,24 @@ fn awkward(random: std.Random, buffer: []u8) []const u8 {
     return buffer[0..len];
 }
 
-/// The envelope and event of a line as `std.json` writes a `Line` for them,
-/// less the closing brace, then the checksum: what every record a journal
-/// holds must be, byte for byte. `p` is read off the record itself, which
-/// is what the chain says it is and is checked by every read.
-fn expectStdJsonRecord(comptime E: type, record: chronicle.Journal(E).Record, version: u32) !void {
+/// The envelope and event of a line as `strand.json.write` writes a `Line`
+/// for them, less the closing brace, then the checksum: what every record a
+/// journal holds must be, byte for byte. `p` is read off the record itself,
+/// which is what the chain says it is and is checked by every read.
+fn expectWrittenRecord(comptime E: type, record: chronicle.Journal(E).Record, version: u32) !void {
     const Line = struct { seq: u64, at: i64, v: u32, p: u32, ev: E };
     const p_at = std.mem.find(u8, record.bytes, ",\"p\":").? + ",\"p\":".len;
     const p_end = std.mem.findScalarPos(u8, record.bytes, p_at, ',').?;
     const back_link = try std.fmt.parseInt(u32, record.bytes[p_at..p_end], 10);
     var want: std.Io.Writer.Allocating = .init(testing.allocator);
     defer want.deinit();
-    try std.json.Stringify.value(Line{
+    try strand.json.write(&want.writer, Line{
         .seq = record.seq.raw(),
         .at = record.at,
         .v = version,
         .p = back_link,
         .ev = record.event,
-    }, .{}, &want.writer);
+    }, .{});
     want.writer.end -= 1;
     const sum = chronicle.checksum(want.written());
     try want.writer.print(",\"c\":{d}}}", .{sum});
@@ -4718,7 +4721,7 @@ test "a journal written before reads as written, and its records are written aga
     }
 }
 
-test "a record is the bytes std.json writes for it, whatever its event's shape" {
+test "a record is the bytes strand writes for it, whatever its event's shape" {
     const io = testing.io;
     const ShapeJournal = chronicle.Journal(Shape);
     var prng: std.Random.DefaultPrng = .init(0x5eed_c4a0);
@@ -4766,7 +4769,9 @@ test "a record is the bytes std.json writes for it, whatever its event's shape" 
             .{ .nested = inner },
             .{ .pointer = boxed },
             .{ .many = &.{ null, random.enumValue(Hue) } },
-            .{ .real = @bitCast(random.int(u64) & 0x7fef_ffff_ffff_ffff) },
+            // Any finite double once strand writes one of every exponent;
+            // until then the ones it writes in under its 128-byte spelling.
+            .{ .real = (random.float(f64) - 0.5) * 1e12 },
             .{ .tuple = .{ random.int(u8), random.boolean() } },
             .{ .value = .{ .string = text } },
             .{ .@"odd \"tag\"" = random.int(u8) },
@@ -4776,12 +4781,25 @@ test "a record is the bytes std.json writes for it, whatever its event's shape" 
             _ = try journal.append(io, stamp, shape);
             const window = try journal.copySince(testing.allocator, io, Seq.fromRaw(0));
             defer window.deinit();
-            try expectStdJsonRecord(Shape, window.records()[window.records().len - 1], 1);
+            try expectWrittenRecord(Shape, window.records()[window.records().len - 1], 1);
         }
     }
 }
 
-test "a record's envelope is the digits std.json would write, at their edges" {
+test "an event holding bytes that are not UTF-8 is refused before anything is written" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const ShapeJournal = chronicle.Journal(Shape);
+    const journal = try ShapeJournal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+    for ([_][]const u8{ "\xff", "a\x80", "\xc3", "\xed\xa0\x80" }) |text| {
+        try testing.expectError(error.NotRoundTrippable, journal.append(io, 1, .{ .text = text }));
+    }
+    try testing.expectEqual(chronicle.beginning, try journal.lastSeq(io));
+}
+
+test "a record's envelope is the digits strand writes, at their edges" {
     const io = testing.io;
     const edges_i64 = [_]i64{ std.math.minInt(i64), std.math.minInt(i64) + 1, -100, -99, -10, -9, -1, 0, 1, 9, 10, 99, 100, std.math.maxInt(i64) };
     const edges_u32 = [_]u32{ 1, 9, 10, 99, 100, 101, 999, 1000, std.math.maxInt(u32) };
@@ -4798,7 +4816,7 @@ test "a record's envelope is the digits std.json would write, at their edges" {
             _ = try journal.append(io, stamp, created(@intCast(version % 1000), "x"));
             const window = try journal.copySince(testing.allocator, io, Seq.fromRaw(0));
             defer window.deinit();
-            try expectStdJsonRecord(Event, window.records()[window.records().len - 1], version);
+            try expectWrittenRecord(Event, window.records()[window.records().len - 1], version);
         }
     }
 }
@@ -4819,19 +4837,18 @@ fn clean(random: std.Random, buffer: []u8) []const u8 {
     return buffer[0..len];
 }
 
-test "a record holding a number std.json cannot cast is read as the number, or is a corrupt record" {
+test "a record holding a number written with a fraction or an exponent is read as the number, or is a corrupt record" {
     const io = testing.io;
     const Wide = union(enum) { huge: u128, big: i128, count: u64 };
     const WideJournal = chronicle.Journal(Wide);
 
     // In the written envelope, where the event is read from its bytes, and
     // in an envelope written by hand with a space in it, which is read as
-    // its members' bytes first and the event from its own. std.json panicked
-    // on each of these on at least one of the two paths. Past the type they
-    // are corrupt records on both, found by the open that reads the tail
-    // or by the replay.
+    // its members' bytes first and the event from its own. Past the type
+    // they are corrupt records on both, found by the open that reads the
+    // tail or by the replay.
     const bad = [_][]const u8{
-        \\{"big":1.7014118346046923173168730371588410572e38}
+        \\{"big":1.7014118346046923173168730371588410573e38}
         ,
         \\{"huge":3.402823669209385e38}
         ,
@@ -4865,10 +4882,12 @@ test "a record holding a number std.json cannot cast is read as the number, or i
     }
 
     // In range, a whole number written with an exponent is read as the
-    // number it is, on both paths: 1.8e38 into a `u128`, which std.json
-    // cast through an `i128`, and 1.5e3 into a `u64`.
+    // number it is, on both paths, from its digits and never through a
+    // float: 1.8e38 into a `u128`, seven below the largest `i128`, and 1.5e3
+    // into a `u64`.
     const good = [_]struct { ev: []const u8, want: Wide }{
         .{ .ev = "{\"huge\":1.8e38}", .want = .{ .huge = 180_000_000_000_000_000_000_000_000_000_000_000_000 } },
+        .{ .ev = "{\"big\":1.7014118346046923173168730371588410572e38}", .want = .{ .big = 170141183460469231731687303715884105720 } },
         .{ .ev = "{\"count\":1.5e3}", .want = .{ .count = 1500 } },
     };
     for (good) |case| {
@@ -5770,7 +5789,7 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
 /// and ordinary letters, so a round trip is asked of every kind of string.
 fn generateName(smith: *testing.Smith, buf: []u8) []u8 {
     @disableInstrumentation();
-    const pieces = [_][]const u8{ "a", "\"", "\\", "\n", "\x00", "\x1f", "\u{e9}", "\u{1f600}", "\xff", "\xc3", "/", " " };
+    const pieces = [_][]const u8{ "a", "\"", "\\", "\n", "\x00", "\x1f", "\u{e9}", "\u{1f600}", "/", " " };
     var end: usize = 0;
     while (!smith.eosWeightedSimple(3, 1)) {
         const piece = pieces[smith.index(pieces.len)];
@@ -5893,9 +5912,8 @@ fn fuzzRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
                 } };
             }
             const before = (try journal.lastSeq(io)).raw();
-            // A name that is not UTF-8 is not a JSON string, and is written
-            // as the array of its bytes `std.json` reads back as the same
-            // bytes: every one of these is a record.
+            // Every name is text, with what JSON escapes in it: every one of
+            // these is a record.
             const last = if (n == 1)
                 try journal.append(io, batch[0].at, batch[0].event)
             else
@@ -6117,6 +6135,14 @@ fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
     try testing.expectEqual(scalar.following(last), try again.lastSeq(io));
 }
 
+/// Whether `bytes` are one JSON value, as strand reads one.
+fn isJson(bytes: []const u8) bool {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    _ = strand.json.parseLeaky(strand.json.Value, arena.allocator(), bytes, .{}) catch return false;
+    return true;
+}
+
 /// Events as JSON, with what a journal of `Event` reads each one as at the
 /// current version: the event, or null for one it must refuse.
 const event_shapes = [_]struct { json: []const u8, event: ?Event }{
@@ -6184,7 +6210,7 @@ fn fuzzRecords(_: void, smith: *testing.Smith) anyerror!void {
         planned[n] = .{ .seq = seq, .at = at, .v = v, .shape = shape };
         if (seq != next) well_formed = false;
         if (v == 2 or (v == 1 and event_shapes[shape].event == null)) refused = true;
-        if (v == 0 and !(std.json.validate(testing.allocator, event_shapes[shape].json) catch false)) refused = true;
+        if (v == 0 and !isJson(event_shapes[shape].json)) refused = true;
         next = seq +% 1;
     }
     // The links were broken where `link` was bumped: re-derive from the bytes.
@@ -6405,14 +6431,14 @@ pub const CountedEvent = struct {
     name: []const u8,
     var parses: usize = 0;
     var writes: usize = 0;
-    pub fn jsonParse(a: std.mem.Allocator, source: anytype, opts: std.json.ParseOptions) !CountedEvent {
+    pub fn strandDeserialize(access: anytype) @TypeOf(access.*).Error!CountedEvent {
         parses += 1;
-        const value = try std.json.innerParse(struct { id: u32, name: []const u8 }, a, source, opts);
+        const value = try access.read(struct { id: u32, name: []const u8 });
         return .{ .id = value.id, .name = value.name };
     }
-    pub fn jsonStringify(value: CountedEvent, writer: anytype) !void {
+    pub fn strandSerialize(value: CountedEvent, access: anytype) @TypeOf(access.*).Error!void {
         writes += 1;
-        try writer.write(.{ .id = value.id, .name = value.name });
+        try access.write(.{ .id = value.id, .name = value.name });
     }
     const J = chronicle.Journal(CountedEvent);
     const Fold = struct {
@@ -6536,7 +6562,7 @@ test "copySince owns nested events and bytes after the journal closes" {
     const E = struct {
         label: [:0]const u8,
         nested: []const *const struct { text: []const u8, numbers: []const ?u32 },
-        value: std.json.Value,
+        value: strand.json.Value,
         raw: chronicle.Raw,
     };
     const J = chronicle.Journal(E);
@@ -6544,12 +6570,10 @@ test "copySince owns nested events and bytes after the journal closes" {
     {
         const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
         defer journal.deinit(io);
-        const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "value" }});
-        defer testing.allocator.free(values);
         _ = try journal.append(io, 12, .{
             .label = "escaped\nlabel",
             .nested = &.{&.{ .text = "inside", .numbers = &.{ 7, null, 9 } }},
-            .value = .{ .array = .fromOwnedSlice(testing.allocator, values) },
+            .value = .{ .array = &.{.{ .string = "value" }} },
             .raw = .{ .bytes = "{ \"raw\": [1, 2] }" },
         });
         // The input value is independent too; the append parsed its own copy.
@@ -6564,7 +6588,7 @@ test "copySince owns nested events and bytes after the journal closes" {
     try testing.expectEqual(@as(u8, 0), record.event.label[record.event.label.len]);
     try testing.expectEqualStrings("inside", record.event.nested[0].text);
     try testing.expectEqualSlices(?u32, &.{ 7, null, 9 }, record.event.nested[0].numbers);
-    try testing.expectEqualStrings("value", record.event.value.array.items[0].string);
+    try testing.expectEqualStrings("value", record.event.value.array[0].string);
     try testing.expectEqualStrings("{ \"raw\": [1, 2] }", record.event.raw.bytes);
     try testing.expect(std.mem.find(u8, record.bytes, "inside") != null);
 }
@@ -6848,30 +6872,6 @@ test "checking a batch nobody keeps holds only one parsed record at a time" {
     try testing.expectEqual(Records.fromRaw(128), try journal.verify(io));
 }
 
-test "a batch keeps the allocator carried by a JSON value alive" {
-    const io = testing.io;
-    var ws = try Workspace.init("log");
-    defer ws.deinit();
-    const J = chronicle.Journal(std.json.Value);
-    var batch: *J.Batch = undefined;
-    {
-        const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never });
-        defer journal.deinit(io);
-        const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
-        defer testing.allocator.free(values);
-        _ = try journal.append(io, 1, .{ .array = .fromOwnedSlice(testing.allocator, values) });
-        batch = try journal.copySince(testing.allocator, io, Seq.fromRaw(0));
-    }
-    defer batch.deinit();
-    // Managed JSON containers carry their allocator. Its context must stay
-    // alive after returning and passing the batch pointer, even for a fresh block.
-    var array = batch.records()[0].event.array;
-    try array.ensureTotalCapacity(65536);
-    try array.append(.{ .string = "next" });
-    try testing.expectEqualStrings("first", array.items[0].string);
-    try testing.expectEqualStrings("next", array.items[1].string);
-}
-
 fn canceledInventoryObservation(comptime observation: enum { oldest, segments }) !void {
     const io = testing.io;
     var ws = try Workspace.init("log");
@@ -6921,32 +6921,6 @@ test "observing persistence status waits for the journal lock" {
     var future = try io.concurrent(Reader.read, .{ io, journal, &started });
     while (!started.load(.acquire)) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
-}
-
-test "a tail keeps the allocator carried by a JSON value at its owner" {
-    const io = testing.io;
-    var ws = try Workspace.init("log");
-    defer ws.deinit();
-    const J = chronicle.Journal(std.json.Value);
-    const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = Records.fromRaw(2) });
-    defer journal.deinit(io);
-    const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
-    defer testing.allocator.free(values);
-    for (1..9) |seq| {
-        _ = try journal.append(io, @intCast(seq), .{ .array = .fromOwnedSlice(testing.allocator, values) });
-    }
-    // Appending moves owners both when the tail grows and when it evicts.
-    // Read the internal owner under its lock before exercising the allocator.
-    var held = journalState(journal).state.acquireUncancelable(io);
-    defer held.deinit(io);
-    const owned = &held.value().tail.entries.items[0];
-    const context = owned.arena;
-    try testing.expectEqual(@as(*anyopaque, context), owned.record.event.array.allocator.ptr);
-    var array = owned.record.event.array;
-    try array.ensureTotalCapacity(65536);
-    try array.append(.{ .string = "next" });
-    try testing.expectEqualStrings("first", array.items[0].string);
-    try testing.expectEqualStrings("next", array.items[1].string);
 }
 
 /// Whether a journal's lock was free at the calls a plan runs it at: test
@@ -7024,35 +6998,6 @@ test "finishing a journal finalizes its owned state under the lock" {
 
 test "deinitializing a journal finalizes its owned state under the lock" {
     try finalizingUnderLock(true);
-}
-
-test "a returned replay keeps the allocator carried by its last JSON value alive" {
-    const io = testing.io;
-    var ws = try Workspace.init("log");
-    defer ws.deinit();
-    const J = chronicle.Journal(std.json.Value);
-    const journal = try J.open(testing.allocator, io, ws.path, .{ .sync = .never, .tail_records = Records.fromRaw(0) });
-    defer journal.deinit(io);
-    const values = try testing.allocator.dupe(std.json.Value, &.{.{ .string = "first" }});
-    defer testing.allocator.free(values);
-    _ = try journal.append(io, 1, .{ .array = .fromOwnedSlice(testing.allocator, values) });
-    const Reader = struct {
-        fn read(inner: Io, j: *J) !struct { walk: *J.Replay, record: J.Record } {
-            const walk = try j.replay(inner, Seq.fromRaw(0));
-            errdefer walk.deinit(inner);
-            const record = (try walk.next(inner)).?;
-            return .{ .walk = walk, .record = record };
-        }
-    };
-    var read = try Reader.read(io, journal);
-    defer read.walk.deinit(io);
-    const context = &replayState(std.json.Value, read.walk).arena;
-    try testing.expectEqual(@as(*anyopaque, context), read.record.event.array.allocator.ptr);
-    var array = read.record.event.array;
-    try array.ensureTotalCapacity(65536);
-    try array.append(.{ .string = "next" });
-    try testing.expectEqualStrings("first", array.items[0].string);
-    try testing.expectEqualStrings("next", array.items[1].string);
 }
 
 test "replay creation releases its scan and stable arena on every allocation failure" {
@@ -7135,14 +7080,14 @@ test "copySince copies hook values without parsing or stringifying again" {
         text: []const u8,
         var parses: usize = 0;
         var writes: usize = 0;
-        pub fn jsonParse(a: std.mem.Allocator, source: anytype, opts: std.json.ParseOptions) !Self {
+        pub fn strandDeserialize(access: anytype) @TypeOf(access.*).Error!Self {
             parses += 1;
-            const value = try std.json.innerParse(struct { text: []const u8 }, a, source, opts);
+            const value = try access.read(struct { text: []const u8 });
             return .{ .text = value.text };
         }
-        pub fn jsonStringify(value: Self, writer: anytype) !void {
+        pub fn strandSerialize(value: Self, access: anytype) @TypeOf(access.*).Error!void {
             writes += 1;
-            try writer.write(.{ .text = value.text });
+            try access.write(.{ .text = value.text });
         }
     };
     const J = chronicle.Journal(Hook);
@@ -7190,13 +7135,10 @@ test "copySince preserves exact migrated Raw bytes" {
 }
 
 test "copySince owns dynamic Value keys strings containers and number spelling" {
-    const J = chronicle.Journal(std.json.Value);
+    const J = chronicle.Journal(strand.json.Value);
     const Migration = struct {
-        fn migrate(a: std.mem.Allocator, _: u32, _: chronicle.Raw) J.MigrateError!std.json.Value {
-            return std.json.parseFromSliceLeaky(std.json.Value, a, "{\"key\":[\"text\",1e2]}", .{
-                .allocate = .alloc_always,
-                .parse_numbers = false,
-            }) catch |err| switch (err) {
+        fn migrate(a: std.mem.Allocator, _: u32, _: chronicle.Raw) J.MigrateError!strand.json.Value {
+            return strand.json.parseLeaky(strand.json.Value, a, "{\"key\":[\"text\",1e2]}", .{}) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.Unmigratable,
             };
@@ -7213,14 +7155,10 @@ test "copySince owns dynamic Value keys strings containers and number spelling" 
         batch = try journal.copySince(testing.allocator, io, Seq.fromRaw(0));
     }
     defer batch.deinit();
-    try testing.expectEqualStrings("key", batch.records()[0].event.object.keys()[0]);
-    var array = batch.records()[0].event.object.get("key").?.array;
-    try testing.expectEqualStrings("text", array.items[0].string);
-    try testing.expectEqual(std.json.Value.number_string, std.meta.activeTag(array.items[1]));
-    try testing.expectEqualStrings("1e2", array.items[1].number_string);
-    try array.ensureTotalCapacity(65536);
-    try array.append(.{ .string = "next" });
-    try testing.expectEqualStrings("next", array.items[2].string);
+    const member = batch.records()[0].event.object[0];
+    try testing.expectEqualStrings("key", member.key);
+    try testing.expectEqualStrings("text", member.value.array[0].string);
+    try testing.expectEqualStrings("1e2", member.value.array[1].number);
 }
 
 test "an oversized stored snapshot is reported by its read bound" {
@@ -7353,13 +7291,18 @@ pub const RefusingEvent = struct {
     text: []const u8,
     refuse: bool = false,
     partial: bool = false,
-    pub fn jsonStringify(value: RefusingEvent, writer: anytype) !void {
-        if (!value.refuse or value.partial) try writer.write(.{ .text = value.text });
-        if (value.refuse) return error.WriteFailed;
+    pub fn strandSerialize(value: RefusingEvent, access: anytype) @TypeOf(access.*).Error!void {
+        if (value.refuse and !value.partial) return access.reject(1);
+        try access.write(.{ .text = value.text });
+        if (value.refuse) return access.reject(2);
+    }
+    pub fn strandDeserialize(access: anytype) @TypeOf(access.*).Error!RefusingEvent {
+        const value = try access.read(struct { text: []const u8 });
+        return .{ .text = value.text };
     }
 };
 
-test "a stringify refusal is distinct from an encoding allocation failure" {
+test "a codec's refusal to write an event is distinct from an encoding allocation failure" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -7369,7 +7312,7 @@ test "a stringify refusal is distinct from an encoding allocation failure" {
         defer journal.deinit(io);
         const previous = try journal.lastSeq(io);
         for ([_]bool{ false, true }) |partial| {
-            try testing.expectError(error.WriteFailed, journal.append(io, 1, .{
+            try testing.expectError(error.NotRoundTrippable, journal.append(io, 1, .{
                 .text = &@as([4096]u8, @splat('x')),
                 .refuse = true,
                 .partial = partial,

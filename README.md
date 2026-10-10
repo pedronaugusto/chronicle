@@ -68,7 +68,10 @@ try reopened.subscribeFrom(io, restored.sink(), from);
 
 ## Design
 
-chronicle depends on a pinned strand package for record encoding and decoding. A journal
+chronicle depends on a pinned strand package for record encoding and decoding: an
+`Event` is any type `strand.json` writes and reads back, a tagged union of structs being
+the expected shape, and a type with a meaning of its own declares strand's
+`strandSerialize` and `strandDeserialize`. A journal
 takes an allocator that must outlive it and owns a directory, active segment files, a
 bounded in-memory tail and a mutex. Journal, replay, tailer, copied batch and
 reader-list results are opaque pointer owners: release each exactly once. Release

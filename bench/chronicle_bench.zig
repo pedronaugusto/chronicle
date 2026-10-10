@@ -279,7 +279,7 @@ fn reopen(io: std.Io, gpa: std.mem.Allocator, path: []const u8, repetitions: usi
 }
 
 // Raw-event case: each record carries generated JSON, cycled to `count`.
-const RawJournal = chronicle.Journal(strand.Raw);
+const RawJournal = chronicle.Journal(strand.json.Raw);
 
 fn rawOptions(sync: chronicle.Sync, access: chronicle.Access) RawJournal.Options {
     return .{
@@ -295,9 +295,9 @@ fn rawOptions(sync: chronicle.Sync, access: chronicle.Access) RawJournal.Options
 /// The whole input file as raw events. The file is the caller's own and the
 /// default run's is 200 MB (a million records), so it has no limit: a
 /// 64 MiB one stopped the default run at `raw_append` with `StreamTooLong`.
-fn loadCorpus(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !struct { bytes: []u8, events: []strand.Raw } {
+fn loadCorpus(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !struct { bytes: []u8, events: []strand.json.Raw } {
     const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
-    var events: std.ArrayList(strand.Raw) = .empty;
+    var events: std.ArrayList(strand.json.Raw) = .empty;
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |line| if (line.len != 0) try events.append(gpa, .{ .bytes = line });
     if (events.items.len == 0) return error.InvalidInput;

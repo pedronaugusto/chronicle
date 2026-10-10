@@ -9,7 +9,9 @@ const continuity = @import("journal/continuity.zig");
 const Log = @import("journal/Log.zig");
 const Crc32c = @import("warp").Crc32c;
 const aegis = @import("aegis");
-const strand = @import("journal/jsonl.zig").strand;
+const jsonl = @import("journal/jsonl.zig");
+const strand = jsonl.strand;
+const json = strand.json;
 const envelope = @import("journal/envelope.zig");
 const Encoding = @import("journal/Encoding.zig");
 const values = @import("journal/values.zig");
@@ -19,7 +21,7 @@ pub const Bytes = values.Bytes;
 pub const Records = values.Records;
 pub const beginning = values.beginning;
 
-pub const Raw = strand.Raw;
+pub const Raw = json.Raw;
 
 pub const OnTruncated = Log.OnTruncated;
 
@@ -57,6 +59,11 @@ pub fn indexName(base_seq: Seq) [Log.name_digits + index_extension.len:0]u8 {
 }
 
 pub const document_format: u32 = 1;
+
+/// The documents beside the log, as they are written: the format first, so a
+/// reader knows which shape the rest is before it reads it.
+const CursorDocument = struct { fmt: u32, seq: u64 };
+const SnapshotDocument = struct { fmt: u32, seq: u64, state: []const u8 };
 
 pub fn checksum(covered: []const u8) u32 {
     return Crc32c.hash(covered);
@@ -347,7 +354,7 @@ pub fn Journal(comptime Event: type) type {
             /// Called for a record written at a version below
             /// `schema_version`. Without it, such a record becomes the `Event`
             /// arm named `unknown` if there is one — typed `void`, `Raw` or
-            /// `std.json.Value` — and `error.OlderSchema` if there is not.
+            /// `strand.json.Value` — and `error.OlderSchema` if there is not.
             migrate: ?Migrate = null,
             /// How often `append` makes the bytes it wrote durable. The
             /// default is the durable one; README.md states what each level
@@ -531,14 +538,16 @@ pub fn Journal(comptime Event: type) type {
         /// append never writes what a read refuses. Strict, because an event
         /// that writes a member it does not read back would not come back
         /// as the event that was appended.
-        const event_parse: strand.ParseOptions = .{ .ignore_unknown_fields = false };
+        fn eventParse(line_bytes: usize) json.ParseOptions {
+            return .{ .limits = jsonl.limits(line_bytes) };
+        }
 
         const unknown_arm: ?UnknownArm = blk: {
             if (@typeInfo(Event) != .@"union" or !@hasField(Event, "unknown")) break :blk null;
             const Arm = @FieldType(Event, "unknown");
             if (Arm == void) break :blk .empty;
             if (Arm == Raw) break :blk .raw;
-            if (Arm == std.json.Value) break :blk .json_value;
+            if (Arm == json.Value) break :blk .json_value;
             break :blk null;
         };
 
@@ -846,7 +855,12 @@ pub fn Journal(comptime Event: type) type {
                 const record = owned.record;
                 copy.* = record;
                 copy.bytes = try a.dupe(u8, record.bytes);
-                copy.event = try strand.copyOwned(a, record.event);
+                copy.event = strand.core.cloneLeaky(a, record.event, jsonl.limits(record.bytes.len)) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    // The event was read from these bytes under these bounds,
+                    // so a copy of it fits them.
+                    else => unreachable,
+                };
             }
             batch.records = copied;
             return batch;
@@ -1306,7 +1320,7 @@ pub fn Journal(comptime Event: type) type {
 
                 var document: std.Io.Writer.Allocating = .init(self.gpa);
                 defer document.deinit();
-                strand.writeValue(&document.writer, .{ .fmt = document_format, .seq = seq.raw() }, .{}) catch
+                json.write(&document.writer, CursorDocument{ .fmt = document_format, .seq = seq.raw() }, .{}) catch
                     return error.OutOfMemory;
 
                 const file = try cursorName(self.gpa, tail.name);
@@ -1449,13 +1463,14 @@ pub fn Journal(comptime Event: type) type {
                 error.StreamTooLong => return error.StreamTooLong,
                 else => return error.MalformedDocument,
             };
+            const how: json.ParseOptions = .{ .ignore_unknown_fields = true, .limits = jsonl.limits(limit) };
             const Versioned = struct { fmt: u32 };
-            const version = strand.parseLine(Versioned, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            const version = json.parseLeaky(Versioned, arena, bytes, how) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.MalformedDocument,
             };
             if (version.fmt != document_format) return error.UnsupportedFormat;
-            return strand.parseLine(Document, arena, bytes, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+            return json.parseLeaky(Document, arena, bytes, how) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.MalformedDocument,
             };
@@ -1527,8 +1542,12 @@ pub fn Journal(comptime Event: type) type {
 
             var document: std.Io.Writer.Allocating = .init(self.gpa);
             defer document.deinit();
-            strand.writeValue(&document.writer, .{ .fmt = document_format, .seq = s.seq.raw(), .state = b64 }, .{}) catch
-                return error.OutOfMemory;
+            json.write(&document.writer, SnapshotDocument{ .fmt = document_format, .seq = s.seq.raw(), .state = b64 }, .{ .limits = jsonl.limits(largest) }) catch |err| switch (err) {
+                error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+                // Base64 is text, and the document was measured against
+                // `largest` above.
+                else => unreachable,
+            };
 
             try s.log.syncBeforeSnapshot(io);
             try s.log.writeSnapshot(io, document.written());
@@ -1663,6 +1682,21 @@ pub fn Journal(comptime Event: type) type {
             return self.keepsRecords(s) or self.config.verify_round_trip;
         }
 
+        /// What writing a record's value refused, as an append says it: the
+        /// buffer's own failure, a value past the record bound, or a value
+        /// the format cannot write.
+        fn refused(encoding: *const Encoding, err: anyerror) AppendError {
+            return switch (err) {
+                error.WriteFailed => switch (encoding.diagnose(error.WriteFailed)) {
+                    error.OutOfMemory => error.OutOfMemory,
+                    error.WriteFailed => error.NotRoundTrippable,
+                },
+                error.OutOfMemory => error.OutOfMemory,
+                error.OutputLimit, error.LengthLimit, error.ItemLimit, error.WorkLimit, error.AllocationLimit => error.RecordTooLarge,
+                else => error.NotRoundTrippable,
+            };
+        }
+
         /// Serialise one record.
         ///
         /// Where something will read the record back — a tail, a sink, or the
@@ -1684,10 +1718,9 @@ pub fn Journal(comptime Event: type) type {
             const arena: ?*std.heap.ArenaAllocator = if (needs_record) try createArena(self.gpa) else null;
             errdefer if (arena) |a| destroyArena(a);
 
-            // The bytes are the ones `std.json.Stringify` writes for a
-            // `Line`, written into the one buffer that becomes the stored
-            // bytes; the suite's golden lines, its property over every shape
-            // and a log written before strand hold it to that.
+            // The bytes are the ones strand writes for a `Line`, written into
+            // the one buffer that becomes the stored bytes; the suite's golden
+            // lines and its property over every shape hold it to that.
             //
             // A record something keeps is written into its own arena, sized
             // from the last record so a run of records alike is written
@@ -1703,11 +1736,10 @@ pub fn Journal(comptime Event: type) type {
             } else {
                 out.clearRetainingCapacity();
             }
-            // The record is `Line` written by strand, which writes what
-            // `std.json` writes (null optionals included, as `std.json`'s
-            // default has it), left open: the checksum is its last member.
-            const value_options: strand.ValueOptions = .{ .emit_null_optional_fields = true };
-            var record = if (batch) |b| strand.writeObjectOpen(&out.writer, LineInBatch{
+            // The record is `Line` written by strand, null optionals
+            // included, left open: the checksum is its last member.
+            const value_options: json.WriteOptions = .{ .limits = jsonl.limits(values.limit(self.config.max_record_bytes)) };
+            var record = if (batch) |b| json.writeObjectOpen(&out.writer, LineInBatch{
                 .seq = seq.raw(),
                 .at = at,
                 .v = self.config.schema_version,
@@ -1715,13 +1747,13 @@ pub fn Journal(comptime Event: type) type {
                 .bf = b.first.raw(),
                 .bl = b.last.raw(),
                 .ev = event,
-            }, value_options) catch |err| return encoding.diagnose(err) else strand.writeObjectOpen(&out.writer, Line{
+            }, value_options) catch |err| return refused(&encoding, err) else json.writeObjectOpen(&out.writer, Line{
                 .seq = seq.raw(),
                 .at = at,
                 .v = self.config.schema_version,
                 .p = back_link,
                 .ev = event,
-            }, value_options) catch |err| return encoding.diagnose(err);
+            }, value_options) catch |err| return refused(&encoding, err);
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
             // it.
@@ -1752,11 +1784,11 @@ pub fn Journal(comptime Event: type) type {
             // exactly as every read parses it, so an event a read would
             // refuse is refused here, before it reaches the disk.
             const span = (envelope.quick(stored[0..covered_len]) orelse return error.NotRoundTrippable).ev;
-            const parsed = strand.parseLine(
+            const parsed = json.parseLeaky(
                 Event,
                 arena.?.allocator(),
                 stored[span.from..span.to],
-                event_parse,
+                eventParse(stored.len),
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.NotRoundTrippable,
@@ -1907,7 +1939,7 @@ pub fn Journal(comptime Event: type) type {
             // past the line in a build that does not check.
             aegis.assert.pre(ev.from <= ev.to and ev.to <= line.len, "an event's span lies inside the line it was read from");
             if (version == decoding.schema_version) {
-                return strand.parseLine(Event, arena, line[ev.from..ev.to], event_parse) catch |err| switch (err) {
+                return json.parseLeaky(Event, arena, line[ev.from..ev.to], eventParse(line.len)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     else => return error.CorruptRecord,
                 };
@@ -1921,7 +1953,7 @@ pub fn Journal(comptime Event: type) type {
         /// The record's `ev` member as its bytes, checked as JSON: a slice of
         /// the record's line, which lasts as long as the record does.
         fn retainedEv(arena: Allocator, ev: Span, line: []const u8) ReadError!Raw {
-            return strand.parseLine(Raw, arena, line[ev.from..ev.to], .{}) catch |err| switch (err) {
+            return json.parseLeaky(Raw, arena, line[ev.from..ev.to], eventParse(line.len)) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.CorruptRecord,
             };
@@ -1934,7 +1966,7 @@ pub fn Journal(comptime Event: type) type {
                 .json_value => return @unionInit(
                     Event,
                     "unknown",
-                    strand.parseLine(std.json.Value, arena, line[ev.from..ev.to], .{ .ignore_unknown_fields = false }) catch |err| switch (err) {
+                    json.parseLeaky(json.Value, arena, line[ev.from..ev.to], eventParse(line.len)) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.CorruptRecord,
                     },

@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- Events are strand's JSON types. strand has one API now, and chronicle writes and
+  reads each record with `strand.json`: an event's own meaning is a
+  `strandSerialize` and `strandDeserialize` pair where it was `jsonStringify` and
+  `jsonParse`, which strand no longer reads; an event of any shape, and an
+  `unknown` arm, is a `strand.json.Value` where it was a `std.json.Value`; a
+  `migrate` hook reads the old shape with `strand.json.parseLeaky(Old, arena,
+  event.bytes, .{})` where it called `event.parse`; and `copySince` copies events
+  with strand's checked `core.cloneLeaky`. Text in an event must be UTF-8: an event
+  holding bytes that are not is refused with `error.NotRoundTrippable`, where they
+  were written as an array of numbers. A codec that refuses to write an event is
+  `error.NotRoundTrippable` too. The lines are the bytes they were: a journal
+  written before reads back and is written again byte for byte.
+
 - chronicle requires Zig 0.17.0, and builds against strand c37ca7a, strand's Zig 0.17 line, and [airlock](https://github.com/pedronaugusto/airlock) 652b0e4, which makes every sync, atomic replace and backup batch.
 - `close` is `finish`, and `CloseError` is `FinishError`. `finish` flushes the active segment, trims what was reserved past its records, syncs it and seals its index as `close` did, and leaves the journal open whether it succeeds or not: `deinit` is still owed, so `finish` sits beside `defer journal.deinit(io)`, and an append after it carries on. `close` released the journal even when it failed.
 - `subscribeFrom` and `subscribeAllFrom` refuse a cursor below `oldestSeq() - 1` with `error.HistoryDropped` and register nothing, so a fold restored from a snapshot older than a `compact` or `dropSegmentsBefore` is told it would skip records. A cursor of zero still means everything the log holds.
@@ -18,7 +31,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Errors carry airlock's names: `BackupError` gains airlock's batch errors, `PublishedNotDurable` among them; `SnapshotError` and a tailer's `commit` take airlock's `WriteFileError` (`PublishedNotDurable`, `Busy`) in place of the rename and delete errors; `CompactError` gains airlock's create and commit errors; `OpenError` gains `airlock.PruneError`.
 - `copySince` and `readers` return opaque `*Batch` and `*Readers` owners; replace direct fields with `records()`, `complete()` and `items()`, keep their pointers instead of values, and release each owner exactly once before its allocator.
 - Journal, Replay and Tailer are opaque managed owners returned by pointer, including `Opened.journal`; keep their pointers, use methods to observe state (`Tailer.name()` borrows its name), and release each owner exactly once before its allocator, with replays and tailers released before their journal.
-- `copySince` copies events through `strand.copyOwned`, preserving Raw bytes and dynamic values without hooks; events must meet its finite-data-tree contract and `CopyError` no longer includes `NotRoundTrippable`.
+- `copySince` copies events without calling their codecs again, preserving Raw bytes and dynamic values; events must be finite trees of plain data and `CopyError` no longer includes `NotRoundTrippable`.
 - pin strand at `3e5c57e40aedfc9b84171a4e9d2f4ee0e04feeb0`; `Raw.encode` adds `WriteFailed`, byte vectors accept strings and arrays, and framing bounds count payload bytes.
 - `Tailer.cursor(io)` observes the committed cursor under the journal lock, replacing the mutable `Tailer.cursor` field.
 - `openedWith(io)` returns the `Options` the journal was opened with, under the journal lock, replacing the public `options` field.
@@ -29,13 +42,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   event as its bytes:
   `fn (arena: Allocator, from_version: u32, event: chronicle.Raw)`. `event`
   is checked as JSON and is a slice of the record's line, and
-  `event.parse(Old, arena, .{})` reads the old shape as a type, its strings
+  `strand.json.parseLeaky(Old, arena, event.bytes, .{})` reads the old shape as a type, its strings
   borrowed from the line where they need no unescaping; the hook used to be
   handed a `std.json.Value` tree built for it. `arena` is the arena that owns
   the record being built, so what the hook parses and allocates lives as
   long as the record. `examples/migrate.zig` reads version 1 records at
   version 2. An `Event` arm named `unknown` may be a `chronicle.Raw` as well
-  as `void` or a `std.json.Value`, and then holds the older record's event
+  as `void` or a `strand.json.Value`, and then holds the older record's event
   as its bytes.
 - Sequence numbers, byte counts and record counts are [aegis](https://github.com/pedronaugusto/aegis) types, kept apart so one cannot stand where another is wanted. `chronicle.Seq` is a position in the sequence (equality and an order, no arithmetic; `Seq.fromRaw(n)` and `raw()` cross to a plain integer, and `chronicle.beginning` is the place before the first record), `chronicle.Bytes` a length or offset, `chronicle.Records` a count. Every `u64` sequence number in the API is a `Seq`: the returns of `append`, `appendDeferred`, `appendAll`, `appendIf`, `appendAllIf`, `reconcile`, `lastSeq`, `oldestSeq`, `waitPast`, `backup` and `seqAtOrAfter`; the arguments `cursor`, `seq`, `keep_after_seq` and `Tailer.commit`; `Record.seq`, `Snapshot.seq`, `Expected.last` and `.found`, `Position.cursor` and its `Last`, `Reader.cursor`, `minCursor`, `Stats.oldest_seq` and `newest_seq`, and `segmentName` and `indexName`. `Options.max_segment_bytes`, `max_record_bytes`, `max_snapshot_bytes`, `preallocate_bytes`, `index_interval_bytes`, `tail_bytes`, `write_buffer_size` and `read_buffer_size` are `Bytes`; `max_segment_records` and `tail_records` are `Records`; `Status.dropped_bytes`, `Stats.bytes` and `Position.Last.start` and `.end` are `Bytes`; `Stats.records` and `verify`'s result are `Records`. chronicle adds aegis as a dependency.
 - `SequenceExhausted` can also come from `compact` and the log's own numbering, not only from `append`: a record is never numbered past `maxInt(i64)` by any caller.

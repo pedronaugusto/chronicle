@@ -26,7 +26,8 @@ const Io = std.Io;
 const Crc32c = @import("warp").Crc32c;
 const clone = @import("clone.zig");
 const envelopes = @import("envelope.zig");
-const strand = @import("jsonl.zig").strand;
+const jsonl = @import("jsonl.zig");
+const strand = jsonl.strand;
 const airlock = @import("airlock");
 const aegis = @import("aegis");
 const values = @import("values.zig");
@@ -89,7 +90,7 @@ pub const SegmentHeader = struct {
     /// and ten of `root`.
     pub fn line(header: SegmentHeader, buffer: *[96]u8) []const u8 {
         var out: std.Io.Writer = .fixed(buffer);
-        strand.writeValue(&out, Shape{ .chronicle = header.version, .base = header.base_seq.raw(), .root = header.root }, .{}) catch unreachable; // unreachable: three bounded unsigned integers and fixed JSON punctuation fit in 96 bytes
+        strand.json.write(&out, Shape{ .chronicle = header.version, .base = header.base_seq.raw(), .root = header.root }, .{}) catch unreachable; // unreachable: three bounded unsigned integers and fixed JSON punctuation fit in 96 bytes
         std.debug.assert(out.end <= buffer.len);
         return out.buffered();
     }
@@ -107,8 +108,8 @@ fn parseSegmentHeader(gpa: Allocator, line: []const u8) Allocator.Error!?Segment
     if (!std.mem.startsWith(u8, line, "{\"chronicle\":")) return null;
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const Members = struct { chronicle: strand.Raw, base: strand.Raw, root: strand.Raw };
-    const found = strand.parseLine(Members, arena.allocator(), line, .{}) catch |err| switch (err) {
+    const Members = struct { chronicle: strand.json.Raw, base: strand.json.Raw, root: strand.json.Raw };
+    const found = strand.json.parseLeaky(Members, arena.allocator(), line, .{ .ignore_unknown_fields = true, .limits = jsonl.limits(line.len) }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
@@ -120,7 +121,7 @@ fn parseSegmentHeader(gpa: Allocator, line: []const u8) Allocator.Error!?Segment
 }
 
 fn quickSegmentHeader(line: []const u8) ?SegmentHeader {
-    const read = strand.leadingIntMembers(SegmentHeader.Shape, line) orelse return null;
+    const read = strand.json.leadingIntMembers(SegmentHeader.Shape, line) orelse return null;
     if (read.end + 1 != line.len) return null;
     return .{ .version = read.value.chronicle, .base_seq = .fromRaw(read.value.base), .root = read.value.root };
 }
@@ -1412,7 +1413,7 @@ fn lineAtFrom(log: *Self, io: Io, file: Io.File, segment: Segment, offset: Bytes
     var bounded = reader.interface.limited(.limited64(remaining.raw()), &buffer);
     // Unbounded, as a line read here always was: what it is for is decided
     // by whoever asked for it.
-    var lines: strand.LineReader = .resumeAt(log.gpa, &bounded.interface, .{ .offset = offset.raw() }, framing(std.math.maxInt(usize)));
+    var lines: strand.jsonl.LineReader = .resumeAt(log.gpa, &bounded.interface, .{ .offset = offset.raw() }, framing(std.math.maxInt(usize)));
     defer lines.deinit();
     const line = lines.next() catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
@@ -1438,7 +1439,7 @@ fn lastLineFrom(log: *Self, io: Io, file: Io.File, segment: Segment) OpenError!L
     var last: [1]u8 = undefined;
     const terminated = try file.readPositionalAll(io, &last, final.raw()) == 1 and last[0] == '\n';
     var reader = file.reader(io, &.{});
-    var tail: strand.Tail(strand.Raw) = try .init(log.gpa, &reader, .{
+    var tail: strand.jsonl.Tail(strand.json.Raw) = try .init(log.gpa, &reader, .{
         .end = segment.bytes.raw(),
         .max_line_bytes = std.math.maxInt(usize),
         .skip_blank = false,
@@ -1534,7 +1535,7 @@ const Scanned = struct {
 /// start are bytes of the record the checksum covers, not the line layer's
 /// to judge — nothing skipped, and a final line with no `\n` after it not a
 /// line (`LineReader.unfinished` says there was one).
-fn framing(max_line_bytes: usize) strand.LineReader.Options {
+fn framing(max_line_bytes: usize) strand.jsonl.LineReader.Options {
     return .{
         .max_line_bytes = max_line_bytes,
         .skip_blank = false,
@@ -1576,7 +1577,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
     // runs on into after it.
     var reader = file.reader(io, &.{});
     var bounded = reader.interface.limited(.limited64(segment.bytes.raw()), buffer);
-    var lines: strand.LineReader = .init(log.gpa, &bounded.interface, framing(values.limit(log.options.max_record_bytes)));
+    var lines: strand.jsonl.LineReader = .init(log.gpa, &bounded.interface, framing(values.limit(log.options.max_record_bytes)));
     defer lines.deinit();
 
     var at_header = true;
@@ -1646,7 +1647,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
     if (batch) |inside| scanned.before_batch = inside.before;
     // What is left after the last newline: how much of it somebody wrote,
     // up to the last byte that is not zero. A record this package writes
-    // can hold no zero byte -- `std.json` escapes every control character --
+    // can hold no zero byte -- JSON escapes every control character --
     // so a run of zeros at the end of a segment is space that was reserved
     // and never written into, and the writer simply carries on there.
     scanned.partial_bytes = try writtenBetween(io, file, scanned.complete_bytes, segment.bytes);
@@ -1717,7 +1718,7 @@ pub const Scan = struct {
     /// segment is open (`framing`). A line whole in `buffer` is handed back
     /// where it lies; one that straddles a refill is copied into its line
     /// buffer.
-    lines: strand.LineReader,
+    lines: strand.jsonl.LineReader,
     /// Where in the current segment the next line starts.
     position: Bytes,
     /// Where the line `next` last returned started.
@@ -1874,7 +1875,7 @@ pub const Scan = struct {
         try reader.seekTo(scan.position.raw());
         const limit = scan.limits[scan.at].sub(scan.position) catch values.no_bytes;
         var bounded = reader.interface.limited(.limited64(limit.raw()), &buffer);
-        var lines: strand.LineReader = .resumeAt(scan.gpa, &bounded.interface, .{ .offset = scan.position.raw() }, framing(scan.max_record_bytes));
+        var lines: strand.jsonl.LineReader = .resumeAt(scan.gpa, &bounded.interface, .{ .offset = scan.position.raw() }, framing(scan.max_record_bytes));
         defer lines.deinit();
         while (true) {
             const line = (lines.next() catch |err| switch (err) {

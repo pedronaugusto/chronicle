@@ -15,7 +15,8 @@
 const std = @import("std");
 const aegis = @import("aegis");
 const Allocator = std.mem.Allocator;
-const strand = @import("jsonl.zig").strand;
+const jsonl = @import("jsonl.zig");
+const strand = jsonl.strand;
 const values = @import("values.zig");
 
 const Seq = values.Seq;
@@ -30,7 +31,7 @@ pub const Unparsed = aegis.input.Untrusted([]const u8);
 /// A member's value as an integer when it is one written as one — no
 /// fraction, no exponent, not a string — and within an `i64`. Null for
 /// anything else.
-pub fn integerOf(value: strand.Raw) ?i64 {
+pub fn integerOf(value: strand.json.Raw) ?i64 {
     const bytes = value.bytes;
     if (bytes.len == 0 or !(bytes[0] == '-' or std.ascii.isDigit(bytes[0]))) return null;
     if (!std.json.isNumberFormattedLikeAnInteger(bytes)) return null;
@@ -96,7 +97,7 @@ pub const Head = struct {
 /// out of what its checksum covers. Null to say "read it as members".
 pub fn quick(covered: []const u8) ?Head {
     const Envelope = struct { seq: i64, at: i64, v: u32, p: u32 };
-    const read = strand.leadingIntMembers(Envelope, covered) orelse return null;
+    const read = strand.json.leadingIntMembers(Envelope, covered) orelse return null;
     if (read.value.seq < 1) return null;
     const seq = Seq.fromRaw(aegis.int.cast(u64, read.value.seq) catch return null);
     var at = read.end;
@@ -167,8 +168,8 @@ pub fn batchOf(gpa: Allocator, line: []const u8) Allocator.Error!?Batch {
 /// whatever reading the members took. `error.Corrupt` when the line is not
 /// a record.
 pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt }!Head {
-    const Members = struct { seq: strand.Raw, at: strand.Raw, v: strand.Raw, p: strand.Raw, bf: ?strand.Raw = null, bl: ?strand.Raw = null, ev: strand.Raw };
-    const found = strand.parseLine(Members, scratch, line, .{}) catch |err| switch (err) {
+    const Members = struct { seq: strand.json.Raw, at: strand.json.Raw, v: strand.json.Raw, p: strand.json.Raw, bf: ?strand.json.Raw = null, bl: ?strand.json.Raw = null, ev: strand.json.Raw };
+    const found = strand.json.parseLeaky(Members, scratch, line, .{ .ignore_unknown_fields = true, .limits = jsonl.limits(line.len) }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Corrupt,
     };
@@ -210,7 +211,7 @@ pub const Stamp = struct {
 /// returns.
 pub fn stamp(gpa: Allocator, line: []const u8) Allocator.Error!?Stamp {
     quick: {
-        const read = strand.leadingIntMembers(struct { seq: i64, at: i64 }, line) orelse break :quick;
+        const read = strand.json.leadingIntMembers(struct { seq: i64, at: i64 }, line) orelse break :quick;
         // A record goes on past its stamp.
         if (line[read.end] != ',') break :quick;
         if (read.value.seq < 1) return null;
@@ -218,8 +219,8 @@ pub fn stamp(gpa: Allocator, line: []const u8) Allocator.Error!?Stamp {
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const Members = struct { seq: strand.Raw, at: strand.Raw = .null };
-    const found = strand.parseLine(Members, arena.allocator(), line, .{}) catch |err| switch (err) {
+    const Members = struct { seq: strand.json.Raw, at: strand.json.Raw = .{ .bytes = "null" } };
+    const found = strand.json.parseLeaky(Members, arena.allocator(), line, .{ .ignore_unknown_fields = true, .limits = jsonl.limits(line.len) }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
@@ -237,7 +238,7 @@ pub fn backLink(gpa: Allocator, line: []const u8) Allocator.Error!?u32 {
     }
     var arena: std.heap.ArenaAllocator = .init(gpa);
     defer arena.deinit();
-    const found = strand.parseLine(struct { p: strand.Raw }, arena.allocator(), line, .{}) catch |err| switch (err) {
+    const found = strand.json.parseLeaky(struct { p: strand.json.Raw }, arena.allocator(), line, .{ .ignore_unknown_fields = true, .limits = jsonl.limits(line.len) }) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };

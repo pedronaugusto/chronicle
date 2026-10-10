@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const chronicle = @import("chronicle");
+const strand = @import("strand");
 
 /// The events as this program writes them now, at version 2.
 const Event = union(enum) {
@@ -33,7 +34,7 @@ const LedgerV1 = chronicle.Journal(V1);
 /// record and nothing is freed by hand.
 fn migrate(arena: std.mem.Allocator, from_version: u32, event: chronicle.Raw) Ledger.MigrateError!Event {
     if (from_version != 1) return error.Unmigratable;
-    const old = event.parse(V1, arena, .{}) catch |err| switch (err) {
+    const old = strand.json.parseLeaky(V1, arena, event.bytes, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Unmigratable,
     };
