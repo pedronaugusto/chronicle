@@ -114,9 +114,9 @@ fn parseSegmentHeader(gpa: Allocator, line: []const u8) Allocator.Error!?Segment
         else => return null,
     };
     return .{
-        .version = std.math.cast(u32, envelopes.integerOf(found.chronicle) orelse return null) orelse return null,
-        .base_seq = .fromRaw(std.math.cast(u64, envelopes.integerOf(found.base) orelse return null) orelse return null),
-        .root = std.math.cast(u32, envelopes.integerOf(found.root) orelse return null) orelse return null,
+        .version = aegis.int.cast(u32, envelopes.integerOf(found.chronicle) orelse return null) catch return null,
+        .base_seq = .fromRaw(aegis.int.cast(u64, envelopes.integerOf(found.base) orelse return null) catch return null),
+        .root = aegis.int.cast(u32, envelopes.integerOf(found.root) orelse return null) catch return null,
     };
 }
 

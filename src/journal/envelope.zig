@@ -189,8 +189,8 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
         .seq = number,
         .batch = batch,
         .at = integerOf(found.at) orelse return error.Corrupt,
-        .v = std.math.cast(u32, integerOf(found.v) orelse return error.Corrupt) orelse return error.Corrupt,
-        .p = std.math.cast(u32, integerOf(found.p) orelse return error.Corrupt) orelse return error.Corrupt,
+        .v = aegis.int.cast(u32, integerOf(found.v) orelse return error.Corrupt) catch return error.Corrupt,
+        .p = aegis.int.cast(u32, integerOf(found.p) orelse return error.Corrupt) catch return error.Corrupt,
         .ev = .{ .from = from, .to = from + found.ev.bytes.len },
     };
 }
@@ -242,7 +242,7 @@ pub fn backLink(gpa: Allocator, line: []const u8) Allocator.Error!?u32 {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    return std.math.cast(u32, integerOf(found.p) orelse return null);
+    return aegis.int.cast(u32, integerOf(found.p) orelse return null) catch null;
 }
 
 //=========================================================================
