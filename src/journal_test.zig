@@ -13,6 +13,7 @@ const Records = chronicle.Records;
 const scalar = @import("journal/values.zig");
 const airlock = @import("airlock");
 const shakedown = @import("shakedown");
+const gen = shakedown.gen;
 const aegis = @import("aegis");
 const seam = @import("airlock.testing");
 const Seam = seam.Seam;
@@ -5029,9 +5030,9 @@ test "two hundred thousand records open and replay within bounded memory" {
 //
 // A journal file is written by the program that owns it, so these are not
 // about hostile input; they are about the crash cases, which produce file
-// contents nobody chose. Under `zig build test` each of these runs its
-// corpus and nothing else, which is fast; `zig build test --fuzz` is what
-// explores from there.
+// contents nobody chose. Each is a shakedown `check` property: under `zig
+// build test` it runs the examples beside it and then seeded cases, and
+// `zig build test --fuzz` explores further.
 //========================================================================
 
 /// `std.testing.io` around one input of `zig build test --fuzz`.
@@ -5048,9 +5049,16 @@ fn fuzzedIo() void {
     if (builtin.fuzz) testing.io_instance.deinit();
 }
 
+/// Fills a prefix of `out` of any length with bytes, and answers it.
+fn bytesInto(s: *shakedown.Source, out: []u8) []u8 {
+    const len = gen.intRange(s, usize, 0, out.len);
+    s.bytes(out[0..len]);
+    return out[0..len];
+}
+
 /// The line that starts a segment file, in front of everything the fuzzer
 /// generates: what is being fuzzed is the records, not whether a file with no
-/// framing on it is read (it is not; there is a corpus entry for that below).
+/// framing on it is read (it is not; there is an example for that below).
 const a_header = "{\"chronicle\":1,\"base\":1,\"root\":0}\n";
 
 /// One record as this version writes it: the first in its file, so its
@@ -5060,32 +5068,32 @@ const a_record = "{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":{\"created\":{\"id\
 /// The one after it, linked to it.
 const a_second_record = "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":2775085038}\n";
 
-/// Inputs worth starting from: the empty file, a whole record, a record cut
+/// Inputs worth keeping as examples: the empty file, a whole record, a record cut
 /// off mid-write, and the shapes that have to be refused by name.
-const open_corpus = [_][]const u8{
-    shakedown.corpus.entry(""),
-    shakedown.corpus.entry("\n"),
-    shakedown.corpus.entry("\n\n"),
-    shakedown.corpus.entry("{"),
-    shakedown.corpus.entry(a_record),
-    shakedown.corpus.entry(a_record ++ a_second_record),
-    shakedown.corpus.entry(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"crea"),
+const open_examples = [_][]const u8{
+    "",
+    "\n",
+    "\n\n",
+    "{",
+    a_record,
+    a_record ++ a_second_record,
+    a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"crea",
     // The zeros a writer's reservation leaves, after a whole record and
     // after half of one.
-    shakedown.corpus.entry(a_record ++ @as([64]u8, @splat(0))),
-    shakedown.corpus.entry(a_record ++ "{\"seq\":2,\"at\":2" ++ @as([64]u8, @splat(0))),
+    a_record ++ &@as([64]u8, @splat(0)),
+    a_record ++ "{\"seq\":2,\"at\":2" ++ &@as([64]u8, @splat(0)),
     // A record whose checksum is not its own, and one that does not link to
     // the record before it.
-    shakedown.corpus.entry(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":0}\n"),
-    shakedown.corpus.entry(a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":7,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":2105350390}\n"),
-    shakedown.corpus.entry("{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":null,\"c\":4294967296}\n"),
-    shakedown.corpus.entry("{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"p\":0,\"ev\":null}\n"),
-    shakedown.corpus.entry("{\"seq\":0,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n"),
-    shakedown.corpus.entry("{\"seq\":9223372036854775807,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n"),
-    shakedown.corpus.entry("{\"seq\":1,\"at\":1,\"v\":4294967296,\"p\":0,\"ev\":null}\n"),
-    shakedown.corpus.entry("{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":{\"created\":{\"id\":-1,\"name\":null}}}\n"),
-    shakedown.corpus.entry("[[[[[[[[[[[[[[[[[[[[\n"),
-    shakedown.corpus.entry("\x00\xff\xfe\n"),
+    a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":4192667910,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":0}\n",
+    a_record ++ "{\"seq\":2,\"at\":2,\"v\":1,\"p\":7,\"ev\":{\"created\":{\"id\":2,\"name\":\"x\"}},\"c\":2105350390}\n",
+    "{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":null,\"c\":4294967296}\n",
+    "{\"seq\":1,\"c\":0,\"at\":1,\"v\":1,\"p\":0,\"ev\":null}\n",
+    "{\"seq\":0,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n",
+    "{\"seq\":9223372036854775807,\"at\":0,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":1}}}\n",
+    "{\"seq\":1,\"at\":1,\"v\":4294967296,\"p\":0,\"ev\":null}\n",
+    "{\"seq\":1,\"at\":1,\"v\":1,\"p\":0,\"ev\":{\"created\":{\"id\":-1,\"name\":null}}}\n",
+    "[[[[[[[[[[[[[[[[[[[[\n",
+    "\x00\xff\xfe\n",
 };
 
 /// Every record a walk from `position` hands on, by sequence number, each
@@ -5372,18 +5380,22 @@ test "a replay can be re-armed across segment rotations" {
     try testing.expectEqual(Seq.fromRaw(9), (try walk.next(io)).?.seq);
 }
 
-test "fuzz: open of arbitrary segment contents, and the repair it promises" {
-    try testing.fuzz({}, fuzzOpen, .{ .corpus = &open_corpus });
+test "open of arbitrary segment contents, and the repair it promises" {
+    for (open_examples) |bytes| try checkOpen(bytes);
+    try shakedown.check(testing.allocator, {}, fuzzOpen, .{ .cases = 48 });
 }
 
-fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+fn fuzzOpen(_: void, c: *shakedown.Case) anyerror!void {
     // Bounded so that a generated run of `[` cannot recurse the JSON parser
     // deeper than a stack holds. A journal record is not adversarial input.
     var buffer: [1024]u8 = undefined;
-    const bytes = buffer[0..smith.slice(&buffer)];
+    try checkOpen(bytesInto(c.source, &buffer));
+}
+
+fn checkOpen(bytes: []const u8) anyerror!void {
+    fuzzingIo();
+    defer fuzzedIo();
+    const io = testing.io;
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5435,27 +5447,31 @@ fn fuzzOpen(_: void, smith: *testing.Smith) anyerror!void {
 }
 
 /// Arbitrary bytes where the line that says what the file is should be.
-const framing_corpus = [_][]const u8{
-    shakedown.corpus.entry(""),
-    shakedown.corpus.entry("\n"),
-    shakedown.corpus.entry("{\"chronicle\":1,\"base\":1,\"root\":0}\n"),
-    shakedown.corpus.entry("{\"chronicle\":2,\"base\":1,\"root\":0}\n"),
-    shakedown.corpus.entry("{\"chronicle\":1,\"base\":9,\"root\":0}\n"),
-    shakedown.corpus.entry("{\"chronicle\":1,\"base\":1}\n"),
-    shakedown.corpus.entry("{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{}}\n"),
-    shakedown.corpus.entry("chronicle\n"),
+const framing_examples = [_][]const u8{
+    "",
+    "\n",
+    "{\"chronicle\":1,\"base\":1,\"root\":0}\n",
+    "{\"chronicle\":2,\"base\":1,\"root\":0}\n",
+    "{\"chronicle\":1,\"base\":9,\"root\":0}\n",
+    "{\"chronicle\":1,\"base\":1}\n",
+    "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":{}}\n",
+    "chronicle\n",
 };
 
-test "fuzz: a segment whose first line is arbitrary" {
-    try testing.fuzz({}, fuzzFraming, .{ .corpus = &framing_corpus });
+test "a segment whose first line is arbitrary" {
+    for (framing_examples) |bytes| try checkFraming(bytes);
+    try shakedown.check(testing.allocator, {}, fuzzFraming, .{ .cases = 48 });
 }
 
-fn fuzzFraming(_: void, smith: *testing.Smith) anyerror!void {
+fn fuzzFraming(_: void, c: *shakedown.Case) anyerror!void {
+    var buffer: [256]u8 = undefined;
+    try checkFraming(bytesInto(c.source, &buffer));
+}
+
+fn checkFraming(head: []const u8) anyerror!void {
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
-    var buffer: [256]u8 = undefined;
-    const head = buffer[0..smith.slice(&buffer)];
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5481,27 +5497,31 @@ fn fuzzFraming(_: void, smith: *testing.Smith) anyerror!void {
     _ = try journal.verify(io);
 }
 
-const index_corpus = [_][]const u8{
-    shakedown.corpus.entry(""),
-    shakedown.corpus.entry("chridx\x02\n"),
-    shakedown.corpus.entry("chridx\x03\n"),
-    shakedown.corpus.entry("chridx\x03\n" ++ @as([88]u8, @splat(0))),
-    shakedown.corpus.entry("chridx\x03\n" ++ @as([88]u8, @splat(0)) ++ @as([24]u8, @splat(0))),
-    shakedown.corpus.entry("chridx\x03\n" ++ @as([88]u8, @splat(0xff))),
-    shakedown.corpus.entry("not an index at all"),
-    shakedown.corpus.entry("chridx\x03\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ @as([80]u8, @splat(0))),
+const index_examples = [_][]const u8{
+    "",
+    "chridx\x02\n",
+    "chridx\x03\n",
+    "chridx\x03\n" ++ &@as([88]u8, @splat(0)),
+    "chridx\x03\n" ++ &@as([88]u8, @splat(0)) ++ &@as([24]u8, @splat(0)),
+    "chridx\x03\n" ++ &@as([88]u8, @splat(0xff)),
+    "not an index at all",
+    "chridx\x03\n" ++ "\x3f\x00\x00\x00\x00\x00\x00\x00" ++ &@as([80]u8, @splat(0)),
 };
 
-test "fuzz: an arbitrary index file is a cache, never an answer" {
-    try testing.fuzz({}, fuzzIndex, .{ .corpus = &index_corpus });
+test "an arbitrary index file is a cache, never an answer" {
+    for (index_examples) |bytes| try checkIndex(bytes);
+    try shakedown.check(testing.allocator, {}, fuzzIndex, .{ .cases = 48 });
 }
 
-fn fuzzIndex(_: void, smith: *testing.Smith) anyerror!void {
+fn fuzzIndex(_: void, c: *shakedown.Case) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    try checkIndex(bytesInto(c.source, &buffer));
+}
+
+fn checkIndex(bytes: []const u8) anyerror!void {
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
-    var buffer: [512]u8 = undefined;
-    const bytes = buffer[0..smith.slice(&buffer)];
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5537,23 +5557,11 @@ fn fuzzIndex(_: void, smith: *testing.Smith) anyerror!void {
 // The invariant after the crash is the one every promise rests on: the log
 // opens, every surviving record passes its checksum and links to the one
 // before it, and the next append continues its sequence.
-test "fuzz: a sequence of calls, cut off part-way through" {
-    try testing.fuzz({}, fuzzCrash, .{ .corpus = &crash_corpus });
+test "a sequence of calls, cut off part-way through" {
+    try shakedown.check(testing.allocator, {}, fuzzCrash, .{ .cases = 64 });
 }
 
-/// Seeds for different operation orders and kill delays.
-const crash_corpus = [_][]const u8{
-    shakedown.corpus.entry("\x00"),
-    shakedown.corpus.entry("\x00\x00\x00"),
-    shakedown.corpus.entry("\x01\x01\x01"),
-    shakedown.corpus.entry("\x02\x00\x03"),
-    shakedown.corpus.entry("\x03\x04\x00\x00"),
-    shakedown.corpus.entry("\x04\x02\x01\x05"),
-    shakedown.corpus.entry("\x05\x05\x05\x05"),
-    shakedown.corpus.entry("\x00\x01\x02\x03\x04\x05"),
-};
-
-fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
+fn fuzzCrash(_: void, c: *shakedown.Case) anyerror!void {
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
@@ -5563,9 +5571,8 @@ fn fuzzCrash(_: void, smith: *testing.Smith) anyerror!void {
     defer ws.deinit();
     errdefer dumpJournalFiles(&ws);
 
-    var input: [64]u8 = undefined;
-    const bytes = input[0..smith.slice(&input)];
-    const seed = std.hash.Wyhash.hash(0x6372617368, bytes);
+    // The writer's own seed, and with it the instruction it is killed at.
+    const seed = gen.int(c.source, u64);
     var seed_buffer: [32]u8 = undefined;
     const seed_text = try std.mem.print(&seed_buffer, "{d}", .{seed});
 
@@ -5650,48 +5657,36 @@ fn dumpJournalFiles(ws: *Workspace) void {
     }
 }
 
-// The same target, driven from a fixed seed rather than from the corpus, so
-// that a plain `zig build test` kills writers at instructions nobody chose;
-// `zig build test --fuzz` explores further.
-test "a sequence of calls cut off part-way through leaves a log that opens" {
-    var prng: std.Random.DefaultPrng = .init(0x5eed5eed);
-    var bytes: [64]u8 = undefined;
-    for (0..64) |i| {
-        prng.random().bytes(&bytes);
-        var smith: testing.Smith = .{ .in = &bytes };
-        fuzzCrash({}, &smith) catch |err| {
-            std.debug.print("crash iteration {d}: {s}\n", .{ i, @errorName(err) });
-            return err;
-        };
-    }
-}
-
 /// A named reader's cursor is the one file a journal opened for reading
 /// writes, and the only one whose contents come from outside the log.
-const cursor_corpus = [_][]const u8{
-    shakedown.corpus.entry(""),
-    shakedown.corpus.entry("{}"),
-    shakedown.corpus.entry("{\"fmt\":1,\"seq\":0}"),
-    shakedown.corpus.entry("{\"fmt\":1,\"seq\":4}"),
-    shakedown.corpus.entry("{\"fmt\":1,\"seq\":-1}"),
-    shakedown.corpus.entry("{\"fmt\":1,\"seq\":18446744073709551615}"),
-    shakedown.corpus.entry("{\"fmt\":1,\"seq\":\"four\"}"),
-    shakedown.corpus.entry("{\"fmt\":2,\"seq\":4}"),
-    shakedown.corpus.entry("{\"seq\":4}"),
-    shakedown.corpus.entry("not json"),
-    shakedown.corpus.entry("[4]"),
+const cursor_examples = [_][]const u8{
+    "",
+    "{}",
+    "{\"fmt\":1,\"seq\":0}",
+    "{\"fmt\":1,\"seq\":4}",
+    "{\"fmt\":1,\"seq\":-1}",
+    "{\"fmt\":1,\"seq\":18446744073709551615}",
+    "{\"fmt\":1,\"seq\":\"four\"}",
+    "{\"fmt\":2,\"seq\":4}",
+    "{\"seq\":4}",
+    "not json",
+    "[4]",
 };
 
-test "fuzz: an arbitrary cursor file names a place in the log or an error" {
-    try testing.fuzz({}, fuzzCursor, .{ .corpus = &cursor_corpus });
+test "an arbitrary cursor file names a place in the log or an error" {
+    for (cursor_examples) |bytes| try checkCursor(bytes);
+    try shakedown.check(testing.allocator, {}, fuzzCursor, .{ .cases = 48 });
 }
 
-fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
+fn fuzzCursor(_: void, c: *shakedown.Case) anyerror!void {
+    var buffer: [512]u8 = undefined;
+    try checkCursor(bytesInto(c.source, &buffer));
+}
+
+fn checkCursor(bytes: []const u8) anyerror!void {
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
-    var buffer: [512]u8 = undefined;
-    const bytes = buffer[0..smith.slice(&buffer)];
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5729,27 +5724,31 @@ fn fuzzCursor(_: void, smith: *testing.Smith) anyerror!void {
     try testing.expectEqual(Seq.fromRaw(3), (try again.cursor(io)));
 }
 
-const snapshot_corpus = [_][]const u8{
-    shakedown.corpus.entry(""),
-    shakedown.corpus.entry("{}"),
-    shakedown.corpus.entry("{\"seq\":1,\"state\":\"\"}"),
-    shakedown.corpus.entry("{\"seq\":1,\"state\":\"aGk=\"}"),
-    shakedown.corpus.entry("{\"seq\":1,\"state\":\"not base64!\"}"),
-    shakedown.corpus.entry("{\"seq\":-1,\"state\":\"aGk=\"}"),
-    shakedown.corpus.entry("{\"state\":\"aGk=\"}"),
-    shakedown.corpus.entry("[1,2,3]"),
+const snapshot_examples = [_][]const u8{
+    "",
+    "{}",
+    "{\"seq\":1,\"state\":\"\"}",
+    "{\"seq\":1,\"state\":\"aGk=\"}",
+    "{\"seq\":1,\"state\":\"not base64!\"}",
+    "{\"seq\":-1,\"state\":\"aGk=\"}",
+    "{\"state\":\"aGk=\"}",
+    "[1,2,3]",
 };
 
-test "fuzz: openWithSnapshot over an arbitrary snapshot file" {
-    try testing.fuzz({}, fuzzSnapshot, .{ .corpus = &snapshot_corpus });
+test "openWithSnapshot over an arbitrary snapshot file" {
+    for (snapshot_examples) |bytes| try checkSnapshot(bytes);
+    try shakedown.check(testing.allocator, {}, fuzzSnapshot, .{ .cases = 48 });
 }
 
-fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
+fn fuzzSnapshot(_: void, c: *shakedown.Case) anyerror!void {
+    var buffer: [1024]u8 = undefined;
+    try checkSnapshot(bytesInto(c.source, &buffer));
+}
+
+fn checkSnapshot(bytes: []const u8) anyerror!void {
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
-    var buffer: [1024]u8 = undefined;
-    const bytes = buffer[0..smith.slice(&buffer)];
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5780,19 +5779,16 @@ fn fuzzSnapshot(_: void, smith: *testing.Smith) anyerror!void {
 }
 
 //========================================================================
-// Round trips, damage, records and stray files over generated input. Each
-// target also runs over seeded rounds below, so that a plain `zig build
-// test` checks the properties and `zig build test --fuzz` goes further.
+// Round trips, damage, records and stray files over generated input.
 //========================================================================
 
 /// A name for an event: bytes that need escaping, bytes that are not UTF-8,
 /// and ordinary letters, so a round trip is asked of every kind of string.
-fn generateName(smith: *testing.Smith, buf: []u8) []u8 {
-    @disableInstrumentation();
+fn generateName(s: *shakedown.Source, buf: []u8) []u8 {
     const pieces = [_][]const u8{ "a", "\"", "\\", "\n", "\x00", "\x1f", "\u{e9}", "\u{1f600}", "/", " " };
     var end: usize = 0;
-    while (!smith.eosWeightedSimple(3, 1)) {
-        const piece = pieces[smith.index(pieces.len)];
+    while (s.more(3)) {
+        const piece = pieces[gen.intRange(s, usize, 0, pieces.len - 1)];
         if (end + piece.len > buf.len) break;
         @memcpy(buf[end..][0..piece.len], piece);
         end += piece.len;
@@ -5873,12 +5869,12 @@ fn expectReplayed(journal: *Journal, cursor: u64, appended: []const Journal.Entr
     return fold.final();
 }
 
-test "fuzz: what is appended is what is read back, and folds the same" {
-    try testing.fuzz({}, fuzzRoundTrip, .{});
+test "what is appended is what is read back, and folds the same" {
+    try shakedown.check(testing.allocator, {}, fuzzRoundTrip, .{ .cases = 48 });
 }
 
-fn fuzzRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
-    @disableInstrumentation();
+fn fuzzRoundTrip(_: void, c: *shakedown.Case) anyerror!void {
+    const s = c.source;
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
@@ -5888,7 +5884,7 @@ fn fuzzRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
     defer arena.deinit();
     const a = arena.allocator();
 
-    const options = small(smith.valueRangeAtMost(u8, 1, 6), smith.valueRangeAtMost(u8, 1, 6));
+    const options = small(gen.intRange(s, u8, 1, 6), gen.intRange(s, u8, 1, 6));
     var appended: std.ArrayList(Journal.Entry) = .empty;
     var lines: std.ArrayList([]const u8) = .empty;
     var expected: Digest = .{};
@@ -5899,13 +5895,13 @@ fn fuzzRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
         try journal.subscribe(io, live.sink());
 
         var batch: [4]Journal.Entry = undefined;
-        while (appended.items.len < 24 and !smith.eosWeightedSimple(7, 1)) {
-            const n: usize = smith.valueRangeAtMost(u8, 1, batch.len);
+        while (appended.items.len < 24 and s.more(7)) {
+            const n: usize = gen.intRange(s, u8, 1, batch.len);
             for (batch[0..n]) |*entry| {
                 var buf: [24]u8 = undefined;
-                const name = try a.dupe(u8, generateName(smith, &buf));
-                const id = smith.value(u32);
-                entry.* = .{ .at = smith.value(i64), .event = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+                const name = try a.dupe(u8, generateName(s, &buf));
+                const id = gen.int(s, u32);
+                entry.* = .{ .at = gen.int(s, i64), .event = switch (gen.intRange(s, u8, 0, 2)) {
                     0 => .{ .created = .{ .id = id, .name = name } },
                     1 => .{ .renamed = .{ .id = id, .name = name } },
                     else => .{ .removed = .{ .id = id } },
@@ -5941,7 +5937,7 @@ fn fuzzRoundTrip(_: void, smith: *testing.Smith) anyerror!void {
     const journal = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail, .sync = .never });
     defer journal.deinit(io);
     try testing.expectEqual(expected.final(), try expectReplayed(journal, 0, appended.items, lines.items));
-    const cursor = smith.index(appended.items.len + 1);
+    const cursor = gen.intRange(s, usize, 0, (appended.items.len + 1) - 1);
     _ = try expectReplayed(journal, cursor, appended.items, lines.items);
     var reopened: Digest = .{};
     try journal.subscribeFrom(io, reopened.sink(), Seq.fromRaw(0));
@@ -5987,38 +5983,38 @@ fn journalFiles(ws: *Workspace, a: std.mem.Allocator) !std.array_hash_map.String
     return files;
 }
 
-test "fuzz: a log damaged anywhere reads back what was written or says why" {
-    try testing.fuzz({}, fuzzDamage, .{});
+test "a log damaged anywhere reads back what was written or says why" {
+    try shakedown.check(testing.allocator, {}, fuzzDamage, .{ .cases = 48 });
 }
 
 const Damage = struct { base: u64, name: []const u8, original: []const u8, offset: usize };
 
 /// Choose and mutate one segment; verification stays in the damage property.
-fn damageSegment(a: std.mem.Allocator, ws: *Workspace, smith: *testing.Smith, count: u64, per_segment: u64) !Damage {
+fn damageSegment(a: std.mem.Allocator, ws: *Workspace, s: *shakedown.Source, count: u64, per_segment: u64) !Damage {
     const io = testing.io;
     var segments: std.ArrayList(u64) = .empty;
     var base: u64 = 1;
     while (base <= count) : (base += per_segment) try segments.append(a, base);
-    const which = smith.index(segments.items.len);
+    const which = gen.intRange(s, usize, 0, segments.items.len - 1);
     const damaged_base = segments.items[which];
     const name = try ws.segment(damaged_base);
     const original = try ws.read(name);
-    const offset = smith.index(original.len + 1);
-    const damaged: []const u8 = switch (smith.valueRangeAtMost(u8, 0, 2)) {
+    const offset = gen.intRange(s, usize, 0, (original.len + 1) - 1);
+    const damaged: []const u8 = switch (gen.intRange(s, u8, 0, 2)) {
         0 => original[0..offset],
         1 => changed: {
             if (offset == original.len) break :changed original;
             const copy = try a.dupe(u8, original);
-            copy[offset] = smith.value(u8);
+            copy[offset] = gen.int(s, u8);
             break :changed copy;
         },
         else => added: {
             var extra: [32]u8 = undefined;
-            break :added try std.mem.concat(a, u8, &.{ original, extra[0..smith.slice(&extra)] });
+            break :added try std.mem.concat(a, u8, &.{ original, bytesInto(s, &extra) });
         },
     };
     try ws.write(name, damaged);
-    if (smith.boolWeighted(1, 1)) ws.root.deleteFile(io, try ws.index(damaged_base)) catch |err| switch (err) {
+    if (gen.boolean(s)) ws.root.deleteFile(io, try ws.index(damaged_base)) catch |err| switch (err) {
         error.FileNotFound => {},
         else => return err,
     };
@@ -6026,8 +6022,8 @@ fn damageSegment(a: std.mem.Allocator, ws: *Workspace, smith: *testing.Smith, co
     return .{ .base = damaged_base, .name = name, .original = original, .offset = offset };
 }
 
-fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
-    @disableInstrumentation();
+fn fuzzDamage(_: void, c: *shakedown.Case) anyerror!void {
+    const s = c.source;
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
@@ -6039,8 +6035,8 @@ fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
 
     // A log of a few segments, written by the journal, with a clean close
     // or without one.
-    const per_segment: u64 = smith.valueRangeAtMost(u8, 1, 4);
-    const count: u64 = smith.valueRangeAtMost(u8, 1, 10);
+    const per_segment: u64 = gen.intRange(s, u8, 1, 4);
+    const count: u64 = gen.intRange(s, u8, 1, 10);
     var lines: std.ArrayList([]const u8) = .empty;
     {
         const journal = try Journal.open(testing.allocator, io, ws.path, small(per_segment, 2));
@@ -6051,7 +6047,7 @@ fn fuzzDamage(_: void, smith: *testing.Smith) anyerror!void {
         while (try walk.next(io)) |record| try lines.append(a, try a.dupe(u8, record.bytes));
     }
 
-    const damage = try damageSegment(a, &ws, smith, count, per_segment);
+    const damage = try damageSegment(a, &ws, s, count, per_segment);
     const damaged_base = damage.base;
     const name = damage.name;
     const original = damage.original;
@@ -6160,12 +6156,12 @@ const event_shapes = [_]struct { json: []const u8, event: ?Event }{
     .{ .json = "{\"removed\":{\"id\":1}", .event = null },
 };
 
-test "fuzz: records checksummed and linked, but otherwise anything" {
-    try testing.fuzz({}, fuzzRecords, .{});
+test "records checksummed and linked, but otherwise anything" {
+    try shakedown.check(testing.allocator, {}, fuzzRecords, .{ .cases = 48 });
 }
 
-fn fuzzRecords(_: void, smith: *testing.Smith) anyerror!void {
-    @disableInstrumentation();
+fn fuzzRecords(_: void, c: *shakedown.Case) anyerror!void {
+    const s = c.source;
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
@@ -6179,29 +6175,29 @@ fn fuzzRecords(_: void, smith: *testing.Smith) anyerror!void {
     const Planned = struct { seq: u64, at: i64, v: u32, shape: usize };
     var planned: [12]Planned = undefined;
     var n: usize = 0;
-    const base: u64 = smith.valueRangeAtMost(u8, 1, 3);
-    var written: Handwritten = try .init(base, smith.valueRangeAtMost(u32, 0, 1));
+    const base: u64 = gen.intRange(s, u8, 1, 3);
+    var written: Handwritten = try .init(base, gen.intRange(s, u32, 0, 1));
     defer written.deinit();
     var well_formed = true;
     var refused = false;
     var next = base;
-    while (n < planned.len and !smith.eosWeightedSimple(5, 1)) : (n += 1) {
-        const seq = switch (smith.valueRangeAtMost(u8, 0, 9)) {
+    while (n < planned.len and s.more(5)) : (n += 1) {
+        const seq = switch (gen.intRange(s, u8, 0, 9)) {
             0 => next -| 1,
             1 => next + 1,
-            2 => smith.value(u64),
+            2 => gen.int(s, u64),
             else => next,
         };
-        const v: u32 = switch (smith.valueRangeAtMost(u8, 0, 9)) {
+        const v: u32 = switch (gen.intRange(s, u8, 0, 9)) {
             0 => 0,
             1 => 2,
             else => 1,
         };
-        const shape = smith.index(event_shapes.len);
-        if (smith.boolWeighted(15, 1)) written.link +%= 1;
+        const shape = gen.intRange(s, usize, 0, event_shapes.len - 1);
+        if (s.chance(62_500)) written.link +%= 1;
         // Above `maxInt(i64)` a sequence number is not one this format
         // reads; the line is still a line.
-        const at = smith.value(i64);
+        const at = gen.int(s, i64);
         const covered = try testing.allocator.print("{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d},\"ev\":{s}", .{
             seq, at, v, written.link, event_shapes[shape].json,
         });
@@ -6269,8 +6265,8 @@ fn fuzzRecords(_: void, smith: *testing.Smith) anyerror!void {
     }
 }
 
-test "fuzz: a file in the journal's directory under any other name is left alone" {
-    try testing.fuzz({}, fuzzStrayName, .{});
+test "a file in the journal's directory under any other name is left alone" {
+    try shakedown.check(testing.allocator, {}, fuzzStrayName, .{ .cases = 48 });
 }
 
 /// Whether `name` is one this package writes for a segment or its index.
@@ -6284,8 +6280,8 @@ fn isLogName(name: []const u8) bool {
     return false;
 }
 
-fn fuzzStrayName(_: void, smith: *testing.Smith) anyerror!void {
-    @disableInstrumentation();
+fn fuzzStrayName(_: void, c: *shakedown.Case) anyerror!void {
+    const s = c.source;
     fuzzingIo();
     defer fuzzedIo();
     const io = testing.io;
@@ -6302,9 +6298,9 @@ fn fuzzStrayName(_: void, smith: *testing.Smith) anyerror!void {
     var buf: [32]u8 = undefined;
     var len: usize = 0;
     const alphabet = "0000000000123456789+-_. ";
-    while (len < 20 and !smith.eosWeightedSimple(20, 1)) : (len += 1) buf[len] = alphabet[smith.index(alphabet.len)];
+    while (len < 20 and s.more(20)) : (len += 1) buf[len] = alphabet[gen.intRange(s, usize, 0, alphabet.len - 1)];
     const extensions = [_][]const u8{ chronicle.segment_extension, chronicle.index_extension, ".se", ".SEG", "", ".seg.seg" };
-    const extension = extensions[smith.index(extensions.len)];
+    const extension = extensions[gen.intRange(s, usize, 0, extensions.len - 1)];
     @memcpy(buf[len..][0..extension.len], extension);
     len += extension.len;
     const name = buf[0..len];
@@ -6316,7 +6312,7 @@ fn fuzzStrayName(_: void, smith: *testing.Smith) anyerror!void {
 
     // Its contents are a copy of one of the log's own segments, the shape
     // most likely to be mistaken for one.
-    const copied = try ws.read(try ws.segment(@as(u64, smith.valueRangeAtMost(u8, 0, 2)) * 2 + 1));
+    const copied = try ws.read(try ws.segment(@as(u64, gen.intRange(s, u8, 0, 2)) * 2 + 1));
     try ws.write(try ws.sub(name), copied);
 
     {
@@ -6330,27 +6326,6 @@ fn fuzzStrayName(_: void, smith: *testing.Smith) anyerror!void {
         try testing.expectEqual(Seq.fromRaw(6), try journal.append(io, 6, created(6, "n")));
     }
     try testing.expectEqualStrings(copied, try ws.read(try ws.sub(name)));
-}
-
-test "the generated-input properties hold over seeded rounds" {
-    var prng: std.Random.DefaultPrng = .init(0xc4a0);
-    var bytes: [512]u8 = undefined;
-    for (0..48) |i| {
-        // Bytes shaped the way a `Smith` reads them: mostly zeros, so that it
-        // goes on choosing rather than ending at once.
-        for (&bytes) |*byte| byte.* = switch (prng.random().uintLessThan(u8, 10)) {
-            0...6 => 0,
-            7, 8 => prng.random().uintLessThan(u8, 12),
-            else => prng.random().int(u8),
-        };
-        inline for (.{ fuzzRoundTrip, fuzzDamage, fuzzRecords, fuzzStrayName }) |property| {
-            var smith: testing.Smith = .{ .in = &bytes };
-            property({}, &smith) catch |err| {
-                std.debug.print("seeded round {d}: {t}\n", .{ i, err });
-                return err;
-            };
-        }
-    }
 }
 
 //========================================================================
