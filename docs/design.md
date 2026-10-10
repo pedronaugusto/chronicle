@@ -108,17 +108,70 @@ a pair that do not belong together is refused in every build, not only in Debug.
 - `Builder.wants` and the log's offsets use checked subtraction, so a record
   that moves backwards in its segment stops the program.
 
+## One lock, and what it guards
+
+Everything about a journal that changes once it is open sits in one `State`
+(`journal.zig`) behind aegis's `BlockingGuarded`: the log and its segments, the
+tail, the sinks, the newest sequence number, the failed-write latch, the nudge
+count and the buffers a record is written through. `BlockingGuarded` is an
+`Io.Mutex` that owns its data: there is no way to the state but a guard, and a
+guard is released explicitly with the `Io` it was taken with. What does not
+change after open, the allocator and the `Options`, is read without it.
+
+Because the state is only reachable through a guard, a helper that needs the lock
+says so in its signature and cannot be called without one. A method that only
+reads or changes state is a method of `State` (`expect`, `tailSince`, `clearTail`,
+`dropTailBefore`, `unstage`); one that also needs the allocator or the options
+takes the journal and the state (`fillTail`, `encode`, `publish`, `deliver`).
+These used to be marked by a comment, "called under the lock", that the tests and
+the thread sanitizer held; the compiler holds it now.
+
+### The wait
+
+`waitPast` is the one place a task lets the lock go and takes it back, and it does
+so through aegis's `Condition`:
+
+```zig
+while (values.atMost(guard.value().seq, cursor) and guard.value().nudges == nudged) {
+    self.changed.wait(io, &guard, .none) catch ...;
+}
+```
+
+`wait` registers the waiter, releases the guard's lock, parks, and returns with the
+lock held again on every path, a cancellation included. A borrow of the state does
+not survive the call, which is why the loop reads `guard.value()` again after it.
+An append or a nudge broadcasts under the lock, after it has published what the
+reader is waiting for, so a reader that has checked and not yet parked cannot be
+missed: it registers before it lets the lock go.
+
+This replaced a futex word, a waiter count and a count of wakes that the package
+kept for itself, written when Zig 0.16's `Io.Condition` lost a cancel that landed
+in the same instant as a broadcast. The condition aegis ships looks for a pending
+cancellation before it parks and after it wakes, and forwards a signal it was
+given if it is canceled, which is the contract that code was written to have;
+`a reader stopped as a record arrives is stopped` runs three thousand rounds of
+exactly that race against it. Its waiter registry is unlimited here (`changed` is
+made with the largest limit): a waiter is a caller's stack frame, so the callers
+bound it, and `waitPast` has no error to report a limit with.
+
+An append that nobody waits on costs the condition's own lock taken and released,
+and no system call; the suite counts the `Io`'s futex calls through shakedown's
+`FaultIo` to hold that, in place of the counters the journal used to keep for it.
+
+### What takes the lock for no state
+
+`openedWith` and `Tailer.cursor` read values the lock does not protect (the options
+are fixed at open; a tailer's committed cursor moves only under its own `commit`,
+which holds the lock). They take it anyway: an observation of the journal waits its
+turn and is canceled there like every other call, and the tests hold the lock to
+prove that.
+
 ## What was left out, and why
 
 - **`own.Owned` for an encoded record.** A `Built` record's arena moves from a
   local to the tail array, whose elements are moved by `removePrefix`, or is
   released after the write. Owned binds to an address and checks in Debug only; the
   `held` flag is the same discipline, and in every build.
-- **`BlockingGuarded` for the journal's state.** One mutex guards a dozen fields
-  that three nested owners (a replay, a tailer, the journal itself) and the sinks
-  reach, and `waitPast` releases it around a futex wait. Moving the fields behind a
-  guard changes ~60 methods for a convention (comments that say "called under the
-  lock") that the tests and TSan already hold; it is a candidate for its own batch.
 - **`bounded.Limit`.** It takes a raw representation, where every limit here is
   already `Bytes` or `Records`.
 - **`handle` and `err`.** No pool or slot map is kept, and errors are named Zig

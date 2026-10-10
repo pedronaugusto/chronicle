@@ -2,8 +2,10 @@
 
 - The public journal, batches, replay walks, tailers and reader lists are opaque
   owners at stable allocated addresses. Each is released once, after its users
-  stop. The implementation's mutex protects the journal sequence, tail, sinks,
-  persistence failure flag and waiter counts.
+  stop. The implementation's lock, an aegis `BlockingGuarded` over one `State`,
+  protects the journal sequence, tail, sinks, persistence failure flag, nudge
+  count, log and the buffers records are written through, and is reachable only
+  through a guard. `waitPast` waits on an aegis `Condition` associated with it.
 - Records are newline-delimited JSON. Sequence numbers are positive signed-64
   integers, advance without gaps, and link each CRC32C checksum to the preceding
   record or segment root. Atomic batch bounds contain the record's sequence and

@@ -42,6 +42,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The journal's lock, and the state it guards, are aegis's `BlockingGuarded` over one struct, and `waitPast` waits on aegis's `Condition`; the package's own futex word, waiter count and wake count are gone. Nothing in the API changes. A helper that needs the lock now takes the guarded state, so it cannot be called without it. `waitPast`, `append` and `nudge` measure level with what they were (macOS and Linux, paired runs of the package's own benchmarks), and a reader canceled in the instant an append signals is still canceled.
 - A segment file's name is a sequence number from 1 to `maxInt(i64)`; a file named for a larger number, which no record can carry, is no longer read as a segment.
 - CRC32C is supplied by [warp](https://github.com/pedronaugusto/warp), pinned at `e607c19`, with runtime CPU dispatch and hardware kernels in baseline builds. Record and index checksum values are unchanged.
 

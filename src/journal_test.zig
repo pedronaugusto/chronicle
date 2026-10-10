@@ -1833,6 +1833,44 @@ test "an append nobody waits on wakes nobody, and one somebody waits on wakes th
     try testing.expectEqual(@as(u64, 1), fio.count(.futexWake));
 }
 
+test "one append wakes every reader parked on the journal" {
+    const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{});
+    defer fio.deinit();
+    const io = fio.io();
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .sync = .never });
+    defer journal.deinit(io);
+
+    const reader = struct {
+        fn f(inner: Io, j: *Journal) Io.Cancelable!Seq {
+            return j.waitPast(inner, Seq.fromRaw(0));
+        }
+    }.f;
+    // One at a time, each parked before the next starts, so that no two
+    // readers meet at the condition's registry and every futex wait seen is
+    // a reader parking.
+    var woken: [3]Io.Future(Io.Cancelable!Seq) = undefined;
+    var started: usize = 0;
+    defer for (woken[0..started]) |*future| {
+        _ = future.cancel(io) catch |err| {
+            // Cancellation joins the task; its error is expected during cleanup or was checked by await.
+            std.log.debug("task cleanup: {t}", .{err});
+        };
+    };
+    for (&woken, 1..) |*future, parked| {
+        future.* = try io.concurrent(reader, .{ io, journal });
+        started += 1;
+        try untilParked(io, fio, parked);
+    }
+
+    _ = try journal.append(io, 1, created(1, "for all"));
+    for (&woken) |*future| try testing.expectEqual(Seq.fromRaw(1), try future.await(io));
+    // Each was signaled once.
+    try testing.expectEqual(@as(u64, 3), fio.count(.futexWake));
+}
+
 test "waitPast is woken by a nudge with no record behind it" {
     const io = testing.io;
     var ws = try Workspace.init("log");
