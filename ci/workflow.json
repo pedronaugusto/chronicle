@@ -1,5 +1,4 @@
 {
-  "package": "chronicle",
   "compile_step": "check",
   "targets": [
     "x86_64-linux-gnu",
@@ -19,5 +18,12 @@
     }
   ],
   "compile_once": false,
-  "sanitizer": "test"
+  "jobs": [
+    {
+      "name": "ThreadSanitizer (Linux)",
+      "step": "test",
+      "args": ["-Dthread-sanitizer=true", "-Doptimize=debug", "-Dci-lint=false"],
+      "tiers": ["release"]
+    }
+  ]
 }
