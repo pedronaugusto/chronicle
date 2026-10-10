@@ -1830,7 +1830,9 @@ test "an append nobody waits on wakes nobody, and one somebody waits on wakes th
     try untilParked(io, fio, 1);
     _ = try journal.append(io, 4, created(4, "awaited"));
     try testing.expectEqual(Seq.fromRaw(4), try future.await(io));
-    try testing.expectEqual(@as(u64, 1), fio.count(.futexWake));
+    // At least the reader's; the lock it took back while the append held it
+    // may have made one more.
+    try testing.expect(fio.count(.futexWake) >= 1);
 }
 
 test "one append wakes every reader parked on the journal" {
@@ -1867,8 +1869,9 @@ test "one append wakes every reader parked on the journal" {
 
     _ = try journal.append(io, 1, created(1, "for all"));
     for (&woken) |*future| try testing.expectEqual(Seq.fromRaw(1), try future.await(io));
-    // Each was signaled once.
-    try testing.expectEqual(@as(u64, 3), fio.count(.futexWake));
+    // Each was signaled; the lock they took back while the append held it
+    // may have made more.
+    try testing.expect(fio.count(.futexWake) >= 3);
 }
 
 test "waitPast is woken by a nudge with no record behind it" {
