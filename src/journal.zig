@@ -94,8 +94,9 @@ pub fn Journal(comptime Event: type) type {
 
         // Only the opaque journal facade hands out access to this state.
 
-        /// The configuration supplied at open. Read through `openedWith`.
-        /// Fixed for the journal's life, so read without the lock.
+        /// The configuration supplied at open, which a caller sees through
+        /// `openedWith`. Fixed for the journal's life, so the journal itself
+        /// reads it without the lock.
         config: Options,
 
         //-------------------------------------------------------------- internals
