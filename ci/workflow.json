@@ -1,4 +1,6 @@
 {
+  "land": true,
+  "attest": true,
   "package": "chronicle",
   "compile_step": "check",
   "targets": [

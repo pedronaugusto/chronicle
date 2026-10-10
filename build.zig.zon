@@ -5,32 +5,32 @@
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight#e3d81b9e477c1c690f1ce03506511935d16035c3",
-            .hash = "preflight-0.1.0-LX1Zwl2HCQB4-h0brJMmXe_1ZA3UoIT6vI9kJ3IE1grE",
+            .url = "git+https://github.com/pedronaugusto/preflight#cb348117bc08b298276d51a00dbbfe83e79570a7",
+            .hash = "preflight-0.1.0-LX1ZwtKECgCyqcfgCDqfVAt-b2a1rEXMuKMEXzv4a0up",
             .lazy = true,
         },
 
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#3e9f34ee257af62769e74970bf5949b95b382c87",
-            .hash = "strand-0.7.0-8LNWVkYnFwAbnspmXHGncit7VYTHxi1m_AeWnaH4sGzy",
+            .url = "git+https://github.com/pedronaugusto/strand#dba457548716ac243002f753b8acf6a53904b37d",
+            .hash = "strand-0.7.0-8LNWVhMnFwDALhZ_3rVrAlpKY1255BgGx8Nn5VW7uOGi",
         },
 
         // Durable files: every sync, atomic replace, batch and file identity.
         .airlock = .{
-            .url = "git+https://github.com/pedronaugusto/airlock#2505fadfad3dcb36137340b3ba731b044c38596c",
-            .hash = "airlock-0.1.0-rfvu6OXqBQDXhoG4omggY-Wdf0mpDIeXBKe4v4FFJA6d",
+            .url = "git+https://github.com/pedronaugusto/airlock#b0d1a413c496fab6f08163cffcd55a8cab1075ac",
+            .hash = "airlock-0.1.0-rfvu6JWGBQDtnYrvq5Yc59eVYr1E6l4-jRzZinJfCusT",
         },
 
         // Record and index CRC-32C, with runtime CPU dispatch.
         .warp = .{
-            .url = "git+https://github.com/pedronaugusto/warp#f446a8b7bf86aef188075a32cc5d42e43eb102e0",
-            .hash = "warp-0.1.0-JASxFaMZEQBWhVdtwJ_gojtCU1nxRcpLj9OX-nlaaSqa",
+            .url = "git+https://github.com/pedronaugusto/warp#1415e781b0c36843d41ad7d2f5d09e54bbdbd594",
+            .hash = "warp-0.1.0-JASxFRpTEQDiEu-_pz9CK_bvTqxkZ_WeE9mshHwHL0_H",
         },
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis#104b1c07ebc698ec86cb65ca0befa0a63c266e8a",
-            .hash = "aegis-0.0.0-rsxouifgBgBOnC8-wtmFrZSIUjR9aEYPYmZD1G-hASAz",
+            .url = "git+https://github.com/pedronaugusto/aegis#28e8df5b3fde1fca2d5b61f6ab110c4acac2f688",
+            .hash = "aegis-0.0.0-rsxougITBwB_VYWvOCMfzQ4ra79s9U5QTAiuKH6ZWOl5",
         },
     },
     .paths = .{
