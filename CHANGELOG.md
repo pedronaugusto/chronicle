@@ -8,6 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- chronicle is developed with [bay](https://github.com/pedronaugusto/bay): preflight and shakedown are dev dependencies, and the tests, examples, checks and benchmarks are the development build's (`bay test`, `bay check`, `bay bench`). chronicle ships with aegis, warp, strand and airlock; what a project that depends on it builds is unchanged. strand and airlock are pinned to the revisions developed with bay.
 - Events are strand's JSON types. strand has one API now, and chronicle writes and
   reads each record with `strand.json`: an event's own meaning is a
   `strandSerialize` and `strandDeserialize` pair where it was `jsonStringify` and

@@ -153,18 +153,21 @@ exercises schema migration.
 - [shakedown](https://github.com/pedronaugusto/shakedown) supplies the tests' doubles:
   faulted and counted `Io` calls and allocators, and airlock's syncs through
   `airlock.testing`, its test seam. Only the tests import them, so a project depending
-  on chronicle never fetches them.
+  on chronicle never fetches them. preflight and shakedown are dev dependencies, which
+  [bay](https://github.com/pedronaugusto/bay) gives chronicle's own development.
 - [preflight](https://github.com/pedronaugusto/preflight) runs the source checks,
   the tests and CI.
 
 ## Testing
 
-`zig build test` runs the unit suite, writer-lock helper and examples in Debug by
+Development runs through bay.
+
+`bay test` runs the unit suite, writer-lock helper and examples in Debug by
 default. Tests cover crash prefixes, checksum and chain failures, recovery, replay,
-snapshots, retention, concurrency and allocation cleanup. `zig build examples` runs the
-examples separately; `zig build check` compiles the suite, helper and examples without
-running them. CI also runs `zig build docs -- usage --check`, and
-`zig build check-consumer` builds a project that depends on chronicle with only aegis,
+snapshots, retention, concurrency and allocation cleanup. `bay examples` runs the
+examples separately; `bay check` compiles the suite, helper and examples without
+running them. CI also runs `bay docs -- usage --check`, and
+`bay check-consumer` builds a project that depends on chronicle with only aegis,
 strand, airlock and warp fetched.
 
 [CI](.github/workflows/ci.yml) has three tiers. The fast tier runs the source checks and
@@ -174,9 +177,9 @@ on all three hosts, ReleaseFast on Ubuntu, ReleaseSmall compile-only, every cros
 and ThreadSanitizer. The merge and release tiers also run the Debug suite on Ubuntu with
 Zig master, a job that reports and never blocks.
 
-`zig build bench` builds the benchmarks in [bench/](bench/) in ReleaseFast under
+`bay bench` builds the benchmarks in [bench/](bench/) in ReleaseFast under
 `zig-out/bench` and runs each, one after another, over every workload it has; each says
-at its top how to run one workload alone. `zig build test` runs each once with
+at its top how to run one workload alone. `bay test` runs each once with
 `--smoke`; CI times nothing.
 
 The release tier's compile-only jobs cover `x86_64-linux-gnu`, `aarch64-linux-gnu`, `x86_64-linux-musl`,

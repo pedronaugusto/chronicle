@@ -2,10 +2,9 @@ const std = @import("std");
 /// airlock's build, for its test seam.
 const airlock_build = @import("airlock");
 
-pub fn build(b: *std.Build) !void {
-    // lazyImport compares every package of the dependency tree at comptime;
-    // a large tree runs past the default quota of 1000 branches.
-    @setEvalBranchQuota(100_000);
+/// What a project that depends on chronicle builds: the `chronicle` module,
+/// on aegis, warp, strand and airlock. The tests, examples and gate are `dev`'s.
+pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
@@ -23,7 +22,7 @@ pub fn build(b: *std.Build) !void {
     const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const airlock_dependency = b.dependency("airlock", .{ .target = target, .optimize = optimize });
     const airlock = airlock_dependency.module("airlock");
-    const module = b.addModule("chronicle", .{
+    _ = b.addModule("chronicle", .{
         .root_source_file = b.path("src/chronicle.zig"),
         .target = target,
         .optimize = optimize,
@@ -34,10 +33,24 @@ pub fn build(b: *std.Build) !void {
             .{ .name = "airlock", .module = airlock },
         },
     });
+}
 
-    // Everything below is chronicle's own: a project depending on chronicle
-    // neither builds nor fetches its tests, examples, benchmarks or CI.
-    if (b.pkg_hash.len != 0) return;
+/// chronicle's development: its tests, examples and benchmarks, under
+/// preflight's gate, with shakedown bound to chronicle's aegis. Run through bay.
+pub fn dev(b: *std.Build, tools: type) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const preflight = tools.preflight;
+    use_aegis = tools.shakedown.useAegis;
+    const package = b.dependency("chronicle", .{ .target = target, .optimize = optimize });
+    const p = package.builder;
+    const module = package.module("chronicle");
+    const aegis_dependency = p.dependency("aegis", .{ .target = target, .optimize = optimize });
+    const aegis = aegis_dependency.module("aegis");
+    const warp = p.dependency("warp", .{ .target = target, .optimize = optimize }).module("warp");
+    const strand = p.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
+    const airlock_dependency = p.dependency("airlock", .{ .target = target, .optimize = optimize });
+    const airlock = airlock_dependency.module("airlock");
 
     //=====================================================================
     // Tests.
@@ -47,7 +60,7 @@ pub fn build(b: *std.Build) !void {
     // `waitPast` or fold live through a sink, and a clean reopen inspects
     // the segments concurrently. Whether those are free of races is a claim
     // a race detector can check and a reader cannot:
-    // `zig build test -Dthread-sanitizer`.
+    // `bay test -Dthread-sanitizer`.
     const thread_sanitizer = b.option(
         bool,
         "thread-sanitizer",
@@ -60,7 +73,7 @@ pub fn build(b: *std.Build) !void {
     const lock_helper = b.addExecutable(.{
         .name = "chronicle-lock-helper",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/testing/lock_helper.zig"),
+            .root_source_file = p.path("src/testing/lock_helper.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{.{ .name = "chronicle", .module = module }},
@@ -74,7 +87,7 @@ pub fn build(b: *std.Build) !void {
         .filters = if (test_filter) |filter| &.{filter} else &.{},
         .name = "chronicle-tests",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/tests.zig"),
+            .root_source_file = p.path("src/tests.zig"),
             .target = target,
             .optimize = optimize,
             .sanitize_thread = if (thread_sanitizer) true else null,
@@ -87,16 +100,10 @@ pub fn build(b: *std.Build) !void {
             },
         }),
     });
-    // shakedown, and airlock's seam on it, are lazy and test-only: no
-    // module a consumer builds imports them. Their error is returned last,
-    // so one configure pass asks for them and for preflight together.
-    var needed: error{LazyDependencyNeeded}!void = {};
-    if (b.dependencyLazy("shakedown", .{ .target = target, .optimize = optimize })) |shakedown| {
-        tests.root_module.addImport("shakedown", shakedown.module("shakedown"));
-    } else |err| needed = err;
-    if (airlock_build.testing(airlock_dependency)) |seam| {
-        tests.root_module.addImport("airlock.testing", seam);
-    } else |err| needed = err;
+    // shakedown, bound to chronicle's aegis, and airlock's seam on it, which is
+    // lazy: its error ends this configure pass until it is fetched.
+    tests.root_module.addImport("shakedown", boundShakedown(b, target, optimize).module("shakedown"));
+    tests.root_module.addImport("airlock.testing", airlock_build.testing(airlock_dependency) catch return);
     const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run chronicle tests");
@@ -115,7 +122,7 @@ pub fn build(b: *std.Build) !void {
     // Built AND run, against the module a consumer gets. An example that is
     // only compiled proves the names still resolve; running it is what
     // proves the package still works. examples/usage.zig is also where
-    // README.md's Usage block comes from -- see zig build docs -- usage -- so a
+    // README.md's Usage block comes from -- see bay docs -- usage -- so a
     // snippet a reader copies cannot drift from code CI executes.
     //=====================================================================
 
@@ -124,7 +131,7 @@ pub fn build(b: *std.Build) !void {
         const example = b.addExecutable(.{
             .name = std.Io.Dir.path.stem(source),
             .root_module = b.createModule(.{
-                .root_source_file = b.path(source),
+                .root_source_file = p.path(source),
                 .target = target,
                 .optimize = optimize,
                 // A migration parses an older event out of its bytes with
@@ -136,71 +143,64 @@ pub fn build(b: *std.Build) !void {
         check_step.dependOn(&example.step);
         const run = b.addRunArtifact(example);
         run.step.dependOn(b.getInstallStep());
-        run.setCwd(b.path("zig-out"));
+        run.setCwd(p.path("zig-out"));
         examples_step.dependOn(&run.step);
     }
     if (test_filter == null) test_step.dependOn(examples_step);
 
     //=====================================================================
     // CI wiring
-    //
-    // preflight is a lazy dependency, and a lazy package's build.zig can
-    // only be reached through `lazyImport`: a plain `@import` of it fails to
-    // compile in any project that depends on chronicle and has not fetched
-    // preflight, which is every such project.
     //=====================================================================
 
-    if (b.lazyImport(@This(), "preflight")) |preflight| {
-        // `zig build bench` times each program in bench/ in ReleaseFast, one
-        // after another, each running every workload it has; `zig build
-        // test` runs each once with `--smoke`.
-        preflight.addCi(b, .{
-            .tests = test_step,
-            .bench = .{
-                .programs = &.{
-                    .{ .name = "chronicle-bench", .source = "bench/chronicle_bench.zig" },
-                    .{ .name = "work-bench", .source = "bench/work_bench.zig" },
-                    .{ .name = "cover-bench", .source = "bench/cover_bench.zig" },
-                },
-                .imports = benchImports,
-                .target = target,
-                .optimize = optimize,
+    // `bay bench` times each program in bench/ in ReleaseFast, one
+    // after another, each running every workload it has; `bay test`
+    // runs each once with `--smoke`.
+    preflight.addCi(b, p, .{
+        .tests = test_step,
+        .bench = .{
+            .programs = &.{
+                .{ .name = "chronicle-bench", .source = "bench/chronicle_bench.zig" },
+                .{ .name = "work-bench", .source = "bench/work_bench.zig" },
+                .{ .name = "cover-bench", .source = "bench/cover_bench.zig" },
             },
-        });
-        // A project that depends on chronicle by path, with strand, airlock
-        // and warp and nothing else to fetch: the build a consumer gets.
-        preflight.addConsumerCheck(b, .{
-            .package = "chronicle",
-            .program = b.path("ci/consumer.zig"),
-            .packages = &.{ b.dependency("aegis", .{}), b.dependency("strand", .{}), b.dependency("airlock", .{}), b.dependency("warp", .{}) },
-        });
-    }
-    return needed;
-}
-
-/// chronicle, aegis, strand, airlock and warp again, in the mode a benchmark builds in:
-/// an imported module keeps its own mode, so a ReleaseFast benchmark over
-/// the Debug module would time the Debug module.
-fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
-    const aegis = b.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis");
-    const warp = b.dependency("warp", .{ .target = target, .optimize = optimize }).module("warp");
-    const strand = b.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
-    const airlock = b.dependency("airlock", .{ .target = target, .optimize = optimize }).module("airlock");
-    const chronicle = b.createModule(.{
-        .root_source_file = b.path("src/chronicle.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "aegis", .module = aegis },
-            .{ .name = "warp", .module = warp },
-            .{ .name = "strand", .module = strand },
-            .{ .name = "airlock", .module = airlock },
+            .imports = benchImports,
+            .target = target,
+            .optimize = optimize,
         },
     });
+    // A project that depends on chronicle by path, with strand, airlock
+    // and warp and nothing else to fetch: the build a consumer gets.
+    preflight.addConsumerCheck(b, p, .{
+        .package = "chronicle",
+        .program = p.path("ci/consumer.zig"),
+        .packages = &.{ aegis_dependency, p.dependency("strand", .{}), airlock_dependency, p.dependency("warp", .{}) },
+    });
+}
+
+/// `tools.shakedown.useAegis`, set by `dev` for the benchmark imports, which are built without `tools`.
+var use_aegis: *const fn (*std.Build.Dependency, *std.Build.Module) void = undefined;
+
+/// shakedown bound to chronicle's aegis in this mode, so a binary links one aegis.
+fn boundShakedown(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Dependency {
+    const p = b.dependency("chronicle", .{ .target = target, .optimize = optimize }).builder;
+    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize, .aegis = .consumer });
+    use_aegis(shakedown, p.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis"));
+    return shakedown;
+}
+
+/// chronicle, strand and airlock again, in the mode a benchmark builds in:
+/// an imported module keeps its own mode, so a ReleaseFast benchmark over
+/// the Debug module would time the Debug module. And shakedown, bound to its aegis.
+fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
+    const package = b.dependency("chronicle", .{ .target = target, .optimize = optimize });
+    const p = package.builder;
+    const strand = p.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
+    const airlock = p.dependency("airlock", .{ .target = target, .optimize = optimize }).module("airlock");
     return b.allocator.dupe(std.Build.Module.Import, &.{
-        .{ .name = "chronicle", .module = chronicle },
+        .{ .name = "chronicle", .module = package.module("chronicle") },
         .{ .name = "strand", .module = strand },
         .{ .name = "airlock", .module = airlock },
+        .{ .name = "shakedown", .module = boundShakedown(b, target, optimize).module("shakedown") },
     }) catch @panic("OOM");
 }
 

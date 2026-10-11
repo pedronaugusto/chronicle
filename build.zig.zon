@@ -4,37 +4,29 @@
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
-        .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight#5a2d7c3f8efb70ead532a923ebb411a6324f2581",
-            .hash = "preflight-0.1.0-LX1Zwtq3CgC2_Gb44-qgEk3AqRQAMkx9dZbsdp_GTx4T",
-            .lazy = true,
-        },
 
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#d8d3a4c1d671147972590fb54fd53cdc269b543d",
-            .hash = "strand-0.7.0-8LNWViErFwCo4B2JKY3RYzkJidoVmy1vqCdypjygKuAJ",
+            .url = "git+https://github.com/pedronaugusto/strand#736eba2eef29d6a7e3a5a1502f0d686171938fe5",
+            .hash = "strand-0.7.0-8LNWVicuFwD6CORoP8ZrBjL-yAH8UyxSclg_9jZ5u_fB",
         },
 
         // Durable files: every sync, atomic replace, batch and file identity.
         .airlock = .{
-            .url = "git+https://github.com/pedronaugusto/airlock#0a176e3c475069f00f361a2b23e7262293f7b3e7",
-            .hash = "airlock-0.1.0-rfvu6JWGBQDjkpM5Ffm3hcMK9dInNDLdCQ6vd6HgEhtQ",
+            .url = "git+https://github.com/pedronaugusto/airlock#89ab03ec7a7e9d16cca47e5e903cea722a18e30f",
+            .hash = "airlock-0.1.0-rfvu6H6LBQAvdjI7-HVGb07snh9b1XUe9d3FNsRu_v67",
         },
 
         // Test doubles, for the tests alone: no module a consumer builds
         // imports it, and a consumer never fetches it.
-        .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown#8a544acff51a2cdc5c503d30e9d0b6f2afa2dfef",
-            .hash = "shakedown-0.1.0-BR8U4xnCFQBUli1AvIQJV1HetPmNZP7jzafAWM5oEAed",
-            .lazy = true,
-        },
+
         // Record and index CRC-32C, with runtime CPU dispatch.
         .warp = .{
             .url = "git+https://github.com/pedronaugusto/warp#b82b8052ab8dfe90e91bf6e2dc1cad24c79b3cc2",
             .hash = "warp-0.1.0-JASxFRpTEQDpCpBibKGQR4HW4fxnWCDhlfGGwn5PPP9N",
         },
+
         .aegis = .{
             .url = "git+https://github.com/pedronaugusto/aegis#39d3bea8da17f1094ee85577e636b127f93e0973",
             .hash = "aegis-0.0.0-rsxouiIXBwCCAncc-oK7MrA3OcZBLFlIBm1d0K9ME3uR",
@@ -47,5 +39,15 @@
         "CHANGELOG.md",
         "LICENSE",
         "README.md",
+    },
+    .dev_dependencies = .{
+        .preflight = .{
+            .url = "git+https://github.com/pedronaugusto/preflight#93cf3dae957424720ef109f656c80bef320acc8b",
+            .hash = "preflight-0.1.0-LX1ZwpsLDAA6OTQHa2XpJ4d5JxReq5cVxvBbJuPYB3_i",
+        },
+        .shakedown = .{
+            .url = "git+https://github.com/pedronaugusto/shakedown#49eec3939fd02f20a4a6b442305fa4d09a82420b",
+            .hash = "shakedown-0.1.0-BR8U40rLFQC0c7SVGxKoBmCPKEUfotD2sR7G9DKEgJas",
+        },
     },
 }
