@@ -6184,7 +6184,7 @@ fn fuzzRecords(_: void, c: *shakedown.Case) anyerror!void {
     while (n < planned.len and s.more(5)) : (n += 1) {
         const seq = switch (gen.intRange(s, u8, 0, 9)) {
             0 => next -| 1,
-            1 => next + 1,
+            1 => next +% 1,
             2 => gen.int(s, u64),
             else => next,
         };
