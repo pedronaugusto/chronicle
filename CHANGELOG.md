@@ -8,6 +8,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking
 
+- The tests build airlock's seam on chronicle's own shakedown (airlock 0.2.0's `testing`).
 - chronicle is developed with [bay](https://github.com/pedronaugusto/bay): preflight and shakedown are dev dependencies, and the tests, examples, checks and benchmarks are the development build's (`bay test`, `bay check`, `bay bench`). chronicle ships with aegis, warp, strand and airlock; what a project that depends on it builds is unchanged. strand and airlock are pinned to the revisions developed with bay.
 - Events are strand's JSON types. strand has one API now, and chronicle writes and
   reads each record with `strand.json`: an event's own meaning is a
@@ -21,7 +22,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   were written as an array of numbers. A codec that refuses to write an event is
   `error.NotRoundTrippable` too. The lines are the bytes they were: a journal
   written before reads back and is written again byte for byte.
-
 - chronicle requires Zig 0.17.0, and builds against strand c37ca7a, strand's Zig 0.17 line, and [airlock](https://github.com/pedronaugusto/airlock) 652b0e4, which makes every sync, atomic replace and backup batch.
 - `close` is `finish`, and `CloseError` is `FinishError`. `finish` flushes the active segment, trims what was reserved past its records, syncs it and seals its index as `close` did, and leaves the journal open whether it succeeds or not: `deinit` is still owed, so `finish` sits beside `defer journal.deinit(io)`, and an append after it carries on. `close` released the journal even when it failed.
 - `subscribeFrom` and `subscribeAllFrom` refuse a cursor below `oldestSeq() - 1` with `error.HistoryDropped` and register nothing, so a fold restored from a snapshot older than a `compact` or `dropSegmentsBefore` is told it would skip records. A cursor of zero still means everything the log holds.
@@ -53,13 +53,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as its bytes.
 - Sequence numbers, byte counts and record counts are [aegis](https://github.com/pedronaugusto/aegis) types, kept apart so one cannot stand where another is wanted. `chronicle.Seq` is a position in the sequence (equality and an order, no arithmetic; `Seq.fromRaw(n)` and `raw()` cross to a plain integer, and `chronicle.beginning` is the place before the first record), `chronicle.Bytes` a length or offset, `chronicle.Records` a count. Every `u64` sequence number in the API is a `Seq`: the returns of `append`, `appendDeferred`, `appendAll`, `appendIf`, `appendAllIf`, `reconcile`, `lastSeq`, `oldestSeq`, `waitPast`, `backup` and `seqAtOrAfter`; the arguments `cursor`, `seq`, `keep_after_seq` and `Tailer.commit`; `Record.seq`, `Snapshot.seq`, `Expected.last` and `.found`, `Position.cursor` and its `Last`, `Reader.cursor`, `minCursor`, `Stats.oldest_seq` and `newest_seq`, and `segmentName` and `indexName`. `Options.max_segment_bytes`, `max_record_bytes`, `max_snapshot_bytes`, `preallocate_bytes`, `index_interval_bytes`, `tail_bytes`, `write_buffer_size` and `read_buffer_size` are `Bytes`; `max_segment_records` and `tail_records` are `Records`; `Status.dropped_bytes`, `Stats.bytes` and `Position.Last.start` and `.end` are `Bytes`; `Stats.records` and `verify`'s result are `Records`. chronicle adds aegis as a dependency.
 - `SequenceExhausted` can also come from `compact` and the log's own numbering, not only from `append`: a record is never numbered past `maxInt(i64)` by any caller.
-
-### Changed
-
-- The Smith fuzz tests are shakedown `check` properties.
-- The journal's lock, and the state it guards, are aegis's `BlockingGuarded` over one struct, and `waitPast` waits on aegis's `Condition`; the package's own futex word, waiter count and wake count are gone. Nothing in the API changes. A helper that needs the lock now takes the guarded state, so it cannot be called without it. `waitPast`, `append` and `nudge` measure level with what they were (macOS and Linux, paired runs of the package's own benchmarks), and a reader canceled in the instant an append signals is still canceled.
-- A segment file's name is a sequence number from 1 to `maxInt(i64)`; a file named for a larger number, which no record can carry, is no longer read as a segment.
-- CRC32C is supplied by [warp](https://github.com/pedronaugusto/warp), pinned at `e607c19`, with runtime CPU dispatch and hardware kernels in baseline builds. Record and index checksum values are unchanged.
 
 ### Added
 
@@ -94,6 +87,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The Smith fuzz tests are shakedown `check` properties.
+- The journal's lock, and the state it guards, are aegis's `BlockingGuarded` over one struct, and `waitPast` waits on aegis's `Condition`; the package's own futex word, waiter count and wake count are gone. Nothing in the API changes. A helper that needs the lock now takes the guarded state, so it cannot be called without it. `waitPast`, `append` and `nudge` measure level with what they were (macOS and Linux, paired runs of the package's own benchmarks), and a reader canceled in the instant an append signals is still canceled.
+- A segment file's name is a sequence number from 1 to `maxInt(i64)`; a file named for a larger number, which no record can carry, is no longer read as a segment.
+- CRC32C is supplied by [warp](https://github.com/pedronaugusto/warp), pinned at `e607c19`, with runtime CPU dispatch and hardware kernels in baseline builds. Record and index checksum values are unchanged.
 - Test lost write answers and cancel-protected writes with shakedown 1bb13e7 faults, replacing the local Io layers; pin preflight 87ff327 for the package contracts.
 - A snapshot, a cursor and a compacted segment are written under a temporary name drawn at random (`.chronicle-tmp-` and 26 characters) and renamed into place, so two readers committing the same cursor never write into one temporary. A writer's `open` removes those temporaries once they are an hour old; a `<name>.tmp` left by an earlier version is not touched.
 - Windows flushes the directory after a name changes, so a new segment, a compaction, a snapshot and a cursor survive a power cut under their names there too.
@@ -102,7 +99,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The fetched package holds the build files, `src` and the three documents; the examples, benchmarks, `ci/` and `.github/` stay in the repository.
 - Builds against strand a8c5e83, whose reads reach chronicle's events. An event type that reaches itself is held to 512 levels of arrays and objects, and a record nested deeper reads as `error.CorruptRecord`, where it overflowed the stack. A `Raw` in an event where no value starts is `error.CorruptRecord`, where it panicked. A union event that declares `jsonl_tag` is written and read tagged inside its object (`{"type":"...",...}`).
 - `backup` has the filesystem clone a sealed segment where it can (APFS); only indexes and the snapshot were cloned.
-- `checksum` runs three CRC32C instruction chains side by side over a buffer of 768 bytes or more and joins them with a shift table, as zlib-ng and the crc32c crates do; the value is unchanged.
+- `checksum` runs three CRC32C instruction chains side by side over a buffer of 768 bytes or more and joins them with a shift table; the value is unchanged.
 - Sync the journal's directory with `strand.syncDir` rather than a file handle borrowed from it: the same calls as before — `F_FULLFSYNC` on macOS, `fsync` on Linux, nothing on Windows.
 - Write a record open and its checksum as a member through strand, and read the envelope's and the segment header's leading integers with strand, rather than trimming a brace and scanning digits here. The bytes on disk are unchanged; a journal written before is read and its records written again byte for byte. A leading integer with a zero in front of its digits, which is not JSON, is no longer read off the bytes and is refused as the parser refuses it.
 - A batch with no tail or sink reserves no record storage and holds only one parsed record at a time when round-trip checks are enabled.
@@ -169,6 +166,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   where it carried the errors of resolving a path. A destination that is
   itself a symbolic link to a directory is now that directory, where it was
   refused with `NotDir`.
+- Pins aegis 0.1.0, airlock 0.2.0, warp 0.2.0 and strand 0.8.0.
 
 ### Fixed
 

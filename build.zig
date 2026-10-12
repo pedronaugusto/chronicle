@@ -100,10 +100,10 @@ pub fn dev(b: *std.Build, tools: type) void {
             },
         }),
     });
-    // shakedown, bound to chronicle's aegis, and airlock's seam on it, which is
-    // lazy: its error ends this configure pass until it is fetched.
-    tests.root_module.addImport("shakedown", boundShakedown(b, target, optimize).module("shakedown"));
-    tests.root_module.addImport("airlock.testing", airlock_build.testing(airlock_dependency) catch return);
+    // shakedown, bound to chronicle's aegis, and airlock's seam built on it.
+    const shakedown = boundShakedown(b, target, optimize).module("shakedown");
+    tests.root_module.addImport("shakedown", shakedown);
+    tests.root_module.addImport("airlock.testing", airlock_build.testing(airlock_dependency, shakedown));
     const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run chronicle tests");

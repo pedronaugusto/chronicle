@@ -8,14 +8,14 @@
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#5fe92351783578a78916d68d610e9eca6b4ad8a8",
-            .hash = "strand-0.7.0-8LNWVikuFwCWpVHRizS1_XhsnJXzIbNE0geDUmGDuBxE",
+            .url = "git+https://github.com/pedronaugusto/strand?ref=v0.8.0#eb6be2d1353a4c03cc967b067e2476f6e27b33ce",
+            .hash = "strand-0.8.0-8LNWVsQuFwAuvo0ge8Wy-6kE2RdFjWliHcqXVHSt-Em8",
         },
 
         // Durable files: every sync, atomic replace, batch and file identity.
         .airlock = .{
-            .url = "git+https://github.com/pedronaugusto/airlock#ee193e8d5f467d2c5e1c51fec25a66a8d2ccc5ef",
-            .hash = "airlock-0.1.0-rfvu6ICLBQDWyFYgMh-9NQ7GKNUZXGN6X7hqVHCIFn0Q",
+            .url = "git+https://github.com/pedronaugusto/airlock?ref=v0.2.0#bac388a2581bf358114841b7a9dcf77d6473307f",
+            .hash = "airlock-0.2.0-rfvu6GOOBQB5avz0PTXorDKw6v4h2k8tQc_Exo-JWuTq",
         },
 
         // Test doubles, for the tests alone: no module a consumer builds
@@ -23,13 +23,13 @@
 
         // Record and index CRC-32C, with runtime CPU dispatch.
         .warp = .{
-            .url = "git+https://github.com/pedronaugusto/warp#7b75a9833457955659b26acc42a9ae7ec03d2c7d",
-            .hash = "warp-0.1.0-JASxFeBaEQAXo7xCsGQftJBcOtE3ot23N2SydCtQfAG0",
+            .url = "git+https://github.com/pedronaugusto/warp?ref=v0.2.0#3ff0a6ba86c824c3a7b0855ae448b3bb414448c6",
+            .hash = "warp-0.2.0-JASxFV1ZEQA-R6vYMwAnigBe8OOdo5OG18PK_SpTzAa3",
         },
 
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis#bb408fa199e81ef295e0d9eeb4873691b37e9df4",
-            .hash = "aegis-0.0.0-rsxoumUhBwBeTJdwPVd-FOyms_nA80JzANSwBePZTvDS",
+            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.0#94a495a85f88a4d538a5d50fc39abcc7f832b124",
+            .hash = "aegis-0.1.0-rsxoun4hBwCem7Iss6TBSVn55trtZmiq0VPl6pC7FF8B",
         },
     },
     .paths = .{
