@@ -188,7 +188,6 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
         .{ .name = "chronicle", .module = package.module("chronicle") },
         .{ .name = "strand", .module = strand },
         .{ .name = "airlock", .module = airlock },
-        .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown") },
     }) catch @panic("OOM");
 }
 
