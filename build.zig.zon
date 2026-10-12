@@ -23,13 +23,13 @@
 
         // Record and index CRC-32C, with runtime CPU dispatch.
         .warp = .{
-            .url = "git+https://github.com/pedronaugusto/warp?ref=v0.2.0#3ff0a6ba86c824c3a7b0855ae448b3bb414448c6",
-            .hash = "warp-0.2.0-JASxFV1ZEQA-R6vYMwAnigBe8OOdo5OG18PK_SpTzAa3",
+            .url = "git+https://github.com/pedronaugusto/warp?ref=v0.2.1#4db0ba5a1c97b86e4b815ff46acdd7e02aad8321",
+            .hash = "warp-0.2.1-JASxFepZEQDYfDwnAAY_2Vo90dqeQpL4BmViUV3Uqt87",
         },
 
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.1#16d440dc2c332a0a91c77e3289376273144678a1",
-            .hash = "aegis-0.1.1-rsxouuchBwA8S79ryuJ6kQ-9GZxnJreWgEgBCp46wmF0",
+            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.2#f2fef4ec6595b6357d683ac258debc4c5184884c",
+            .hash = "aegis-0.1.2-rsxougohBwASqdDTGy3Y46Jb6IDW5sOSrgEO5ggjbgpV",
         },
     },
     .paths = .{
@@ -47,8 +47,8 @@
         },
 
         .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.2.6#5becaa0dafaf80d18662bc0df64e92f7676a110d",
-            .hash = "shakedown-0.2.6-BR8U43kqFgA0tls4urweSOXdQXn95gnWgHWfxaao9MZw",
+            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.3.0#978965e6499970b5b0ac5e658316ac7917d32f87",
+            .hash = "shakedown-0.3.0-BR8U4wEjFgDarRGeXUKdstYvJneZDgavWzGPh9sT9rVX",
         },
     },
 }

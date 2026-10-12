@@ -36,12 +36,11 @@ pub fn build(b: *std.Build) void {
 }
 
 /// chronicle's development: its tests, examples and benchmarks, under
-/// preflight's gate, with shakedown bound to chronicle's aegis. Run through bay.
+/// preflight's gate. Run through bay.
 pub fn dev(b: *std.Build, tools: type) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const preflight = tools.preflight;
-    use_aegis = tools.shakedown.useAegis;
     const package = b.dependency("chronicle", .{ .target = target, .optimize = optimize });
     const p = package.builder;
     const module = package.module("chronicle");
@@ -100,8 +99,8 @@ pub fn dev(b: *std.Build, tools: type) void {
             },
         }),
     });
-    // shakedown, bound to chronicle's aegis, and airlock's seam built on it.
-    const shakedown = boundShakedown(b, target, optimize).module("shakedown");
+    // shakedown, and airlock's seam built on it.
+    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown");
     tests.root_module.addImport("shakedown", shakedown);
     tests.root_module.addImport("airlock.testing", airlock_build.testing(airlock_dependency, shakedown));
     const run_tests = b.addRunArtifact(tests);
@@ -177,20 +176,9 @@ pub fn dev(b: *std.Build, tools: type) void {
     });
 }
 
-/// `tools.shakedown.useAegis`, set by `dev` for the benchmark imports, which are built without `tools`.
-var use_aegis: *const fn (*std.Build.Dependency, *std.Build.Module) void = undefined;
-
-/// shakedown bound to chronicle's aegis in this mode, so a binary links one aegis.
-fn boundShakedown(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) *std.Build.Dependency {
-    const p = b.dependency("chronicle", .{ .target = target, .optimize = optimize }).builder;
-    const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize, .aegis = .consumer });
-    use_aegis(shakedown, p.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis"));
-    return shakedown;
-}
-
 /// chronicle, strand and airlock again, in the mode a benchmark builds in:
 /// an imported module keeps its own mode, so a ReleaseFast benchmark over
-/// the Debug module would time the Debug module. And shakedown, bound to its aegis.
+/// the Debug module would time the Debug module. And shakedown.
 fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.lang.Optimize) []const std.Build.Module.Import {
     const package = b.dependency("chronicle", .{ .target = target, .optimize = optimize });
     const p = package.builder;
@@ -200,7 +188,7 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
         .{ .name = "chronicle", .module = package.module("chronicle") },
         .{ .name = "strand", .module = strand },
         .{ .name = "airlock", .module = airlock },
-        .{ .name = "shakedown", .module = boundShakedown(b, target, optimize).module("shakedown") },
+        .{ .name = "shakedown", .module = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown") },
     }) catch @panic("OOM");
 }
 
