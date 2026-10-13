@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-10-13
+
 ### Changed
 
 - The tests take shakedown as bay gives it, with no `.aegis = .consumer` or `useAegis` binding: bay gives a graph one aegis, so shakedown's is this package's.
@@ -661,7 +663,8 @@ back.
 - Fuzz tests over arbitrary journal and snapshot file contents, because the
   file shapes this package exists to survive are the ones nobody chose.
 
-[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/pedronaugusto/chronicle/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/pedronaugusto/chronicle/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/pedronaugusto/chronicle/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/pedronaugusto/chronicle/releases/tag/v0.6.0
