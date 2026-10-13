@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-10-14
+
+### Changed
+
+- Pins aegis 0.1.6, airlock 0.3.3, strand 0.10.0, warp 0.3.1.
+
 ## [0.7.3] - 2026-10-13
 
 ### Fixed
