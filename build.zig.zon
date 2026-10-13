@@ -8,14 +8,14 @@
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand?ref=v0.8.2#ffa20c46d29fd2cbf0a9b31f4a57bfe2eca7c143",
-            .hash = "strand-0.8.2-8LNWVrAsFwD_SAOQHu8yF0nR47L0Jy0hN32dmlGiXmb9",
+            .url = "git+https://github.com/pedronaugusto/strand?ref=v0.8.3#232fd0bbfb8b6df3f4a45e28c46406e774f5da76",
+            .hash = "strand-0.8.3-8LNWVmgtFwDsotNGx2cyX7Ppo6i-NENMJQ15YmwvUmU5",
         },
 
         // Durable files: every sync, atomic replace, batch and file identity.
         .airlock = .{
-            .url = "git+https://github.com/pedronaugusto/airlock?ref=v0.3.0#df830892e32faa1b2f9888171e3ae2996c6f9e21",
-            .hash = "airlock-0.3.0-rfvu6BKMBQAwS-uwi3aX-2tesz3kiI59Q1ur81xzagl1",
+            .url = "git+https://github.com/pedronaugusto/airlock?ref=v0.3.1#071738b5f733cb0b9ef83532bba6bd831a5dd540",
+            .hash = "airlock-0.3.1-rfvu6Bz1BQA9KJ2iSefdcu14GkFIAdFUjR1_DKQWMpNE",
         },
 
         // Test doubles, for the tests alone: no module a consumer builds
@@ -42,8 +42,8 @@
     },
     .dev_dependencies = .{
         .preflight = .{
-            .url = "git+https://github.com/pedronaugusto/preflight?ref=v0.4.1#cad07c151f1a15865b28299698823aec8ac4fadf",
-            .hash = "preflight-0.4.1-LX1Zwl5pDgDaYwJnKLGctaPAEOgz1JpoG325EIz9J-Vx",
+            .url = "git+https://github.com/pedronaugusto/preflight?ref=v0.4.2#6c014e77b1c24149b9f790204d7ee3e6358a8bdd",
+            .hash = "preflight-0.4.2-LX1Zwk14DgDRIFh62ke49W2BAC1HKnkh-ndj_0sSARCN",
         },
 
         .shakedown = .{
