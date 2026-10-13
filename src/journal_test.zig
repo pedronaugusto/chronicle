@@ -5049,13 +5049,6 @@ fn fuzzedIo() void {
     if (builtin.fuzz) testing.io_instance.deinit();
 }
 
-/// Fills a prefix of `out` of any length with bytes, and answers it.
-fn bytesInto(s: *shakedown.Source, out: []u8) []u8 {
-    const len = gen.intRange(s, usize, 0, out.len);
-    s.bytes(out[0..len]);
-    return out[0..len];
-}
-
 /// The line that starts a segment file, in front of everything the fuzzer
 /// generates: what is being fuzzed is the records, not whether a file with no
 /// framing on it is read (it is not; there is an example for that below).
@@ -5389,7 +5382,7 @@ fn fuzzOpen(_: void, c: *shakedown.Case) anyerror!void {
     // Bounded so that a generated run of `[` cannot recurse the JSON parser
     // deeper than a stack holds. A journal record is not adversarial input.
     var buffer: [1024]u8 = undefined;
-    try checkOpen(bytesInto(c.source, &buffer));
+    try checkOpen(gen.bytesInto(c.source, &buffer));
 }
 
 fn checkOpen(bytes: []const u8) anyerror!void {
@@ -5465,7 +5458,7 @@ test "a segment whose first line is arbitrary" {
 
 fn fuzzFraming(_: void, c: *shakedown.Case) anyerror!void {
     var buffer: [256]u8 = undefined;
-    try checkFraming(bytesInto(c.source, &buffer));
+    try checkFraming(gen.bytesInto(c.source, &buffer));
 }
 
 fn checkFraming(head: []const u8) anyerror!void {
@@ -5515,7 +5508,7 @@ test "an arbitrary index file is a cache, never an answer" {
 
 fn fuzzIndex(_: void, c: *shakedown.Case) anyerror!void {
     var buffer: [512]u8 = undefined;
-    try checkIndex(bytesInto(c.source, &buffer));
+    try checkIndex(gen.bytesInto(c.source, &buffer));
 }
 
 fn checkIndex(bytes: []const u8) anyerror!void {
@@ -5680,7 +5673,7 @@ test "an arbitrary cursor file names a place in the log or an error" {
 
 fn fuzzCursor(_: void, c: *shakedown.Case) anyerror!void {
     var buffer: [512]u8 = undefined;
-    try checkCursor(bytesInto(c.source, &buffer));
+    try checkCursor(gen.bytesInto(c.source, &buffer));
 }
 
 fn checkCursor(bytes: []const u8) anyerror!void {
@@ -5742,7 +5735,7 @@ test "openWithSnapshot over an arbitrary snapshot file" {
 
 fn fuzzSnapshot(_: void, c: *shakedown.Case) anyerror!void {
     var buffer: [1024]u8 = undefined;
-    try checkSnapshot(bytesInto(c.source, &buffer));
+    try checkSnapshot(gen.bytesInto(c.source, &buffer));
 }
 
 fn checkSnapshot(bytes: []const u8) anyerror!void {
@@ -6010,7 +6003,7 @@ fn damageSegment(a: std.mem.Allocator, ws: *Workspace, s: *shakedown.Source, cou
         },
         else => added: {
             var extra: [32]u8 = undefined;
-            break :added try std.mem.concat(a, u8, &.{ original, bytesInto(s, &extra) });
+            break :added try std.mem.concat(a, u8, &.{ original, gen.bytesInto(s, &extra) });
         },
     };
     try ws.write(name, damaged);
