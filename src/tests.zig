@@ -7,6 +7,7 @@ test {
     _ = @import("journal_test.zig");
     _ = @import("crc32c_test.zig");
     _ = @import("crash_test.zig");
+    _ = @import("explore_test.zig");
     _ = @import("journal/envelope.zig");
     _ = @import("envelope_test.zig");
 }

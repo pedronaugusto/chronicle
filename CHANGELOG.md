@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- A proof, in the tests, that a reader waiting past what it has seen meets the writer in every order: shakedown's `explore` runs the journal inside a `Sim`, airlock's calls on its disk, once for every schedule within two preemptions and a spurious wake (107 runs), and the reader sees every record, in order and whole, never waiting on one that arrived.
+
 ### Changed
 
 - The fuzz properties draw any bytes with shakedown's `gen.bytesInto`, where the package kept its own copy.
