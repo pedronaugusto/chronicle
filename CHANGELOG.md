@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-10-14
+
 ### Changed
 
 - A record's envelope and a segment's header are read off their bytes by strand's readers alone: the batch's `bf` and `bl` by `json.intMembersAt`, the checksum by `json.trailingIntMember`, a member kept as bytes by `json.intOf`. chronicle no longer scans JSON integers itself or reads them through `std.json`. A JSON integer written `-0` is now read as 0 where it was refused.
