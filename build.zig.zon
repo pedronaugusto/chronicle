@@ -1,6 +1,6 @@
 .{
     .name = .chronicle,
-    .version = "0.7.5",
+    .version = "0.8.0",
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0xdc91dbecd4617a72,
     .dependencies = .{
@@ -8,8 +8,8 @@
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand?ref=v0.10.4#f02da333b0fb33298f2953b38137be9dc3915275",
-            .hash = "strand-0.10.4-8LNWVhokJQAsYJuevmnX-9gRKrgU2x2DYJiReIDZBGY1",
+            .url = "git+https://github.com/pedronaugusto/strand?ref=v0.11.0#c023a903326320fad7a3f378f0a728dac92ca4fb",
+            .hash = "strand-0.11.0-8LNWVreyJQAlCOezHxNsI6U2bR6x7lv4p2PtMuLMtMOw",
         },
 
         // Durable files: every sync, atomic replace, batch and file identity.

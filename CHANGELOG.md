@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-14
+
 ### Breaking
 
 - A line whose damage breaks its JSON (zeros a crash left, a flipped quote) is refused as `CorruptRecord` where it was refused as `ChecksumMismatch`: every line is now read as a JSON object before its checksum is found, so `ChecksumMismatch` is the damage only the checksum finds. A torn final record is still recognised by its zeros and dropped under `OnTruncated.truncate`; under `.fail` it is refused as `CorruptRecord`.
@@ -13,6 +15,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - A record's envelope, the checksum it closes with and a segment's header are read through strand's member iterator (`json.Members`), once per line, in any spelling: the byte-matched fast paths for the spelling chronicle writes and the parser fallback behind them are gone, and so is the scratch arena the fallback took. The on-disk format does not change. A segment header may be spelled with whitespace or its members in another order. The open scan reads each line once for its stamp, batch, checksum and tear, where it read the end of the line three times.
+- Every byte of a line is now read where only its first integers and its last member were: on an M1, the scan of an active segment without its index (26,987 records of 270 bytes) takes 13.1 ms where it took 8.4, a replay reads 3.47 M records/s where it read 5.37 M, and an open with good indexes is unchanged (0.80 ms). The cost is checking each record's event, which the byte match never looked at and a replay then parses again.
 - Pins strand 0.11.0.
 
 ## [0.7.5] - 2026-10-14
