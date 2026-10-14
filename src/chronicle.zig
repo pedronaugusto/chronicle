@@ -270,11 +270,13 @@ pub fn Journal(comptime Event: type) type {
 
         /// What reading a record back can go wrong with.
         ///
-        /// * `ChecksumMismatch` — a line carries a checksum and does not
-        ///   match it: the bytes on the disk are not the bytes that were
-        ///   written. This is the one corruption a parse cannot find.
+        /// * `ChecksumMismatch` — a line reads as a record and its checksum
+        ///   does not match: the bytes on the disk are not the bytes that
+        ///   were written. This is the one corruption a parse cannot find.
         /// * `CorruptRecord` — a line is not a JSON object with the members
-        ///   this format requires, or its `ev` does not parse as `Event`.
+        ///   this format requires, or its `ev` does not parse as `Event`:
+        ///   damage that breaks the JSON is found here, before the checksum
+        ///   is read.
         /// * `TruncatedRecord` — a line is unterminated where a complete one
         ///   was required: the final line with `Options.on_truncated` set to
         ///   `.fail`, or any line of a segment that is not the newest.

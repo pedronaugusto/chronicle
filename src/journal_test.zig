@@ -802,8 +802,10 @@ test "on_truncated .fail refuses a final record torn with its newline kept" {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const torn = try tornFinalRecord(io, &ws);
+    // The zeros are no JSON: the line is not a record before any checksum
+    // can be found in it.
     try testing.expectError(
-        error.ChecksumMismatch,
+        error.CorruptRecord,
         Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail }),
     );
     try testing.expectEqualStrings(torn, try ws.read(try ws.segment(1)));
@@ -823,7 +825,9 @@ test "a damaged record before the final one is refused, not dropped" {
     @memset(bytes[second + 20 .. second + 28], 0);
     try ws.write(try ws.segment(1), bytes);
     try ws.root.deleteFile(io, try ws.index(1));
-    try testing.expectError(error.ChecksumMismatch, Journal.open(testing.allocator, io, ws.path, .{}));
+    // Zeros inside a string are no JSON: the record is refused as damage
+    // before its checksum is read.
+    try testing.expectError(error.CorruptRecord, Journal.open(testing.allocator, io, ws.path, .{}));
     try testing.expectEqualStrings(bytes, try ws.read(try ws.segment(1)));
 }
 
@@ -5014,7 +5018,7 @@ test "two hundred thousand records open and replay within bounded memory" {
     // Loose on purpose: record-sized working memory is the newest segment and
     // the tail. Fixed-size segment metadata is accounted separately.
     try testing.expect(scalar.atMost(Records.fromRaw(quiescent(journal).tail.entries.items.len), (try journal.openedWith(io)).tail_records));
-    var held: usize = quiescent(journal).scratch.queryCapacity();
+    var held: usize = 0;
     for (quiescent(journal).tail.entries.items) |*owned| held += owned.arena.queryCapacity();
     try testing.expect(held < 4 * 1024 * 1024);
 

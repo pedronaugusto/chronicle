@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- A line whose damage breaks its JSON (zeros a crash left, a flipped quote) is refused as `CorruptRecord` where it was refused as `ChecksumMismatch`: every line is now read as a JSON object before its checksum is found, so `ChecksumMismatch` is the damage only the checksum finds. A torn final record is still recognised by its zeros and dropped under `OnTruncated.truncate`; under `.fail` it is refused as `CorruptRecord`.
+
+### Changed
+
+- A record's envelope, the checksum it closes with and a segment's header are read through strand's member iterator (`json.Members`), once per line, in any spelling: the byte-matched fast paths for the spelling chronicle writes and the parser fallback behind them are gone, and so is the scratch arena the fallback took. The on-disk format does not change. A segment header may be spelled with whitespace or its members in another order. The open scan reads each line once for its stamp, batch, checksum and tear, where it read the end of the line three times.
+- Pins strand 0.11.0.
+
 ## [0.7.5] - 2026-10-14
 
 ### Changed

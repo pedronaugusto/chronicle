@@ -88,11 +88,23 @@ count.
 Everything a scan returns is an `envelope.Unparsed`
 (`aegis.input.Untrusted([]const u8)`). It cannot be read as a record, a segment
 header or a sequence number without handing it to the reader that answers for it,
-whose result is a refined value or a named refusal: `parseHeader` for a record's
-envelope and checksum, `envelope.members`, `stamp`, `backLink` and `batchOf` for
-the parts of one, `parseSegmentHeader` for a file's first line. The places that
-use the bytes themselves (copying a record into a compacted segment, keeping a
-copy in the tail) say why in a comment.
+whose result is a refined value or a named refusal: `envelope.read` for a
+record's members (`Fields`, from which `head`, `stamp`, `backLink` and `batchOf`
+are taken), `parseHeader` for a record's envelope with its checksum checked,
+`parseSegmentHeader` for a file's first line. The places that use the bytes
+themselves (copying a record into a compacted segment, keeping a copy in the tail)
+say why in a comment.
+
+A line is read once, through strand's member iterator (`json.Members`), in any
+spelling JSON allows: members in any order, whitespace anywhere, names escaped.
+There is no second reader for the spelling chronicle writes. The read checks that
+the line is one JSON object, refuses a member of the envelope given twice, and
+takes the checksum where the object's last member is `c`: it covers the line up
+to the separator before `c`, the same bytes the writer checksummed. A line whose
+damage breaks the JSON is `CorruptRecord` before any checksum is read; a line that
+reads as a record and does not match its checksum is `ChecksumMismatch`. A final
+line holding zeros (space a writer reserved and never filled) is torn, whatever
+else it holds.
 
 A header's event span is cut from the line it was read from; handing `eventFrom`
 a pair that do not belong together is refused in every build, not only in Debug.

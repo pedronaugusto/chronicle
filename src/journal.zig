@@ -139,9 +139,6 @@ pub fn Journal(comptime Event: type) type {
             /// copies it. Reused, so once it has held a record that long such an
             /// append allocates nothing.
             line: std.ArrayList(u8),
-            /// Reset once per record while reading records back; never holds
-            /// anything a caller can see.
-            scratch: std.heap.ArenaAllocator,
             sinks: std.ArrayList(Sink),
             /// Bumped by `nudge`: a wake with no record behind it.
             nudges: u64,
@@ -579,7 +576,6 @@ pub fn Journal(comptime Event: type) type {
                     .tail = .{},
                     .record_hint = 256,
                     .line = .empty,
-                    .scratch = .init(gpa),
                     .sinks = .empty,
                     .nudges = 0,
                     .seq = values.beginning,
@@ -649,7 +645,6 @@ pub fn Journal(comptime Event: type) type {
             s.tail.deinit(self.gpa);
             s.line.deinit(self.gpa);
             s.sinks.deinit(self.gpa);
-            s.scratch.deinit();
         }
 
         //====================================================================
@@ -912,8 +907,6 @@ pub fn Journal(comptime Event: type) type {
             scan: Log.Scan,
             /// Holds the record `next` last returned, and nothing else.
             arena: std.heap.ArenaAllocator,
-            /// Its own, so that two walks and an `append` never share one.
-            scratch: std.heap.ArenaAllocator,
             run: Continuity,
             /// The last record read whole: handed on, or stepped over.
             last: ?Position.Last = null,
@@ -928,7 +921,6 @@ pub fn Journal(comptime Event: type) type {
                 defer gpa.destroy(walk);
                 walk.scan.deinit(io);
                 walk.arena.deinit();
-                walk.scratch.deinit();
                 walk.* = undefined;
             }
 
@@ -960,7 +952,6 @@ pub fn Journal(comptime Event: type) type {
                 walk.run = .{ .cursor = at.cursor };
                 walk.last = null;
                 _ = walk.arena.reset(.retain_capacity);
-                _ = walk.scratch.reset(.retain_capacity);
                 if (at.last) |last| {
                     // Read the named record back before reading its successor.
                     const line = (walk.scan.next(io) catch |err| switch (err) {
@@ -972,10 +963,7 @@ pub fn Journal(comptime Event: type) type {
                         else => |e| return e,
                     }) orelse return error.StalePosition;
                     if (walk.scan.at != 0 or walk.scan.position != last.end) return error.StalePosition;
-                    const header = line.parse(walk.scratch.allocator(), parseHeader) catch |err| switch (err) {
-                        error.OutOfMemory => return error.OutOfMemory,
-                        else => return error.StalePosition,
-                    };
+                    const header = line.parse({}, parseHeader) catch return error.StalePosition;
                     if (header.seq != last.seq or header.c != last.checksum) return error.StalePosition;
                     walk.run.expected = values.following(last.seq);
                     walk.run.link = last.checksum;
@@ -986,8 +974,7 @@ pub fn Journal(comptime Event: type) type {
             pub fn next(walk: *Replay, io: Io) ReplayError!?Record {
                 while (try walk.scan.next(io)) |line| {
                     if (walk.scan.takeBoundary()) |boundary| try walk.run.beginSegment(boundary);
-                    _ = walk.scratch.reset(.retain_capacity);
-                    const header = try line.parse(walk.scratch.allocator(), parseHeader);
+                    const header = try line.parse({}, parseHeader);
                     if (header.batch) |batch| if (values.below(walk.whole_through, batch.last)) {
                         // A batch being written beside this walk, or one a
                         // crash cut: none of it until all of it is there.
@@ -1051,7 +1038,6 @@ pub fn Journal(comptime Event: type) type {
                 .decoder = self.captureDecoder(),
                 .scan = scan,
                 .arena = .init(self.gpa),
-                .scratch = .init(self.gpa),
                 .run = .{ .cursor = cursor },
                 .whole_through = s.seq,
             };
@@ -1072,7 +1058,6 @@ pub fn Journal(comptime Event: type) type {
                     .decoder = self.captureDecoder(),
                     .scan = scan,
                     .arena = .init(self.gpa),
-                    .scratch = .init(self.gpa),
                     .run = .{ .cursor = position.cursor },
                     .whole_through = s.seq,
                 };
@@ -1757,7 +1742,6 @@ pub fn Journal(comptime Event: type) type {
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
             // it.
-            const covered_len = out.written().len;
             const sum = checksum(out.written());
             record.member("c", sum) catch return error.OutOfMemory;
             record.close() catch return error.OutOfMemory;
@@ -1783,7 +1767,8 @@ pub fn Journal(comptime Event: type) type {
             // found by the envelope reader every replay uses, and parsed
             // exactly as every read parses it, so an event a read would
             // refuse is refused here, before it reaches the disk.
-            const span = (envelope.quick(stored[0..covered_len]) orelse return error.NotRoundTrippable).ev;
+            const fields = envelope.read({}, stored) catch return error.NotRoundTrippable;
+            const span = (fields.head() catch return error.NotRoundTrippable).ev;
             const parsed = json.parseLeaky(
                 Event,
                 arena.?.allocator(),
@@ -1837,8 +1822,7 @@ pub fn Journal(comptime Event: type) type {
             var run: Continuity = .{ .cursor = from };
             while (try scan.next(io)) |line| {
                 if (scan.takeBoundary()) |boundary| try run.beginSegment(boundary);
-                _ = s.scratch.reset(.retain_capacity);
-                const header = try line.parse(s.scratch.allocator(), parseHeader);
+                const header = try line.parse({}, parseHeader);
                 if (!try run.accept(header)) continue;
 
                 const arena = try createArena(self.gpa);
@@ -1887,21 +1871,20 @@ pub fn Journal(comptime Event: type) type {
 
         const Span = envelope.Span;
 
-        /// Read a line's envelope, checking its checksum.
-        ///
-        /// `scratch` holds nothing unless the line is not in the shape this
-        /// package writes, in which case it holds what reading it took.
-        fn parseHeader(scratch: Allocator, line: []const u8) ReadError!Header {
+        /// A line's envelope, read through its members (`envelope.read`),
+        /// and its checksum checked.
+        fn parseHeader(_: void, line: []const u8) HeaderError!Header {
+            const fields = envelope.read({}, line) catch return error.CorruptRecord;
             // A line that does not end in a checksum is not a record and
             // there is nothing to check it against.
-            const t = envelope.trailer(line) orelse return error.CorruptRecord;
+            const t = fields.trailer orelse return error.CorruptRecord;
             if (checksum(t.covered) != t.c) return error.ChecksumMismatch;
-            const head = envelope.quick(t.covered) orelse envelope.members(scratch, line) catch |err| switch (err) {
-                error.OutOfMemory => return error.OutOfMemory,
-                error.Corrupt => return error.CorruptRecord,
-            };
+            const head = fields.head() catch return error.CorruptRecord;
             return .{ .seq = head.seq, .at = head.at, .version = head.v, .p = head.p, .c = t.c, .batch = head.batch, .ev = head.ev };
         }
+
+        /// What reading a line's envelope can find wrong with it.
+        const HeaderError = error{ CorruptRecord, ChecksumMismatch };
 
         /// Only the schema and migration hook determine how an event is read.
         /// A walk owns this value rather than observing the journal as it goes.

@@ -98,42 +98,42 @@ pub const SegmentHeader = struct {
 
 const SegmentHead = struct { root: u32, header_bytes: Bytes };
 
-/// The header a segment's first line carries, or null when that line is not
-/// one. Nothing here guesses: a line that does not read as this object is
-/// not a segment header, and a segment whose first line is not one is not a
-/// segment this package wrote. The shape this package writes is read off the
-/// bytes; another is read as its members.
-fn parseSegmentHeader(gpa: Allocator, line: []const u8) Allocator.Error!?SegmentHeader {
-    if (quickSegmentHeader(line)) |header| return header;
-    if (!std.mem.startsWith(u8, line, "{\"chronicle\":")) return null;
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const Members = struct { chronicle: strand.json.Raw, base: strand.json.Raw, root: strand.json.Raw };
-    const found = strand.json.parseLeaky(Members, arena.allocator(), line, .{ .ignore_unknown_fields = true, .limits = jsonl.limits(line.len) }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
+/// The header a segment's first line carries, read through its members as a
+/// record is. Nothing here guesses: a line that does not read as this object
+/// is not a segment header, and a segment whose first line is not one is not
+/// a segment this package wrote.
+fn parseSegmentHeader(_: void, line: []const u8) error{UnsupportedFormat}!SegmentHeader {
+    var members: strand.json.Members = undefined;
+    members.init(line, .{ .limits = jsonl.limits(line.len) });
+    var found: struct { chronicle: ?[]const u8 = null, base: ?[]const u8 = null, root: ?[]const u8 = null } = .{};
+    while (members.next() catch return error.UnsupportedFormat) |member| {
+        inline for (.{ "chronicle", "base", "root" }) |name| {
+            if (member.is(name)) {
+                if (@field(found, name) != null) return error.UnsupportedFormat;
+                @field(found, name) = member.value;
+            }
+        }
+    }
+    _ = members.finish() catch return error.UnsupportedFormat;
+    const base = envelopes.integerOf(i64, found.base orelse return error.UnsupportedFormat) orelse return error.UnsupportedFormat;
     return .{
-        .version = envelopes.integerOf(u32, found.chronicle) orelse return null,
-        .base_seq = .fromRaw(aegis.int.cast(u64, envelopes.integerOf(i64, found.base) orelse return null) catch return null),
-        .root = envelopes.integerOf(u32, found.root) orelse return null,
+        .version = envelopes.integerOf(u32, found.chronicle orelse return error.UnsupportedFormat) orelse return error.UnsupportedFormat,
+        .base_seq = .fromRaw(aegis.int.cast(u64, base) catch return error.UnsupportedFormat),
+        .root = envelopes.integerOf(u32, found.root orelse return error.UnsupportedFormat) orelse return error.UnsupportedFormat,
     };
-}
-
-fn quickSegmentHeader(line: []const u8) ?SegmentHeader {
-    const read = strand.json.leadingIntMembers(SegmentHeader.Shape, line) orelse return null;
-    if (read.end + 1 != line.len) return null;
-    return .{ .version = read.value.chronicle, .base_seq = .fromRaw(read.value.base), .root = read.value.root };
 }
 
 /// What `open` does with a final record the previous writer did not finish:
 /// a line with no newline, or -- after a power cut, which need not keep a
 /// file's pages in order -- a final line whose newline reached the disk and
-/// whose bytes did not all follow it, so that its checksum does not match.
+/// whose bytes did not all follow it: it holds the zeros of space never
+/// written, or reads as a record whose checksum does not match.
 pub const OnTruncated = enum {
     /// Leave the file exactly as found and refuse it: `error.TruncatedRecord`
     /// for a line with no newline, and the error reading the record gives
-    /// (`error.ChecksumMismatch`, usually) for one that is not whole.
+    /// for one that is not whole: `error.CorruptRecord` where what is missing
+    /// leaves no JSON object (zeros, usually), `error.ChecksumMismatch` where
+    /// it does.
     fail,
     /// Drop the unfinished bytes and shorten the segment to the last whole
     /// record, so the next append is well formed. Only the final record of
@@ -651,7 +651,7 @@ fn tryInspectCleanSegmentFile(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?
     };
     if (read != want) return null;
     const newline = std.mem.findScalar(u8, raw[0..want], '\n') orelse return null;
-    const head = quickSegmentHeader(raw[0..newline]) orelse return null;
+    const head = parseSegmentHeader({}, raw[0..newline]) catch return null;
     if (head.version != log_format or head.base_seq != base_seq) return null;
     return .{ .bytes = length, .header_bytes = .fromRaw(newline + 1) };
 }
@@ -812,7 +812,7 @@ fn describeSealed(log: *Self, io: Io, segment: *Segment) OpenError!void {
         segment.times = scanned.times;
         return;
     }
-    segment.last_seq = (try line.unparsed().parse(log.gpa, seqOf)) orelse return error.CorruptRecord;
+    segment.last_seq = (envelopeOf(line.unparsed()) orelse return error.CorruptRecord).seq;
 }
 
 //========================================================================
@@ -1471,17 +1471,21 @@ const Envelope = struct {
     c: ?u32,
 };
 
-/// A line's `seq`, `at` and `c`, or null when the line is not an object
-/// carrying a sequence number at all (`envelope.stamp`).
-fn envelopeOf(gpa: Allocator, line: []const u8) Allocator.Error!?Envelope {
-    const found = (try envelopes.stamp(gpa, line)) orelse return null;
-    return .{ .seq = found.seq, .at = found.at, .c = if (envelopes.trailer(line)) |t| t.c else null };
+/// The members of a line the envelope reads, or null when the line is no
+/// record (`envelope.read`).
+fn fieldsOf(text: Unparsed) ?envelopes.Fields {
+    return text.parse({}, envelopes.read) catch null;
 }
 
-/// The `seq` member of a line, or null when the line is not an object carrying
-/// one.
-fn seqOf(gpa: Allocator, line: []const u8) Allocator.Error!?Seq {
-    return ((try envelopes.stamp(gpa, line)) orelse return null).seq;
+/// A line's `seq`, `at` and `c`, or null when the line is not an object
+/// carrying a sequence number at all.
+fn envelopeOf(text: Unparsed) ?Envelope {
+    return envelopeFrom(fieldsOf(text) orelse return null);
+}
+
+fn envelopeFrom(fields: envelopes.Fields) ?Envelope {
+    const found = fields.stamp() orelse return null;
+    return .{ .seq = found.seq, .at = found.at, .c = if (fields.trailer) |t| t.c else null };
 }
 
 const Scanned = struct {
@@ -1600,8 +1604,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
             // The first line says what format the rest of the file is in
             // and what the first record's back-link has to be. A file
             // whose first line is not one is refused rather than read.
-            const header = (try text.parse(log.gpa, parseSegmentHeader)) orelse
-                return error.UnsupportedFormat;
+            const header = try text.parse({}, parseSegmentHeader);
             if (header.version != log_format or header.base_seq != segment.base_seq) {
                 return error.UnsupportedFormat;
             }
@@ -1609,9 +1612,11 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
             scanned.header_bytes = end;
             at_header = false;
         } else {
-            const found = try text.parse(log.gpa, envelopeOf);
+            // Each line is read once, for everything the scan asks of it.
+            const fields = fieldsOf(text);
+            const found = if (fields) |members| envelopeFrom(members) else null;
             if (found) |envelope| {
-                const in = try text.parse(log.gpa, envelopes.batchOf);
+                const in = fields.?.batchOf();
                 if (batch) |inside| {
                     if (in == null or in.?.last != inside.last) batch = null;
                 }
@@ -1639,7 +1644,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
                 try sink.record(seq, start, at orelse 0);
             }
             scanned.lines = values.plus(scanned.lines, .fromRaw(1));
-            scanned.torn_final = if (torn(text)) start else null;
+            scanned.torn_final = if (torn(text, fields)) start else null;
         }
         scanned.complete_bytes = end;
     }
@@ -1658,12 +1663,12 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
 
 /// Whether a line is a record whose bytes did not all reach the disk: it
 /// holds a zero byte, which no record this package writes can hold, or it
-/// ends in a checksum the rest does not match. A line that is whole but is
-/// not a record is not torn: it is damage, and refused wherever it is.
-fn torn(text: Unparsed) bool {
-    const line = text.readForParse();
-    if (std.mem.findScalar(u8, line, 0) != null) return true;
-    const t = envelopes.trailer(line) orelse return false;
+/// reads as a record (`fields`) whose checksum the rest does not match. A
+/// line that is whole but is not a record is not torn: it is damage, and
+/// refused wherever it is.
+fn torn(text: Unparsed, fields: ?envelopes.Fields) bool {
+    if (std.mem.findScalar(u8, text.readForParse(), 0) != null) return true;
+    const t = (fields orelse return false).trailer orelse return false;
     return Crc32c.hash(t.covered) != t.c;
 }
 
@@ -1851,8 +1856,7 @@ pub const Scan = struct {
                 // that starts at an offset the index gave is already past
                 // it, and the open that gave it the offset checked it.
                 scan.at_header = false;
-                const header = (try text.parse(scan.gpa, parseSegmentHeader)) orelse
-                    return error.UnsupportedFormat;
+                const header = try text.parse({}, parseSegmentHeader);
                 if (header.version != log_format or header.base_seq != scan.bases[scan.at]) {
                     return error.UnsupportedFormat;
                 }
@@ -1883,7 +1887,7 @@ pub const Scan = struct {
                 error.LineTooLong => return false,
                 error.ControlByte, error.MissingSeparator => unreachable,
             }) orelse return false;
-            const found = (try Unparsed.init(line.line).parse(scan.gpa, envelopes.stamp)) orelse continue;
+            const found = envelopeOf(.init(line.line)) orelse continue;
             if (found.seq.compare(seq) != .lt) return true;
         }
     }
@@ -2127,7 +2131,7 @@ fn scannedSeqAtOrAfter(
     defer scan.deinit(io);
     var index = values.no_records;
     while (try scan.next(io)) |line| : (index = values.plus(index, .fromRaw(1))) {
-        const envelope = (try line.parse(log.gpa, envelopeOf)) orelse return error.CorruptRecord;
+        const envelope = envelopeOf(line) orelse return error.CorruptRecord;
         const at = envelope.at orelse return error.CorruptRecord;
         if (at >= want) return values.advance(from_seq, index) catch error.CorruptRecord;
     }
@@ -2452,7 +2456,7 @@ fn openActive(log: *Self, io: Io) OpenError!void {
             log.chain = 0;
             return;
         }
-        const head = try log.segmentHeaderFromLine(segment.*, first);
+        const head = try segmentHeaderFromLine(segment.*, first);
         segment.header_bytes = head.header_bytes;
         if (try log.readIndex(io, segment.*)) |indexed| {
             segment.last_seq = indexed.last_seq;
@@ -2462,7 +2466,7 @@ fn openActive(log: *Self, io: Io) OpenError!void {
                 const line = try log.lastLineFrom(io, file, segment.*);
                 defer log.gpa.free(line.bytes);
                 if (!line.terminated) return error.TruncatedRecord;
-                const envelope = (try line.unparsed().parse(log.gpa, envelopeOf)) orelse return error.CorruptRecord;
+                const envelope = envelopeOf(line.unparsed()) orelse return error.CorruptRecord;
                 break :chain envelope.c orelse return error.CorruptRecord;
             };
             return;
@@ -2621,18 +2625,18 @@ fn resumeActive(log: *Self, io: Io, segment: *Segment) OpenError!?Active {
 fn readSegmentHeader(log: *Self, io: Io, segment: Segment) OpenError!SegmentHead {
     const line = try log.lineAt(io, segment, values.no_bytes);
     defer log.gpa.free(line.bytes);
-    return log.segmentHeaderFromLine(segment, line);
+    return segmentHeaderFromLine(segment, line);
 }
 
 fn readSegmentHeaderFrom(log: *Self, io: Io, file: Io.File, segment: Segment) OpenError!SegmentHead {
     const line = try log.lineAtFrom(io, file, segment, values.no_bytes);
     defer log.gpa.free(line.bytes);
-    return log.segmentHeaderFromLine(segment, line);
+    return segmentHeaderFromLine(segment, line);
 }
 
-fn segmentHeaderFromLine(log: *Self, segment: Segment, line: Line) OpenError!SegmentHead {
+fn segmentHeaderFromLine(segment: Segment, line: Line) OpenError!SegmentHead {
     if (!line.terminated) return error.UnsupportedFormat;
-    const header = (try line.unparsed().parse(log.gpa, parseSegmentHeader)) orelse return error.UnsupportedFormat;
+    const header = try line.unparsed().parse({}, parseSegmentHeader);
     if (header.version != log_format or header.base_seq != segment.base_seq) return error.UnsupportedFormat;
     return .{ .root = header.root, .header_bytes = .fromRaw(line.bytes.len + 1) };
 }
@@ -2644,7 +2648,7 @@ fn lastChecksum(log: *Self, io: Io, segment: Segment, root: u32) OpenError!u32 {
     const line = try log.lastLine(io, segment);
     defer log.gpa.free(line.bytes);
     if (!line.terminated) return error.TruncatedRecord;
-    const envelope = (try line.unparsed().parse(log.gpa, envelopeOf)) orelse return error.CorruptRecord;
+    const envelope = envelopeOf(line.unparsed()) orelse return error.CorruptRecord;
     return envelope.c orelse return error.CorruptRecord;
 }
 
@@ -2920,7 +2924,7 @@ fn rewriteSegment(log: *Self, io: Io, segment: Segment, keep_from: Seq) CompactE
             // Records are copied byte for byte, so the new file's chain has
             // to root where the first of them links back to. That number is
             // in the record itself.
-            const root = (try line.parse(log.gpa, envelopes.backLink)) orelse return error.CorruptRecord;
+            const root = (fieldsOf(line) orelse return error.CorruptRecord).backLink() orelse return error.CorruptRecord;
             var buffer: [96]u8 = undefined;
             const header: SegmentHeader = .{
                 .version = log_format,

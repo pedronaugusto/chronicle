@@ -1,21 +1,18 @@
-//! A record's envelope and a segment's first line, read off the bytes.
+//! A record's envelope, read through its members.
 //!
-//! This package writes both in one shape — `{"seq":…,"at":…,"v":…,"p":…,
-//! "ev":…,"c":…}` and `{"chronicle":…,"base":…,"root":…}`, no whitespace,
-//! members in that order — and every read of a record goes through its
-//! envelope, so that shape is read here directly, off the bytes by strand:
-//! its leading integers (`leadingIntMembers`), a batch's two after them
-//! (`intMembersAt`), and the checksum from the end of the line
-//! (`trailingIntMember`). A line in any other shape, a record written by
-//! hand, has its members read by strand as their bytes, and a member is an
-//! integer only when it is written as one (`json.intOf`), which is what a
-//! reader of this format has always taken.
+//! This package writes a record as `{"seq":…,"at":…,"v":…,"p":…,"ev":…,
+//! "c":…}`, and reads one in any spelling JSON allows: the members in any
+//! order, whitespace anywhere, names escaped. Every reader of a line — the
+//! scan at open, a replay, a backup — reads it once through strand's member
+//! iterator (`read`), which checks the line is one JSON object and hands
+//! over the members this file names; what a caller needs of them is asked
+//! of the `Fields` that come back. A member is an integer only when it is
+//! written as one (`strand.json.intOf`).
 //!
 //! This file is internal. `chronicle.zig` is the package.
 
 const std = @import("std");
 const aegis = @import("aegis");
-const Allocator = std.mem.Allocator;
 const jsonl = @import("jsonl.zig");
 const strand = jsonl.strand;
 const values = @import("values.zig");
@@ -32,24 +29,17 @@ pub const Unparsed = aegis.input.Untrusted([]const u8);
 /// A member's value as a `T` when it is an integer written as one — no
 /// fraction, no exponent, not a string — that `T` holds. Null for anything
 /// else.
-pub fn integerOf(comptime T: type, value: strand.json.Raw) ?T {
-    return strand.json.intOf(T, value.bytes);
+pub fn integerOf(comptime T: type, value: []const u8) ?T {
+    return strand.json.intOf(T, value);
 }
 
 /// What a record's checksum covers, and the checksum.
 pub const Trailer = struct {
-    /// Everything before the `,"c":<digits>}` the line ends with.
+    /// The line up to the separator before `c`: everything the object holds
+    /// before its last member.
     covered: []const u8,
     c: u32,
 };
-
-/// The checksum is the last member of every record this package writes, so
-/// it is found from the end. Null when the line does not end in one, a JSON
-/// integer that fits a `u32`.
-pub fn trailer(line: []const u8) ?Trailer {
-    const read = strand.json.trailingIntMember(u32, "c", line) orelse return null;
-    return .{ .covered = line[0..read.start], .c = read.value };
-}
 
 /// Where a record's event sits in its line, as a pair of offsets rather
 /// than a slice: the line a record is built from may be a copy of the one
@@ -81,30 +71,115 @@ pub const Head = struct {
     ev: Span,
 };
 
-/// The envelope of a record in exactly the shape this package writes, read
-/// out of what its checksum covers. Null to say "read it as members".
-pub fn quick(covered: []const u8) ?Head {
-    const Envelope = struct { seq: i64, at: i64, v: u32, p: u32 };
-    const read = strand.json.leadingIntMembers(Envelope, covered) orelse return null;
-    if (read.value.seq < 1) return null;
-    const seq = Seq.fromRaw(aegis.int.cast(u64, read.value.seq) catch return null);
-    var at = read.end;
-    var batch: ?Batch = null;
-    if (std.mem.startsWith(u8, covered[at..], ",\"bf\":")) {
-        const members_ = strand.json.intMembersAt(struct { bf: i64, bl: i64 }, covered, at) orelse return null;
-        at = members_.end;
-        batch = checkedBatch(seq, members_.value.bf, members_.value.bl) orelse return null;
+/// What the segment layer reads of a line: where the record sits in the
+/// sequence, and when the caller said it happened.
+pub const Stamp = struct {
+    seq: Seq,
+    /// Null when the line carries no `at`, or one that is not an integer.
+    at: ?i64,
+};
+
+/// A line that is not one JSON object, or that gives a member this file
+/// reads more than once: no record, whatever else it holds.
+pub const NotRecord = error{NotRecord};
+
+/// The members of a line this file reads, each as its value's bytes, and
+/// where the checksum is.
+pub const Fields = struct {
+    seq: ?[]const u8 = null,
+    at: ?[]const u8 = null,
+    v: ?[]const u8 = null,
+    p: ?[]const u8 = null,
+    bf: ?[]const u8 = null,
+    bl: ?[]const u8 = null,
+    ev: ?Span = null,
+    /// The checksum when the object's last member is `c`, an integer that
+    /// fits a `u32`; null when it is not, which no record this package
+    /// writes is.
+    trailer: ?Trailer = null,
+
+    /// The envelope, or `error.Corrupt` when the line lacks a member a
+    /// record carries or carries one that is not what it must be.
+    pub fn head(fields: Fields) error{Corrupt}!Head {
+        const seq = seqOf(fields.seq orelse return error.Corrupt) orelse return error.Corrupt;
+        // Both members of a batch or neither, and one the record can be in.
+        if ((fields.bf == null) != (fields.bl == null)) return error.Corrupt;
+        const batch: ?Batch = if (fields.bf) |bf| checkedBatch(
+            seq,
+            integerOf(i64, bf) orelse return error.Corrupt,
+            integerOf(i64, fields.bl.?) orelse return error.Corrupt,
+        ) orelse return error.Corrupt else null;
+        return .{
+            .seq = seq,
+            .batch = batch,
+            .at = integerOf(i64, fields.at orelse return error.Corrupt) orelse return error.Corrupt,
+            .v = integerOf(u32, fields.v orelse return error.Corrupt) orelse return error.Corrupt,
+            .p = integerOf(u32, fields.p orelse return error.Corrupt) orelse return error.Corrupt,
+            .ev = fields.ev orelse return error.Corrupt,
+        };
     }
-    const ev_prefix = ",\"ev\":";
-    if (!std.mem.startsWith(u8, covered[at..], ev_prefix)) return null;
-    return .{
-        .seq = seq,
-        .at = read.value.at,
-        .v = read.value.v,
-        .p = read.value.p,
-        .batch = batch,
-        .ev = .{ .from = at + ev_prefix.len, .to = covered.len },
+
+    /// The line's `seq` and `at`, or null when it carries no sequence
+    /// number.
+    pub fn stamp(fields: Fields) ?Stamp {
+        const seq = seqOf(fields.seq orelse return null) orelse return null;
+        return .{ .seq = seq, .at = if (fields.at) |at| integerOf(i64, at) else null };
+    }
+
+    /// The `p` the line carries: the checksum of the record before it.
+    pub fn backLink(fields: Fields) ?u32 {
+        return integerOf(u32, fields.p orelse return null);
+    }
+
+    /// The batch the line's record was written in. Null for a record written
+    /// on its own and for a line that is not a record, which is not this
+    /// question's to refuse.
+    pub fn batchOf(fields: Fields) ?Batch {
+        const found = fields.head() catch return null;
+        return found.batch;
+    }
+};
+
+/// A sequence number: an integer from 1 to `maxInt(i64)`.
+fn seqOf(value: []const u8) ?Seq {
+    const seq = integerOf(i64, value) orelse return null;
+    if (seq < 1) return null;
+    return .fromRaw(aegis.int.cast(u64, seq) catch return null);
+}
+
+/// The members of `line` this file reads, through strand's member iterator,
+/// once: the line is checked to be one JSON object, and a member named twice
+/// is refused, as a parse of the record refuses one.
+pub fn read(_: void, line: []const u8) NotRecord!Fields {
+    var members: strand.json.Members = undefined;
+    members.init(line, .{ .limits = jsonl.limits(line.len) });
+    var fields: Fields = .{};
+    var last: ?strand.json.Member = null;
+    var checksum = false;
+    while (members.next() catch return error.NotRecord) |member| {
+        last = member;
+        const index = member.which(&.{ "seq", "at", "v", "p", "bf", "bl", "ev", "c" }) orelse continue;
+        switch (index) {
+            inline 0...5 => |i| {
+                const name = comptime (&[_][]const u8{ "seq", "at", "v", "p", "bf", "bl" })[i];
+                if (@field(fields, name) != null) return error.NotRecord;
+                @field(fields, name) = member.value;
+            },
+            6 => {
+                if (fields.ev != null) return error.NotRecord;
+                fields.ev = .{ .from = member.value_start, .to = member.valueEnd() };
+            },
+            else => {
+                if (checksum) return error.NotRecord;
+                checksum = true;
+            },
+        }
+    }
+    _ = members.finish() catch return error.NotRecord;
+    if (last) |member| if (member.is("c")) {
+        if (integerOf(u32, member.value)) |c| fields.trailer = .{ .covered = line[0..member.separator], .c = c };
     };
+    return fields;
 }
 
 /// The batch a record of sequence number `seq` names, when it is one that
@@ -119,105 +194,6 @@ fn checkedBatch(seq: Seq, first: i64, last: i64) ?Batch {
     return batch;
 }
 
-/// The batch a line's record was written in, read as `quick` and `members`
-/// read the envelope. Null for a record written on its own and for a line
-/// that is not a record, which is not this question's to refuse.
-pub fn batchOf(gpa: Allocator, line: []const u8) Allocator.Error!?Batch {
-    if (trailer(line)) |t| {
-        if (quick(t.covered)) |head| return head.batch;
-    }
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const head = members(arena.allocator(), line) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        error.Corrupt => return null,
-    };
-    return head.batch;
-}
-
-/// The envelope of a record in some other shape — members in another
-/// order, whitespace, a record written by hand — read as its members'
-/// bytes. The event is found where it lies in `line`. `scratch` holds
-/// whatever reading the members took. `error.Corrupt` when the line is not
-/// a record.
-pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt }!Head {
-    const Members = struct { seq: strand.json.Raw, at: strand.json.Raw, v: strand.json.Raw, p: strand.json.Raw, bf: ?strand.json.Raw = null, bl: ?strand.json.Raw = null, ev: strand.json.Raw };
-    const found = strand.json.parseLeaky(Members, scratch, line, .{ .ignore_unknown_fields = true, .limits = jsonl.limits(line.len) }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return error.Corrupt,
-    };
-    const seq = integerOf(i64, found.seq) orelse return error.Corrupt;
-    if (seq < 1) return error.Corrupt;
-    const number: Seq = .fromRaw(aegis.int.cast(u64, seq) catch return error.Corrupt);
-    const from = @intFromPtr(found.ev.bytes.ptr) - @intFromPtr(line.ptr); // safe: parseLine without copy_strings hands back a view into line; numbers only
-    aegis.assert.invariant(from <= line.len and found.ev.bytes.len <= line.len - from, "a member read without a copy is a view into the line it was read from");
-    // Both members of a batch or neither, and one the record can be in.
-    if ((found.bf == null) != (found.bl == null)) return error.Corrupt;
-    const batch: ?Batch = if (found.bf) |bf| checkedBatch(
-        number,
-        integerOf(i64, bf) orelse return error.Corrupt,
-        integerOf(i64, found.bl.?) orelse return error.Corrupt,
-    ) orelse return error.Corrupt else null;
-    return .{
-        .seq = number,
-        .batch = batch,
-        .at = integerOf(i64, found.at) orelse return error.Corrupt,
-        .v = integerOf(u32, found.v) orelse return error.Corrupt,
-        .p = integerOf(u32, found.p) orelse return error.Corrupt,
-        .ev = .{ .from = from, .to = from + found.ev.bytes.len },
-    };
-}
-
-/// What the segment layer reads of a line: where the record sits in the
-/// sequence, and when the caller said it happened.
-pub const Stamp = struct {
-    seq: Seq,
-    /// Null when the line carries no `at`, or one that is not an integer.
-    at: ?i64,
-};
-
-/// A line's `seq` and `at`, or null when the line is not an object carrying
-/// a sequence number at all. The shape this package writes begins
-/// `{"seq":<digits>,"at":<digits>,` and is read off the bytes, since this
-/// runs over every line of the active segment at every open; anything else
-/// is read as members, on an arena over `gpa` that is gone when this
-/// returns.
-pub fn stamp(gpa: Allocator, line: []const u8) Allocator.Error!?Stamp {
-    quick: {
-        const read = strand.json.leadingIntMembers(struct { seq: i64, at: i64 }, line) orelse break :quick;
-        // A record goes on past its stamp.
-        if (line[read.end] != ',') break :quick;
-        if (read.value.seq < 1) return null;
-        return .{ .seq = .fromRaw(aegis.int.cast(u64, read.value.seq) catch return null), .at = read.value.at };
-    }
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const Members = struct { seq: strand.json.Raw, at: strand.json.Raw = .{ .bytes = "null" } };
-    const found = strand.json.parseLeaky(Members, arena.allocator(), line, .{ .ignore_unknown_fields = true, .limits = jsonl.limits(line.len) }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    const seq = integerOf(i64, found.seq) orelse return null;
-    if (seq < 1) return null;
-    return .{ .seq = .fromRaw(aegis.int.cast(u64, seq) catch return null), .at = integerOf(i64, found.at) };
-}
-
-/// The `p` a line carries: the checksum of the record before it. Read off
-/// the bytes where the shape is the one this package writes, and as members
-/// where it is not, on an arena over `gpa`.
-pub fn backLink(gpa: Allocator, line: []const u8) Allocator.Error!?u32 {
-    if (trailer(line)) |t| {
-        if (quick(t.covered)) |head| return head.p;
-    }
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    defer arena.deinit();
-    const found = strand.json.parseLeaky(struct { p: strand.json.Raw }, arena.allocator(), line, .{ .ignore_unknown_fields = true, .limits = jsonl.limits(line.len) }) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => return null,
-    };
-    return integerOf(u32, found.p);
-}
-
 //=========================================================================
 // Tests. The journal-level ones, over records in every shape, are in
 // `journal_test.zig`.
@@ -225,31 +201,31 @@ pub fn backLink(gpa: Allocator, line: []const u8) Allocator.Error!?u32 {
 
 const testing = std.testing;
 
-test "the written shape and any other read as the same envelope" {
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
+fn headOf(line: []const u8) error{ NotRecord, Corrupt }!Head {
+    return (try read({}, line)).head();
+}
 
+test "a line in any spelling reads as the same envelope" {
     const written = "{\"seq\":7,\"at\":-3,\"v\":2,\"p\":11,\"ev\":{\"x\":1},\"c\":42}";
-    const t = trailer(written).?;
-    try testing.expectEqual(@as(u32, 42), t.c);
-    const head = quick(t.covered).?;
+    const fields = try read({}, written);
+    try testing.expectEqual(@as(u32, 42), fields.trailer.?.c);
+    try testing.expectEqualStrings("{\"seq\":7,\"at\":-3,\"v\":2,\"p\":11,\"ev\":{\"x\":1}", fields.trailer.?.covered);
+    const head = try fields.head();
     try testing.expectEqual(Head{ .seq = .fromRaw(7), .at = -3, .v = 2, .p = 11, .ev = .{ .from = 35, .to = 42 } }, head);
     try testing.expectEqualStrings("{\"x\":1}", written[head.ev.from..head.ev.to]);
 
-    // Reordered and spaced, the same envelope out of its members.
-    const by_hand = "{ \"p\" : 11, \"ev\" : {\"x\":1}, \"v\":2, \"at\":-3, \"seq\":7, \"c\":42}";
-    try testing.expectEqual(@as(?Head, null), quick(by_hand));
-    const other = try members(a, by_hand);
+    // Reordered, spaced and escaped, the same envelope.
+    const by_hand = "{ \"p\" : 11, \"ev\" : {\"x\":1}, \"v\":2, \"\\u0061t\":-3, \"seq\":7 , \"c\" : 42 }\t";
+    const other_fields = try read({}, by_hand);
+    const other = try other_fields.head();
     try testing.expectEqual(head.seq, other.seq);
     try testing.expectEqual(head.at, other.at);
     try testing.expectEqual(head.v, other.v);
     try testing.expectEqual(head.p, other.p);
     try testing.expectEqualStrings("{\"x\":1}", by_hand[other.ev.from..other.ev.to]);
-    try testing.expectEqual(@as(?u32, 11), (try backLink(testing.allocator, by_hand)));
-    try testing.expectEqual(@as(?u32, 11), (try backLink(testing.allocator, written)));
-    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(7), .at = -3 }, (try stamp(testing.allocator, by_hand)).?);
-    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(7), .at = -3 }, (try stamp(testing.allocator, written)).?);
+    try testing.expectEqualStrings("{ \"p\" : 11, \"ev\" : {\"x\":1}, \"v\":2, \"\\u0061t\":-3, \"seq\":7 ", other_fields.trailer.?.covered);
+    try testing.expectEqual(@as(?u32, 11), other_fields.backLink());
+    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(7), .at = -3 }, other_fields.stamp().?);
 
     // An integer only when written as one, within an `i64`, and a sequence
     // number from 1.
@@ -257,53 +233,52 @@ test "the written shape and any other read as the same envelope" {
         "{\"seq\":\"7\",\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":7.0,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":7e0,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
-        "{\"seq\":07,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":0,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":9223372036854775808,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":1,\"at\":1,\"v\":4294967296,\"p\":1,\"ev\":1}",
         "{\"seq\":1,\"at\":1,\"v\":1,\"p\":-1,\"ev\":1}",
         "{\"seq\":1,\"at\":1,\"v\":1,\"ev\":1}",
+    }) |line| try testing.expectError(error.Corrupt, headOf(line));
+    // Not a record at all: not JSON, not an object, a member given twice.
+    for ([_][]const u8{
+        "{\"seq\":07,\"at\":1,\"v\":1,\"p\":1,\"ev\":1}",
         "{\"seq\":1,\"at\":1,\"v\":1,\"p\":1,\"ev\":1,\"seq\":2}",
+        "{\"seq\":1,\"at\":1,\"v\":1,\"p\":1,\"ev\":1,\"s\\u0065q\":2}",
+        "{\"seq\":1,\"c\":1,\"ev\":1,\"c\":1}",
+        "{\"seq\":1,\"at\":1",
+        "{\"seq\":1} x",
         "[1]",
-    }) |line| {
-        try testing.expectError(error.Corrupt, members(a, line));
-    }
-    // A zero in front of digits is not a JSON integer, off the bytes or not.
-    try testing.expectEqual(@as(?Head, null), quick("{\"seq\":07,\"at\":1,\"v\":1,\"p\":1,\"ev\":1"));
+    }) |line| try testing.expectError(error.NotRecord, headOf(line));
     // A record whose `p` is inside its event as well as its envelope is read
     // for its envelope's.
-    const shadowed = "{\"ev\":{\"q\":1,\"p\":99},\"seq\":1,\"at\":1,\"v\":1,\"p\":5,\"c\":3}";
-    try testing.expectEqual(@as(?u32, 5), (try backLink(testing.allocator, shadowed)));
+    const shadowed = try read({}, "{\"ev\":{\"q\":1,\"p\":99},\"seq\":1,\"at\":1,\"v\":1,\"p\":5,\"c\":3}");
+    try testing.expectEqual(@as(?u32, 5), shadowed.backLink());
     // A timestamp that is not an integer is no timestamp, not a bad line.
-    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(3), .at = null }, (try stamp(testing.allocator, "{\"at\":\"x\",\"seq\":3}")).?);
-    try testing.expectEqual(@as(?Stamp, null), (try stamp(testing.allocator, "{\"seq\":0,\"at\":1,\"v\":1}")));
-    try testing.expectEqual(@as(?Trailer, null), trailer("{\"seq\":1,\"c\":}"));
-    try testing.expectEqual(@as(?Trailer, null), trailer("{\"seq\":1,\"c\":4294967296}"));
-}
-
-test "metadata probes preserve allocation failure instead of declaring bytes invalid" {
-    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    const line = "{\"s\\u0065q\":1,\"at\":2,\"\\u0070\":3}";
-    try testing.expectError(error.OutOfMemory, stamp(failing.allocator(), line));
-    try testing.expectError(error.OutOfMemory, backLink(failing.allocator(), line));
+    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(3), .at = null }, (try read({}, "{\"at\":\"x\",\"seq\":3}")).stamp().?);
+    try testing.expectEqual(@as(?Stamp, null), (try read({}, "{\"seq\":0,\"at\":1,\"v\":1}")).stamp());
+    // A checksum only as the last member, an integer that fits a `u32`.
+    try testing.expectEqual(@as(?Trailer, null), (try read({}, "{\"c\":1,\"seq\":1}")).trailer);
+    try testing.expectEqual(@as(?Trailer, null), (try read({}, "{\"seq\":1,\"c\":4294967296}")).trailer);
+    try testing.expectEqual(@as(?Trailer, null), (try read({}, "{\"seq\":1,\"c\":-1}")).trailer);
+    // Alone, it covers nothing: there is nothing before the brace.
+    try testing.expectEqualStrings("", (try read({}, "{\"c\":0}")).trailer.?.covered);
 }
 
 test "a record of an atomic batch names a batch it can be in" {
-    const covered = "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"bl\":5,\"ev\":{}";
-    const head = quick(covered).?;
+    const line = "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"bl\":5,\"ev\":{},\"c\":1}";
+    const head = try headOf(line);
     try testing.expectEqual(Batch{ .first = .fromRaw(3), .last = .fromRaw(5) }, head.batch.?);
-    try testing.expectEqualStrings("{}", covered[head.ev.from..head.ev.to]);
+    try testing.expectEqualStrings("{}", line[head.ev.from..head.ev.to]);
+    try testing.expectEqual(Batch{ .first = Seq.fromRaw(3), .last = Seq.fromRaw(5) }, (try headOf("{\"bl\":5,\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"ev\":{}}")).batch.?);
     for ([_][]const u8{
-        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":5,\"bl\":6,\"ev\":{}",
-        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":1,\"bl\":3,\"ev\":{}",
-        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":0,\"bl\":4,\"ev\":{}",
-        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"ev\":{}",
-        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":03,\"bl\":5,\"ev\":{}",
-    }) |bad| try testing.expectEqual(@as(?Head, null), quick(bad));
-    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
-    defer arena.deinit();
-    // As members, both or neither, and in range.
-    try testing.expectEqual(Batch{ .first = Seq.fromRaw(3), .last = Seq.fromRaw(5) }, (try members(arena.allocator(), "{\"bl\":5,\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"ev\":{}}")).batch.?);
-    try testing.expectError(error.Corrupt, members(arena.allocator(), "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bl\":5,\"ev\":{}}"));
-    try testing.expectError(error.Corrupt, members(arena.allocator(), "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":5,\"bl\":9,\"ev\":{}}"));
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":5,\"bl\":6,\"ev\":{}}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":1,\"bl\":3,\"ev\":{}}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":0,\"bl\":4,\"ev\":{}}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":3,\"ev\":{}}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bl\":5,\"ev\":{}}",
+        "{\"seq\":4,\"at\":1,\"v\":1,\"p\":2,\"bf\":5,\"bl\":9,\"ev\":{}}",
+    }) |bad| {
+        try testing.expectError(error.Corrupt, headOf(bad));
+        try testing.expectEqual(@as(?Batch, null), (try read({}, bad)).batchOf());
+    }
 }
