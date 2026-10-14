@@ -58,8 +58,8 @@ pub const beginning: Seq = .fromRaw(0);
 pub const first_record: Seq = .fromRaw(1);
 
 /// The last sequence number a record can carry. A record's `seq` is written
-/// as a JSON integer, and `std.json` and every reader of this format take
-/// that as an `i64`.
+/// as a JSON integer, and every reader of this format takes that as an
+/// `i64`.
 pub const newest_possible: Seq = .fromRaw(std.math.maxInt(i64));
 
 pub const SequenceError = error{SequenceExhausted};

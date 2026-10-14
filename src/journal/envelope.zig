@@ -3,12 +3,13 @@
 //! This package writes both in one shape — `{"seq":…,"at":…,"v":…,"p":…,
 //! "ev":…,"c":…}` and `{"chronicle":…,"base":…,"root":…}`, no whitespace,
 //! members in that order — and every read of a record goes through its
-//! envelope, so that shape is read here directly: its leading integers off
-//! the bytes by strand (`leadingIntMembers`), and the checksum found from the
-//! end of the line. A line in
-//! any other shape, a record written by hand, has its members read by strand
-//! as their bytes, and a member is an integer only when it is written as one
-//! (`integerOf`), which is what a reader of this format has always taken.
+//! envelope, so that shape is read here directly, off the bytes by strand:
+//! its leading integers (`leadingIntMembers`), a batch's two after them
+//! (`intMembersAt`), and the checksum from the end of the line
+//! (`trailingIntMember`). A line in any other shape, a record written by
+//! hand, has its members read by strand as their bytes, and a member is an
+//! integer only when it is written as one (`json.intOf`), which is what a
+//! reader of this format has always taken.
 //!
 //! This file is internal. `chronicle.zig` is the package.
 
@@ -28,14 +29,11 @@ const Seq = values.Seq;
 /// refusal.
 pub const Unparsed = aegis.input.Untrusted([]const u8);
 
-/// A member's value as an integer when it is one written as one — no
-/// fraction, no exponent, not a string — and within an `i64`. Null for
-/// anything else.
-pub fn integerOf(value: strand.json.Raw) ?i64 {
-    const bytes = value.bytes;
-    if (bytes.len == 0 or !(bytes[0] == '-' or std.ascii.isDigit(bytes[0]))) return null;
-    if (!std.json.isNumberFormattedLikeAnInteger(bytes)) return null;
-    return std.fmt.parseInt(i64, bytes, 10) catch null;
+/// A member's value as a `T` when it is an integer written as one — no
+/// fraction, no exponent, not a string — that `T` holds. Null for anything
+/// else.
+pub fn integerOf(comptime T: type, value: strand.json.Raw) ?T {
+    return strand.json.intOf(T, value.bytes);
 }
 
 /// What a record's checksum covers, and the checksum.
@@ -49,18 +47,8 @@ pub const Trailer = struct {
 /// it is found from the end. Null when the line does not end in one, a JSON
 /// integer that fits a `u32`.
 pub fn trailer(line: []const u8) ?Trailer {
-    const opening = ",\"c\":";
-    if (line.len < opening.len + 2 or line[line.len - 1] != '}') return null;
-    var at = line.len - 1;
-    while (at > 0 and std.ascii.isDigit(line[at - 1])) at -= 1;
-    if (at == line.len - 1 or at < opening.len) return null;
-    // A JSON integer: no zero in front of other digits.
-    if (line[at] == '0' and at + 1 != line.len - 1) return null;
-    if (!std.mem.eql(u8, line[at - opening.len .. at], opening)) return null;
-    return .{
-        .covered = line[0 .. at - opening.len],
-        .c = std.fmt.parseInt(u32, line[at .. line.len - 1], 10) catch return null,
-    };
+    const read = strand.json.trailingIntMember(u32, "c", line) orelse return null;
+    return .{ .covered = line[0..read.start], .c = read.value };
 }
 
 /// Where a record's event sits in its line, as a pair of offsets rather
@@ -102,15 +90,10 @@ pub fn quick(covered: []const u8) ?Head {
     const seq = Seq.fromRaw(aegis.int.cast(u64, read.value.seq) catch return null);
     var at = read.end;
     var batch: ?Batch = null;
-    const bf_prefix = ",\"bf\":";
-    if (std.mem.startsWith(u8, covered[at..], bf_prefix)) {
-        at += bf_prefix.len;
-        const first = digitsAt(covered, &at) orelse return null;
-        const bl_prefix = ",\"bl\":";
-        if (!std.mem.startsWith(u8, covered[at..], bl_prefix)) return null;
-        at += bl_prefix.len;
-        const last = digitsAt(covered, &at) orelse return null;
-        batch = checkedBatch(seq, first, last) orelse return null;
+    if (std.mem.startsWith(u8, covered[at..], ",\"bf\":")) {
+        const members_ = strand.json.intMembersAt(struct { bf: i64, bl: i64 }, covered, at) orelse return null;
+        at = members_.end;
+        batch = checkedBatch(seq, members_.value.bf, members_.value.bl) orelse return null;
     }
     const ev_prefix = ",\"ev\":";
     if (!std.mem.startsWith(u8, covered[at..], ev_prefix)) return null;
@@ -122,16 +105,6 @@ pub fn quick(covered: []const u8) ?Head {
         .batch = batch,
         .ev = .{ .from = at + ev_prefix.len, .to = covered.len },
     };
-}
-
-/// A JSON integer of digits alone at `at.*`, which moves past it, or null.
-fn digitsAt(bytes: []const u8, at: *usize) ?i64 {
-    const from = at.*;
-    var end = from;
-    while (end < bytes.len and std.ascii.isDigit(bytes[end])) end += 1;
-    if (end == from or (bytes[from] == '0' and end - from > 1)) return null;
-    at.* = end;
-    return std.fmt.parseInt(i64, bytes[from..end], 10) catch null;
 }
 
 /// The batch a record of sequence number `seq` names, when it is one that
@@ -173,7 +146,7 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
         error.OutOfMemory => return error.OutOfMemory,
         else => return error.Corrupt,
     };
-    const seq = integerOf(found.seq) orelse return error.Corrupt;
+    const seq = integerOf(i64, found.seq) orelse return error.Corrupt;
     if (seq < 1) return error.Corrupt;
     const number: Seq = .fromRaw(aegis.int.cast(u64, seq) catch return error.Corrupt);
     const from = @intFromPtr(found.ev.bytes.ptr) - @intFromPtr(line.ptr); // safe: parseLine without copy_strings hands back a view into line; numbers only
@@ -182,15 +155,15 @@ pub fn members(scratch: Allocator, line: []const u8) error{ OutOfMemory, Corrupt
     if ((found.bf == null) != (found.bl == null)) return error.Corrupt;
     const batch: ?Batch = if (found.bf) |bf| checkedBatch(
         number,
-        integerOf(bf) orelse return error.Corrupt,
-        integerOf(found.bl.?) orelse return error.Corrupt,
+        integerOf(i64, bf) orelse return error.Corrupt,
+        integerOf(i64, found.bl.?) orelse return error.Corrupt,
     ) orelse return error.Corrupt else null;
     return .{
         .seq = number,
         .batch = batch,
-        .at = integerOf(found.at) orelse return error.Corrupt,
-        .v = aegis.int.cast(u32, integerOf(found.v) orelse return error.Corrupt) catch return error.Corrupt,
-        .p = aegis.int.cast(u32, integerOf(found.p) orelse return error.Corrupt) catch return error.Corrupt,
+        .at = integerOf(i64, found.at) orelse return error.Corrupt,
+        .v = integerOf(u32, found.v) orelse return error.Corrupt,
+        .p = integerOf(u32, found.p) orelse return error.Corrupt,
         .ev = .{ .from = from, .to = from + found.ev.bytes.len },
     };
 }
@@ -224,9 +197,9 @@ pub fn stamp(gpa: Allocator, line: []const u8) Allocator.Error!?Stamp {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    const seq = integerOf(found.seq) orelse return null;
+    const seq = integerOf(i64, found.seq) orelse return null;
     if (seq < 1) return null;
-    return .{ .seq = .fromRaw(aegis.int.cast(u64, seq) catch return null), .at = integerOf(found.at) };
+    return .{ .seq = .fromRaw(aegis.int.cast(u64, seq) catch return null), .at = integerOf(i64, found.at) };
 }
 
 /// The `p` a line carries: the checksum of the record before it. Read off
@@ -242,7 +215,7 @@ pub fn backLink(gpa: Allocator, line: []const u8) Allocator.Error!?u32 {
         error.OutOfMemory => return error.OutOfMemory,
         else => return null,
     };
-    return aegis.int.cast(u32, integerOf(found.p) orelse return null) catch null;
+    return integerOf(u32, found.p);
 }
 
 //=========================================================================

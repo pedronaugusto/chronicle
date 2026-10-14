@@ -60,8 +60,11 @@ fn referenceTrailer(line: []const u8) ?Trailer {
     if (line.len == 0 or line[line.len - 1] != '}') return null;
     var start = line.len - 1;
     while (start > 0 and std.ascii.isDigit(line[start - 1])) start -= 1;
+    const unsigned = line[start .. line.len - 1];
+    if (unsigned.len == 0 or (unsigned[0] == '0' and unsigned.len > 1)) return null;
+    // A JSON integer may be signed; only `-0` fits a checksum.
+    if (start > 0 and line[start - 1] == '-') start -= 1;
     const digits = line[start .. line.len - 1];
-    if (digits.len == 0 or (digits[0] == '0' and digits.len > 1)) return null;
     if (!std.mem.endsWith(u8, line[0..start], ",\"c\":")) return null;
     const c = std.fmt.parseInt(u32, digits, 10) catch return null;
     return .{ .covered = line[0 .. start - ",\"c\":".len], .c = c };
