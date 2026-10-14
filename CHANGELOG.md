@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-10-14
+
 ### Added
 
 - A proof, in the tests, that a reader waiting past what it has seen meets the writer in every order: shakedown's `explore` runs the journal inside a `Sim`, airlock's calls on its disk, once for every schedule within two preemptions and a spurious wake (107 runs), and the reader sees every record, in order and whole, never waiting on one that arrived.
@@ -698,7 +700,8 @@ back.
 - Fuzz tests over arbitrary journal and snapshot file contents, because the
   file shapes this package exists to survive are the ones nobody chose.
 
-[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.7.6...HEAD
+[0.7.6]: https://github.com/pedronaugusto/chronicle/compare/v0.7.3...v0.7.6
 [0.7.3]: https://github.com/pedronaugusto/chronicle/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/pedronaugusto/chronicle/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/pedronaugusto/chronicle/compare/v0.7.0...v0.7.1
