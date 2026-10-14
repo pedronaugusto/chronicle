@@ -18,6 +18,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Every byte of a line is now read where only its first integers and its last member were: on an M1, the scan of an active segment without its index (26,987 records of 270 bytes) takes 13.1 ms where it took 8.4, a replay reads 3.47 M records/s where it read 5.37 M, and an open with good indexes is unchanged (0.80 ms). The cost is checking each record's event, which the byte match never looked at and a replay then parses again.
 - Pins strand 0.11.0.
 
+## [0.7.6] - 2026-10-14
+
+### Added
+
+- A proof, in the tests, that a reader waiting past what it has seen meets the writer in every order: shakedown's `explore` runs the journal inside a `Sim`, airlock's calls on its disk, once for every schedule within two preemptions and a spurious wake (107 runs), and the reader sees every record, in order and whole, never waiting on one that arrived.
+
+### Changed
+
+- The fuzz properties draw any bytes with shakedown's `gen.bytesInto`, where the package kept its own copy.
+
 ## [0.7.5] - 2026-10-14
 
 ### Changed
@@ -702,7 +712,8 @@ back.
 - Fuzz tests over arbitrary journal and snapshot file contents, because the
   file shapes this package exists to survive are the ones nobody chose.
 
-[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.7.3...HEAD
+[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.7.6...HEAD
+[0.7.6]: https://github.com/pedronaugusto/chronicle/compare/v0.7.3...v0.7.6
 [0.7.3]: https://github.com/pedronaugusto/chronicle/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/pedronaugusto/chronicle/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/pedronaugusto/chronicle/compare/v0.7.0...v0.7.1
