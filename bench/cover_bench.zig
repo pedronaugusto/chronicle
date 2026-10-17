@@ -84,7 +84,7 @@ fn fill(journal: *J, io: Io, count: usize) !void {
     var offset: usize = 0;
     while (offset < count) {
         const n = @min(entries.len, count - offset);
-        for (entries[0..n], 0..) |*entry, i| entry.* = .{ .at = @intCast(offset + i + 1), .event = .{ .value = 1, .padding = padding } };
+        for (entries[0..n], 0..) |*entry, i| entry.* = .{ .at = .fromRaw(@intCast(offset + i + 1)), .event = .{ .value = 1, .padding = padding } };
         _ = try journal.appendAll(io, entries[0..n], .group);
         offset += n;
     }
@@ -235,7 +235,7 @@ fn seqAt(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const started = now(io);
     for (0..rounds) |_| {
         const at = cursors.next(count) + 1;
-        sum += ((try journal.seqAtOrAfter(io, @intCast(at))) orelse return error.NoRecord).raw();
+        sum += ((try journal.seqAtOrAfter(io, .fromRaw(@intCast(at)))) orelse return error.NoRecord).raw();
     }
     const elapsed = since(io, started);
     try rate("seq-at", rounds, elapsed);
@@ -311,7 +311,7 @@ fn refresh(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     const rounds: usize = if (smoke) 1 else 1000;
     var total: u64 = 0;
     for (0..rounds) |i| {
-        _ = try writer.append(io, @intCast(1001 + i), .{ .value = 1, .padding = padding });
+        _ = try writer.append(io, .fromRaw(@intCast(1001 + i)), .{ .value = 1, .padding = padding });
         const started = now(io);
         try reader.refresh(io);
         total += since(io, started);
@@ -364,7 +364,7 @@ fn waitPast(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     var task = try io.concurrent(wait, .{ io, gpa, journal, rounds, &waiter });
     for (0..rounds) |i| {
         waiter.sent_at.store(stamp(io), .release);
-        _ = try journal.append(io, @intCast(1001 + i), .{ .value = 1, .padding = padding });
+        _ = try journal.append(io, .fromRaw(@intCast(1001 + i)), .{ .value = 1, .padding = padding });
         while (waiter.done.load(.acquire) < i + 1) {
             if (waiter.ended.load(.acquire)) break;
             std.atomic.spinLoopHint();
@@ -383,8 +383,8 @@ fn deferred(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     const journal = try J.open(gpa, io, scratch, options(.always, .write));
     defer journal.deinit(io);
     const started = now(io);
-    for (0..count - 1) |i| _ = try journal.appendDeferred(io, @intCast(i + 1), .{ .value = 1, .padding = padding });
-    const last = try journal.append(io, @intCast(count), .{ .value = 1, .padding = padding });
+    for (0..count - 1) |i| _ = try journal.appendDeferred(io, .fromRaw(@intCast(i + 1)), .{ .value = 1, .padding = padding });
+    const last = try journal.append(io, .fromRaw(@intCast(count)), .{ .value = 1, .padding = padding });
     const elapsed = since(io, started);
     try rate("append-deferred", count, elapsed);
     try check("append-deferred", "last", last.raw());
@@ -581,7 +581,7 @@ fn finish(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     var total: u64 = 0;
     for (0..rounds) |i| {
         const journal = try J.open(gpa, io, scratch, .{ .sync = .always });
-        _ = journal.append(io, @intCast(i + 1), .{ .value = 1, .padding = padding }) catch |err| {
+        _ = journal.append(io, .fromRaw(@intCast(i + 1)), .{ .value = 1, .padding = padding }) catch |err| {
             journal.deinit(io);
             return err;
         };

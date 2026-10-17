@@ -112,7 +112,7 @@ fn writeAtomicBatches(journal: *Journal, io: std.Io, input: Input, batch_len: us
     while (offset < input.count) {
         const take = @min(batch_len, input.count - offset);
         for (entries[0..take], 0..) |*entry, i| {
-            entry.* = .{ .at = @intCast(offset + i + 1), .event = input.event };
+            entry.* = .{ .at = .fromRaw(@intCast(offset + i + 1)), .event = input.event };
         }
         _ = try journal.appendAll(io, entries[0..take], .atomic);
         offset += take;
@@ -126,7 +126,7 @@ fn writeBatches(journal: *Journal, io: std.Io, input: Input, batch_len: usize) !
     while (offset < input.count) {
         const take = @min(batch_len, input.count - offset);
         for (entries[0..take], 0..) |*entry, i| {
-            entry.* = .{ .at = @intCast(offset + i + 1), .event = input.event };
+            entry.* = .{ .at = .fromRaw(@intCast(offset + i + 1)), .event = input.event };
         }
         _ = try journal.appendAll(io, entries[0..take], .group);
         offset += take;
@@ -169,9 +169,9 @@ fn appendWorkload(
     } else if (std.mem.eql(u8, workload, "append_if")) {
         // One writer, its expectation always met: what the comparison under
         // the lock costs beside `append_no_fsync`.
-        for (0..count) |i| _ = try journal.appendIf(io, .{ .last = .fromRaw(i) }, @intCast(i + 1), input.event);
+        for (0..count) |i| _ = try journal.appendIf(io, .{ .last = .fromRaw(i) }, .fromRaw(@intCast(i + 1)), input.event);
     } else {
-        for (0..count) |i| _ = try journal.append(io, @intCast(i + 1), input.event);
+        for (0..count) |i| _ = try journal.append(io, .fromRaw(@intCast(i + 1)), input.event);
     }
     const elapsed = seconds(started, io);
     try printMetric(io, name, "records_per_second", @as(f64, @floatFromInt(count)) / elapsed, "records/s");
@@ -242,7 +242,7 @@ fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []co
     var elapsed: f64 = 0;
     var seen: usize = 0;
     for (0..wakes) |i| {
-        _ = try journal.append(io, @intCast(count + i + 1), input.event);
+        _ = try journal.append(io, .fromRaw(@intCast(count + i + 1)), input.event);
         const started = benchmarkNow(io);
         if (reusable) |walk| {
             try walk.rearmAt(io, position);
@@ -331,7 +331,7 @@ fn rawWorkload(io: std.Io, gpa: std.mem.Allocator, corpus_path: []const u8, path
     defer journal.deinit(io);
     const measuring = std.mem.eql(u8, workload, "raw_append");
     const started = if (measuring) benchmarkNow(io) else std.Io.Timestamp{ .nanoseconds = 0 };
-    for (0..count) |i| _ = try journal.append(io, @intCast(i + 1), corpus.events[i % corpus.events.len]);
+    for (0..count) |i| _ = try journal.append(io, .fromRaw(@intCast(i + 1)), corpus.events[i % corpus.events.len]);
     const elapsed = if (measuring) seconds(started, io) else 1;
     if (measuring) {
         try printMetric(io, workload, "records_per_second", @as(f64, @floatFromInt(count)) / elapsed, "records/s");

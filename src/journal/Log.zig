@@ -35,6 +35,7 @@ const values = @import("values.zig");
 const Seq = values.Seq;
 const Bytes = values.Bytes;
 const Records = values.Records;
+const Time = values.Time;
 const Unparsed = envelopes.Unparsed;
 
 const Self = @This();
@@ -207,36 +208,36 @@ pub const Access = enum {
 /// the pair, not the ends, and a segment is skipped only when its *highest* is
 /// below what is being looked for.
 pub const Times = struct {
-    lowest: i64,
-    highest: i64,
+    lowest: Time,
+    highest: Time,
     /// Whether no record's `at` was below the one before it. A segment where
     /// that holds can be searched by bisection; one where it does not has to
     /// be looked through.
     rising: bool,
     /// The last `at` seen, for `rising`.
-    last: i64,
+    last: Time,
 
     /// What a segment with no records carries, and what one whose timestamps
     /// have not been read back carries: an empty range, which `known` reports
     /// as nothing to go on.
     pub const unknown: Times = .{
-        .lowest = std.math.maxInt(i64),
-        .highest = std.math.minInt(i64),
+        .lowest = .fromRaw(std.math.maxInt(i64)),
+        .highest = .fromRaw(std.math.minInt(i64)),
         .rising = true,
-        .last = std.math.minInt(i64),
+        .last = .fromRaw(std.math.minInt(i64)),
     };
 
     pub fn known(times: Times) bool {
-        return times.lowest <= times.highest;
+        return values.atMost(times.lowest, times.highest);
     }
 
-    pub fn widen(times: *Times, at: i64) void {
-        if (at < times.last) times.rising = false;
+    pub fn widen(times: *Times, at: Time) void {
+        if (values.below(at, times.last)) times.rising = false;
         times.last = at;
-        times.lowest = @min(times.lowest, at);
-        times.highest = @max(times.highest, at);
-        std.debug.assert(times.lowest <= times.last);
-        std.debug.assert(times.last <= times.highest);
+        times.lowest = values.lesser(times.lowest, at);
+        times.highest = values.greater(times.highest, at);
+        std.debug.assert(values.atMost(times.lowest, times.last));
+        std.debug.assert(values.atMost(times.last, times.highest));
     }
 };
 
@@ -870,8 +871,8 @@ const IndexHeader = struct {
         var out: [index_header_len]u8 = @splat(0);
         @memcpy(out[0..index_magic.len], index_magic);
         std.mem.writeInt(u64, out[8..16], header.segment_bytes.raw(), .little);
-        std.mem.writeInt(i64, out[16..24], header.times.lowest, .little);
-        std.mem.writeInt(i64, out[24..32], header.times.highest, .little);
+        std.mem.writeInt(i64, out[16..24], header.times.lowest.raw(), .little);
+        std.mem.writeInt(i64, out[24..32], header.times.highest.raw(), .little);
         std.mem.writeInt(u64, out[32..40], header.base_seq.raw(), .little);
         std.mem.writeInt(u64, out[40..48], header.records.raw(), .little);
         std.mem.writeInt(u32, out[48..52], wireInterval(header.interval), .little);
@@ -885,13 +886,13 @@ const IndexHeader = struct {
     fn parse(raw: *const [index_header_len]u8) ?IndexHeader {
         if (!std.mem.eql(u8, raw[0..index_magic.len], index_magic)) return null;
         const flags = std.mem.readInt(u32, raw[52..56], .little);
-        const highest = std.mem.readInt(i64, raw[24..32], .little);
+        const highest: Time = .fromRaw(std.mem.readInt(i64, raw[24..32], .little));
         return .{
             .segment_bytes = .fromRaw(std.mem.readInt(u64, raw[8..16], .little)),
             .base_seq = .fromRaw(std.mem.readInt(u64, raw[32..40], .little)),
             .records = .fromRaw(std.mem.readInt(u64, raw[40..48], .little)),
             .times = .{
-                .lowest = std.mem.readInt(i64, raw[16..24], .little),
+                .lowest = .fromRaw(std.mem.readInt(i64, raw[16..24], .little)),
                 .highest = highest,
                 .rising = flags & index_rising != 0,
                 .last = highest,
@@ -912,14 +913,14 @@ fn wireInterval(interval: Bytes) u32 {
 const IndexEntry = struct {
     seq: Seq,
     offset: Bytes,
-    at: i64,
+    at: Time,
 
     fn bytes(entry: IndexEntry) [index_entry_len]u8 {
         aegis.assert.pre(entry.seq != values.beginning, "an index entry names a record");
         var out: [index_entry_len]u8 = undefined;
         std.mem.writeInt(u64, out[0..8], entry.seq.raw(), .little);
         std.mem.writeInt(u64, out[8..16], entry.offset.raw(), .little);
-        std.mem.writeInt(i64, out[16..24], entry.at, .little);
+        std.mem.writeInt(i64, out[16..24], entry.at.raw(), .little);
         return out;
     }
 
@@ -927,7 +928,7 @@ const IndexEntry = struct {
         return .{
             .seq = .fromRaw(std.mem.readInt(u64, raw[0..8], .little)),
             .offset = .fromRaw(std.mem.readInt(u64, raw[8..16], .little)),
-            .at = std.mem.readInt(i64, raw[16..24], .little),
+            .at = .fromRaw(std.mem.readInt(i64, raw[16..24], .little)),
         };
     }
 };
@@ -969,7 +970,7 @@ const Builder = struct {
         writer: *Io.File.Writer,
         seq: Seq,
         offset: Bytes,
-        at: i64,
+        at: Time,
     ) Io.Writer.Error!void {
         if (!builder.wants(offset)) return;
         const entry: IndexEntry = .{ .seq = seq, .offset = offset, .at = at };
@@ -987,7 +988,7 @@ const IndexSink = struct {
     builder: *Builder,
     writer: *Io.File.Writer,
 
-    fn record(sink: *IndexSink, seq: Seq, offset: Bytes, at: i64) Io.Writer.Error!void {
+    fn record(sink: *IndexSink, seq: Seq, offset: Bytes, at: Time) Io.Writer.Error!void {
         return sink.builder.record(sink.writer, seq, offset, at);
     }
 };
@@ -1466,7 +1467,7 @@ const Envelope = struct {
     /// Null when the line carries no `at`, or one that is not an integer. Such
     /// a record is one the journal above will refuse; here it only means there
     /// is no timestamp to index it by.
-    at: ?i64,
+    at: ?Time,
     /// Null when the line carries none.
     c: ?u32,
 };
@@ -1632,7 +1633,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
                     }
                 }
             } else batch = null;
-            const at: ?i64 = if (found) |envelope| envelope.at else null;
+            const at: ?Time = if (found) |envelope| envelope.at else null;
             if (at) |stamp| scanned.times.widen(stamp) else {
                 timed = false;
             }
@@ -1641,7 +1642,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
             }
             if (index) |sink| {
                 const seq = values.advance(segment.base_seq, scanned.lines) catch return error.CorruptRecord;
-                try sink.record(seq, start, at orelse 0);
+                try sink.record(seq, start, at orelse .fromRaw(0));
             }
             scanned.lines = values.plus(scanned.lines, .fromRaw(1));
             scanned.torn_final = if (torn(text, fields)) start else null;
@@ -2047,7 +2048,7 @@ fn scanStart(log: *Self, io: Io, cursor: Seq, may_write: bool) ScanError!ScanSta
 /// it is missing or stale. For the active segment, whose index is not sealed
 /// yet, a walk of the segment — bounded by `Options.max_segment_bytes`, and
 /// only when its own timestamps say a record could be in there.
-pub fn seqAtOrAfter(log: *Self, io: Io, want: i64) Self.OpenError!?Seq {
+pub fn seqAtOrAfter(log: *Self, io: Io, want: Time) Self.OpenError!?Seq {
     for (log.segments.items, 0..) |*segment, i| {
         if (segment.count() == values.no_records) continue;
         const active = i + 1 == log.segments.items.len;
@@ -2057,8 +2058,8 @@ pub fn seqAtOrAfter(log: *Self, io: Io, want: i64) Self.OpenError!?Seq {
             if (try log.provenIndex(io, i, true)) |indexed| segment.times = indexed.times;
         }
         if (segment.times.known()) {
-            if (segment.times.highest < want) continue;
-            if (segment.times.lowest >= want) return segment.base_seq;
+            if (values.below(segment.times.highest, want)) continue;
+            if (!values.below(segment.times.lowest, want)) return segment.base_seq;
             if (!active) {
                 if (try log.indexedSeqAtOrAfter(io, i, want)) |seq| return seq;
             }
@@ -2070,7 +2071,7 @@ pub fn seqAtOrAfter(log: *Self, io: Io, want: i64) Self.OpenError!?Seq {
 
 /// The first sequence number at or after `want` inside one segment, read from
 /// the timestamps in its index rather than from the segment itself.
-fn indexedSeqAtOrAfter(log: *Self, io: Io, at: usize, want: i64) OpenError!?Seq {
+fn indexedSeqAtOrAfter(log: *Self, io: Io, at: usize, want: Time) OpenError!?Seq {
     const segment = log.segments.items[at];
     const indexed = (try log.provenIndex(io, at, true)) orelse return null;
     if (indexed.entries == values.no_records) return null;
@@ -2085,7 +2086,7 @@ fn indexedSeqAtOrAfter(log: *Self, io: Io, at: usize, want: i64) OpenError!?Seq 
         while (low < high) {
             const middle = low + (high - low) / 2;
             const entry = (try log.indexEntryAt(io, file, middle)) orelse return null;
-            if (entry.at < want) {
+            if (values.below(entry.at, want)) {
                 from = entry;
                 low = middle + 1;
             } else {
@@ -2110,7 +2111,7 @@ fn indexedSeqAtOrAfter(log: *Self, io: Io, at: usize, want: i64) OpenError!?Seq 
     }
     for (0..indexed.entries.raw()) |slot| {
         const entry = (try log.indexEntryAt(io, file, slot)) orelse return null;
-        if (entry.at >= want) return entry.seq;
+        if (!values.below(entry.at, want)) return entry.seq;
     }
     return null;
 }
@@ -2123,7 +2124,7 @@ fn scannedSeqAtOrAfter(
     log: *Self,
     io: Io,
     segment: Segment,
-    want: i64,
+    want: Time,
     from_offset: Bytes,
     from_seq: Seq,
 ) OpenError!?Seq {
@@ -2133,7 +2134,7 @@ fn scannedSeqAtOrAfter(
     while (try scan.next(io)) |line| : (index = values.plus(index, .fromRaw(1))) {
         const envelope = envelopeOf(line) orelse return error.CorruptRecord;
         const at = envelope.at orelse return error.CorruptRecord;
-        if (at >= want) return values.advance(from_seq, index) catch error.CorruptRecord;
+        if (!values.below(at, want)) return values.advance(from_seq, index) catch error.CorruptRecord;
     }
     return null;
 }
@@ -2171,7 +2172,7 @@ fn assertValid(log: *const Self) void {
 /// Returns only once the bytes are in the file and — unless `Options.sync`
 /// says otherwise — on the disk. It is `stageLine` and `commit`, which is what
 /// a batch does once around many records rather than once around each.
-pub fn appendLine(log: *Self, io: Io, bytes: []const u8, at: i64, checksum: u32) Self.StageError!void {
+pub fn appendLine(log: *Self, io: Io, bytes: []const u8, at: Time, checksum: u32) Self.StageError!void {
     try log.stageLine(io, bytes, at, checksum, .may_rotate);
     try log.commit(io);
 }
@@ -2197,7 +2198,7 @@ pub fn chainTip(log: *const Self) u32 {
 /// limits that takes it: a record of an atomic batch after the first, since
 /// a batch is never split across segments, which is what lets an open find a
 /// torn one in the active segment alone.
-pub fn stageLine(log: *Self, io: Io, bytes: []const u8, at: i64, checksum: u32, rotation: Rotation) Self.StageError!void {
+pub fn stageLine(log: *Self, io: Io, bytes: []const u8, at: Time, checksum: u32, rotation: Rotation) Self.StageError!void {
     log.assertValid();
     if (log.active == null) return error.ReadOnly;
     std.debug.assert(std.mem.findScalar(u8, bytes, '\n') == null);

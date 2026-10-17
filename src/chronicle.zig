@@ -68,6 +68,14 @@ pub const Bytes = implementation.Bytes;
 /// bytes and from sequence numbers; `Records.fromRaw(n)` makes one.
 pub const Records = implementation.Records;
 
+/// When the caller said a record happened: milliseconds since the Unix epoch,
+/// on the wall clock (`std.Io.Clock.real`). chronicle never reads a clock; it
+/// stores the time it is handed and searches by it (`seqAtOrAfter`). An aegis
+/// instant, so a count of seconds or a reading of another clock cannot be
+/// passed for one; `Time.fromRaw(ms)` makes one, and
+/// `Time.fromTimestamp(std.Io.Clock.real.now(io), .down)` reads one off `std.Io`.
+pub const Time = implementation.Time;
+
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
 pub const OnTruncated = Log.OnTruncated;
@@ -555,7 +563,7 @@ pub fn Journal(comptime Event: type) type {
         /// the cancel is the caller's next cancelation point's to report.
         ///
         /// Safe to call from any task or thread.
-        pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!Seq {
+        pub fn append(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
             return State.append(self.inner(), io, at, event);
         }
 
@@ -580,7 +588,7 @@ pub fn Journal(comptime Event: type) type {
         /// Under `.on_segment` and `.never` it is `append`.
         ///
         /// Safe to call from any task or thread.
-        pub fn appendDeferred(self: *Self, io: Io, at: i64, event: Event) AppendError!Seq {
+        pub fn appendDeferred(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
             return State.appendDeferred(self.inner(), io, at, event);
         }
 
@@ -644,7 +652,7 @@ pub fn Journal(comptime Event: type) type {
         /// by a failed write — says that first.
         ///
         /// Safe to call from any task or thread.
-        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: i64, event: Event) AppendIfError!Seq {
+        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: Time, event: Event) AppendIfError!Seq {
             return State.appendIf(self.inner(), io, expected, at, event);
         }
 
@@ -826,7 +834,7 @@ pub fn Journal(comptime Event: type) type {
         /// record that has no time.
         ///
         /// Safe to call from any task or thread.
-        pub fn seqAtOrAfter(self: *Self, io: Io, at: i64) SeekError!?Seq {
+        pub fn seqAtOrAfter(self: *Self, io: Io, at: Time) SeekError!?Seq {
             return State.seqAtOrAfter(self.inner(), io, at);
         }
 

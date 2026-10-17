@@ -19,6 +19,7 @@ const values = @import("journal/values.zig");
 pub const Seq = values.Seq;
 pub const Bytes = values.Bytes;
 pub const Records = values.Records;
+pub const Time = values.Time;
 pub const beginning = values.beginning;
 
 pub const Raw = json.Raw;
@@ -207,9 +208,9 @@ pub fn Journal(comptime Event: type) type {
             /// written as a JSON integer, so `maxInt(i64)` is the last one a
             /// journal can hold; see `AppendError.SequenceExhausted`.
             seq: Seq,
-            /// Whatever the appender passed as `at`. chronicle never reads a
-            /// clock; milliseconds since the Unix epoch is the intended unit.
-            at: i64,
+            /// Whatever the appender passed as `at`: milliseconds since the
+            /// Unix epoch. chronicle never reads a clock.
+            at: Time,
             /// The schema version this record was written at. Equal to the
             /// journal's `Options.schema_version` unless it was written by an
             /// older writer and read back through `Options.migrate` or the
@@ -320,7 +321,7 @@ pub fn Journal(comptime Event: type) type {
 
         pub const Entry = struct {
             /// Stored as given; chronicle never reads a clock.
-            at: i64,
+            at: Time,
             event: Event,
         };
 
@@ -651,25 +652,25 @@ pub fn Journal(comptime Event: type) type {
         // Writing.
         //====================================================================
 
-        pub fn append(self: *Self, io: Io, at: i64, event: Event) AppendError!Seq {
+        pub fn append(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
             return self.appendOne(io, null, at, event, .now) catch |err| switch (err) {
                 error.WrongExpectedSeq => unreachable,
                 else => |e| return e,
             };
         }
 
-        pub fn appendDeferred(self: *Self, io: Io, at: i64, event: Event) AppendError!Seq {
+        pub fn appendDeferred(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
             return self.appendOne(io, null, at, event, .deferred) catch |err| switch (err) {
                 error.WrongExpectedSeq => unreachable,
                 else => |e| return e,
             };
         }
 
-        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: i64, event: Event) AppendIfError!Seq {
+        pub fn appendIf(self: *Self, io: Io, expected: Expected, at: Time, event: Event) AppendIfError!Seq {
             return self.appendOne(io, expected, at, event, .now);
         }
 
-        fn appendOne(self: *Self, io: Io, expected: ?Expected, at: i64, event: Event, durability: enum { now, deferred }) AppendIfError!Seq {
+        fn appendOne(self: *Self, io: Io, expected: ?Expected, at: Time, event: Event, durability: enum { now, deferred }) AppendIfError!Seq {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
@@ -1088,7 +1089,7 @@ pub fn Journal(comptime Event: type) type {
             return s.seq;
         }
 
-        pub fn seqAtOrAfter(self: *Self, io: Io, at: i64) SeekError!?Seq {
+        pub fn seqAtOrAfter(self: *Self, io: Io, at: Time) SeekError!?Seq {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
@@ -1646,7 +1647,7 @@ pub fn Journal(comptime Event: type) type {
             arena: ?*std.heap.ArenaAllocator,
             bytes: []const u8,
             seq: Seq,
-            at: i64,
+            at: Time,
             /// This record's checksum, which the next one links back to.
             checksum: u32,
             record: ?Record,
@@ -1690,7 +1691,7 @@ pub fn Journal(comptime Event: type) type {
         /// would produce: an `Event` whose slices point at a stack buffer is
         /// safe to append. Where nothing will, that parse would build a record
         /// and drop it unread, so it is not done.
-        fn encode(self: *Self, s: *State, seq: Seq, at: i64, back_link: u32, event: Event, batch: ?envelope.Batch) AppendError!Built {
+        fn encode(self: *Self, s: *State, seq: Seq, at: Time, back_link: u32, event: Event, batch: ?envelope.Batch) AppendError!Built {
             // A record numbered outside what a reader accepts would be durable
             // before anything noticed, so these hold in every build.
             aegis.assert.pre(seq != values.beginning, "a record is numbered from one");
@@ -1726,7 +1727,7 @@ pub fn Journal(comptime Event: type) type {
             const value_options: json.WriteOptions = .{ .limits = jsonl.limits(values.limit(self.config.max_record_bytes)) };
             var record = if (batch) |b| json.writeObjectOpen(&out.writer, LineInBatch{
                 .seq = seq.raw(),
-                .at = at,
+                .at = at.raw(),
                 .v = self.config.schema_version,
                 .p = back_link,
                 .bf = b.first.raw(),
@@ -1734,7 +1735,7 @@ pub fn Journal(comptime Event: type) type {
                 .ev = event,
             }, value_options) catch |err| return refused(&encoding, err) else json.writeObjectOpen(&out.writer, Line{
                 .seq = seq.raw(),
-                .at = at,
+                .at = at.raw(),
                 .v = self.config.schema_version,
                 .p = back_link,
                 .ev = event,
@@ -1856,7 +1857,7 @@ pub fn Journal(comptime Event: type) type {
         /// whether the event is worth parsing at all.
         const Header = struct {
             seq: Seq,
-            at: i64,
+            at: Time,
             version: u32,
             /// The checksum of the record before this one.
             p: u32,

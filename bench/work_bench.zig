@@ -47,7 +47,7 @@ fn metric(io: Io, name: []const u8, value: f64, unit: []const u8) !void {
     try out.interface.flush();
 }
 fn fill(journal: *J, io: Io, count: usize) !void {
-    const entries: [100]J.Entry = @splat(.{ .at = 1, .event = .{ .id = 1, .name = "a name" } });
+    const entries: [100]J.Entry = @splat(.{ .at = .fromRaw(1), .event = .{ .id = 1, .name = "a name" } });
     var left = count;
     while (left != 0) {
         const n = @min(left, entries.len);
@@ -106,7 +106,7 @@ fn rates(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const journal = try J.open(a, io, path, .{ .sync = .never, .tail_records = .fromRaw(4) });
     defer journal.deinit(io);
     const start = benchmarkNow(io);
-    for (0..count) |i| _ = try journal.append(io, @intCast(i), .{ .id = @intCast(i), .name = "a name" });
+    for (0..count) |i| _ = try journal.append(io, .fromRaw(@intCast(i)), .{ .id = @intCast(i), .name = "a name" });
     const writing = elapsed(io, start);
     var fold: Fold = .{};
     const read_start = benchmarkNow(io);
@@ -122,7 +122,7 @@ fn batches(io: Io, a: std.mem.Allocator, path: []const u8) !void {
     const journal = try J.open(a, io, path, .{ .sync = .always, .tail_records = .fromRaw(4) });
     defer journal.deinit(io);
     const start = benchmarkNow(io);
-    for (0..count) |i| _ = try journal.append(io, @intCast(i), .{ .id = @intCast(i), .name = "a name" });
+    for (0..count) |i| _ = try journal.append(io, .fromRaw(@intCast(i)), .{ .id = @intCast(i), .name = "a name" });
     const single = elapsed(io, start);
     const batch_start = benchmarkNow(io);
     try fill(journal, io, count);
@@ -147,7 +147,7 @@ fn largeOpen(io: Io, a: std.mem.Allocator, path: []const u8) !void {
         while (offset < count) {
             const n = @min(count - offset, entries.len);
             for (entries[0..n], 0..) |*entry, i| entry.* = .{
-                .at = @intCast(offset + i),
+                .at = .fromRaw(@intCast(offset + i)),
                 .event = .{ .created = .{ .id = @intCast(offset + i), .name = "a name of some length" } },
             };
             _ = try journal.appendAll(io, entries[0..n], .group);

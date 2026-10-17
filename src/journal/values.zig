@@ -1,7 +1,8 @@
 //! The kinds of number the journal keeps apart: where a record sits in the
-//! sequence, how many bytes a file or a buffer holds, and how many records.
+//! sequence, how many bytes a file or a buffer holds, how many records, and
+//! when a record happened.
 //!
-//! All three are aegis types, so a sequence number cannot stand where a byte
+//! All four are aegis types, so a sequence number cannot stand where a byte
 //! count is wanted and a count of records cannot be added to a count of bytes.
 //! aegis gives each its checked arithmetic, its conversions, an equality and an
 //! order. What it does not give are the relations between the kinds: a
@@ -10,7 +11,7 @@
 //! written once, here, on top of aegis's checked integers; docs/design.md says
 //! why each of the raw reads below is the one place that needs it.
 //!
-//! This file is internal. `chronicle.zig` names the three types.
+//! This file is internal. `chronicle.zig` names the four types.
 
 const std = @import("std");
 const aegis = @import("aegis");
@@ -32,6 +33,11 @@ pub const Bytes = aegis.units.Bytes(u64);
 
 /// A number of records.
 pub const Records = aegis.units.Count(Record, u64);
+
+/// When the caller said a record happened: milliseconds since the Unix epoch,
+/// on the wall clock. chronicle never reads a clock; it stores what it is
+/// handed and searches by it.
+pub const Time = aegis.units.Instant(.real, .millisecond, i64);
 
 /// `bytes` as a length in memory. A size past what the address space can hold
 /// is a size no allocation can satisfy.

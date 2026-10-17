@@ -74,15 +74,15 @@ pub fn main() !void {
     {
         const ledger = try LedgerV1.open(gpa, io, path, .{ .schema_version = 1 });
         defer ledger.deinit(io);
-        _ = try ledger.append(io, 0, .{ .account_opened = .{ .id = 1, .owner = "Ada Lovelace" } });
-        _ = try ledger.append(io, 0, .{ .deposited = .{ .id = 1, .cents = 5_000 } });
+        _ = try ledger.append(io, .fromRaw(0), .{ .account_opened = .{ .id = 1, .owner = "Ada Lovelace" } });
+        _ = try ledger.append(io, .fromRaw(0), .{ .deposited = .{ .id = 1, .cents = 5_000 } });
     }
 
     // This year's, at version 2. The old records come back as today's
     // events; the new one is written at version 2.
     const ledger = try Ledger.open(gpa, io, path, .{ .schema_version = 2, .migrate = migrate });
     defer ledger.deinit(io);
-    _ = try ledger.append(io, 0, .{ .deposited = .{ .id = 1, .cents = 700 } });
+    _ = try ledger.append(io, .fromRaw(0), .{ .deposited = .{ .id = 1, .cents = 700 } });
 
     var cents: i64 = 0;
     const batch = try ledger.copySince(gpa, io, chronicle.beginning);

@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- A record's time is `chronicle.Time`, an aegis instant on the wall clock in milliseconds since the Unix epoch, where it was a plain `i64`: `append`, `appendDeferred`, `appendIf`, `Entry.at`, `Record.at` and `seqAtOrAfter` take or give one. `Time.fromRaw(ms)` wraps a number already in that unit; `Time.fromTimestamp(std.Io.Clock.real.now(io), .down)` reads the clock. The format on disk is unchanged.
+
 ## [0.8.0] - 2026-10-14
 
 ### Breaking

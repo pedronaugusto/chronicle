@@ -18,6 +18,7 @@ const strand = jsonl.strand;
 const values = @import("values.zig");
 
 const Seq = values.Seq;
+const Time = values.Time;
 
 /// A line as it lies in a file: bytes nothing has read yet, which are a record,
 /// a segment's first line or damage until one of the readers in this file or in
@@ -61,7 +62,7 @@ pub const Head = struct {
     /// From 1 to `maxInt(i64)`, which is as far as a record's `seq` is
     /// read as an integer.
     seq: Seq,
-    at: i64,
+    at: Time,
     v: u32,
     /// The checksum of the record before this one.
     p: u32,
@@ -76,7 +77,7 @@ pub const Head = struct {
 pub const Stamp = struct {
     seq: Seq,
     /// Null when the line carries no `at`, or one that is not an integer.
-    at: ?i64,
+    at: ?Time,
 };
 
 /// A line that is not one JSON object, or that gives a member this file
@@ -112,7 +113,7 @@ pub const Fields = struct {
         return .{
             .seq = seq,
             .batch = batch,
-            .at = integerOf(i64, fields.at orelse return error.Corrupt) orelse return error.Corrupt,
+            .at = .fromRaw(integerOf(i64, fields.at orelse return error.Corrupt) orelse return error.Corrupt),
             .v = integerOf(u32, fields.v orelse return error.Corrupt) orelse return error.Corrupt,
             .p = integerOf(u32, fields.p orelse return error.Corrupt) orelse return error.Corrupt,
             .ev = fields.ev orelse return error.Corrupt,
@@ -123,7 +124,7 @@ pub const Fields = struct {
     /// number.
     pub fn stamp(fields: Fields) ?Stamp {
         const seq = seqOf(fields.seq orelse return null) orelse return null;
-        return .{ .seq = seq, .at = if (fields.at) |at| integerOf(i64, at) else null };
+        return .{ .seq = seq, .at = if (fields.at) |at| if (integerOf(i64, at)) |ms| Time.fromRaw(ms) else null else null };
     }
 
     /// The `p` the line carries: the checksum of the record before it.
@@ -211,7 +212,7 @@ test "a line in any spelling reads as the same envelope" {
     try testing.expectEqual(@as(u32, 42), fields.trailer.?.c);
     try testing.expectEqualStrings("{\"seq\":7,\"at\":-3,\"v\":2,\"p\":11,\"ev\":{\"x\":1}", fields.trailer.?.covered);
     const head = try fields.head();
-    try testing.expectEqual(Head{ .seq = .fromRaw(7), .at = -3, .v = 2, .p = 11, .ev = .{ .from = 35, .to = 42 } }, head);
+    try testing.expectEqual(Head{ .seq = .fromRaw(7), .at = .fromRaw(-3), .v = 2, .p = 11, .ev = .{ .from = 35, .to = 42 } }, head);
     try testing.expectEqualStrings("{\"x\":1}", written[head.ev.from..head.ev.to]);
 
     // Reordered, spaced and escaped, the same envelope.
@@ -225,7 +226,7 @@ test "a line in any spelling reads as the same envelope" {
     try testing.expectEqualStrings("{\"x\":1}", by_hand[other.ev.from..other.ev.to]);
     try testing.expectEqualStrings("{ \"p\" : 11, \"ev\" : {\"x\":1}, \"v\":2, \"\\u0061t\":-3, \"seq\":7 ", other_fields.trailer.?.covered);
     try testing.expectEqual(@as(?u32, 11), other_fields.backLink());
-    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(7), .at = -3 }, other_fields.stamp().?);
+    try testing.expectEqual(Stamp{ .seq = Seq.fromRaw(7), .at = .fromRaw(-3) }, other_fields.stamp().?);
 
     // An integer only when written as one, within an `i64`, and a sequence
     // number from 1.

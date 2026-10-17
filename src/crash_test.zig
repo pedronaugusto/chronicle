@@ -89,13 +89,13 @@ const Operation = struct {
         var next: u64 = 1;
         if (s.kind == .group) {
             var entries: [3]Journal.Entry = undefined;
-            for (&entries, 1..) |*entry, seq| entry.* = .{ .at = @intCast(seq), .event = event(seq) };
+            for (&entries, 1..) |*entry, seq| entry.* = .{ .at = .fromRaw(@intCast(seq)), .event = event(seq) };
             _ = try journal.appendAll(io, &entries, .group);
             next = 4;
             s.acknowledged = 3;
         }
         while (next <= appended) : (next += 1) {
-            _ = try journal.append(io, @intCast(next), event(next));
+            _ = try journal.append(io, .fromRaw(@intCast(next)), event(next));
             s.acknowledged = next;
         }
         switch (s.kind) {
@@ -152,7 +152,7 @@ const Operation = struct {
                 if (!first_ok) return error.HistoryLost;
             }
             try testing.expectEqual(@as(u32, @intCast(seq)), record.event.created.id);
-            try testing.expectEqual(@as(i64, @intCast(seq)), record.at);
+            try testing.expectEqual(@as(i64, @intCast(seq)), record.at.raw());
             expected = seq + 1;
         }
         if (last != 0 and expected != last + 1) return error.RecordsMissing;

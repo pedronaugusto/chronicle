@@ -62,12 +62,12 @@ pub fn main(init: std.process.Init) !void {
             const newest = try journal.lastSeq(io);
             const oldest = (try journal.oldestSeq(io));
             switch (random.random().uintLessThan(u8, 7)) {
-                0 => _ = try journal.append(io, @intCast(step % std.math.maxInt(i64)), .{ .ping = @intCast(step % 1000) }),
+                0 => _ = try journal.append(io, .fromRaw(@intCast(step % std.math.maxInt(i64))), .{ .ping = @intCast(step % 1000) }),
                 1 => {
                     const batch = [_]chronicle.Journal(Event).Entry{
-                        .{ .at = @intCast(step % std.math.maxInt(i64)), .event = .{ .ping = 1 } },
-                        .{ .at = @intCast(step % std.math.maxInt(i64)), .event = .{ .ping = 2 } },
-                        .{ .at = @intCast(step % std.math.maxInt(i64)), .event = .{ .ping = 3 } },
+                        .{ .at = .fromRaw(@intCast(step % std.math.maxInt(i64))), .event = .{ .ping = 1 } },
+                        .{ .at = .fromRaw(@intCast(step % std.math.maxInt(i64))), .event = .{ .ping = 2 } },
+                        .{ .at = .fromRaw(@intCast(step % std.math.maxInt(i64))), .event = .{ .ping = 3 } },
                     };
                     _ = try journal.appendAll(io, &batch, .group);
                 },
@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init) !void {
 
     var written: u64 = 0;
     while (written < appends) : (written += 1) {
-        _ = try journal.append(io, @intCast(written), .{ .ping = @intCast(written % 1000) });
+        _ = try journal.append(io, .fromRaw(@intCast(written)), .{ .ping = @intCast(written % 1000) });
         if (written + 1 == announce_after) {
             try out.interface.writeAll("appending\n");
             try out.interface.flush();

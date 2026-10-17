@@ -7,7 +7,8 @@ in `ci/invariants.md`.
 ## Three kinds of number
 
 A journal talks about where a record sits in the sequence, how many bytes
-something is, and how many records there are. All three are `u64`s on the disk
+something is, how many records there are, and when a record happened. The first
+three are `u64`s on the disk
 and in the first versions of this code were `u64`s everywhere, so a sequence
 number could stand where an offset was wanted and compile. They are
 [aegis](https://github.com/pedronaugusto/aegis) types now, declared once in
@@ -22,6 +23,11 @@ number could stand where an offset was wanted and compile. They are
   and every size in `Options`.
 - `Records` (`aegis.units.Count`): how many records, whether a segment's limit,
   a tail's, a `verify`'s result or the entries an index holds.
+- `Time` (`aegis.units.Instant(.real, .millisecond, i64)`): when the caller
+  said a record happened, milliseconds since the Unix epoch. chronicle stores
+  what it is handed and never reads a clock; the index's bisection treats the
+  times as ordered only when they are. A record's `at`, an `Entry`'s, a
+  segment's lowest and highest and `seqAtOrAfter`'s argument are all `Time`.
 
 The relations between the kinds are not in aegis: a sequence number moved by
 a count of records, the count between two sequence numbers, the sequence number a
@@ -74,9 +80,6 @@ count.
   (`indexEntryAt`, `bisectSeq`, the proof's read loop). They are bounded by the
   file's measured length, and the numbers that matter (the entry count) are
   `Records` at the boundary.
-- A timestamp, `at`. chronicle stores what it is handed and never reads a clock;
-  a caller may pass anything, and the index's bisection treats it as ordered only
-  when it is.
 - Checksums and schema versions, `u32`s. They are compared with others of their
   own kind and with nothing else.
 - Counters that exist for the tests (`index_opens`, `segment_scans`, ...), the

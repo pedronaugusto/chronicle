@@ -68,7 +68,7 @@ pub fn main() !void {
 
         try ledger.subscribe(io, balances.sink());
 
-        const now = std.Io.Clock.real.now(io).toMilliseconds();
+        const now = try chronicle.Time.fromTimestamp(std.Io.Clock.real.now(io), .down);
         _ = try ledger.append(io, now, .{ .account_opened = .{ .id = 1, .owner = "ada" } });
 
         const follower = try ledger.replayAt(io, .after(chronicle.beginning));

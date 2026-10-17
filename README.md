@@ -29,7 +29,7 @@ var last: chronicle.Seq = chronicle.beginning;
 
     try ledger.subscribe(io, balances.sink());
 
-    const now = std.Io.Clock.real.now(io).toMilliseconds();
+    const now = try chronicle.Time.fromTimestamp(std.Io.Clock.real.now(io), .down);
     _ = try ledger.append(io, now, .{ .account_opened = .{ .id = 1, .owner = "ada" } });
 
     const follower = try ledger.replayAt(io, .after(chronicle.beginning));
@@ -79,9 +79,9 @@ replays and tailers before the journal. `finish` makes the active segment durabl
 reports what failed, leaving the journal open; `deinit` releases it, writing the same as
 best it can.
 
-`append` takes the timestamp from the caller. With the default `sync = .always`, it
-syncs the record before publishing it or returning its sequence number; `appendAll`
-shares a record sync across a batch. A `.group` batch cut by a crash leaves a prefix; an
+`append` takes the time from the caller, a `chronicle.Time` (milliseconds since the
+Unix epoch). With the default `sync = .always`, it syncs the record before publishing it
+or returning its sequence number; `appendAll` shares a record sync across a batch. A `.group` batch cut by a crash leaves a prefix; an
 `.atomic` batch names its first and last records in each of its records, stays in one
 segment, and is dropped whole by an open that finds the log ending inside it. Readers
 beside the writer read an atomic batch only once it is whole. `appendIf` and

@@ -57,7 +57,7 @@ fn tail(io: Io) !void {
         // Cancellation joins the task; its error was checked by await.
         std.log.debug("task cleanup: {t}", .{err});
     };
-    for (1..appended + 1) |seq| _ = try journal.append(hooked, @intCast(seq), .{ .created = .{ .id = @intCast(seq) } });
+    for (1..appended + 1) |seq| _ = try journal.append(hooked, .fromRaw(@intCast(seq)), .{ .created = .{ .id = @intCast(seq) } });
     try reader.await(hooked);
 }
 
