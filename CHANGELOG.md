@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Development: the properties that open journals give each fuzzing input an `Io` of its own, joined at the input's end. Zig 0.17's fuzzing runner keeps one `std.testing.io` across all of a target's inputs while each input has a new `std.testing.allocator`, and a group's task is freed by the thread that ran it after the group's await returned, so a task of one input could free into the next input's allocator ("corrupted footer metadata"). The properties had replaced the runner's `std.testing.io` in place instead, which left it undefined for the runner to tear down at the end of a campaign.
+
 ## [0.9.0] - 2026-10-17
 
 ### Breaking

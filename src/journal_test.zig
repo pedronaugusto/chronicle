@@ -5039,18 +5039,15 @@ test "two hundred thousand records open and replay within bounded memory" {
 // `zig build test --fuzz` explores further.
 //========================================================================
 
-/// `std.testing.io` around one input of `zig build test --fuzz`.
-///
-/// The test runner sets it up around each test of an ordinary run, and not
-/// around the inputs a fuzzing run feeds one target: there it is never
-/// initialised, and the first task it starts -- a clean open inspects its
-/// sealed segments concurrently -- allocates through a null allocator.
-fn fuzzingIo() void {
-    if (builtin.fuzz) testing.io_instance = .init(testing.allocator, .{});
-}
-
-fn fuzzedIo() void {
-    if (builtin.fuzz) testing.io_instance.deinit();
+/// An `Io` of one input's own, whose tasks end with it. Zig's fuzzing
+/// runner keeps one `std.testing.io` for every input it feeds a target,
+/// while `std.testing.allocator` is a new one per input, and a task of a
+/// group (a clean open inspects its sealed segments that way) is freed by
+/// the thread that ran it after its group's await has returned: through
+/// the shared `Io`, past the end of the input whose allocator it came from.
+/// This one's `deinit` joins its threads before the allocator is checked.
+fn inputIo() std.Io.Threaded {
+    return .init(testing.allocator, .{});
 }
 
 /// The line that starts a segment file, in front of everything the fuzzer
@@ -5390,9 +5387,9 @@ fn fuzzOpen(_: void, c: *shakedown.Case) anyerror!void {
 }
 
 fn checkOpen(bytes: []const u8) anyerror!void {
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5466,9 +5463,9 @@ fn fuzzFraming(_: void, c: *shakedown.Case) anyerror!void {
 }
 
 fn checkFraming(head: []const u8) anyerror!void {
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5516,9 +5513,9 @@ fn fuzzIndex(_: void, c: *shakedown.Case) anyerror!void {
 }
 
 fn checkIndex(bytes: []const u8) anyerror!void {
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5559,9 +5556,9 @@ test "a sequence of calls, cut off part-way through" {
 }
 
 fn fuzzCrash(_: void, c: *shakedown.Case) anyerror!void {
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
     const helper = test_options.lock_helper;
 
     var ws = try Workspace.init("log");
@@ -5681,9 +5678,9 @@ fn fuzzCursor(_: void, c: *shakedown.Case) anyerror!void {
 }
 
 fn checkCursor(bytes: []const u8) anyerror!void {
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5743,9 +5740,9 @@ fn fuzzSnapshot(_: void, c: *shakedown.Case) anyerror!void {
 }
 
 fn checkSnapshot(bytes: []const u8) anyerror!void {
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
 
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -5872,9 +5869,9 @@ test "what is appended is what is read back, and folds the same" {
 
 fn fuzzRoundTrip(_: void, c: *shakedown.Case) anyerror!void {
     const s = c.source;
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -6021,9 +6018,9 @@ fn damageSegment(a: std.mem.Allocator, ws: *Workspace, s: *shakedown.Source, cou
 
 fn fuzzDamage(_: void, c: *shakedown.Case) anyerror!void {
     const s = c.source;
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -6159,9 +6156,9 @@ test "records checksummed and linked, but otherwise anything" {
 
 fn fuzzRecords(_: void, c: *shakedown.Case) anyerror!void {
     const s = c.source;
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
@@ -6279,9 +6276,9 @@ fn isLogName(name: []const u8) bool {
 
 fn fuzzStrayName(_: void, c: *shakedown.Case) anyerror!void {
     const s = c.source;
-    fuzzingIo();
-    defer fuzzedIo();
-    const io = testing.io;
+    var input_io = inputIo();
+    defer input_io.deinit();
+    const io = input_io.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
