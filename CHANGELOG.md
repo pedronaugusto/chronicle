@@ -9,6 +9,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Development: the suite runs under the release tier's hardened profile (`bay hardened`, `bay hardened-fuzz`, `bay hardened-tsan`), which takes the place of the `thread-sanitizer` build option and its declared ThreadSanitizer job.
+- Pins aegis 0.1.12, the version shakedown 0.4.13 takes.
+- Development: the journal properties take their `Io` from the case (shakedown 0.4.13's `Case.io`, an `Io` of each fuzzing input's own), in place of one each property made for itself.
 
 ### Fixed
 

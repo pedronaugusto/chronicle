@@ -5039,17 +5039,6 @@ test "two hundred thousand records open and replay within bounded memory" {
 // `zig build test --fuzz` explores further.
 //========================================================================
 
-/// An `Io` of one input's own, whose tasks end with it. Zig's fuzzing
-/// runner keeps one `std.testing.io` for every input it feeds a target,
-/// while `std.testing.allocator` is a new one per input, and a task of a
-/// group (a clean open inspects its sealed segments that way) is freed by
-/// the thread that ran it after its group's await has returned: through
-/// the shared `Io`, past the end of the input whose allocator it came from.
-/// This one's `deinit` joins its threads before the allocator is checked.
-fn inputIo() std.Io.Threaded {
-    return .init(testing.allocator, .{});
-}
-
 /// The line that starts a segment file, in front of everything the fuzzer
 /// generates: what is being fuzzed is the records, not whether a file with no
 /// framing on it is read (it is not; there is an example for that below).
@@ -5375,7 +5364,7 @@ test "a replay can be re-armed across segment rotations" {
 }
 
 test "open of arbitrary segment contents, and the repair it promises" {
-    for (open_examples) |bytes| try checkOpen(bytes);
+    for (open_examples) |bytes| try checkOpen(testing.io, bytes);
     try shakedown.check(testing.allocator, {}, fuzzOpen, .{ .cases = 48 });
 }
 
@@ -5383,14 +5372,10 @@ fn fuzzOpen(_: void, c: *shakedown.Case) anyerror!void {
     // Bounded so that a generated run of `[` cannot recurse the JSON parser
     // deeper than a stack holds. A journal record is not adversarial input.
     var buffer: [1024]u8 = undefined;
-    try checkOpen(gen.bytesInto(c.source, &buffer));
+    try checkOpen(c.io(), gen.bytesInto(c.source, &buffer));
 }
 
-fn checkOpen(bytes: []const u8) anyerror!void {
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
-
+fn checkOpen(io: std.Io, bytes: []const u8) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const name = try ws.segment(1);
@@ -5453,20 +5438,16 @@ const framing_examples = [_][]const u8{
 };
 
 test "a segment whose first line is arbitrary" {
-    for (framing_examples) |bytes| try checkFraming(bytes);
+    for (framing_examples) |bytes| try checkFraming(testing.io, bytes);
     try shakedown.check(testing.allocator, {}, fuzzFraming, .{ .cases = 48 });
 }
 
 fn fuzzFraming(_: void, c: *shakedown.Case) anyerror!void {
     var buffer: [256]u8 = undefined;
-    try checkFraming(gen.bytesInto(c.source, &buffer));
+    try checkFraming(c.io(), gen.bytesInto(c.source, &buffer));
 }
 
-fn checkFraming(head: []const u8) anyerror!void {
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
-
+fn checkFraming(io: std.Io, head: []const u8) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     const name = try ws.segment(1);
@@ -5503,20 +5484,16 @@ const index_examples = [_][]const u8{
 };
 
 test "an arbitrary index file is a cache, never an answer" {
-    for (index_examples) |bytes| try checkIndex(bytes);
+    for (index_examples) |bytes| try checkIndex(testing.io, bytes);
     try shakedown.check(testing.allocator, {}, fuzzIndex, .{ .cases = 48 });
 }
 
 fn fuzzIndex(_: void, c: *shakedown.Case) anyerror!void {
     var buffer: [512]u8 = undefined;
-    try checkIndex(gen.bytesInto(c.source, &buffer));
+    try checkIndex(c.io(), gen.bytesInto(c.source, &buffer));
 }
 
-fn checkIndex(bytes: []const u8) anyerror!void {
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
-
+fn checkIndex(io: std.Io, bytes: []const u8) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
@@ -5556,9 +5533,7 @@ test "a sequence of calls, cut off part-way through" {
 }
 
 fn fuzzCrash(_: void, c: *shakedown.Case) anyerror!void {
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
+    const io = c.io();
     const helper = test_options.lock_helper;
 
     var ws = try Workspace.init("log");
@@ -5668,20 +5643,16 @@ const cursor_examples = [_][]const u8{
 };
 
 test "an arbitrary cursor file names a place in the log or an error" {
-    for (cursor_examples) |bytes| try checkCursor(bytes);
+    for (cursor_examples) |bytes| try checkCursor(testing.io, bytes);
     try shakedown.check(testing.allocator, {}, fuzzCursor, .{ .cases = 48 });
 }
 
 fn fuzzCursor(_: void, c: *shakedown.Case) anyerror!void {
     var buffer: [512]u8 = undefined;
-    try checkCursor(gen.bytesInto(c.source, &buffer));
+    try checkCursor(c.io(), gen.bytesInto(c.source, &buffer));
 }
 
-fn checkCursor(bytes: []const u8) anyerror!void {
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
-
+fn checkCursor(io: std.Io, bytes: []const u8) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {
@@ -5730,20 +5701,16 @@ const snapshot_examples = [_][]const u8{
 };
 
 test "openWithSnapshot over an arbitrary snapshot file" {
-    for (snapshot_examples) |bytes| try checkSnapshot(bytes);
+    for (snapshot_examples) |bytes| try checkSnapshot(testing.io, bytes);
     try shakedown.check(testing.allocator, {}, fuzzSnapshot, .{ .cases = 48 });
 }
 
 fn fuzzSnapshot(_: void, c: *shakedown.Case) anyerror!void {
     var buffer: [1024]u8 = undefined;
-    try checkSnapshot(gen.bytesInto(c.source, &buffer));
+    try checkSnapshot(c.io(), gen.bytesInto(c.source, &buffer));
 }
 
-fn checkSnapshot(bytes: []const u8) anyerror!void {
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
-
+fn checkSnapshot(io: std.Io, bytes: []const u8) anyerror!void {
     var ws = try Workspace.init("log");
     defer ws.deinit();
     try ws.write(try ws.segment(1), a_header ++ a_record);
@@ -5869,9 +5836,7 @@ test "what is appended is what is read back, and folds the same" {
 
 fn fuzzRoundTrip(_: void, c: *shakedown.Case) anyerror!void {
     const s = c.source;
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
+    const io = c.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -6018,9 +5983,7 @@ fn damageSegment(a: std.mem.Allocator, ws: *Workspace, s: *shakedown.Source, cou
 
 fn fuzzDamage(_: void, c: *shakedown.Case) anyerror!void {
     const s = c.source;
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
+    const io = c.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
@@ -6156,9 +6119,7 @@ test "records checksummed and linked, but otherwise anything" {
 
 fn fuzzRecords(_: void, c: *shakedown.Case) anyerror!void {
     const s = c.source;
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
+    const io = c.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
 
@@ -6276,9 +6237,7 @@ fn isLogName(name: []const u8) bool {
 
 fn fuzzStrayName(_: void, c: *shakedown.Case) anyerror!void {
     const s = c.source;
-    var input_io = inputIo();
-    defer input_io.deinit();
-    const io = input_io.io();
+    const io = c.io();
     var ws = try Workspace.init("log");
     defer ws.deinit();
     {

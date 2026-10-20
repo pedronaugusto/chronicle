@@ -28,8 +28,8 @@
         },
 
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.6#2b97b877a07690ea3ac447f82f9efe660743a84a",
-            .hash = "aegis-0.1.6-rsxouvHOBwC2_K3U8Vewo9LnTYL48c57ztMYdlW72Z3r",
+            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.1.12#c42a14671d4ed29ba4d19d0d1f44953a5cc17853",
+            .hash = "aegis-0.1.12-rsxoui7_BwAB0cnMzQFpCtiy22l5DylsDwA6c7eSAu34",
         },
     },
     .paths = .{
@@ -47,8 +47,8 @@
         },
 
         .shakedown = .{
-            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.4.3#13d249434d23c0a744766b42217546863c41bc07",
-            .hash = "shakedown-0.4.3-BR8U40sSFgAW7sXQ4fi_WxDVNqJ9h4LfpjAwFKsEB-4N",
+            .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.4.13#fc2b519e0435324cd3a2b1ad76a05dbd9b5cf296",
+            .hash = "shakedown-0.4.13-BR8U442AFgAWe87wzq9vLeUZ0htWg9Z1JIHD_HkfnJUC",
         },
     },
 }
