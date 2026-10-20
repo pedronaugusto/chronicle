@@ -179,8 +179,11 @@ strand, airlock and warp fetched.
 [CI](.github/workflows/ci.yml) has three tiers. The fast tier runs the source checks and
 the Debug suite with the examples on `ubuntu-latest`. The merge tier also runs the Debug
 suite on `macos-latest` and `windows-latest`. The release tier runs Debug and ReleaseSafe
-on all three hosts, ReleaseFast on Ubuntu, ReleaseSmall compile-only, every cross target
-and ThreadSanitizer. The merge and release tiers also run the Debug suite on Ubuntu with
+on all three hosts, ReleaseFast on Ubuntu, ReleaseSmall compile-only, every cross target,
+and the hardened profile: `bay hardened` (the suite with safety on and
+`std.testing.allocator` on shakedown's quarantine), `bay hardened-fuzz` (the properties
+under Zig's fuzzer) and, on x86_64 or aarch64 Linux, `bay hardened-tsan` (the suite under
+ThreadSanitizer). The merge and release tiers also run the Debug suite on Ubuntu with
 Zig master, a job that reports and never blocks.
 
 `bay bench` builds the benchmarks in [bench/](bench/) in ReleaseFast under

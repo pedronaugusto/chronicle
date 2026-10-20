@@ -55,17 +55,6 @@ pub fn dev(b: *std.Build, tools: type) void {
     // Tests.
     //=====================================================================
 
-    // A journal is one mutex between an appender and the tasks that wait on
-    // `waitPast` or fold live through a sink, and a clean reopen inspects
-    // the segments concurrently. Whether those are free of races is a claim
-    // a race detector can check and a reader cannot:
-    // `bay test -Dthread-sanitizer`.
-    const thread_sanitizer = b.option(
-        bool,
-        "thread-sanitizer",
-        "Build the tests with ThreadSanitizer",
-    ) orelse false;
-
     // A second process is the only honest way to prove that a second writer
     // is refused, so the suite spawns one. The helper is built here and its
     // path compiled into the suite.
@@ -89,7 +78,6 @@ pub fn dev(b: *std.Build, tools: type) void {
             .root_source_file = p.path("src/tests.zig"),
             .target = target,
             .optimize = optimize,
-            .sanitize_thread = if (thread_sanitizer) true else null,
             .imports = &.{
                 .{ .name = "aegis", .module = aegis },
                 .{ .name = "warp", .module = warp },
@@ -156,6 +144,13 @@ pub fn dev(b: *std.Build, tools: type) void {
     // runs each once with `--smoke`.
     preflight.addCi(b, p, .{
         .tests = test_step,
+        // The release tier fuzzes the properties and runs the suite under
+        // ThreadSanitizer. A journal is one mutex between an appender and
+        // the tasks that wait on `waitPast` or fold live through a sink, and
+        // a clean reopen inspects the segments concurrently: whether those
+        // are free of races is a claim a race detector checks and a reader
+        // cannot (`bay hardened-tsan` on Linux).
+        .hardened = .{ .fuzz_step = "test", .tsan_step = "test" },
         .bench = .{
             .programs = &.{
                 .{ .name = "chronicle-bench", .source = "bench/chronicle_bench.zig" },

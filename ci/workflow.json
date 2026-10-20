@@ -21,12 +21,5 @@
     }
   ],
   "compile_once": false,
-  "jobs": [
-    {
-      "name": "ThreadSanitizer (Linux)",
-      "step": "test",
-      "args": ["-Dthread-sanitizer=true", "-Doptimize=debug", "-Dci-lint=false"],
-      "tiers": ["release"]
-    }
-  ]
+  "hardened": true
 }
