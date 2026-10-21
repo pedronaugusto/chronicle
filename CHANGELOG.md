@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-21
+
 ### Fixed
 
 - An open that is refused leaves the journal's files as it found them, as `.on_truncated = .fail` promises. A segment the log opened but the journal then refused (a record that does not parse, a snapshot that cannot be read) was closed as a writer closes it, which cut the space a writer had reserved: its zeros were gone from a file the open said it had not touched. A refused open now lets go of the log without writing (`Log.abandon`). Found by the open property in the 2026-10-21 nightly (a header, an empty line and one zero).
