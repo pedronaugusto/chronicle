@@ -5057,6 +5057,8 @@ const open_examples = [_][]const u8{
     "",
     "\n",
     "\n\n",
+    // An empty line, then a reservation's zero: refused, and left as found.
+    "\n\x00",
     "{",
     a_record,
     a_record ++ a_second_record,

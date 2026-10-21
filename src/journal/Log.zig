@@ -3360,6 +3360,14 @@ pub fn deinit(log: *Self, io: Io) void {
     log.* = undefined;
 }
 
+/// Lets go of a log whose open its caller refused, as it was found: nothing
+/// written, the space a writer reserved kept, the index not sealed. A refused
+/// open must leave the files as it found them, and `deinit` is a writer's
+/// close, which trims the reservation.
+pub fn abandon(log: *Self, io: Io) void {
+    log.release(io);
+}
+
 fn release(log: *Self, io: Io) void {
     if (log.active) |active| {
         active.file.close(io);

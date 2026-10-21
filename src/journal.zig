@@ -585,9 +585,10 @@ pub fn Journal(comptime Event: type) type {
                 .changed = .initLimit(std.math.maxInt(usize)),
             };
             errdefer {
-                // No other task has the journal yet.
+                // No other task has the journal yet, and a refused open leaves
+                // the log as it found it.
                 const s = self.state.teardown();
-                s.log.deinit(io);
+                s.log.abandon(io);
                 self.release(s);
             }
             {
@@ -607,7 +608,7 @@ pub fn Journal(comptime Event: type) type {
             options: Options,
         ) OpenWithSnapshotError!Opened {
             const self = try open(gpa, io, path, options);
-            errdefer self.deinit(io);
+            errdefer self.abandon(io);
             const found = snapshot_read: {
                 var guard = try self.state.acquire(io);
                 defer guard.deinit(io);
@@ -638,6 +639,21 @@ pub fn Journal(comptime Event: type) type {
             }
             const s = guard.value();
             s.log.deinit(io);
+            self.release(s);
+        }
+
+        /// `deinit` for a journal whose open its caller refused: the log let
+        /// go as it was found (`Log.abandon`).
+        fn abandon(self: *Self, io: Io) void {
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            var guard = self.state.acquireUncancelable(io);
+            defer {
+                guard.deinit(io);
+                self.gpa.destroy(self);
+            }
+            const s = guard.value();
+            s.log.abandon(io);
             self.release(s);
         }
 
