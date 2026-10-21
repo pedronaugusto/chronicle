@@ -11,8 +11,6 @@ const strand = @import("journal/jsonl.zig").strand;
 const json = strand.json;
 const envelope = @import("journal/envelope.zig");
 const values = @import("journal/values.zig");
-const Head = envelope.Head;
-const Stamp = envelope.Stamp;
 const read = envelope.read;
 
 /// A line built from the pieces an envelope is made of, in any order and
