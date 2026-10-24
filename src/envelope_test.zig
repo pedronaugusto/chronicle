@@ -59,7 +59,7 @@ fn checkEnvelope(line: []const u8) !void {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const any: json.ParseOptions = .{ .reject_duplicates = false };
+    const any: json.ParseOptions = .{ .duplicates = null };
     const fields = read({}, line);
     const parsed = json.parseLeaky(json.Value, a, line, any) catch {
         try testing.expectError(error.NotRecord, fields);

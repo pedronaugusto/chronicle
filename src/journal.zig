@@ -544,7 +544,7 @@ pub fn Journal(comptime Event: type) type {
         /// that writes a member it does not read back would not come back
         /// as the event that was appended.
         fn eventParse(line_bytes: usize) json.ParseOptions {
-            return .{ .limits = jsonl.limits(line_bytes) };
+            return .{ .limits = .sized(line_bytes) };
         }
 
         const unknown_arm: ?UnknownArm = blk: {
@@ -892,7 +892,7 @@ pub fn Journal(comptime Event: type) type {
                 const record = owned.record;
                 copy.* = record;
                 copy.bytes = try a.dupe(u8, record.bytes);
-                copy.event = strand.core.cloneLeaky(a, record.event, jsonl.limits(record.bytes.len)) catch |err| switch (err) {
+                copy.event = strand.core.cloneLeaky(a, record.event, .sized(record.bytes.len)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
                     // The event was read from these bytes under these bounds,
                     // so a copy of it fits them.
@@ -1490,7 +1490,7 @@ pub fn Journal(comptime Event: type) type {
                 error.StreamTooLong => return error.StreamTooLong,
                 else => return error.MalformedDocument,
             };
-            const how: json.ParseOptions = .{ .ignore_unknown_fields = true, .limits = jsonl.limits(limit) };
+            const how: json.ParseOptions = .{ .ignore_unknown_fields = true, .limits = .sized(limit) };
             const Versioned = struct { fmt: u32 };
             const version = json.parseLeaky(Versioned, arena, bytes, how) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1569,7 +1569,7 @@ pub fn Journal(comptime Event: type) type {
 
             var document: std.Io.Writer.Allocating = .init(self.gpa);
             defer document.deinit();
-            json.write(&document.writer, SnapshotDocument{ .fmt = document_format, .seq = s.seq.raw(), .state = b64 }, .{ .limits = jsonl.limits(largest) }) catch |err| switch (err) {
+            json.write(&document.writer, SnapshotDocument{ .fmt = document_format, .seq = s.seq.raw(), .state = b64 }, .{ .limits = .sized(largest) }) catch |err| switch (err) {
                 error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
                 // Base64 is text, and the document was measured against
                 // `largest` above.
@@ -1765,7 +1765,7 @@ pub fn Journal(comptime Event: type) type {
             }
             // The record is `Line` written by strand, null optionals
             // included, left open: the checksum is its last member.
-            const value_options: json.WriteOptions = .{ .limits = jsonl.limits(values.limit(self.config.max_record_bytes)) };
+            const value_options: json.WriteOptions = .{ .limits = .sized(values.limit(self.config.max_record_bytes)) };
             var record = if (batch) |b| json.writeObjectOpen(&out.writer, LineInBatch{
                 .seq = seq.raw(),
                 .at = at.raw(),
