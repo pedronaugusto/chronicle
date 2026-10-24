@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A backup returns what stops the filesystem's copy of a file instead of copying the bytes around it: the copy falls back to bytes only where the platform cannot share extents (`EXDEV`, `EOPNOTSUPP`, `ENOSYS`, `EINVAL`), and a full disk, an I/O error, a refused permission or a cancel is the backup's error, where before any of them was a byte copy, or a success over a destination file it could not remove (whose removal error went to a debug log).
+
 ## [0.9.3] - 2026-10-24
 
 ### Fixed

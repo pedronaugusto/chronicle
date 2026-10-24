@@ -3250,19 +3250,21 @@ fn copyFile(log: *Self, io: Io, copies: *Copies, name: [:0]const u8, bytes: ?Byt
     // is bytes that will never change again, and sharing their extents makes
     // a backup of a year of them the size of a directory entry. The clone is
     // made durable with the copies, as a copy would be.
-    if (bytes == null and clone.available) {
+    if (bytes == null and clone.available) cloned: {
         dest.deleteFile(io, name) catch |err| switch (err) {
             error.FileNotFound => {}, // A new destination needs no removal.
-            else => {
-                // Cloning is optional; the ordinary copy path reports any destination failure.
-                std.log.debug("clone destination cleanup: {t}", .{err});
-            },
+            else => |e| return e,
         };
-        if (clone.whole(io, log.dir, dest, name)) {
-            log.clones += 1;
-            try copies.addClone(io, name);
-            return true;
-        }
+        clone.whole(io, log.dir, dest, name) catch |err| switch (err) {
+            // This platform or this pair of directories shares no extents.
+            error.Unsupported => break :cloned,
+            error.FileNotFound => return false,
+            error.ShortSource => unreachable, // unreachable: a whole copy asks for the length it measured
+            else => |e| return e,
+        };
+        log.clones += 1;
+        try copies.addClone(io, name);
+        return true;
     }
 
     const from = log.dir.openFile(io, name, .{}) catch |err| switch (err) {
@@ -3279,7 +3281,12 @@ fn copyFile(log: *Self, io: Io, copies: *Copies, name: [:0]const u8, bytes: ?Byt
     // A prefix of a file -- the newest segment, up to its last whole record
     // -- can still go through the filesystem where the platform takes a
     // length.
-    if (!clone.range(to, from, length.raw())) {
+    if (clone.range(to, from, length.raw())) |_| {} else |err| {
+        switch (err) {
+            error.Unsupported => {},
+            error.ShortSource => return error.TruncatedRecord,
+            else => |e| return e,
+        }
         const chunk = try log.allocateReadBuffer();
         defer log.gpa.free(chunk);
 
