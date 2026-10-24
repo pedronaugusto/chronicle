@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-24
+
 ### Fixed
 
 - A refused open writes none of the repairs it found. A writer's open cut the zeros a crash left after a sealed segment's records, and removed the segments an interrupted rotation or compaction left behind, as it came to them, before the rest of the log was read: an open that then refused the log (a gap in the sequence, damage further on, a record the journal could not read) had already changed it, though `.on_truncated = .fail` promises the files as found. The log now notes those repairs and makes them once the journal has accepted it (`Log.settle`); a refused open drops them. Found by the damage property in the 2026-10-23 nightly (a sealed segment's zeros, then a segment that does not follow it).
@@ -740,7 +742,8 @@ back.
 - Fuzz tests over arbitrary journal and snapshot file contents, because the
   file shapes this package exists to survive are the ones nobody chose.
 
-[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.7.6...HEAD
+[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/pedronaugusto/chronicle/compare/v0.7.6...v0.9.3
 [0.7.6]: https://github.com/pedronaugusto/chronicle/compare/v0.7.3...v0.7.6
 [0.7.3]: https://github.com/pedronaugusto/chronicle/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/pedronaugusto/chronicle/compare/v0.7.1...v0.7.2
