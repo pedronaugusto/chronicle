@@ -554,6 +554,16 @@ pub fn Journal(comptime Event: type) type {
         //====================================================================
 
         pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!*Self {
+            const self = try openUnsettled(gpa, io, path, options);
+            errdefer self.abandon(io);
+            try self.settle(io);
+            return self;
+        }
+
+        /// `open` up to the repairs the log found (`Log.settle`): a caller
+        /// that may still refuse the journal settles once it has accepted it,
+        /// and `abandon` leaves the files as they were found.
+        fn openUnsettled(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
             const log = try Log.open(gpa, io, path, .{
@@ -607,7 +617,7 @@ pub fn Journal(comptime Event: type) type {
             path: []const u8,
             options: Options,
         ) OpenWithSnapshotError!Opened {
-            const self = try open(gpa, io, path, options);
+            const self = try openUnsettled(gpa, io, path, options);
             errdefer self.abandon(io);
             const found = snapshot_read: {
                 var guard = try self.state.acquire(io);
@@ -615,7 +625,14 @@ pub fn Journal(comptime Event: type) type {
                 const s = guard.value();
                 break :snapshot_read try self.readSnapshot(s, io);
             };
+            try self.settle(io);
             return .{ .journal = self, .snapshot = found };
+        }
+
+        fn settle(self: *Self, io: Io) OpenError!void {
+            var guard = try self.state.acquire(io);
+            defer guard.deinit(io);
+            try guard.value().log.settle(io);
         }
 
         pub fn finish(self: *Self, io: Io) FinishError!void {

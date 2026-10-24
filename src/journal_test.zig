@@ -1346,6 +1346,45 @@ test "space a writer reserved and never filled is not a record it did not finish
     try testing.expectEqual(Bytes.fromRaw(0), (try reopened.status(io)).dropped_bytes);
 }
 
+test "an open refused after a repair it found writes none of it, and an accepted one writes it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // Three segments of two records, and the oldest with the zeros a crash
+    // left after its records: a repair a writer's open makes.
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(2, 2));
+        defer journal.deinit(io);
+        for (1..7) |i| _ = try journal.append(io, .fromRaw(@intCast(i)), created(@intCast(i), "n"));
+    }
+    const records = try ws.read(try ws.segment(1));
+    const crashed = try testing.allocator.alloc(u8, records.len + 64);
+    defer testing.allocator.free(crashed);
+    @memcpy(crashed[0..records.len], records);
+    @memset(crashed[records.len..], 0);
+    try ws.write(try ws.segment(1), crashed);
+
+    // The middle segment gone: a gap, which every open refuses, found after
+    // the zeros. Neither way of opening cuts them.
+    const middle = try ws.read(try ws.segment(3));
+    try ws.root.deleteFile(io, try ws.segment(3));
+    for ([_]chronicle.OnTruncated{ .fail, .drop }) |on_truncated| {
+        try testing.expectError(error.DiscontinuousSeq, Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = on_truncated, .sync = .never }));
+        try testing.expectEqualStrings(crashed, try ws.read(try ws.segment(1)));
+    }
+
+    // With the gap closed the open is accepted, and the zeros go.
+    try ws.write(try ws.segment(3), middle);
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{ .on_truncated = .fail, .sync = .never });
+        defer journal.deinit(io);
+        try testing.expectEqual(Seq.fromRaw(6), try journal.lastSeq(io));
+        try testing.expectEqual(@as(u64, 6), (try journal.verify(io)).raw());
+    }
+    try testing.expectEqualStrings(records, try ws.read(try ws.segment(1)));
+}
+
 test "a reader stops at a live writer's oversized zero reservation" {
     const io = testing.io;
     var ws = try Workspace.init("log");

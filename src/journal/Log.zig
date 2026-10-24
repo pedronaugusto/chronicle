@@ -405,6 +405,20 @@ flushed: ?Flush,
 /// that seeks repeatedly stays in one segment for as long as it is reading
 /// it, so one handle is the whole of the win and a cache is not needed.
 held_index: ?HeldIndex,
+/// What `load` found to repair and has not written yet: the zeros a crash
+/// left in a sealed segment, the segments an interrupted rotation or
+/// compaction left behind. A refused open must leave the files as it found
+/// them, and what refuses it may come after `load` (a later segment, the
+/// journal's own reading), so the repairs wait for `settle`.
+pending: std.ArrayList(Repair),
+
+/// A change to the files that `load` decided on, written by `settle`.
+const Repair = union(enum) {
+    /// Cut a sealed segment back to its last record, and drop its index.
+    trim: struct { base_seq: Seq, bytes: Bytes },
+    /// Unlink a segment's files, durably, before the next is removed.
+    drop: Seq,
+};
 
 /// The two open files that make up the newest segment.
 const Active = struct {
@@ -468,7 +482,8 @@ fn parseNumberedName(name: []const u8, extension: []const u8) ?Seq {
 /// This reads the whole of the active segment — to rebuild its index, to find
 /// the last sequence number and to repair a torn tail — and one line of each
 /// sealed segment. The cost is one segment plus one read per segment, never
-/// the size of the log.
+/// the size of the log. The other repairs it finds are left for `settle`,
+/// which the caller runs once it has accepted the log, and `abandon` drops.
 pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Self.OpenError!Self {
     _ = aegis.int.cast(u32, options.index_interval_bytes.raw()) catch return error.IndexIntervalTooLarge;
     const owned_path = try gpa.dupe(u8, path);
@@ -519,11 +534,13 @@ pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) Self.Ope
         .clones = 0,
         .flushed = null,
         .held_index = null,
+        .pending = .empty,
     };
     errdefer {
         log.closeActive(io);
         log.releaseIndex(io);
         log.segments.deinit(gpa);
+        log.pending.deinit(gpa);
     }
     try log.load(io);
     log.assertValid();
@@ -551,7 +568,40 @@ fn openDir(io: Io, path: []const u8, options: Options) OpenError!Io.Dir {
 /// directory handle and the lock. A `.read` log picks up what the writer has
 /// added since; a `.write` one picks up what its own `compact` rearranged.
 pub fn reload(log: *Self, io: Io) Self.OpenError!void {
-    return log.load(io);
+    try log.load(io);
+    try log.settle(io);
+}
+
+/// Write the repairs `load` found (`pending`), in the order it found them.
+/// A trim is for a sealed segment the log still holds: one an interrupted
+/// rotation's removal left newest is the active segment now, and its zeros
+/// are its writer's reservation.
+pub fn settle(log: *Self, io: Io) Self.OpenError!void {
+    defer log.pending.clearRetainingCapacity();
+    for (log.pending.items) |repair| switch (repair) {
+        .trim => |trim| {
+            const at = log.segmentIndex(trim.base_seq) orelse continue;
+            if (at + 1 == log.segments.items.len) continue;
+            const file = try log.dir.createFile(io, &segmentName(segment_extension, trim.base_seq), .{ .truncate = false });
+            defer file.close(io);
+            try file.setLength(io, trim.bytes.raw());
+            if (log.options.sync != .never) _ = try syncFile(io, file, .full);
+            log.dir.deleteFile(io, &segmentName(index_extension, trim.base_seq)) catch |err| {
+                // The index is a rebuildable cache; record durability is handled separately.
+                std.log.debug("optional index maintenance: {t}", .{err});
+            };
+            try log.syncDir(io);
+            // Its index is gone with the zeros: the next lookup builds one.
+            log.segments.items[at].index = .unchecked;
+        },
+        .drop => |base_seq| try log.dropSegment(io, base_seq),
+    };
+}
+
+/// Where the segment named for `base_seq` is in `segments`, if the log holds it.
+fn segmentIndex(log: *const Self, base_seq: Seq) ?usize {
+    for (log.segments.items, 0..) |segment, i| if (segment.base_seq == base_seq) return i;
+    return null;
 }
 
 /// Close the active segment, forget every segment, and read the directory
@@ -561,6 +611,8 @@ fn load(log: *Self, io: Io) OpenError!void {
     log.closeActive(io);
     log.releaseIndex(io);
     log.segments.clearRetainingCapacity();
+    // What an earlier load found and nobody settled is found again.
+    log.pending.clearRetainingCapacity();
     try log.listSegments(io);
 
     if (log.segments.items.len == 0) {
@@ -720,10 +772,7 @@ fn resolveOverlaps(log: *Self, io: Io) OpenError!void {
                     // The name was created but its header was not published.
                     // Treat the rotation or empty compaction as not having
                     // happened; the preceding segment is still authoritative.
-                    if (log.options.access == .write) {
-                        try log.deleteSegmentFiles(io, later.base_seq);
-                        try log.syncDir(io);
-                    }
+                    if (log.options.access == .write) try log.pending.append(log.gpa, .{ .drop = later.base_seq });
                     _ = log.segments.orderedRemove(i + 1);
                     continue;
                 }
@@ -732,7 +781,7 @@ fn resolveOverlaps(log: *Self, io: Io) OpenError!void {
                 const previous = try log.lastChecksum(io, earlier, earlier_head.root);
                 if (later_head.root != previous) {
                     if (log.options.access == .write) {
-                        for (log.segments.items[0 .. i + 1]) |segment| try log.dropSegment(io, segment.base_seq);
+                        for (log.segments.items[0 .. i + 1]) |segment| try log.pending.append(log.gpa, .{ .drop = segment.base_seq });
                     }
                     var remove = i + 1;
                     while (remove != 0) : (remove -= 1) _ = log.segments.orderedRemove(0);
@@ -746,7 +795,7 @@ fn resolveOverlaps(log: *Self, io: Io) OpenError!void {
         if (earlier.last_seq.compare(later.base_seq) == .lt) return error.DiscontinuousSeq;
         if (try log.lastSeqOf(io, later) != earlier.last_seq) return error.DiscontinuousSeq;
         if (log.options.access == .write) {
-            for (log.segments.items[0 .. i + 1]) |segment| try log.dropSegment(io, segment.base_seq);
+            for (log.segments.items[0 .. i + 1]) |segment| try log.pending.append(log.gpa, .{ .drop = segment.base_seq });
         }
         var remove = i + 1;
         while (remove != 0) : (remove -= 1) _ = log.segments.orderedRemove(0);
@@ -797,16 +846,11 @@ fn describeSealed(log: *Self, io: Io, segment: *Segment) OpenError!void {
         const scanned = try log.scanSegment(io, segment.*, null);
         if (scanned.partial_bytes != values.no_bytes) return error.TruncatedRecord;
         if (log.options.access == .write) {
-            const repair_file = try log.dir.createFile(io, &segmentName(segment_extension, segment.base_seq), .{ .truncate = false });
-            defer repair_file.close(io);
-            try repair_file.setLength(io, scanned.complete_bytes.raw());
-            if (log.options.sync != .never) _ = try syncFile(io, repair_file, .full);
-            log.dir.deleteFile(io, &segmentName(index_extension, segment.base_seq)) catch |err| {
-                // The index is a rebuildable cache; record durability is handled separately.
-                std.log.debug("optional index maintenance: {t}", .{err});
-            };
-            try log.syncDir(io);
+            try log.pending.append(log.gpa, .{ .trim = .{ .base_seq = segment.base_seq, .bytes = scanned.complete_bytes } });
         }
+        // The index on disk is the one the segment had while active, and
+        // goes with the zeros.
+        segment.index = .none;
         segment.bytes = scanned.complete_bytes;
         segment.header_bytes = scanned.header_bytes;
         segment.last_seq = values.lastOf(segment.base_seq, scanned.lines) orelse return error.CorruptRecord;
@@ -2836,6 +2880,7 @@ pub fn truncateAfter(log: *Self, io: Io, seq: Seq) Self.TruncateError!void {
         try log.syncDir(io);
     }
     try log.load(io);
+    try log.settle(io);
 }
 
 /// The byte offset inside `segment` at which the record after `seq` begins,
@@ -2901,6 +2946,7 @@ pub fn compact(log: *Self, io: Io, keep_after_seq: Seq) Self.CompactError!void {
         try log.dropSegment(io, segment.base_seq);
     }
     try log.load(io);
+    try log.settle(io);
 }
 
 /// Copy the records of `segment` from `keep_from` onward into a new segment
@@ -3361,9 +3407,10 @@ pub fn deinit(log: *Self, io: Io) void {
 }
 
 /// Lets go of a log whose open its caller refused, as it was found: nothing
-/// written, the space a writer reserved kept, the index not sealed. A refused
-/// open must leave the files as it found them, and `deinit` is a writer's
-/// close, which trims the reservation.
+/// written, the space a writer reserved kept, the index not sealed, the
+/// repairs `load` found (`pending`) not made. A refused open must leave the
+/// files as it found them, and `deinit` is a writer's close, which trims the
+/// reservation.
 pub fn abandon(log: *Self, io: Io) void {
     log.release(io);
 }
@@ -3377,6 +3424,7 @@ fn release(log: *Self, io: Io) void {
     log.releaseIndex(io);
     if (log.lock_file) |file| file.close(io);
     log.segments.deinit(log.gpa);
+    log.pending.deinit(log.gpa);
     log.dir.close(io);
     log.gpa.free(log.write_buf);
     log.gpa.free(log.index_buf);
