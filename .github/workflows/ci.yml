@@ -12,10 +12,6 @@ on:
         type: choice
         options: [fast, merge, release]
         default: fast
-      land:
-        description: Fast-forward main to this commit when the merge tier passes
-        type: boolean
-        default: true
       status-only:
         description: Verify the recorded merge or release tier for this exact commit
         type: boolean
@@ -54,14 +50,3 @@ jobs:
         {"include":[]}
       windows-git-latest: false
       compile-once: false
-  land:
-    needs: gate
-    if: github.event_name == 'workflow_dispatch' && inputs.land && inputs.tier == 'merge' && needs.gate.result == 'success'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    steps:
-      - uses: pedronaugusto/preflight/.github/actions/land@5518e92aa5a1e587392477dc4b6e08296562f5ee
-        with:
-          version: ${{ needs.gate.outputs.version }}
