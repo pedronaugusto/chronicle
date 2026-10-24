@@ -10,4 +10,5 @@ test {
     _ = @import("explore_test.zig");
     _ = @import("journal/envelope.zig");
     _ = @import("envelope_test.zig");
+    _ = @import("testing/runtime_test.zig");
 }

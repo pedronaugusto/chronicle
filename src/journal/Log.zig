@@ -182,13 +182,13 @@ pub const flush: Flush = airlock.Reached.expected(.full);
 /// thread, as `Io.File.sync` does. An interrupted call is made again; a
 /// failure is reported, never answered with a weaker call. A filesystem that
 /// declines the call gets the strongest one it takes, and the answer says so.
-fn syncFile(io: Io, file: Io.File, level: airlock.Level) Io.File.SyncError!Flush {
-    return airlock.syncFile(io, file, .{ .level = level });
+fn syncFile(io: Io, blocking: ?airlock.Blocking, file: Io.File, level: airlock.Level) Io.File.SyncError!Flush {
+    return airlock.syncFile(io, file, .{ .level = level, .blocking = blocking });
 }
 
 /// `syncFile` for the active segment, noting what its records reached.
 fn syncActiveFile(log: *Self, io: Io, level: airlock.Level) Io.File.SyncError!void {
-    log.flushed = try syncFile(io, log.active.?.file, level);
+    log.flushed = try syncFile(io, log.options.blocking, log.active.?.file, level);
 }
 
 /// Whether this process may write to the log.
@@ -306,6 +306,9 @@ const IndexState = union(enum) {
     good: Indexed,
 };
 
+/// airlock's executor for raw syncs, which `Options.blocking` names.
+pub const Blocking = airlock.Blocking;
+
 /// How a log is opened. `Journal.Options` forwards these.
 pub const Options = struct {
     access: Access = .write,
@@ -318,6 +321,7 @@ pub const Options = struct {
     preallocate_bytes: Bytes = .fromRaw(0),
     index_interval_bytes: Bytes = .fromRaw(4096),
     max_record_bytes: Bytes = .fromRaw(1024 * 1024),
+    blocking: ?airlock.Blocking = null,
 };
 
 pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
@@ -557,7 +561,7 @@ fn openDir(io: Io, path: []const u8, options: Options) OpenError!Io.Dir {
         error.FileNotFound => {
             if (options.access == .read) return error.FileNotFound;
             const level: airlock.Level = if (options.sync == .never) .none else .full;
-            _ = try airlock.makePath(io, cwd, path, .{ .sync = .{ .level = level } });
+            _ = try airlock.makePath(io, cwd, path, .{ .sync = .{ .level = level, .blocking = options.blocking } });
             return cwd.openDir(io, path, .{ .iterate = true });
         },
         else => |e| return e,
@@ -585,7 +589,7 @@ pub fn settle(log: *Self, io: Io) Self.OpenError!void {
             const file = try log.dir.createFile(io, &segmentName(segment_extension, trim.base_seq), .{ .truncate = false });
             defer file.close(io);
             try file.setLength(io, trim.bytes.raw());
-            if (log.options.sync != .never) _ = try syncFile(io, file, .full);
+            if (log.options.sync != .never) _ = try syncFile(io, log.options.blocking, file, .full);
             log.dir.deleteFile(io, &segmentName(index_extension, trim.base_seq)) catch |err| {
                 // The index is a rebuildable cache; record durability is handled separately.
                 std.log.debug("optional index maintenance: {t}", .{err});
@@ -1302,7 +1306,7 @@ fn rebuildIndex(log: *Self, io: Io, segment: Segment) OpenError!void {
         .times = scanned.times,
         .interval = builder.interval,
         .entries_checksum = builder.checksum.final(),
-    }, log.options.sync);
+    }, log.options.sync, log.options.blocking);
     log.releaseIndex(io);
 }
 
@@ -1323,12 +1327,12 @@ fn placeholderHeader(base_seq: Seq, interval: Bytes) [index_header_len]u8 {
 /// Stamp a finished index with everything that proves it and make it durable,
 /// which is what turns it from a cache being filled into one a later process
 /// may take.
-fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync) SealError!void {
+fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync, blocking: ?airlock.Blocking) SealError!void {
     try file.writePositionalAll(io, &header.bytes(), 0);
     // Under `.never` the log itself is not asked to reach the drive, and a
     // seal that outlives its segment is one the next open checks against the
     // segment and rebuilds; so the index is held to the log's own level.
-    if (sync != .never) _ = try syncFile(io, file, .full);
+    if (sync != .never) _ = try syncFile(io, blocking, file, .full);
 }
 
 /// The active segment's index, reopened for appending, when the one on the
@@ -2406,7 +2410,7 @@ fn rotate(log: *Self, io: Io) StageError!void {
             .times = segment.times,
             .interval = active.builder.interval,
             .entries_checksum = active.builder.checksum.final(),
-        }, log.options.sync);
+        }, log.options.sync, log.options.blocking);
     }
     log.closeActive(io);
 
@@ -2443,7 +2447,7 @@ fn startSegment(log: *Self, io: Io, base_seq: Seq, root: u32) AppendError!Starte
     try writer.interface.writeByte('\n');
     try writer.interface.flush();
     if (log.options.sync != .never) {
-        _ = try syncFile(io, file, .full);
+        _ = try syncFile(io, log.options.blocking, file, .full);
         try log.syncDir(io);
     }
     const header_bytes: Bytes = .fromRaw(writer.pos);
@@ -2609,7 +2613,7 @@ fn resumeActive(log: *Self, io: Io, segment: *Segment) OpenError!?Active {
         // way. The segment, as it then is, is read again.
         const dropped = values.plus(values.minus(scanned.complete_bytes, start), scanned.partial_bytes);
         try file.setLength(io, start.raw());
-        if (log.options.sync != .never) _ = try syncFile(io, file, .full);
+        if (log.options.sync != .never) _ = try syncFile(io, log.options.blocking, file, .full);
         segment.bytes = start;
         file.close(io);
         index_file.close(io);
@@ -2633,7 +2637,7 @@ fn resumeActive(log: *Self, io: Io, segment: *Segment) OpenError!?Active {
                 // The index just built names records of the batch that was
                 // dropped: the segment, as it now is, is read again for one
                 // that does not. Once, after a crash inside a batch.
-                if (log.options.sync != .never) _ = try syncFile(io, file, .full);
+                if (log.options.sync != .never) _ = try syncFile(io, log.options.blocking, file, .full);
                 segment.bytes = scanned.complete_bytes;
                 const dropped = log.dropped_bytes;
                 file.close(io);
@@ -2782,11 +2786,11 @@ fn closeActive(log: *Self, io: Io) void {
 /// or removed is still named that way after a power cut: airlock's `syncDir`,
 /// on Windows as everywhere else.
 pub fn syncDir(log: *Self, io: Io) Self.SyncDirError!void {
-    return syncDirHandle(io, log.dir);
+    return syncDirHandle(io, log.options.blocking, log.dir);
 }
 
-fn syncDirHandle(io: Io, dir: Io.Dir) SyncDirError!void {
-    _ = try airlock.syncDir(io, dir, .{ .level = .full });
+fn syncDirHandle(io: Io, blocking: ?airlock.Blocking, dir: Io.Dir) SyncDirError!void {
+    _ = try airlock.syncDir(io, dir, .{ .level = .full, .blocking = blocking });
 }
 
 /// Unlink a segment's files and make the unlink durable before anything
@@ -2870,7 +2874,7 @@ pub fn truncateAfter(log: *Self, io: Io, seq: Seq) Self.TruncateError!void {
         const file = try log.dir.createFile(io, &segmentName(segment_extension, holder.base_seq), .{ .truncate = false });
         defer file.close(io);
         try file.setLength(io, offset.raw());
-        if (log.options.sync != .never) _ = try syncFile(io, file, .full);
+        if (log.options.sync != .never) _ = try syncFile(io, log.options.blocking, file, .full);
         // The index describes bytes that are no longer there. Removing it is
         // cheaper than leaving one the next open has to reject and rebuild.
         log.dir.deleteFile(io, &segmentName(index_extension, holder.base_seq)) catch |err| {
@@ -2997,7 +3001,7 @@ fn rewriteSegment(log: *Self, io: Io, segment: Segment, keep_from: Seq) CompactE
     // rename durable.
     try log.trimPreallocation(io);
     log.closeActive(io);
-    _ = try pending.commit(io, .{ .level = .full });
+    _ = try pending.commit(io, .{ .level = .full, .blocking = log.options.blocking });
 }
 
 //========================================================================
@@ -3017,7 +3021,7 @@ fn rewriteSegment(log: *Self, io: Io, segment: Segment, keep_from: Seq) CompactE
 pub fn writeAtomic(log: *Self, io: Io, name: []const u8, bytes: []const u8) Self.WriteFileError!void {
     _ = try airlock.writeFile(io, log.dir, name, bytes, .{
         .create = .{ .temp = .{ .random = temp_prefix } },
-        .commit = .{ .level = .data },
+        .commit = .{ .level = .data, .blocking = log.options.blocking },
     });
 }
 
@@ -3093,7 +3097,7 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
     // directories are made durable, as the copy in them will be.
     var dest = cwd.openDir(io, dest_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => created: {
-            _ = try airlock.makePath(io, cwd, dest_path, .{ .sync = .{ .level = .full } });
+            _ = try airlock.makePath(io, cwd, dest_path, .{ .sync = .{ .level = .full, .blocking = log.options.blocking } });
             break :created try cwd.openDir(io, dest_path, .{ .iterate = true });
         },
         else => |e| return e,
@@ -3105,7 +3109,7 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
     try log.clearBackup(io, dest);
 
     var copies: Copies = undefined;
-    copies.init(dest);
+    copies.init(dest, log.options.blocking);
     defer copies.release(io);
     if (log.segments.items.len == 0) {
         try copies.finish(io);
@@ -3174,6 +3178,8 @@ const backup_name_bytes = name_digits + index_extension.len;
 /// directory, which makes every name created or removed there durable.
 const Copies = struct {
     dest: Io.Dir,
+    /// Where the batch runs its syncs: the log's `Options.blocking`.
+    blocking: ?airlock.Blocking,
     batch: airlock.Batch,
     slots: [backup_batch + 1]airlock.Batch.Slot,
     /// Copies the batch syncs through their own handles, closed once it has.
@@ -3184,8 +3190,9 @@ const Copies = struct {
     names_len: usize,
 
     /// In place: the batch keeps a pointer to `slots`.
-    fn init(c: *Copies, dest: Io.Dir) void {
+    fn init(c: *Copies, dest: Io.Dir, blocking: ?airlock.Blocking) void {
         c.dest = dest;
+        c.blocking = blocking;
         c.batch = .init(&c.slots);
         c.open_len = 0;
         c.names_len = 0;
@@ -3218,7 +3225,7 @@ const Copies = struct {
     /// destination's names too.
     fn flush(c: *Copies, io: Io, what: enum { files, directory }) BackupError!void {
         if (what == .directory) try c.batch.addDir(c.dest);
-        _ = try c.batch.commit(io, .{ .level = .data });
+        _ = try c.batch.commit(io, .{ .level = .data, .blocking = c.blocking });
         c.closeOpen(io);
         c.names_len = 0;
     }
@@ -3351,7 +3358,7 @@ pub fn finish(log: *Self, io: Io) Self.FinishError!void {
     if (log.active) |*active| {
         try active.writer.interface.flush();
         try log.trimPreallocation(io);
-        if (log.options.sync != .never) _ = try syncFile(io, active.file, .full);
+        if (log.options.sync != .never) _ = try syncFile(io, log.options.blocking, active.file, .full);
 
         // The index is only a cache. Failure to finish it costs the next open
         // a scan and does not change whether the log itself was closed durably.
@@ -3367,7 +3374,7 @@ pub fn finish(log: *Self, io: Io) Self.FinishError!void {
             .times = segment.times,
             .interval = active.builder.interval,
             .entries_checksum = active.builder.checksum.final(),
-        }, log.options.sync) catch |err| {
+        }, log.options.sync, log.options.blocking) catch |err| {
             // The index is a rebuildable cache; record durability is handled separately.
             std.log.debug("optional index maintenance: {t}", .{err});
         };
@@ -3385,7 +3392,7 @@ pub fn deinit(log: *Self, io: Io) void {
             std.log.debug("best-effort log release: {t}", .{err});
         };
         if (log.options.sync != .never) {
-            if (syncFile(io, active.file, .full)) |_| {} else |err| {
+            if (syncFile(io, log.options.blocking, active.file, .full)) |_| {} else |err| {
                 // Best-effort resource release cannot return errors; finish reports durability failures.
                 std.log.debug("best-effort log release: {t}", .{err});
             }
@@ -3404,7 +3411,7 @@ pub fn deinit(log: *Self, io: Io) void {
             .times = segment.times,
             .interval = active.builder.interval,
             .entries_checksum = active.builder.checksum.final(),
-        }, log.options.sync) catch |err| {
+        }, log.options.sync, log.options.blocking) catch |err| {
             // The index is a rebuildable cache; record durability is handled separately.
             std.log.debug("optional index maintenance: {t}", .{err});
         };

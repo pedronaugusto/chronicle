@@ -10,7 +10,8 @@
   ],
   "test_dependencies": [
     "shakedown",
-    "airlock.testing"
+    "airlock.testing",
+    "reactor"
   ],
   "function_exceptions": {},
   "layout_exceptions": {},

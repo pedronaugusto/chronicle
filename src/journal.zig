@@ -424,6 +424,13 @@ pub fn Journal(comptime Event: type) type {
             /// the parsed record would be built and dropped unread. That
             /// parse is a third of what an `append` costs.
             verify_round_trip: bool = false,
+            /// The executor airlock runs the journal's syncs on, every one of
+            /// them (`airlock.Blocking`). A sync holds the thread that makes
+            /// it until the drive answers: on an evented `Io` that thread is
+            /// a worker other tasks are waiting for, so a program on a
+            /// reactor runtime gives its sync lane, `.{ .run =
+            /// reactor.syncLane }`. Null makes them on the calling thread.
+            blocking: ?Log.Blocking = null,
         };
 
         pub const Snapshot = struct {
@@ -577,6 +584,7 @@ pub fn Journal(comptime Event: type) type {
                 .preallocate_bytes = options.preallocate_bytes,
                 .index_interval_bytes = options.index_interval_bytes,
                 .max_record_bytes = options.max_record_bytes,
+                .blocking = options.blocking,
             });
 
             self.* = .{

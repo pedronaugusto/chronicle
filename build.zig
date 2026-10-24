@@ -91,6 +91,8 @@ pub fn dev(b: *std.Build, tools: type) void {
     const shakedown = b.dependency("shakedown", .{ .target = target, .optimize = optimize }).module("shakedown");
     tests.root_module.addImport("shakedown", shakedown);
     tests.root_module.addImport("airlock.testing", airlock_build.testing(airlock_dependency, shakedown));
+    // The evented `Io` the runtime leg runs the journal on beside Threaded.
+    tests.root_module.addImport("reactor", b.dependency("reactor", .{ .target = target, .optimize = optimize }).module("reactor"));
     const run_tests = b.addRunArtifact(tests);
 
     const test_step = b.step("test", "Run chronicle tests");

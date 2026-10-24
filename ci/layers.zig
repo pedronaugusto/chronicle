@@ -34,6 +34,7 @@ pub const references: []const gantry.rules.ReferenceRule = &.{
         "airlock.testing",
         "builtin",
         "chronicle_test_options",
+        "reactor",
         "shakedown",
         "std",
         "strand",

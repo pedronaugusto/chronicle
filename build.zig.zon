@@ -50,5 +50,9 @@
             .url = "git+https://github.com/pedronaugusto/shakedown?ref=v0.4.13#fc2b519e0435324cd3a2b1ad76a05dbd9b5cf296",
             .hash = "shakedown-0.4.13-BR8U442AFgAWe87wzq9vLeUZ0htWg9Z1JIHD_HkfnJUC",
         },
+        .reactor = .{
+            .url = "git+https://github.com/pedronaugusto/reactor?ref=v0.8.2#79e28a7b2831bf4347352531ff34fb4bffb5005b",
+            .hash = "reactor-0.8.2-MjQ-WBVaFACQqYOubhhGUdLUpXOb5_6GjJYxOuppVhO6",
+        },
     },
 }

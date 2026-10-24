@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `Options.blocking`: the executor airlock makes every one of the journal's syncs on (`airlock.Blocking`), for a program whose `Io` must not hold a worker on a drive: on a reactor runtime, `.{ .run = reactor.syncLane }`. Null makes them on the calling thread, as before. The journal's life on a `reactor.Runtime` is in the suite (reactor a development dependency): appends, a reader woken and one canceled, replay, a backup, compaction and a reopen, every sync counted through the executor.
+
 ### Fixed
 
 - A backup returns what stops the filesystem's copy of a file instead of copying the bytes around it: the copy falls back to bytes only where the platform cannot share extents (`EXDEV`, `EOPNOTSUPP`, `ENOSYS`, `EINVAL`), and a full disk, an I/O error, a refused permission or a cancel is the backup's error, where before any of them was a byte copy, or a success over a destination file it could not remove (whose removal error went to a debug log).
