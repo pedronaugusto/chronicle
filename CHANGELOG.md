@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The limits a record and a document are read and written under are strand's `core.Limits.sized` (strand 0.14.0), of which the journal had a copy.
+
 ## [0.9.3] - 2026-10-24
 
 ### Fixed

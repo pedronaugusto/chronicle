@@ -105,7 +105,7 @@ const SegmentHead = struct { root: u32, header_bytes: Bytes };
 /// a segment this package wrote.
 fn parseSegmentHeader(_: void, line: []const u8) error{UnsupportedFormat}!SegmentHeader {
     var members: strand.json.Members = undefined;
-    members.init(line, .{ .limits = jsonl.limits(line.len) });
+    members.init(line, .{ .limits = .sized(line.len) });
     var found: struct { chronicle: ?[]const u8 = null, base: ?[]const u8 = null, root: ?[]const u8 = null } = .{};
     while (members.next() catch return error.UnsupportedFormat) |member| {
         inline for (.{ "chronicle", "base", "root" }) |name| {
@@ -1485,12 +1485,12 @@ fn lastLineFrom(log: *Self, io: Io, file: Io.File, segment: Segment) OpenError!L
     var reader = file.reader(io, &.{});
     var tail: strand.jsonl.Tail(strand.json.Raw) = try .init(log.gpa, &reader, .{
         .end = segment.bytes.raw(),
-        .max_line_bytes = std.math.maxInt(usize),
+        .max_line_bytes = .fromRaw(std.math.maxInt(usize)),
         .skip_blank = false,
         .reject_control_bytes = false,
         .skip_bom = false,
         .crlf = false,
-        .block_bytes = 4096,
+        .block_bytes = .literal("4KiB"),
     });
     defer tail.deinit();
     const line = tail.prevRaw() catch |err| switch (err) {
@@ -1585,7 +1585,7 @@ const Scanned = struct {
 /// line (`LineReader.unfinished` says there was one).
 fn framing(max_line_bytes: usize) strand.jsonl.LineReader.Options {
     return .{
-        .max_line_bytes = max_line_bytes,
+        .max_line_bytes = .fromRaw(max_line_bytes),
         .skip_blank = false,
         .reject_control_bytes = false,
         .require_terminator = true,

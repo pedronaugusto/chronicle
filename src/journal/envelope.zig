@@ -153,7 +153,7 @@ fn seqOf(value: []const u8) ?Seq {
 /// is refused, as a parse of the record refuses one.
 pub fn read(_: void, line: []const u8) NotRecord!Fields {
     var members: strand.json.Members = undefined;
-    members.init(line, .{ .limits = jsonl.limits(line.len) });
+    members.init(line, .{ .limits = .sized(line.len) });
     var fields: Fields = .{};
     var last: ?strand.json.Member = null;
     var checksum = false;
