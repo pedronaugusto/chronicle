@@ -14,8 +14,9 @@ const Journal = chronicle.Journal(Event);
 const Seq = chronicle.Seq;
 const Blocking = @import("airlock").Blocking;
 
-/// An executor that runs each sync where it is asked, counting them: the
-/// journal's syncs are proved to go through `Options.blocking`, every one.
+/// The runtime's sync lane (`reactor.syncLane`), as an application wires it
+/// into `Options.blocking`, counting each sync on its way: the journal's
+/// syncs are proved to go through it, every one, off the runtime's workers.
 const Counted = struct {
     syncs: std.atomic.Value(u32) = .init(0),
 
@@ -24,10 +25,9 @@ const Counted = struct {
     }
 
     fn run(io: Io, context: ?*anyopaque, function: *const fn (*anyopaque) void, argument: *anyopaque) Io.Cancelable!void {
-        try io.checkCancel();
         const c: *Counted = @ptrCast(@alignCast(context.?)); // safe: `blocking` passed its own
         _ = c.syncs.fetchAdd(1, .monotonic);
-        function(argument);
+        return reactor.syncLane(io, null, function, argument);
     }
 
     fn take(c: *Counted) u32 {

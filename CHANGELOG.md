@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The limits a record and a document are read and written under are strand's `core.Limits.sized` (strand 0.14.0), of which the journal had a copy. On strand 0.14.0, airlock 0.5.5 and aegis 0.1.18; the suite on reactor 0.8.5, its syncs through `reactor.syncLane`.
+
 ## [0.9.4] - 2026-10-25
 
 ### Added
@@ -15,9 +19,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - A backup returns what stops the filesystem's copy of a file instead of copying the bytes around it: the copy falls back to bytes only where the platform cannot share extents (`EXDEV`, `EOPNOTSUPP`, `ENOSYS`, `EINVAL`), and a full disk, an I/O error, a refused permission or a cancel is the backup's error, where before any of them was a byte copy, or a success over a destination file it could not remove (whose removal error went to a debug log).
-### Changed
-
-- The limits a record and a document are read and written under are strand's `core.Limits.sized` (strand 0.14.0), of which the journal had a copy.
 
 ## [0.9.3] - 2026-10-24
 
