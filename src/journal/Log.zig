@@ -660,14 +660,17 @@ fn describeSealedSegments(log: *Self, io: Io, segments: []Segment) OpenError!voi
     defer log.gpa.free(indexes);
     @memset(indexes, null);
 
+    // The tasks read the directory through a copy borrowed here, on the
+    // task that owns the log: none of them touches the owner.
+    const dir = log.dir.borrow().*;
     const batch_size = 64;
     var from: usize = 0;
     while (from < segments.len) {
         const to = @min(from + batch_size, segments.len);
         var group: Io.Group = .init;
         for (segments[from..to], files[from..to], indexes[from..to]) |segment, *file_proof, *index_proof| {
-            group.async(io, inspectCleanSegmentFile, .{ log, io, segment.base_seq, file_proof });
-            group.async(io, inspectCleanIndex, .{ log, io, segment.base_seq, index_proof });
+            group.async(io, inspectCleanSegmentFile, .{ dir, io, segment.base_seq, file_proof });
+            group.async(io, inspectCleanIndex, .{ dir, io, segment.base_seq, index_proof });
         }
         try group.await(io);
         from = to;
@@ -693,14 +696,14 @@ const CleanSegmentFile = struct {
     header_bytes: Bytes,
 };
 
-fn inspectCleanSegmentFile(log: *Self, io: Io, base_seq: Seq, proof: *?CleanSegmentFile) Io.Cancelable!void {
+fn inspectCleanSegmentFile(dir: Io.Dir, io: Io, base_seq: Seq, proof: *?CleanSegmentFile) Io.Cancelable!void {
     // a group drops what its task returns, and a task it ran on the
     // caller's own thread would take the caller's cancel with it: put back
-    proof.* = log.tryInspectCleanSegmentFile(io, base_seq) catch return io.recancel();
+    proof.* = tryInspectCleanSegmentFile(dir, io, base_seq) catch return io.recancel();
 }
 
-fn tryInspectCleanSegmentFile(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?CleanSegmentFile {
-    const file = log.dir.borrow().openFile(io, &segmentName(segment_extension, base_seq), .{}) catch |e| {
+fn tryInspectCleanSegmentFile(dir: Io.Dir, io: Io, base_seq: Seq) Io.Cancelable!?CleanSegmentFile {
+    const file = dir.openFile(io, &segmentName(segment_extension, base_seq), .{}) catch |e| {
         try cancelOf(e);
         return null;
     };
@@ -724,13 +727,13 @@ fn tryInspectCleanSegmentFile(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?
     return .{ .bytes = length, .header_bytes = .fromRaw(newline + 1) };
 }
 
-fn inspectCleanIndex(log: *Self, io: Io, base_seq: Seq, proof: *?IndexProof) Io.Cancelable!void {
+fn inspectCleanIndex(dir: Io.Dir, io: Io, base_seq: Seq, proof: *?IndexProof) Io.Cancelable!void {
     // as for the segment file: the cancel is put back, never dropped
-    proof.* = log.tryInspectCleanIndex(io, base_seq) catch return io.recancel();
+    proof.* = tryInspectCleanIndex(dir, io, base_seq) catch return io.recancel();
 }
 
-fn tryInspectCleanIndex(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?IndexProof {
-    const file = log.dir.borrow().openFile(io, &segmentName(index_extension, base_seq), .{}) catch |e| {
+fn tryInspectCleanIndex(dir: Io.Dir, io: Io, base_seq: Seq) Io.Cancelable!?IndexProof {
+    const file = dir.openFile(io, &segmentName(index_extension, base_seq), .{}) catch |e| {
         try cancelOf(e);
         return null;
     };
