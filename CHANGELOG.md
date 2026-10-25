@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.5] - 2026-10-25
+
 ### Changed
 
 - The limits a record and a document are read and written under are strand's `core.Limits.sized` (strand 0.14.0), of which the journal had a copy. On strand 0.14.0, airlock 0.5.5 and aegis 0.1.18; the suite on reactor 0.8.5, its syncs through `reactor.syncLane`.
@@ -756,7 +758,8 @@ back.
 - Fuzz tests over arbitrary journal and snapshot file contents, because the
   file shapes this package exists to survive are the ones nobody chose.
 
-[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/pedronaugusto/chronicle/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/pedronaugusto/chronicle/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/pedronaugusto/chronicle/compare/v0.7.6...v0.9.3
 [0.7.6]: https://github.com/pedronaugusto/chronicle/compare/v0.7.3...v0.7.6
