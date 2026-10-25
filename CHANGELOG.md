@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.4] - 2026-10-25
+
 ### Added
 
 - `Options.blocking`: the executor airlock makes every one of the journal's syncs on (`airlock.Blocking`), for a program whose `Io` must not hold a worker on a drive: on a reactor runtime, `.{ .run = reactor.syncLane }`. Null makes them on the calling thread, as before. The journal's life on a `reactor.Runtime` is in the suite (reactor a development dependency): appends, a reader woken and one canceled, replay, a backup, compaction and a reopen, every sync counted through the executor.
@@ -750,7 +752,8 @@ back.
 - Fuzz tests over arbitrary journal and snapshot file contents, because the
   file shapes this package exists to survive are the ones nobody chose.
 
-[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.9.3...HEAD
+[Unreleased]: https://github.com/pedronaugusto/chronicle/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/pedronaugusto/chronicle/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/pedronaugusto/chronicle/compare/v0.7.6...v0.9.3
 [0.7.6]: https://github.com/pedronaugusto/chronicle/compare/v0.7.3...v0.7.6
 [0.7.3]: https://github.com/pedronaugusto/chronicle/compare/v0.7.2...v0.7.3
