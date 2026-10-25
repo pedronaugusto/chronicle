@@ -181,8 +181,10 @@ fn benchImports(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.l
     const p = package.builder;
     const strand = p.dependency("strand", .{ .target = target, .optimize = optimize }).module("strand");
     const airlock = p.dependency("airlock", .{ .target = target, .optimize = optimize }).module("airlock");
+    const aegis = p.dependency("aegis", .{ .target = target, .optimize = optimize }).module("aegis");
     return b.allocator.dupe(std.Build.Module.Import, &.{
         .{ .name = "chronicle", .module = package.module("chronicle") },
+        .{ .name = "aegis", .module = aegis },
         .{ .name = "strand", .module = strand },
         .{ .name = "airlock", .module = airlock },
     }) catch @panic("OOM");

@@ -22,6 +22,7 @@
 /// reading no clock, as `zig build test` runs it to keep it working.
 var smoke = false;
 const std = @import("std");
+const aegis = @import("aegis");
 const chronicle = @import("chronicle");
 const strand = @import("strand");
 
@@ -296,7 +297,7 @@ fn rawOptions(sync: chronicle.Sync, access: chronicle.Access) RawJournal.Options
 /// default run's is 200 MB (a million records), so it has no limit: a
 /// 64 MiB one stopped the default run at `raw_append` with `StreamTooLong`.
 fn loadCorpus(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !struct { bytes: []u8, events: []strand.json.Raw } {
-    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+    const bytes = try aegis.own.readFile(io, .cwd(), path, gpa, .fromRaw(std.math.maxInt(u64)));
     var events: std.ArrayList(strand.json.Raw) = .empty;
     var it = std.mem.splitScalar(u8, bytes, '\n');
     while (it.next()) |line| if (line.len != 0) try events.append(gpa, .{ .bytes = line });

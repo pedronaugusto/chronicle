@@ -573,25 +573,13 @@ pub fn Journal(comptime Event: type) type {
         fn openUnsettled(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!*Self {
             const self = try gpa.create(Self);
             errdefer gpa.destroy(self);
-            const log = try Log.open(gpa, io, path, .{
-                .access = options.access,
-                .on_truncated = options.on_truncated,
-                .sync = options.sync,
-                .write_buffer_size = options.write_buffer_size,
-                .read_buffer_size = options.read_buffer_size,
-                .max_segment_bytes = options.max_segment_bytes,
-                .max_segment_records = options.max_segment_records,
-                .preallocate_bytes = options.preallocate_bytes,
-                .index_interval_bytes = options.index_interval_bytes,
-                .max_record_bytes = options.max_record_bytes,
-                .blocking = options.blocking,
-            });
-
             self.* = .{
                 .gpa = gpa,
                 .config = options,
                 .state = .init(.{
-                    .log = log,
+                    // Opened below, where it stays: its handles' owners
+                    // are bound to where the log is.
+                    .log = undefined,
                     .tail = .{},
                     .record_hint = 256,
                     .line = .empty,
@@ -602,6 +590,24 @@ pub fn Journal(comptime Event: type) type {
                 }),
                 .changed = .initLimit(std.math.maxInt(usize)),
             };
+            {
+                // No other task has the journal yet.
+                var guard = self.state.acquireUncancelable(io);
+                defer guard.deinit(io);
+                try guard.value().log.open(gpa, io, path, .{
+                    .access = options.access,
+                    .on_truncated = options.on_truncated,
+                    .sync = options.sync,
+                    .write_buffer_size = options.write_buffer_size,
+                    .read_buffer_size = options.read_buffer_size,
+                    .max_segment_bytes = options.max_segment_bytes,
+                    .max_segment_records = options.max_segment_records,
+                    .preallocate_bytes = options.preallocate_bytes,
+                    .index_interval_bytes = options.index_interval_bytes,
+                    .max_record_bytes = options.max_record_bytes,
+                    .blocking = options.blocking,
+                });
+            }
             errdefer {
                 // No other task has the journal yet, and a refused open leaves
                 // the log as it found it.
@@ -1363,7 +1369,7 @@ pub fn Journal(comptime Event: type) type {
                 const s = guard.value();
                 const file = try cursorName(self.gpa, tail.name);
                 defer self.gpa.free(file);
-                s.log.dir.deleteFile(io, file) catch |err| switch (err) {
+                s.log.dir.borrow().deleteFile(io, file) catch |err| switch (err) {
                     error.FileNotFound => return,
                     error.Canceled => return error.Canceled,
                     else => |e| return e,
@@ -1401,7 +1407,7 @@ pub fn Journal(comptime Event: type) type {
             const a = list.arena.allocator();
             var found: std.ArrayList(Reader) = .empty;
 
-            var iterator = s.log.dir.iterate();
+            var iterator = s.log.dir.borrow().iterate();
             while (try iterator.next(io)) |entry| {
                 if (entry.kind == .directory) continue;
                 if (!std.mem.endsWith(u8, entry.name, cursor_extension)) continue;
@@ -1476,21 +1482,16 @@ pub fn Journal(comptime Event: type) type {
             arena: Allocator,
             Document: type,
             name: []const u8,
-            limit: usize,
+            limit: Bytes,
         ) DocumentError!?Document {
-            const bytes = s.log.dir.readFileAlloc(
-                io,
-                name,
-                arena,
-                .limited(limit),
-            ) catch |err| switch (err) {
+            const bytes = aegis.own.readFile(io, s.log.dir.borrow().*, name, arena, limit) catch |err| switch (err) {
                 error.FileNotFound => return null,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
                 error.StreamTooLong => return error.StreamTooLong,
                 else => return error.MalformedDocument,
             };
-            const how: json.ParseOptions = .{ .ignore_unknown_fields = true, .limits = .sized(limit) };
+            const how: json.ParseOptions = .{ .ignore_unknown_fields = true, .limits = .sized(values.limit(limit)) };
             const Versioned = struct { fmt: u32 };
             const version = json.parseLeaky(Versioned, arena, bytes, how) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -1526,7 +1527,7 @@ pub fn Journal(comptime Event: type) type {
                 arena.allocator(),
                 Document,
                 file,
-                4096,
+                .fromRaw(4096),
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
@@ -1630,7 +1631,7 @@ pub fn Journal(comptime Event: type) type {
                 arena.allocator(),
                 Document,
                 Log.snapshot_name,
-                values.limit(self.config.max_snapshot_bytes),
+                self.config.max_snapshot_bytes,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
@@ -2010,7 +2011,7 @@ pub fn Journal(comptime Event: type) type {
                 arena.allocator(),
                 Document,
                 Log.snapshot_name,
-                values.limit(self.config.max_snapshot_bytes),
+                self.config.max_snapshot_bytes,
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,

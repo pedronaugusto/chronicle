@@ -3,20 +3,39 @@ const std = @import("std");
 const Io = std.Io;
 const Seq = @import("values.zig").Seq;
 
+/// The one conversion between an opaque owner and the state it names. An
+/// owner is its state's own allocation under another type, made by the
+/// journal and held until the owner's `deinit`: the same pointer, never a
+/// copy, so every owner converts here and nowhere else.
+pub fn Hidden(comptime Owner: type, comptime State: type) type {
+    return struct {
+        pub fn hide(state: *State) *Owner {
+            return @ptrCast(state); // aegis: design: an owner is its state's allocation, named opaquely
+        }
+        pub fn reveal(owner: *Owner) *State {
+            return @ptrCast(@alignCast(owner)); // aegis: design: every owner was made by hide from its state's allocation
+        }
+        pub fn view(owner: *const Owner) *const State {
+            return @ptrCast(@alignCast(owner)); // aegis: design: every owner was made by hide from its state's allocation
+        }
+    };
+}
+
 pub fn ReplayOwner(comptime State: type, comptime PositionType: type) type {
     return opaque {
         /// Where a walk is, for `rearmAt` and `Journal.replayAt`.
         pub const Position = PositionType;
         const Self = @This();
+        const hidden = Hidden(Self, State.Replay);
         fn inner(self: *Self) *State.Replay {
-            return @ptrCast(@alignCast(self)); // safe: construction retains this allocated state until deinit.
+            return hidden.reveal(self);
         }
         /// Private: the owner over the walk a journal built.
         pub fn from(state: *State.Replay) *Self {
-            return @ptrCast(state); // safe: hides the stable allocation without copying it.
+            return hidden.hide(state);
         }
         fn view(self: *const Self) *const State.Replay {
-            return @ptrCast(@alignCast(self)); // safe: observes the same allocated replay state without mutating it.
+            return hidden.view(self);
         }
         /// Release the walk and every record it owns. Its journal must still be alive.
         pub fn deinit(walk: *Self, io: Io) void {
@@ -57,12 +76,13 @@ pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
         /// The walk `replay` returns.
         pub const Replay = ReplayType;
         const Self = @This();
+        const hidden = Hidden(Self, State.Tailer);
         fn inner(self: *Self) *State.Tailer {
-            return @ptrCast(@alignCast(self)); // safe: construction retains this allocated state until deinit.
+            return hidden.reveal(self);
         }
         /// Private: the owner over the reader a journal built.
         pub fn from(state: *State.Tailer) *Self {
-            return @ptrCast(state); // safe: hides the stable allocation without copying it.
+            return hidden.hide(state);
         }
         /// Where this reader has got to, copied under the journal lock.
         /// Safe to call from any task or thread, except from inside a sink.
@@ -107,8 +127,7 @@ pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
 
         /// This reader's immutable name, borrowed until deinit.
         pub fn name(tail: *const Self) []const u8 {
-            const state: *const State.Tailer = @ptrCast(@alignCast(tail)); // safe: borrows the initialized tailer allocation for its lifetime.
-            return state.name;
+            return hidden.view(tail).name;
         }
     };
 }

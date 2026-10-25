@@ -182,11 +182,12 @@ pub fn Journal(comptime Event: type) type {
         const Self = @This();
         const State = implementation.Journal(Event);
 
+        const hidden = facade.Hidden(Self, State);
         fn inner(self: *Self) *State {
-            return @ptrCast(@alignCast(self)); // safe: open returns this allocated State, retained until deinit.
+            return hidden.reveal(self);
         }
         fn from(state: *State) *Self {
-            return @ptrCast(state); // safe: hides the same stable State allocation without copying it.
+            return hidden.hide(state);
         }
         /// One entry of the log, as held in memory.
         ///
@@ -202,11 +203,12 @@ pub fn Journal(comptime Event: type) type {
         /// before the allocator passed to `copySince`. Every pointer alias and
         /// record borrow becomes invalid on release.
         pub const Batch = opaque {
+            const hidden_batch = facade.Hidden(Batch, State.Batch);
             fn inner(batch: *const Batch) *const State.Batch {
-                return @ptrCast(@alignCast(batch)); // safe: copySince returns this allocated State.Batch, retained until deinit.
+                return hidden_batch.view(batch);
             }
             fn from(batch: *State.Batch) *Batch {
-                return @ptrCast(batch); // safe: hides the same stable State.Batch allocation without copying it.
+                return hidden_batch.hide(batch);
             }
 
             /// The records, oldest first. Empty when the cursor is caught up.
@@ -225,8 +227,7 @@ pub fn Journal(comptime Event: type) type {
             /// Release the owner, every record and all its referenced data.
             /// Call only after every user of this batch has finished.
             pub fn deinit(batch: *Batch) void {
-                const state: *State.Batch = @ptrCast(@alignCast(batch)); // safe: this is the live allocation returned by copySince, released exactly once here.
-                state.deinit();
+                hidden_batch.reveal(batch).deinit();
             }
         };
 
@@ -452,11 +453,12 @@ pub fn Journal(comptime Event: type) type {
         /// passed to `open`. Every pointer alias and item borrow becomes
         /// invalid on release.
         pub const Readers = opaque {
+            const hidden_readers = facade.Hidden(Readers, State.Readers);
             fn inner(list: *const Readers) *const State.Readers {
-                return @ptrCast(@alignCast(list)); // safe: readers returns this allocated State.Readers, retained until deinit.
+                return hidden_readers.view(list);
             }
             fn from(list: *State.Readers) *Readers {
-                return @ptrCast(list); // safe: hides the same stable State.Readers allocation without copying it.
+                return hidden_readers.hide(list);
             }
 
             /// The readers at the time of the listing, in directory order.
@@ -468,8 +470,7 @@ pub fn Journal(comptime Event: type) type {
             /// Release the owner, the list and every reader name together.
             /// Call only after every user of this list has finished.
             pub fn deinit(list: *Readers) void {
-                const state: *State.Readers = @ptrCast(@alignCast(list)); // safe: this is the live allocation returned by readers, released exactly once here.
-                state.deinit();
+                hidden_readers.reveal(list).deinit();
             }
         };
 

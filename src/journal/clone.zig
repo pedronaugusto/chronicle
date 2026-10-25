@@ -23,6 +23,7 @@ const Io = std.Io;
 
 /// Darwin's whole-file clone. Not declared in `std.c`, so it is declared here.
 /// `flags` is zero; there is no flag this package wants.
+// aegis: boundary: Darwin's clonefileat(2), declared as its man page gives it; whole is its one caller
 extern "c" fn clonefileat(
     src_dirfd: std.c.fd_t,
     src: [*:0]const u8,

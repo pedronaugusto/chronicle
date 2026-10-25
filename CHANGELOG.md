@@ -6,6 +6,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A cancel that lands on the length of a cursor or snapshot file is the call's `Canceled`. std's whole-file read took a length it could not learn for none and read on, so a tailer opened over the cancel; the documents are read through aegis's `own.readFile`, with the limit they had.
+
+### Changed
+
+- On preflight 0.18.1, under the aegis pack: every directory and file the log opens has one owner, aegis's `own.OwnedIo`, which checks in Debug that it is closed once and never moved once in use, so the journal opens its log where it stays. The journal's opaque owners convert to their state in one place, and the `clonefileat` declaration carries its reason.
+
 ## [0.9.5] - 2026-10-25
 
 ### Changed

@@ -1066,7 +1066,7 @@ fn writeThroughCancels(io: Io, journal: *Journal, fold: *Registry) !void {
     try testing.expectEqual(Seq.fromRaw(4), try journal.appendDeferred(io, .fromRaw(4), created(4, "deferred")));
     // and nothing swallowed the cancel: a write outside the journal's is
     // still where it lands
-    try testing.expectError(error.Canceled, io.vtable.fileWritePositional(io.userdata, quiescent(journal).log.active.?.file, "", &.{""}, 1, 0));
+    try testing.expectError(error.Canceled, io.vtable.fileWritePositional(io.userdata, quiescent(journal).log.active.?.file.borrow().*, "", &.{""}, 1, 0));
 }
 
 test "a cancel that lands on a write is not a failed write" {
@@ -1609,9 +1609,9 @@ test "finish reports a failure while finalizing the active segment and leaves th
     // with the journal still whole for `deinit` to release with its lock.
     const active = &quiescent(journal).log.active.?;
     const position = active.writer.pos;
-    active.file.close(io);
-    active.file = try quiescent(journal).log.dir.openFile(io, &chronicle.segmentName(Seq.fromRaw(1)), .{});
-    active.writer = active.file.writer(io, quiescent(journal).log.write_buf);
+    active.file.deinit(io);
+    active.file = .init(try quiescent(journal).log.dir.borrow().openFile(io, &chronicle.segmentName(Seq.fromRaw(1)), .{}));
+    active.writer = active.file.borrow().writer(io, quiescent(journal).log.write_buf);
     active.writer.pos = position;
     // Which error names the refusal is the platform's: POSIX says the file
     // cannot be resized, Windows that the handle may not do it.
@@ -2439,6 +2439,36 @@ test "a tailer remembers where it got to, in a file of its own" {
     // The cursor files sit beside the log and are not part of it.
     try testing.expectEqual(@as(usize, 3), (try journal.segmentCount(io)));
     try testing.expectEqual(Records.fromRaw(9), try journal.verify(io));
+}
+
+test "a cancel that lands on a cursor file's length is the tailer's Canceled, not lost" {
+    const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{});
+    defer fio.deinit();
+    const io = fio.io();
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{});
+    defer journal.deinit(io);
+    _ = try journal.append(io, .fromRaw(1), created(1, "one"));
+    {
+        const kept = try journal.tailer(io, "kept");
+        defer kept.deinit();
+        try kept.commit(io, .fromRaw(1));
+    }
+
+    // The cursor file's length is the one length the tailer reads. std's
+    // whole-file read took a cancel there for a length it could not learn,
+    // and read on.
+    try fio.setPlan(&.{.{
+        .at = .{ .nth = .{ .call = .fileStat, .n = 1 } },
+        .fault = .cancel,
+    }});
+    try testing.expectError(error.Canceled, journal.tailer(io, "kept"));
+    try fio.setPlan(&.{});
+    const again = try journal.tailer(io, "kept");
+    defer again.deinit();
+    try testing.expectEqual(Seq.fromRaw(1), try again.cursor(io));
 }
 
 test "a reader's tailer writes its cursor and nothing else" {
