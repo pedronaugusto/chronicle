@@ -1679,6 +1679,9 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
     // was before it: the end of the segment if the batch never closes.
     var batch: ?struct { last: Seq, before: Scanned.BeforeBatch } = null;
     while (true) {
+        // A segment read through a buffer reads the file once a buffer:
+        // a cancel is taken at each line, not only at those reads.
+        try io.checkCancel();
         const line = lines.next() catch |err| switch (err) {
             // Past what a record may be, and the segment ends inside it: the
             // tail after the last newline, measured below.
@@ -1972,6 +1975,7 @@ pub const Scan = struct {
         var lines: strand.jsonl.LineReader = .resumeAt(scan.gpa, &bounded.interface, .{ .offset = scan.position.raw() }, framing(scan.max_record_bytes));
         defer lines.deinit();
         while (true) {
+            try io.checkCancel();
             const line = (lines.next() catch |err| switch (err) {
                 error.ReadFailed => return reader.err orelse error.ReadFailed,
                 error.OutOfMemory => return error.OutOfMemory,

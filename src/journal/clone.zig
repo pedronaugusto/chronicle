@@ -66,7 +66,11 @@ pub fn whole(io: Io, source: Io.Dir, dest: Io.Dir, name: [:0]const u8) Error!voi
         .macos, .ios, .tvos, .watchos, .visionos => while (true) {
             if (clonefileat(source.handle, name, dest.handle, name, 0) == 0) return;
             return switch (std.posix.errno(@as(c_int, -1))) {
-                .INTR => continue,
+                // A signal stopped it: the cancel, if it was one, is taken.
+                .INTR => {
+                    try io.checkCancel();
+                    continue;
+                },
                 // A volume that does not clone, or two volumes.
                 .OPNOTSUPP, .XDEV => error.Unsupported,
                 .NOENT => error.FileNotFound,

@@ -57,7 +57,7 @@ fn event(seq: u64) Event {
     return .{ .created = .{ .id = @intCast(seq), .name = "n" } };
 }
 
-const Operation = struct {
+pub const Operation = struct {
     kind: Kind,
     h: ?*Seam = null,
     /// What a run allocates: a crash abandons its tasks with their defers

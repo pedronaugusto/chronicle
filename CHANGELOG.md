@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- A cancel reaches an open, a replay's look-ahead and a backup's clone while they run: a segment's scan takes it at each line (a buffered read reached the file once a buffer, so a long segment ran to its end), and a clone interrupted by a signal on macOS takes it before trying again.
+
 ## [0.10.0] - 2026-10-27
 
 ### Breaking

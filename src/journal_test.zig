@@ -2441,6 +2441,43 @@ test "a tailer remembers where it got to, in a file of its own" {
     try testing.expectEqual(Records.fromRaw(9), try journal.verify(io));
 }
 
+test "an open takes a cancel at each line of a segment it scans" {
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const records = 300;
+    {
+        const journal = try Journal.open(testing.allocator, testing.io, ws.path, .{ .sync = .never });
+        defer journal.deinit(testing.io);
+        for (1..records + 1) |i| _ = try journal.append(testing.io, .fromRaw(@intCast(i)), created(@intCast(i), "n"));
+    }
+    // With no index to trust, a reader's open reads the segment's lines.
+    try ws.root.deleteFile(testing.io, try ws.index(1));
+    // Each cancel point the open offers, counted, and one of them taken.
+    const Points = struct {
+        seen: usize = 0,
+        cancel_at: ?usize = null,
+
+        const Layer = shakedown.Layer(@This(), .{ .checkCancel = check });
+
+        fn check(u: ?*anyopaque) Io.Cancelable!void {
+            const layer = Layer.of(u);
+            layer.state.seen += 1;
+            if (layer.state.cancel_at) |at| if (layer.state.seen == at) return error.Canceled;
+            return layer.base.checkCancel();
+        }
+    };
+    var points: Points.Layer = .init(testing.io, .{});
+    {
+        const journal = try Journal.open(testing.allocator, points.io(), ws.path, .{ .access = .read });
+        journal.deinit(points.io());
+    }
+    // The segment's buffered read reaches the file once for all of its
+    // lines: without a point at each line, a cancel waited for the end.
+    try testing.expect(points.state.seen >= records);
+    points.state = .{ .cancel_at = records / 2 };
+    try testing.expectError(error.Canceled, Journal.open(testing.allocator, points.io(), ws.path, .{ .access = .read }));
+}
+
 test "a cancel that lands on a cursor file's length is the tailer's Canceled, not lost" {
     const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{});
     defer fio.deinit();
