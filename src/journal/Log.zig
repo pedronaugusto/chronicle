@@ -83,6 +83,20 @@ pub const name_digits = 20;
 /// name rather than read as if it were records.
 const log_format: u32 = 1;
 
+/// The format of a segment rewritten with removed records' stubs in it: the
+/// records of format 1, and stubs, which a reader of format 1 alone cannot
+/// read. It refuses the segment by its header instead of misreading a stub.
+const stub_format: u32 = 2;
+
+/// Whether this package reads segments of format `version`.
+fn readable(version: u32) bool {
+    return version == log_format or version == stub_format;
+}
+
+/// The file in the log's directory that keeps each truncated stream's
+/// point: state, not a cache, so a backup takes it.
+pub const truncations_name = "truncations";
+
 /// The first line of a segment: which format the records after it are in,
 /// which sequence number the segment starts at, and what the first record's
 /// back-link has to be.
@@ -724,7 +738,7 @@ fn tryInspectCleanSegmentFile(dir: Io.Dir, io: Io, base_seq: Seq) Io.Cancelable!
     if (read != want) return null;
     const newline = std.mem.findScalar(u8, raw[0..want], '\n') orelse return null;
     const head = parseSegmentHeader({}, raw[0..newline]) catch return null;
-    if (head.version != log_format or head.base_seq != base_seq) return null;
+    if (!readable(head.version) or head.base_seq != base_seq) return null;
     return .{ .bytes = length, .header_bytes = .fromRaw(newline + 1) };
 }
 
@@ -1681,7 +1695,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
             // and what the first record's back-link has to be. A file
             // whose first line is not one is refused rather than read.
             const header = try text.parse({}, parseSegmentHeader);
-            if (header.version != log_format or header.base_seq != segment.base_seq) {
+            if (!readable(header.version) or header.base_seq != segment.base_seq) {
                 return error.UnsupportedFormat;
             }
             scanned.chain = header.root;
@@ -1934,7 +1948,7 @@ pub const Scan = struct {
                 // it, and the open that gave it the offset checked it.
                 scan.at_header = false;
                 const header = try text.parse({}, parseSegmentHeader);
-                if (header.version != log_format or header.base_seq != scan.bases[scan.at]) {
+                if (!readable(header.version) or header.base_seq != scan.bases[scan.at]) {
                     return error.UnsupportedFormat;
                 }
                 scan.boundary = .{ .base_seq = header.base_seq, .root = header.root };
@@ -2714,7 +2728,7 @@ fn readSegmentHeaderFrom(log: *Self, io: Io, file: Io.File, segment: Segment) Op
 fn segmentHeaderFromLine(segment: Segment, line: Line) OpenError!SegmentHead {
     if (!line.terminated) return error.UnsupportedFormat;
     const header = try line.unparsed().parse({}, parseSegmentHeader);
-    if (header.version != log_format or header.base_seq != segment.base_seq) return error.UnsupportedFormat;
+    if (!readable(header.version) or header.base_seq != segment.base_seq) return error.UnsupportedFormat;
     return .{ .root = header.root, .header_bytes = .fromRaw(line.bytes.len + 1) };
 }
 
@@ -2987,6 +3001,75 @@ pub fn compact(log: *Self, io: Io, keep_after_seq: Seq) Self.CompactError!void {
     try log.settle(io);
 }
 
+/// What a rewrite asks of each record of a segment: the stub it becomes,
+/// written into `out`, or false to keep it as it is.
+pub const Redactor = struct {
+    ctx: *anyopaque,
+    stub: *const fn (ctx: *anyopaque, line: []const u8, out: *std.ArrayList(u8)) error{ OutOfMemory, CorruptRecord }!bool,
+};
+
+/// Seal the active segment, if it holds a record, so that a rewrite can
+/// reach every record: the next append starts a new one.
+pub fn sealActive(log: *Self, io: Io) CompactError!void {
+    if (log.options.access == .read) return error.ReadOnly;
+    const segments = log.segments.items;
+    if (segments.len == 0 or log.active == null) return;
+    if (segments[segments.len - 1].count() == values.no_records) return;
+    try log.rotate(io);
+}
+
+/// Rewrite sealed segment `base_seq` with each record `redactor` names
+/// replaced by its stub, through a temporary renamed over it, so that a
+/// crash leaves the old segment or the new one. A segment with a stub in
+/// it says so in its header (`stub_format`). Its index and stream index
+/// describe the old bytes, and go. False when no record changed: the file
+/// is left alone. Call `reload` once the rewrites are done.
+pub fn redactSegment(log: *Self, io: Io, base_seq: Seq, redactor: Redactor) CompactError!bool {
+    if (log.options.access == .read) return error.ReadOnly;
+    const at = log.segmentIndex(base_seq) orelse return false;
+    // The active segment is written to; `sealActive` first.
+    if (at == log.segments.items.len - 1 and log.active != null) return false;
+    const segment = log.segments.items[at];
+    const head = try log.readSegmentHeader(io, segment);
+
+    const name = segmentName(segment_extension, base_seq);
+    var pending = try airlock.create(io, log.dir.borrow().*, &name, .{ .temp = .{ .random = temp_prefix } });
+    // Before the publish this removes the temporary; after it, nothing.
+    defer pending.discard(io);
+    const writer = pending.writer(io, log.write_buf);
+    var buffer: [96]u8 = undefined;
+    const header: SegmentHeader = .{ .version = stub_format, .base_seq = base_seq, .root = head.root };
+    try writer.writeAll(header.line(&buffer));
+    try writer.writeByte('\n');
+
+    var stub: std.ArrayList(u8) = .empty;
+    defer stub.deinit(log.gpa);
+    var changed = false;
+    var scan = try log.scanOver(&.{segment}, values.no_bytes, .live);
+    defer scan.deinit(io);
+    while (try scan.next(io)) |line| {
+        stub.clearRetainingCapacity();
+        const bytes = line.readForParse();
+        if (try redactor.stub(redactor.ctx, bytes, &stub)) {
+            changed = true;
+            try writer.writeAll(stub.items);
+        } else try writer.writeAll(bytes);
+        try writer.writeByte('\n');
+    }
+    if (!changed) return false;
+    _ = try pending.commit(io, .{ .level = .full, .blocking = log.options.blocking });
+    inline for (.{ index_extension, stream_index_extension }) |extension| {
+        log.dir.borrow().deleteFile(io, &segmentName(extension, base_seq)) catch |err| switch (err) {
+            error.FileNotFound => {},
+            // A cache that no longer describes its segment: a check of it
+            // finds that, and rebuilds it.
+            else => std.log.debug("optional index maintenance: {t}", .{err}),
+        };
+    }
+    try log.syncDir(io);
+    return true;
+}
+
 /// Copy the records of `segment` from `keep_from` onward into a new segment
 /// named for `keep_from`, durably, without holding the whole segment.
 fn rewriteSegment(log: *Self, io: Io, segment: Segment, keep_from: Seq) CompactError!void {
@@ -3157,6 +3240,13 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
         try active.index_writer.interface.flush();
     }
 
+    // State: a truncated stream stays truncated in its copy. A reader may
+    // take one newer than the segments it copies, which hides no more than
+    // the journal already does.
+    if (!try log.copyFile(io, &copies, truncations_name, null)) dest.deleteFile(io, truncations_name) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => |e| return e,
+    };
     if (log.options.access == .write) {
         _ = try log.copyFile(io, &copies, snapshot_name, null);
     } else {

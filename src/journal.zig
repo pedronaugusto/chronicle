@@ -525,9 +525,9 @@ pub fn Journal(comptime Event: type) type {
         pub const TailerError = Allocator.Error || Io.Cancelable ||
             Log.WriteFileError || error{ InvalidName, CorruptCursor, UnsupportedFormat };
 
-        pub const CompactError = OpenError || Log.CompactError || error{PersistenceFailed};
+        pub const CompactError = OpenError || Log.CompactError || Log.WriteFileError || error{PersistenceFailed};
 
-        pub const DropError = Log.CompactError;
+        pub const DropError = Log.CompactError || ReadError || Log.WriteFileError;
 
         pub const BackupError = OpenError || Log.BackupError;
 
@@ -1644,6 +1644,9 @@ pub fn Journal(comptime Event: type) type {
             // bytes of a record and its flush.
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
+            // The streams whose records go stand past them first, durably, so
+            // that none starts again at a version it had.
+            try self.raiseFloors(s, io, seq, .whole_segments);
             const dropped = try s.log.dropSegmentsBefore(io, seq);
             if (dropped != 0) s.dropTailBefore(values.following(s.log.baseSeq()));
             return dropped;
@@ -1705,7 +1708,11 @@ pub fn Journal(comptime Event: type) type {
             defer _ = io.swapCancelProtection(protection);
             if (self.config.access == .read) return error.ReadOnly;
             if (s.write_failed) return error.PersistenceFailed;
+            try self.raiseFloors(s, io, keep_after_seq, .every_record);
             try s.log.compact(io, keep_after_seq);
+            // The streams' records below their truncation points become
+            // stubs: their events leave the files.
+            try self.redactTruncated(s, io);
             s.clearTail();
             try self.fillTail(s, io);
         }
@@ -1997,7 +2004,7 @@ pub fn Journal(comptime Event: type) type {
 
         /// The name of the file that keeps each truncated stream's point, in
         /// the journal's directory.
-        pub const truncations_name = "truncations";
+        pub const truncations_name = Log.truncations_name;
 
         /// Append `event` to `stream`, if the stream holds what `expected`
         /// says, as its next version: one durable write, as `append`.
@@ -2331,6 +2338,127 @@ pub fn Journal(comptime Event: type) type {
                 const bytes = line.readForParse();
                 try book.place(bytes[in.id.from..in.id.to], .{ .version = in.version, .seq = header.seq, .offset = scan.line_start });
             }
+        }
+
+        /// Which records a cut at a sequence number removes: every one at or
+        /// before it (`compact`), or those of the segments wholly at or
+        /// before it (`dropSegmentsBefore`).
+        const Cut = enum { every_record, whole_segments };
+
+        /// Raise the truncation point of each stream with records a cut at
+        /// `cut` removes past the newest of them, and write the points
+        /// before the cut is made: a stream whose records are all gone keeps
+        /// its version, and a read below what is left is
+        /// `error.StreamCompacted` rather than a gap.
+        fn raiseFloors(self: *Self, s: *State, io: Io, cut: Seq, which: Cut) (OpenError || Log.WriteFileError)!void {
+            if (self.config.access == .read) return;
+            try self.freshStreams(s, io);
+            var ids: std.heap.ArenaAllocator = .init(self.gpa);
+            defer ids.deinit();
+            var newest: std.StringHashMapUnmanaged(StreamVersion) = .empty;
+            defer newest.deinit(self.gpa);
+            const segments = s.log.segments.items;
+            if (segments.len == 0) return;
+            for (segments[0 .. segments.len - 1]) |segment| {
+                if (segment.base_seq.compare(cut) == .gt) break;
+                if (which == .whole_segments and segment.last_seq.compare(cut) == .gt) break;
+                const bytes = try self.streamIndex(s, io, segment) orelse continue;
+                defer self.gpa.free(bytes);
+                const index = streams.Index.parse(bytes, segment.base_seq, segment.bytes) catch continue;
+                var it = index.iterator();
+                while (it.next() catch null) |section| {
+                    var top = no_version;
+                    for (0..section.len()) |i| {
+                        const entry = section.at(i);
+                        if (entry.seq.compare(cut) != .gt) top = entry.version;
+                    }
+                    if (top != no_version) try keepNewest(self.gpa, &ids, &newest, section.id, top);
+                }
+            }
+            if (which == .every_record) for (s.streams.placed.items) |p| {
+                if (p.entry.seq.compare(cut) != .gt) try keepNewest(self.gpa, &ids, &newest, p.id, p.entry.version);
+            };
+            var changed = false;
+            var it = newest.iterator();
+            while (it.next()) |found| {
+                const past: StreamVersion = .fromRaw(found.value_ptr.raw() + 1);
+                if (s.streams.truncation(found.key_ptr.*).compare(past) != .lt) continue;
+                try s.streams.setTruncation(found.key_ptr.*, past);
+                changed = true;
+            }
+            if (changed) try self.writeTruncations(s, io);
+        }
+
+        fn keepNewest(gpa: Allocator, ids: *std.heap.ArenaAllocator, newest: *std.StringHashMapUnmanaged(StreamVersion), id: []const u8, version: StreamVersion) Allocator.Error!void {
+            const slot = try newest.getOrPut(gpa, id);
+            if (!slot.found_existing) {
+                slot.key_ptr.* = try ids.allocator().dupe(u8, id);
+                slot.value_ptr.* = version;
+            } else if (slot.value_ptr.compare(version) == .lt) slot.value_ptr.* = version;
+        }
+
+        /// Rewrite every segment holding a record below its stream's
+        /// truncation point, with that record's stub in its place: the
+        /// event leaves the files, the record's place in the sequence and
+        /// in its stream stays, and so does every checksum after it. The
+        /// active segment is sealed first when it holds one.
+        fn redactTruncated(self: *Self, s: *State, io: Io) (OpenError || Log.CompactError)!void {
+            if (s.streams.truncations.count() == 0) return;
+            try self.freshStreams(s, io);
+            var active_holds = false;
+            for (s.streams.placed.items) |p| {
+                if (p.entry.version.compare(s.streams.truncation(p.id)) == .lt) active_holds = true;
+            }
+            if (active_holds) {
+                try s.log.sealActive(io);
+                // A record now names the new active segment: the book is
+                // read again when it is next asked.
+                s.streams.stale = true;
+            }
+            var rewrote = false;
+            var i: usize = 0;
+            while (i + 1 < s.log.segments.items.len) : (i += 1) {
+                const segment = s.log.segments.items[i];
+                if (!try self.holdsTruncated(s, io, segment)) continue;
+                if (try s.log.redactSegment(io, segment.base_seq, .{ .ctx = s, .stub = stubOf })) rewrote = true;
+            }
+            if (rewrote) try s.log.reload(io);
+        }
+
+        /// Whether `segment`'s stream index has a record below its stream's
+        /// truncation point that is not a stub already.
+        fn holdsTruncated(self: *Self, s: *State, io: Io, segment: Log.Segment) OpenError!bool {
+            const bytes = try self.streamIndex(s, io, segment) orelse return false;
+            defer self.gpa.free(bytes);
+            const index = streams.Index.parse(bytes, segment.base_seq, segment.bytes) catch return false;
+            var points = s.streams.truncations.iterator();
+            while (points.next()) |point| {
+                const section = index.find(point.key_ptr.*) orelse continue;
+                if (section.at(0).version.compare(point.value_ptr.*) == .lt) return true;
+            }
+            return false;
+        }
+
+        /// The stub of a record below its stream's truncation point, into
+        /// `out`: `seq`, `at`, `v`, `p`, the batch it was in, `s`, `sv`,
+        /// then `"x":1`, `sc` (the checksum of all before it) and the
+        /// record's own `c`, which the record after it links back to.
+        fn stubOf(ctx: *anyopaque, line: []const u8, out: *std.ArrayList(u8)) error{ OutOfMemory, CorruptRecord }!bool {
+            const s: *State = @ptrCast(@alignCast(ctx)); // safe: `redactTruncated` passes its state
+            const header = parseHeader({}, line) catch return error.CorruptRecord;
+            if (header.removed) return false;
+            const in = header.in_stream orelse return false;
+            const id = line[in.id.from..in.id.to];
+            if (in.version.compare(s.streams.truncation(id)) != .lt) return false;
+            const gpa = s.streams.gpa;
+            var w: std.Io.Writer.Allocating = .fromArrayList(gpa, out);
+            defer out.* = w.toArrayList();
+            w.writer.print("{{\"seq\":{d},\"at\":{d},\"v\":{d},\"p\":{d}", .{ header.seq.raw(), header.at.raw(), header.version, header.p }) catch return error.OutOfMemory;
+            if (header.batch) |b| w.writer.print(",\"bf\":{d},\"bl\":{d}", .{ b.first.raw(), b.last.raw() }) catch return error.OutOfMemory;
+            w.writer.print(",\"s\":\"{s}\",\"sv\":{d},\"x\":1", .{ id, in.version.raw() }) catch return error.OutOfMemory;
+            const sc = checksum(w.written());
+            w.writer.print(",\"sc\":{d},\"c\":{d}}}", .{ sc, header.c }) catch return error.OutOfMemory;
+            return true;
         }
 
         /// Each truncated stream's point, from the file that keeps them.

@@ -5568,9 +5568,11 @@ fn checkFraming(io: std.Io, head: []const u8) anyerror!void {
         }
     };
     defer journal.deinit(io);
-    // If it opened, the first line was a header this version writes, and the
+    // If it opened, the first line was a header of a format this version
+    // reads (1, or 2 for a segment holding removed records' stubs), and the
     // records behind it are the ones the log holds.
-    try testing.expect(std.mem.startsWith(u8, whole, "{\"chronicle\":1,\"base\":1,"));
+    try testing.expect(std.mem.startsWith(u8, whole, "{\"chronicle\":1,\"base\":1,") or
+        std.mem.startsWith(u8, whole, "{\"chronicle\":2,\"base\":1,"));
     _ = try journal.verify(io);
 }
 

@@ -261,3 +261,113 @@ test "a stream id is refused unless it has one plain spelling" {
     try testing.expectError(error.InvalidStream, Stream.of("new\nline"));
     _ = try Stream.of("order-7/line:2");
 }
+
+/// Every byte of the journal's segment files, concatenated.
+fn segmentBytes(path: []const u8, gpa: std.mem.Allocator) ![]u8 {
+    const io = testing.io;
+    var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var all: std.ArrayList(u8) = .empty;
+    errdefer all.deinit(gpa);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, chronicle.segment_extension)) continue;
+        const bytes = try dir.readFileAlloc(io, entry.name, gpa, .unlimited);
+        defer gpa.free(bytes);
+        try all.appendSlice(gpa, bytes);
+    }
+    return all.toOwnedSlice(gpa);
+}
+
+test "compaction takes a truncated stream's events out of the files and leaves each one's place, the chain whole" {
+    const io = testing.io;
+    var place = try Place.init();
+    defer place.deinit();
+    const options: Journal.Options = .{ .max_segment_records = .fromRaw(3) };
+    {
+        const journal = try Journal.open(testing.allocator, io, place.path, options);
+        defer journal.deinit(io);
+        for (0..8) |i| {
+            const id: []const u8 = if (i % 2 == 0) "person-7" else "keep";
+            _ = try journal.appendTo(io, stream(id), .any, .fromRaw(@intCast(i)), deposit(@intCast(1000 + i)));
+        }
+        try journal.truncateStreamBefore(io, stream("person-7"), .fromRaw(4));
+        // Until the compaction the events are still in the files.
+        const before = try segmentBytes(place.path, testing.allocator);
+        defer testing.allocator.free(before);
+        try testing.expect(std.mem.find(u8, before, "1000") != null);
+
+        try journal.compact(io, chronicle.beginning);
+        const after = try segmentBytes(place.path, testing.allocator);
+        defer testing.allocator.free(after);
+        // person-7's versions 1 to 3 were the amounts 1000, 1002, 1004.
+        for ([_][]const u8{ "1000", "1002", "1004" }) |gone| try testing.expect(std.mem.find(u8, after, gone) == null);
+        try testing.expect(std.mem.find(u8, after, "1006") != null);
+        try testing.expect(std.mem.find(u8, after, "\"chronicle\":2") != null);
+
+        // The global walk steps over the stubs; the sequence keeps its places.
+        const walk = try journal.replay(io, chronicle.beginning);
+        defer walk.deinit(io);
+        var seqs: [8]u64 = undefined;
+        var n: usize = 0;
+        while (try walk.next(io)) |record| : (n += 1) seqs[n] = record.seq.raw();
+        try testing.expectEqualSlices(u64, &.{ 2, 4, 6, 7, 8 }, seqs[0..n]);
+        var buf: [8]u32 = undefined;
+        try testing.expectEqualSlices(u32, &.{1006}, try amounts(journal, "person-7", chronicle.no_version, &buf));
+        try testing.expectEqualSlices(u32, &.{ 1001, 1003, 1005, 1007 }, try amounts(journal, "keep", chronicle.no_version, &buf));
+        _ = try journal.appendTo(io, stream("person-7"), .{ .exact = .fromRaw(4) }, .fromRaw(9), deposit(9));
+    }
+    // Reopened and checked through: every link holds across the stubs.
+    var full = options;
+    full.verify = .full;
+    const journal = try Journal.open(testing.allocator, io, place.path, full);
+    defer journal.deinit(io);
+    try testing.expectEqual(Seq.fromRaw(9), try journal.lastSeq(io));
+    try testing.expectEqual(StreamVersion.fromRaw(5), try journal.streamVersion(io, stream("person-7")));
+}
+
+test "a stream whose records are dropped with their segments keeps its version, and reads below what is left are refused" {
+    const io = testing.io;
+    var place = try Place.init();
+    defer place.deinit();
+    const options: Journal.Options = .{ .max_segment_records = .fromRaw(2) };
+    {
+        const journal = try Journal.open(testing.allocator, io, place.path, options);
+        defer journal.deinit(io);
+        _ = try journal.appendTo(io, stream("old"), .no_stream, .fromRaw(1), deposit(1));
+        _ = try journal.appendTo(io, stream("old"), .any, .fromRaw(2), deposit(2));
+        _ = try journal.appendTo(io, stream("both"), .no_stream, .fromRaw(3), deposit(3));
+        _ = try journal.appendTo(io, stream("both"), .any, .fromRaw(4), deposit(4));
+        _ = try journal.appendTo(io, stream("both"), .any, .fromRaw(5), deposit(5));
+        _ = try journal.append(io, .fromRaw(6), deposit(6));
+        _ = try journal.append(io, .fromRaw(7), deposit(7));
+        try testing.expect(try journal.dropSegmentsBefore(io, .fromRaw(4)) >= 2);
+    }
+    const journal = try Journal.open(testing.allocator, io, place.path, options);
+    defer journal.deinit(io);
+    try testing.expectEqual(StreamVersion.fromRaw(2), try journal.streamVersion(io, stream("old")));
+    try testing.expectError(error.WrongExpectedVersion, journal.appendTo(io, stream("old"), .no_stream, .fromRaw(8), deposit(8)));
+    try testing.expectError(error.StreamCompacted, journal.readStream(io, stream("both"), .fromRaw(1)));
+    var buf: [8]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{5}, try amounts(journal, "both", chronicle.no_version, &buf));
+    try testing.expectEqual(StreamVersion.fromRaw(3), try journal.streamVersion(io, stream("both")));
+}
+
+test "a backup carries the streams' truncation points" {
+    const io = testing.io;
+    var place = try Place.init();
+    defer place.deinit();
+    const copy = try std.fmt.allocPrint(testing.allocator, "{s}-copy", .{place.path});
+    defer testing.allocator.free(copy);
+    {
+        const journal = try Journal.open(testing.allocator, io, place.path, .{});
+        defer journal.deinit(io);
+        for (0..4) |i| _ = try journal.appendTo(io, stream("p"), .any, .fromRaw(@intCast(i)), deposit(@intCast(i)));
+        try journal.truncateStreamBefore(io, stream("p"), .fromRaw(3));
+        _ = try journal.backup(io, copy);
+    }
+    const journal = try Journal.open(testing.allocator, io, copy, .{});
+    defer journal.deinit(io);
+    var buf: [8]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 2, 3 }, try amounts(journal, "p", chronicle.no_version, &buf));
+}
