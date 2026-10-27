@@ -15,11 +15,21 @@ const json = strand.json;
 const envelope = @import("journal/envelope.zig");
 const Encoding = @import("journal/Encoding.zig");
 const values = @import("journal/values.zig");
+const streams = @import("journal/streams.zig");
 
 pub const Seq = values.Seq;
 pub const Bytes = values.Bytes;
 pub const Records = values.Records;
 pub const Time = values.Time;
+pub const Stream = streams.Stream;
+pub const StreamVersion = streams.StreamVersion;
+pub const no_version = streams.no_version;
+
+/// A record's place in its stream.
+pub const StreamAt = struct {
+    id: []const u8,
+    version: StreamVersion,
+};
 pub const beginning = values.beginning;
 
 pub const Raw = json.Raw;
@@ -146,6 +156,9 @@ pub fn Journal(comptime Event: type) type {
             /// The sequence number of the newest record, or zero. Read it with
             /// `lastSeq`, which takes the lock.
             seq: Seq,
+            /// The streams: the active segment's, the heads looked up, and
+            /// where each truncated stream now starts.
+            streams: streams.Book,
 
             /// Refuse a conditional append whose journal has moved on. Called
             /// after everything that says the journal cannot be appended to at
@@ -166,6 +179,8 @@ pub fn Journal(comptime Event: type) type {
             /// happened. Nothing here was ever acknowledged, so nothing is lost
             /// by it.
             fn unstage(s: *State, io: Io, from: Log.Mark) void {
+                // The records taken back may have been noted in the book.
+                s.streams.stale = true;
                 s.log.discardStaged(io, from) catch {
                     // The log could not be put back. What this process staged
                     // may reach the disk as records it never acknowledged, so it
@@ -184,9 +199,13 @@ pub fn Journal(comptime Event: type) type {
                 // The tail starts one record after `tail_base`; a cursor behind
                 // that has fallen off the front of it.
                 if (values.below(cursor, values.predecessor(first) orelse values.beginning)) return .{ .records = items, .complete = false };
-                // The records the cursor has already passed, counted from the first.
-                const passed = values.span(first, cursor) orelse Records.fromRaw(items.len);
-                const skip = @min(values.limit(passed), items.len);
+                // The records the cursor has already passed: found by number,
+                // since a removed record's stub leaves a gap in the tail.
+                const skip = std.sort.partitionPoint(OwnedRecord, items, cursor, struct {
+                    fn atOrBefore(c: Seq, item: OwnedRecord) bool {
+                        return values.atMost(item.record.seq, c);
+                    }
+                }.atOrBefore);
                 return .{ .records = items[skip..], .complete = true };
             }
 
@@ -216,6 +235,9 @@ pub fn Journal(comptime Event: type) type {
             /// older writer and read back through `Options.migrate` or the
             /// `unknown` arm.
             version: u32,
+            /// Its stream and its version in it, or null for a record in no
+            /// stream. The id is a slice of `bytes`.
+            stream: ?StreamAt = null,
             /// The parsed event.
             event: Event,
             /// This record's exact line on disk, without the trailing newline.
@@ -402,6 +424,13 @@ pub fn Journal(comptime Event: type) type {
             /// a damaged segment being taken into memory whole to find out
             /// that it holds no record.
             max_record_bytes: Bytes = .fromRaw(1024 * 1024),
+            /// How many streams' newest versions to keep in memory, past those
+            /// of the active segment: the ones touched most recently. A
+            /// stream not among them is looked up in the sealed segments'
+            /// stream indexes, a filter probe each and one read of each that
+            /// may hold it. Memory is a few hundred bytes a stream, whatever
+            /// number of streams the journal holds.
+            stream_heads: u32 = 4096,
             /// How large a snapshot file may be to be written or read back. It holds
             /// whatever a fold serialises to, so this is the caller's number
             /// and not the package's; a larger one is
@@ -528,6 +557,39 @@ pub fn Journal(comptime Event: type) type {
             ev: Event,
         };
 
+        /// `Line` for a record in a stream: its id and its version in it,
+        /// between the back-link and the event.
+        const LineInStream = struct {
+            seq: u64,
+            at: i64,
+            v: u32,
+            p: u32,
+            s: []const u8,
+            sv: u64,
+            ev: Event,
+        };
+
+        /// `LineInBatch` for a record in a stream.
+        const LineInStreamBatch = struct {
+            seq: u64,
+            at: i64,
+            v: u32,
+            p: u32,
+            bf: u64,
+            bl: u64,
+            s: []const u8,
+            sv: u64,
+            ev: Event,
+        };
+
+        /// The stream id inside a line written for it: `"s":"<id>"` is
+        /// written once, before the event, so its first occurrence is it.
+        fn idIn(line: []const u8, id: []const u8) []const u8 {
+            const marker = "\"s\":\"";
+            const at = std.mem.find(u8, line, marker).? + marker.len;
+            return line[at..][0..id.len];
+        }
+
         const UnknownArm = enum { empty, raw, json_value };
 
         /// Whether `Event` has an arm this package can put an unrecognised
@@ -579,6 +641,7 @@ pub fn Journal(comptime Event: type) type {
                     .sinks = .empty,
                     .nudges = 0,
                     .seq = values.beginning,
+                    .streams = .init(gpa, options.stream_heads),
                     .write_failed = false,
                 }),
                 .changed = .initLimit(std.math.maxInt(usize)),
@@ -613,6 +676,7 @@ pub fn Journal(comptime Event: type) type {
                 defer guard.deinit(io);
                 const s = guard.value();
                 try self.fillTail(s, io);
+                try self.loadTruncations(s, io);
             }
             if (options.verify == .full) _ = try self.verify(io);
         }
@@ -677,6 +741,7 @@ pub fn Journal(comptime Event: type) type {
         }
 
         fn release(self: *Self, s: *State) void {
+            s.streams.deinit();
             s.clearTail();
             s.tail.deinit(self.gpa);
             s.line.deinit(self.gpa);
@@ -688,24 +753,29 @@ pub fn Journal(comptime Event: type) type {
         //====================================================================
 
         pub fn append(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
-            return self.appendOne(io, null, at, event, .now) catch |err| switch (err) {
+            return self.appendOne(io, null, false, {}, at, event, .now) catch |err| switch (err) {
                 error.WrongExpectedSeq => unreachable,
                 else => |e| return e,
             };
         }
 
         pub fn appendDeferred(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
-            return self.appendOne(io, null, at, event, .deferred) catch |err| switch (err) {
+            return self.appendOne(io, null, false, {}, at, event, .deferred) catch |err| switch (err) {
                 error.WrongExpectedSeq => unreachable,
                 else => |e| return e,
             };
         }
 
         pub fn appendIf(self: *Self, io: Io, expected: Expected, at: Time, event: Event) AppendIfError!Seq {
-            return self.appendOne(io, expected, at, event, .now);
+            return self.appendOne(io, expected, false, {}, at, event, .now);
         }
 
-        fn appendOne(self: *Self, io: Io, expected: ?Expected, at: Time, event: Event, durability: enum { now, deferred }) AppendIfError!Seq {
+        /// The error and the result of an append, into a stream or not.
+        fn AppendResult(comptime streamed: bool) type {
+            return if (streamed) StreamAppendError!Appended else AppendIfError!Seq;
+        }
+
+        fn appendOne(self: *Self, io: Io, expected: ?Expected, comptime streamed: bool, in: if (streamed) Target else void, at: Time, event: Event, durability: enum { now, deferred }) AppendResult(streamed) {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
@@ -720,11 +790,12 @@ pub fn Journal(comptime Event: type) type {
             // one.
             if (self.config.access == .read) return error.ReadOnly;
             if (s.write_failed) return error.PersistenceFailed;
-            try s.expect(expected);
+            if (!streamed) try s.expect(expected);
+            const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = try self.nextVersion(s, io, in, 1) } else null;
             const next = try values.successor(s.seq);
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
-            var built = try self.encode(s, next, at, s.log.chainTip(), event, null);
+            var built = try self.encode(s, next, at, s.log.chainTip(), event, null, place);
             var held = false;
             defer if (!held) built.release();
 
@@ -742,27 +813,28 @@ pub fn Journal(comptime Event: type) type {
                     },
                 }
             }
+            self.noteStaged(s, io, place, next, built.bytes.len);
 
             held = self.publish(s, built);
             self.wake(io);
             // Last, so that a sink reading this record was reading memory that
             // still existed.
             self.trimTail(s);
-            return next;
+            return if (streamed) .{ .seq = next, .version = place.?.version } else next;
         }
 
         pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!Seq {
-            return self.appendBatch(io, null, entries, commit) catch |err| switch (err) {
+            return self.appendBatch(io, null, false, {}, entries, commit) catch |err| switch (err) {
                 error.WrongExpectedSeq => unreachable,
                 else => |e| return e,
             };
         }
 
         pub fn appendAllIf(self: *Self, io: Io, expected: Expected, entries: []const Entry, commit: Commit) AppendIfError!Seq {
-            return self.appendBatch(io, expected, entries, commit);
+            return self.appendBatch(io, expected, false, {}, entries, commit);
         }
 
-        fn appendBatch(self: *Self, io: Io, expected: ?Expected, entries: []const Entry, commit: Commit) AppendIfError!Seq {
+        fn appendBatch(self: *Self, io: Io, expected: ?Expected, comptime streamed: bool, in: if (streamed) Target else void, entries: []const Entry, commit: Commit) AppendResult(streamed) {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
@@ -774,8 +846,9 @@ pub fn Journal(comptime Event: type) type {
             defer _ = io.swapCancelProtection(protection);
             if (self.config.access == .read) return error.ReadOnly;
             if (s.write_failed) return error.PersistenceFailed;
-            try s.expect(expected);
-            if (entries.len == 0) return s.seq;
+            if (!streamed) try s.expect(expected);
+            const first_version: StreamVersion = if (streamed) try self.nextVersion(s, io, in, entries.len) else no_version;
+            if (entries.len == 0) return if (streamed) .{ .seq = s.seq, .version = .fromRaw(first_version.raw() - 1) } else s.seq;
             const last = try values.advance(s.seq, .fromRaw(entries.len));
 
             // Reserved before anything is written: after the bytes are
@@ -804,7 +877,8 @@ pub fn Journal(comptime Event: type) type {
             const staged_from = s.log.mark();
             for (entries, 0..) |entry, i| {
                 const numbered = values.advance(before, .fromRaw(i + 1)) catch unreachable; // unreachable: the last of them, `last`, was numbered above
-                var item = self.encode(s, numbered, entry.at, link, entry.event, batch) catch |err| {
+                const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = .fromRaw(first_version.raw() + i) } else null;
+                var item = self.encode(s, numbered, entry.at, link, entry.event, batch, place) catch |err| {
                     s.unstage(io, staged_from);
                     return err;
                 };
@@ -819,6 +893,7 @@ pub fn Journal(comptime Event: type) type {
                         return err;
                     };
                 }
+                self.noteStaged(s, io, place, numbered, item.bytes.len);
                 if (self.keepsRecords(s)) built.appendAssumeCapacity(item) else item.release();
             }
 
@@ -835,7 +910,7 @@ pub fn Journal(comptime Event: type) type {
             s.seq = last;
             self.wake(io);
             self.trimTail(s);
-            return last;
+            return if (streamed) .{ .seq = last, .version = .fromRaw(first_version.raw() + entries.len - 1) } else last;
         }
 
         pub fn reconcile(self: *Self, io: Io) ReconcileError!Seq {
@@ -1021,7 +1096,8 @@ pub fn Journal(comptime Event: type) type {
                     // Stepping over a record before its event is parsed is
                     // what lets a reader hold a cursor into a log whose
                     // events it does not know.
-                    if (!try walk.run.accept(header)) {
+                    // A stub keeps its place in the sequence, and is no event.
+                    if (!try walk.run.accept(header) or header.removed) {
                         walk.last = walk.lastRead(header);
                         continue;
                     }
@@ -1710,7 +1786,7 @@ pub fn Journal(comptime Event: type) type {
         /// would produce: an `Event` whose slices point at a stack buffer is
         /// safe to append. Where nothing will, that parse would build a record
         /// and drop it unread, so it is not done.
-        fn encode(self: *Self, s: *State, seq: Seq, at: Time, back_link: u32, event: Event, batch: ?envelope.Batch) AppendError!Built {
+        fn encode(self: *Self, s: *State, seq: Seq, at: Time, back_link: u32, event: Event, batch: ?envelope.Batch, place: ?StreamAt) AppendError!Built {
             // A record numbered outside what a reader accepts would be durable
             // before anything noticed, so these hold in every build.
             aegis.assert.pre(seq != values.beginning, "a record is numbered from one");
@@ -1744,21 +1820,40 @@ pub fn Journal(comptime Event: type) type {
             // The record is `Line` written by strand, null optionals
             // included, left open: the checksum is its last member.
             const value_options: json.WriteOptions = .{ .limits = .sized(values.limit(self.config.max_record_bytes)) };
-            var record = if (batch) |b| json.writeObjectOpen(&out.writer, LineInBatch{
+            const v = self.config.schema_version;
+            var record = (if (batch) |b| (if (place) |in| json.writeObjectOpen(&out.writer, LineInStreamBatch{
                 .seq = seq.raw(),
                 .at = at.raw(),
-                .v = self.config.schema_version,
+                .v = v,
+                .p = back_link,
+                .bf = b.first.raw(),
+                .bl = b.last.raw(),
+                .s = in.id,
+                .sv = in.version.raw(),
+                .ev = event,
+            }, value_options) else json.writeObjectOpen(&out.writer, LineInBatch{
+                .seq = seq.raw(),
+                .at = at.raw(),
+                .v = v,
                 .p = back_link,
                 .bf = b.first.raw(),
                 .bl = b.last.raw(),
                 .ev = event,
-            }, value_options) catch |err| return refused(&encoding, err) else json.writeObjectOpen(&out.writer, Line{
+            }, value_options)) else if (place) |in| json.writeObjectOpen(&out.writer, LineInStream{
                 .seq = seq.raw(),
                 .at = at.raw(),
-                .v = self.config.schema_version,
+                .v = v,
+                .p = back_link,
+                .s = in.id,
+                .sv = in.version.raw(),
+                .ev = event,
+            }, value_options) else json.writeObjectOpen(&out.writer, Line{
+                .seq = seq.raw(),
+                .at = at.raw(),
+                .v = v,
                 .p = back_link,
                 .ev = event,
-            }, value_options) catch |err| return refused(&encoding, err);
+            }, value_options)) catch |err| return refused(&encoding, err);
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
             // it.
@@ -1808,6 +1903,8 @@ pub fn Journal(comptime Event: type) type {
                     .seq = seq,
                     .at = at,
                     .version = self.config.schema_version,
+                    // The id the record carries is the one in its own bytes.
+                    .stream = if (place) |in| .{ .id = idIn(stored, in.id), .version = in.version } else null,
                     .event = parsed,
                     .bytes = stored,
                 },
@@ -1843,7 +1940,7 @@ pub fn Journal(comptime Event: type) type {
             while (try scan.next(io)) |line| {
                 if (scan.takeBoundary()) |boundary| try run.beginSegment(boundary);
                 const header = try line.parse({}, parseHeader);
-                if (!try run.accept(header)) continue;
+                if (!try run.accept(header) or header.removed) continue;
 
                 const arena = try createArena(self.gpa);
                 errdefer destroyArena(arena);
@@ -1861,8 +1958,429 @@ pub fn Journal(comptime Event: type) type {
             } else if (s.log.baseSeq() != s.seq) {
                 return error.DiscontinuousSeq;
             }
+            // Before the tail is taken: a failure here leaves the old one.
+            try self.rescanStreams(s, io);
             s.tail.deinit(self.gpa);
             s.tail = rebuilt;
+        }
+
+        //====================================================================
+        // Streams.
+        //====================================================================
+
+        /// What an append into a stream expects the stream to hold.
+        pub const StreamExpected = union(enum) {
+            /// Whatever it holds.
+            any,
+            /// No record: the stream is new.
+            no_stream,
+            /// At least one record.
+            exists,
+            /// Exactly this many: its newest record is this version.
+            exact: StreamVersion,
+        };
+
+        /// Where an append into a stream put its record, or the last of its
+        /// batch.
+        pub const Appended = struct {
+            seq: Seq,
+            version: StreamVersion,
+        };
+
+        pub const StreamAppendError = AppendError || OpenError || error{ WrongExpectedVersion, StreamVersionExhausted };
+
+        pub const StreamReadError = OpenError || error{StreamCompacted};
+
+        pub const TruncateStreamError = OpenError || Log.WriteFileError || error{ ReadOnly, PersistenceFailed, StreamCompacted };
+
+        const Target = struct { stream: Stream, expected: StreamExpected };
+
+        /// The name of the file that keeps each truncated stream's point, in
+        /// the journal's directory.
+        pub const truncations_name = "truncations";
+
+        /// Append `event` to `stream`, if the stream holds what `expected`
+        /// says, as its next version: one durable write, as `append`.
+        /// `error.WrongExpectedVersion` when it does not, and nothing is
+        /// written; `streamVersion` reads what it holds.
+        pub fn appendTo(self: *Self, io: Io, stream: Stream, expected: StreamExpected, at: Time, event: Event) StreamAppendError!Appended {
+            return self.appendOne(io, null, true, .{ .stream = stream, .expected = expected }, at, event, .now);
+        }
+
+        /// Append `entries` to `stream` as its next versions, one batch, if
+        /// the stream holds what `expected` says. Every record of the batch
+        /// is in `stream`. Returns where the last went.
+        pub fn appendAllTo(self: *Self, io: Io, stream: Stream, expected: StreamExpected, entries: []const Entry, commit: Commit) StreamAppendError!Appended {
+            return self.appendBatch(io, null, true, .{ .stream = stream, .expected = expected }, entries, commit);
+        }
+
+        /// The version of `stream`'s newest record, or `no_version` for a
+        /// stream with none. A stream truncated past all its records stands
+        /// at the version before its truncation point.
+        pub fn streamVersion(self: *Self, io: Io, stream: Stream) OpenError!StreamVersion {
+            var guard = try self.state.acquire(io);
+            defer guard.deinit(io);
+            return self.streamHead(guard.value(), io, stream.bytes);
+        }
+
+        /// Make `stream`'s records below version `before` unreadable now:
+        /// `readStream` starts at `before`, and one asked to start below it
+        /// is `error.StreamCompacted`. The next `compact` removes their
+        /// events from the files. A point at or below the stream's current
+        /// one changes nothing. Durable when it returns.
+        pub fn truncateStreamBefore(self: *Self, io: Io, stream: Stream, before: StreamVersion) TruncateStreamError!void {
+            var guard = try self.state.acquire(io);
+            defer guard.deinit(io);
+            const s = guard.value();
+            const protection = io.swapCancelProtection(.blocked);
+            defer _ = io.swapCancelProtection(protection);
+            if (self.config.access == .read) return error.ReadOnly;
+            if (s.write_failed) return error.PersistenceFailed;
+            const now = s.streams.truncation(stream.bytes);
+            if (!(now.compare(before) == .lt)) return;
+            // The head stays where it is: truncating removes records, not the
+            // stream's place.
+            const head = try self.streamHead(s, io, stream.bytes);
+            try s.streams.setTruncation(stream.bytes, before);
+            self.writeTruncations(s, io) catch |err| {
+                s.streams.setTruncation(stream.bytes, now) catch {};
+                return err;
+            };
+            s.streams.heads.put(stream.bytes, .{ .version = head });
+        }
+
+        /// The records of one stream, oldest first, from a version on.
+        pub const StreamRead = struct {
+            journal: *Self,
+            decoder: Decoder,
+            /// Where each record to read is, chosen when the read began.
+            places: std.ArrayList(Place),
+            next_place: usize,
+            /// Holds the record `next` last returned, and nothing else.
+            arena: std.heap.ArenaAllocator,
+            /// The stream, copied.
+            id: [streams.max_id_bytes]u8 = undefined,
+            id_len: u8 = 0,
+
+            const Place = struct { segment: Seq, offset: Bytes, version: StreamVersion };
+
+            pub fn deinit(walk: *StreamRead) void {
+                walk.places.deinit(walk.journal.gpa);
+                walk.arena.deinit();
+                walk.* = undefined;
+            }
+
+            /// The next record, or null when the records the stream held
+            /// when the read began are done. A record the journal no longer
+            /// holds (dropped, compacted, truncated since) is stepped over.
+            pub fn next(walk: *StreamRead, io: Io) StreamReadError!?Record {
+                const self = walk.journal;
+                while (walk.next_place < walk.places.items.len) {
+                    const place = walk.places.items[walk.next_place];
+                    walk.next_place += 1;
+                    const line = line: {
+                        var guard = try self.state.acquire(io);
+                        defer guard.deinit(io);
+                        const s = guard.value();
+                        if (place.version.compare(s.streams.truncation(walk.streamId())) == .lt) continue;
+                        break :line try s.log.lineOf(io, place.segment, place.offset) orelse continue;
+                    };
+                    defer self.gpa.free(line);
+                    const header = parseHeader({}, line) catch |err| switch (err) {
+                        // A record rewritten or gone since the read began.
+                        error.CorruptRecord, error.ChecksumMismatch => continue,
+                    };
+                    const in = header.in_stream orelse continue;
+                    if (header.removed or in.version != place.version) continue;
+                    _ = walk.arena.reset(.retain_capacity);
+                    const stored = try walk.arena.allocator().dupe(u8, line);
+                    return try recordFrom(walk.decoder, walk.arena.allocator(), header, stored);
+                }
+                return null;
+            }
+
+            fn streamId(walk: *const StreamRead) []const u8 {
+                return walk.id[0..walk.id_len];
+            }
+        };
+
+        /// Read `stream` from version `from` on, into `walk`, which is the
+        /// caller's to `deinit`. `no_version` reads from its oldest readable
+        /// record. A `from` below the stream's truncation point, or below
+        /// the records compaction and dropped segments have left, is
+        /// `error.StreamCompacted`. The read takes the records the stream
+        /// holds now; one appended after it is not among them.
+        pub fn readStream(self: *Self, io: Io, stream: Stream, from: StreamVersion, walk: *StreamRead) StreamReadError!void {
+            walk.* = .{
+                .journal = self,
+                .decoder = self.captureDecoder(),
+                .places = .empty,
+                .next_place = 0,
+                .arena = .init(self.gpa),
+            };
+            errdefer walk.deinit();
+            @memcpy(walk.id[0..stream.bytes.len], stream.bytes);
+            walk.id_len = @intCast(stream.bytes.len);
+
+            var guard = try self.state.acquire(io);
+            defer guard.deinit(io);
+            const s = guard.value();
+            try self.freshStreams(s, io);
+            const floor = s.streams.truncation(stream.bytes);
+            if (from != no_version and (from.compare(floor) == .lt)) return error.StreamCompacted;
+            const start = if ((from.compare(floor) == .lt)) floor else from;
+
+            const segments = s.log.segments.items;
+            if (segments.len == 0) return;
+            for (segments[0 .. segments.len - 1]) |segment| {
+                const bytes = try self.streamIndex(s, io, segment) orelse continue;
+                defer self.gpa.free(bytes);
+                const index = streams.Index.parse(bytes, segment.base_seq, segment.bytes) catch continue;
+                const section = index.find(stream.bytes) orelse continue;
+                for (0..section.len()) |i| {
+                    const entry = section.at(i);
+                    if ((entry.version.compare(start) == .lt)) continue;
+                    try walk.places.append(self.gpa, .{ .segment = segment.base_seq, .offset = entry.offset, .version = entry.version });
+                }
+            }
+            for (s.streams.placed.items) |p| {
+                if (!std.mem.eql(u8, p.id, stream.bytes) or (p.entry.version.compare(start) == .lt)) continue;
+                try walk.places.append(self.gpa, .{ .segment = s.streams.active_base, .offset = p.entry.offset, .version = p.entry.version });
+            }
+            // What compaction or a dropped segment took is below the first
+            // record found; a `from` there is not readable.
+            if (from != no_version and walk.places.items.len > 0 and (from.compare(walk.places.items[0].version) == .lt))
+                return error.StreamCompacted;
+        }
+
+        /// The newest version of stream `id`: the active segment's, else the
+        /// heads', else the newest sealed segment's whose index holds it,
+        /// and never below its truncation point's predecessor.
+        fn streamHead(self: *Self, s: *State, io: Io, id: []const u8) OpenError!StreamVersion {
+            try self.freshStreams(s, io);
+            const book = &s.streams;
+            const found = found: {
+                if (book.activeVersion(id)) |v| break :found v;
+                if (book.heads.get(id)) |head| break :found head.version;
+                const segments = s.log.segments.items;
+                var v = no_version;
+                if (segments.len > 1) {
+                    var i = segments.len - 1;
+                    while (i > 0) {
+                        i -= 1;
+                        const segment = segments[i];
+                        const bytes = try self.streamIndex(s, io, segment) orelse continue;
+                        defer self.gpa.free(bytes);
+                        const index = streams.Index.parse(bytes, segment.base_seq, segment.bytes) catch continue;
+                        if (index.find(id)) |section| {
+                            v = section.last().version;
+                            break;
+                        }
+                    }
+                }
+                book.heads.put(id, .{ .version = v });
+                break :found v;
+            };
+            const floor = book.truncation(id);
+            if (floor == no_version) return found;
+            const below_floor: StreamVersion = .fromRaw(floor.raw() - 1);
+            return if ((found.compare(below_floor) == .lt)) below_floor else found;
+        }
+
+        /// The version an append of `count` records into `in` starts at,
+        /// once the stream is what `in.expected` says.
+        fn nextVersion(self: *Self, s: *State, io: Io, in: Target, count: usize) StreamAppendError!StreamVersion {
+            const head = try self.streamHead(s, io, in.stream.bytes);
+            switch (in.expected) {
+                .any => {},
+                .no_stream => if (head != no_version) return error.WrongExpectedVersion,
+                .exists => if (head == no_version) return error.WrongExpectedVersion,
+                .exact => |v| if (head != v) return error.WrongExpectedVersion,
+            }
+            // Written as a JSON integer, so `maxInt(i64)` is the last.
+            const last = std.math.add(u64, head.raw(), count) catch return error.StreamVersionExhausted;
+            if (last > std.math.maxInt(i64)) return error.StreamVersionExhausted;
+            return .fromRaw(head.raw() + 1);
+        }
+
+        /// Note a record just staged: a stream's record joins the active
+        /// segment's, and a segment the log has just sealed gets its stream
+        /// index. Never fails: what cannot be noted leaves the book stale,
+        /// and the next lookup reads the active segment again.
+        fn noteStaged(self: *Self, s: *State, io: Io, place: ?StreamAt, seq: Seq, line_len: usize) void {
+            const book = &s.streams;
+            const segments = s.log.segments.items;
+            if (segments.len == 0) {
+                book.stale = true;
+                return;
+            }
+            const active = segments[segments.len - 1];
+            if (!book.stale and active.base_seq != book.active_base) self.sealStreams(s, io);
+            if (book.stale) return;
+            const in = place orelse return;
+            const offset = active.bytes.sub(.fromRaw(line_len + 1)) catch {
+                book.stale = true;
+                return;
+            };
+            book.place(in.id, .{ .version = in.version, .seq = seq, .offset = offset }) catch {
+                book.stale = true;
+            };
+        }
+
+        /// The active segment the book describes has been sealed: write its
+        /// stream index, keep its heads, and start on the new one.
+        fn sealStreams(self: *Self, s: *State, io: Io) void {
+            const book = &s.streams;
+            for (book.placed.items) |p| book.heads.put(p.id, .{ .version = p.entry.version });
+            if (self.config.access == .write) for (s.log.segments.items) |segment| {
+                if (segment.base_seq != book.active_base) continue;
+                self.writeStreamIndex(s, io, segment, book.placed.items) catch |err| {
+                    // A cache: a lookup that finds none builds it.
+                    std.log.debug("optional stream index maintenance: {t}", .{err});
+                };
+            };
+            const segments = s.log.segments.items;
+            book.resetActive(segments[segments.len - 1].base_seq);
+        }
+
+        fn writeStreamIndex(self: *Self, s: *State, io: Io, segment: Log.Segment, placed: []const streams.Placed) (Allocator.Error || Io.Dir.WriteFileError)!void {
+            const buf = &s.streams.buf;
+            try streams.encode(self.gpa, segment.base_seq, segment.bytes, placed, buf);
+            const name = Log.segmentName(Log.stream_index_extension, segment.base_seq);
+            try s.log.dir.borrow().writeFile(io, .{ .sub_path = &name, .data = buf.items });
+        }
+
+        /// Segment `segment`'s stream index, read whole and owned by the
+        /// caller: the one beside it when it describes the segment's bytes,
+        /// else one built from the segment (and written beside it, when the
+        /// journal writes). Null for a segment holding no stream's record.
+        fn streamIndex(self: *Self, s: *State, io: Io, segment: Log.Segment) OpenError!?[]u8 {
+            const name = Log.segmentName(Log.stream_index_extension, segment.base_seq);
+            const limit: Io.Limit = .limited(values.limit(segment.bytes) + 4096);
+            if (s.log.dir.borrow().readFileAlloc(io, &name, self.gpa, limit)) |bytes| {
+                if (streams.Index.parse(bytes, segment.base_seq, segment.bytes)) |index| {
+                    if (index.streams == 0) {
+                        self.gpa.free(bytes);
+                        return null;
+                    }
+                    return bytes;
+                } else |_| self.gpa.free(bytes);
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                else => {},
+            }
+
+            // Built from the segment: each line's place in its stream.
+            var ids: std.heap.ArenaAllocator = .init(self.gpa);
+            defer ids.deinit();
+            var placed: std.ArrayList(streams.Placed) = .empty;
+            defer placed.deinit(self.gpa);
+            var scan = try s.log.scanIdle();
+            defer scan.deinit(io);
+            if (try s.log.scanAtInto(io, &scan, segment.base_seq, values.no_bytes)) {
+                while (try scan.next(io)) |line| {
+                    if (scan.bases[scan.at] != segment.base_seq) break;
+                    const header = try line.parse({}, parseHeader);
+                    const in = header.in_stream orelse continue;
+                    const bytes = line.readForParse();
+                    try placed.append(self.gpa, .{
+                        .id = try ids.allocator().dupe(u8, bytes[in.id.from..in.id.to]),
+                        .entry = .{ .version = in.version, .seq = header.seq, .offset = scan.line_start },
+                    });
+                }
+            }
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(self.gpa);
+            try streams.encode(self.gpa, segment.base_seq, segment.bytes, placed.items, &out);
+            if (self.config.access == .write) s.log.dir.borrow().writeFile(io, .{ .sub_path = &name, .data = out.items }) catch |err| {
+                std.log.debug("optional stream index maintenance: {t}", .{err});
+            };
+            if (placed.items.len == 0) return null;
+            return try out.toOwnedSlice(self.gpa);
+        }
+
+        /// Read the active segment's records in streams again, if the book
+        /// may not describe them.
+        fn freshStreams(self: *Self, s: *State, io: Io) OpenError!void {
+            if (!s.streams.stale) return;
+            try self.rescanStreams(s, io);
+        }
+
+        /// The book from the files: the active segment's streams read again,
+        /// and no head kept, since what the segments hold may have changed.
+        fn rescanStreams(self: *Self, s: *State, io: Io) OpenError!void {
+            _ = self;
+            const book = &s.streams;
+            book.heads.clear();
+            book.stale = true;
+            const segments = s.log.segments.items;
+            if (segments.len == 0) {
+                book.resetActive(values.beginning);
+                return;
+            }
+            const active = segments[segments.len - 1];
+            book.resetActive(active.base_seq);
+            errdefer book.stale = true;
+            var scan = try s.log.scanIdle();
+            defer scan.deinit(io);
+            if (!try s.log.scanAtInto(io, &scan, active.base_seq, values.no_bytes)) return;
+            while (try scan.next(io)) |line| {
+                const header = try line.parse({}, parseHeader);
+                const in = header.in_stream orelse continue;
+                const bytes = line.readForParse();
+                try book.place(bytes[in.id.from..in.id.to], .{ .version = in.version, .seq = header.seq, .offset = scan.line_start });
+            }
+        }
+
+        /// Each truncated stream's point, from the file that keeps them.
+        fn loadTruncations(self: *Self, s: *State, io: Io) OpenError!void {
+            s.streams.clearTruncations();
+            const bytes = s.log.dir.borrow().readFileAlloc(io, truncations_name, self.gpa, .unlimited) catch |err| switch (err) {
+                error.FileNotFound => return,
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                else => return error.CorruptRecord,
+            };
+            defer self.gpa.free(bytes);
+            var lines = std.mem.splitScalar(u8, bytes, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                const point = parseTruncation(line) orelse return error.CorruptRecord;
+                try s.streams.setTruncation(point.id, point.before);
+            }
+        }
+
+        const Truncation = struct { id: []const u8, before: StreamVersion };
+
+        /// One line of the truncations file: `{"s":"<id>","tb":<version>}`.
+        fn parseTruncation(line: []const u8) ?Truncation {
+            var members: json.Members = undefined;
+            members.init(line, .{ .limits = .sized(line.len) });
+            var id: ?streams.Stream = null;
+            var before: ?u64 = null;
+            while (members.next() catch return null) |member| {
+                if (member.is("s")) {
+                    if (id != null) return null;
+                    id = streams.idOf(member.value) orelse return null;
+                } else if (member.is("tb")) {
+                    if (before != null) return null;
+                    before = envelope.integerOf(u64, member.value) orelse return null;
+                }
+            }
+            _ = members.finish() catch return null;
+            return .{ .id = (id orelse return null).bytes, .before = .fromRaw(before orelse return null) };
+        }
+
+        /// Every truncation point, written whole and atomically.
+        fn writeTruncations(self: *Self, s: *State, io: Io) (Allocator.Error || Log.WriteFileError)!void {
+            var out: std.Io.Writer.Allocating = .init(self.gpa);
+            defer out.deinit();
+            var it = s.streams.truncations.iterator();
+            while (it.next()) |point| {
+                out.writer.print("{{\"s\":\"{s}\",\"tb\":{d}}}\n", .{ point.key_ptr.*, point.value_ptr.raw() }) catch return error.OutOfMemory;
+            }
+            try s.log.writeAtomic(io, truncations_name, out.written());
         }
 
         /// Drop the oldest records until the tail is inside both of its
@@ -1885,9 +2403,16 @@ pub fn Journal(comptime Event: type) type {
             c: u32,
             /// The atomic batch the record was written in, if it was.
             batch: ?envelope.Batch,
+            /// Its stream: where the id sits in the line, and its version.
+            in_stream: ?InStream,
+            /// A stub: a stream's record removed past its truncation, which
+            /// keeps its place and has no event.
+            removed: bool,
             /// Where the event sits in the line, still unparsed.
             ev: Span,
         };
+
+        const InStream = struct { id: Span, version: StreamVersion };
 
         const Span = envelope.Span;
 
@@ -1898,9 +2423,15 @@ pub fn Journal(comptime Event: type) type {
             // A line that does not end in a checksum is not a record and
             // there is nothing to check it against.
             const t = fields.trailer orelse return error.CorruptRecord;
-            if (checksum(t.covered) != t.c) return error.ChecksumMismatch;
+            if (checksum(t.covered) != t.sum) return error.ChecksumMismatch;
             const head = fields.head() catch return error.CorruptRecord;
-            return .{ .seq = head.seq, .at = head.at, .version = head.v, .p = head.p, .c = t.c, .batch = head.batch, .ev = head.ev };
+            // The id is a slice of `line`; kept as where it sits, so a record
+            // built from a copy of the line takes it from the copy.
+            const in_stream: ?InStream = if (head.in_stream) |place| .{
+                .id = .{ .from = @intFromPtr(place.stream.bytes.ptr) - @intFromPtr(line.ptr), .to = @intFromPtr(place.stream.bytes.ptr) - @intFromPtr(line.ptr) + place.stream.bytes.len },
+                .version = place.version,
+            } else null;
+            return .{ .seq = head.seq, .at = head.at, .version = head.v, .p = head.p, .c = t.c, .batch = head.batch, .in_stream = in_stream, .removed = head.removed, .ev = head.ev };
         }
 
         /// What reading a line's envelope can find wrong with it.
@@ -1925,6 +2456,7 @@ pub fn Journal(comptime Event: type) type {
                 .seq = header.seq,
                 .at = header.at,
                 .version = header.version,
+                .stream = if (header.in_stream) |place| .{ .id = line[place.id.from..place.id.to], .version = place.version } else null,
                 .event = try eventFrom(decoding, arena, header.version, header.ev, line),
                 .bytes = line,
             };

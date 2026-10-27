@@ -66,6 +66,7 @@ pub const cursor_extension = ".cursor";
 /// that the directory sorts in sequence order, plus one of these.
 pub const segment_extension = ".log";
 pub const index_extension = ".idx";
+pub const stream_index_extension = @import("streams.zig").extension;
 /// The start of every temporary name: a segment `compact` is building, a
 /// snapshot or a cursor on its way in. Each is renamed into place once it is
 /// whole; one a crash left behind is never read, and a writer's `open`
@@ -1457,6 +1458,19 @@ fn fileLength(log: *Self, io: Io, name: []const u8) OpenError!Bytes {
     return .fromRaw(try file.length(io));
 }
 
+/// The line of segment `base_seq` that begins at `offset`, owned by the
+/// caller and freed with the log's allocator; null when no segment has that
+/// name, or the segment ends before a whole line does.
+pub fn lineOf(log: *Self, io: Io, base_seq: Seq, offset: Bytes) OpenError!?[]u8 {
+    const at = log.segmentIndex(base_seq) orelse return null;
+    const line = try log.lineAt(io, log.segments.items[at], offset);
+    if (!line.terminated) {
+        log.gpa.free(line.bytes);
+        return null;
+    }
+    return line.bytes;
+}
+
 /// The line beginning at `offset`, read through strand's line layer in
 /// bounded steps rather than by taking the segment into memory.
 fn lineAt(log: *Self, io: Io, segment: Segment, offset: Bytes) OpenError!Line {
@@ -1731,7 +1745,7 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
 fn torn(text: Unparsed, fields: ?envelopes.Fields) bool {
     if (std.mem.findScalar(u8, text.readForParse(), 0) != null) return true;
     const t = (fields orelse return false).trailer orelse return false;
-    return Crc32c.hash(t.covered) != t.c;
+    return Crc32c.hash(t.covered) != t.sum;
 }
 
 /// How many of the bytes of `file` from `from` to `to` somebody wrote: up to
@@ -2822,6 +2836,12 @@ fn deleteSegmentFiles(log: *Self, io: Io, base_seq: Seq) Io.Dir.DeleteFileError!
     log.dir.borrow().deleteFile(io, &segmentName(index_extension, base_seq)) catch |err| {
         // The index is a rebuildable cache; record durability is handled separately.
         std.log.debug("optional index maintenance: {t}", .{err});
+    };
+    log.dir.borrow().deleteFile(io, &segmentName(stream_index_extension, base_seq)) catch |err| switch (err) {
+        // A segment no lookup has needed one for has none.
+        error.FileNotFound => {},
+        // So is the stream index a cache.
+        else => std.log.debug("optional stream index maintenance: {t}", .{err}),
     };
 }
 

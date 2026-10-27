@@ -76,6 +76,22 @@ pub const Records = implementation.Records;
 /// `Time.fromTimestamp(std.Io.Clock.real.now(io), .down)` reads one off `std.Io`.
 pub const Time = implementation.Time;
 
+/// A stream's id: 1 to 255 bytes of printable ASCII, neither `"` nor `\`,
+/// so it has one spelling in JSON. `Stream.of(bytes)` checks one, and
+/// borrows the bytes.
+pub const Stream = implementation.Stream;
+
+/// Where a record sits in its stream: its first record is 1, each one
+/// after it the next. An aegis id, apart from the journal's `Seq`.
+pub const StreamVersion = implementation.StreamVersion;
+
+/// The place before a stream's first record: what a stream with no record
+/// stands at, and what `readStream` takes to read from its oldest.
+pub const no_version: StreamVersion = implementation.no_version;
+
+/// A record's stream and its version there (`Record.stream`).
+pub const StreamAt = implementation.StreamAt;
+
 /// What `Journal.open` does with a final line the previous writer did not
 /// finish — the normal shape of a crash during `append`.
 pub const OnTruncated = Log.OnTruncated;
@@ -362,6 +378,28 @@ pub fn Journal(comptime Event: type) type {
         /// one the caller expected, so nothing was written. `Expected.found`
         /// says which it is.
         pub const AppendIfError = State.AppendIfError;
+
+        /// What `appendTo` and `appendAllTo` expect of a stream: anything,
+        /// no record, at least one, or this version as its newest.
+        pub const StreamExpected = State.StreamExpected;
+
+        /// Where an append into a stream put its record, or its batch's last.
+        pub const Appended = State.Appended;
+
+        /// `AppendError`, what reading the stream indexes can meet, and
+        /// `WrongExpectedVersion` (the stream is not what was expected:
+        /// nothing was written) or `StreamVersionExhausted`.
+        pub const StreamAppendError = State.StreamAppendError;
+
+        /// Errors from `readStream` and from the read it returns, and
+        /// `StreamCompacted`: the version asked for is below the stream's
+        /// truncation point, or was in a segment compaction removed.
+        pub const StreamReadError = State.StreamReadError;
+
+        pub const TruncateStreamError = State.TruncateStreamError;
+
+        /// The records of one stream, from `readStream`.
+        pub const StreamRead = facade.StreamReadOwner(State);
 
         /// What `appendIf` and `appendAllIf` expect of the journal: the
         /// sequence number its newest record must still have, and where to
@@ -667,6 +705,61 @@ pub fn Journal(comptime Event: type) type {
         /// Safe to call from any task or thread.
         pub fn appendIf(self: *Self, io: Io, expected: Expected, at: Time, event: Event) AppendIfError!Seq {
             return State.appendIf(self.inner(), io, expected, at, event);
+        }
+
+        /// `append` into `stream`, as its next version, if the stream holds
+        /// what `expected` says: optimistic concurrency per stream, as an
+        /// event store's expected version, with thousands of streams in one
+        /// journal. The record carries the stream's id and its version in
+        /// it (`Record.stream`), inside its checksum. The check and the
+        /// append are one step under the journal's lock.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn appendTo(self: *Self, io: Io, stream: Stream, expected: StreamExpected, at: Time, event: Event) StreamAppendError!Appended {
+            return State.appendTo(self.inner(), io, stream, expected, at, event);
+        }
+
+        /// `appendAll` into `stream`: every record of the batch is in it,
+        /// at its next versions, if the stream holds what `expected` says.
+        /// An empty batch checks the expectation and writes nothing.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn appendAllTo(self: *Self, io: Io, stream: Stream, expected: StreamExpected, entries: []const Entry, commit: Commit) StreamAppendError!Appended {
+            return State.appendAllTo(self.inner(), io, stream, expected, entries, commit);
+        }
+
+        /// The version of `stream`'s newest record, `no_version` for a
+        /// stream with none. A stream truncated past every record it had
+        /// keeps its version.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn streamVersion(self: *Self, io: Io, stream: Stream) OpenError!StreamVersion {
+            return State.streamVersion(self.inner(), io, stream);
+        }
+
+        /// The records of `stream` from version `from` on, oldest first:
+        /// `no_version` reads from its oldest readable one. The read takes
+        /// the records the stream holds now. It reads a sealed segment only
+        /// when its stream index's filter says the stream may be there.
+        ///
+        /// Safe to call from any task or thread, except from inside a sink.
+        pub fn readStream(self: *Self, io: Io, stream: Stream, from: StreamVersion) StreamReadError!*StreamRead {
+            const walk = try self.state.gpa.create(StreamRead);
+            errdefer self.state.gpa.destroy(walk);
+            try State.readStream(self.inner(), io, stream, from, &walk.state);
+            return walk;
+        }
+
+        /// Make `stream`'s records below version `before` unreadable, now
+        /// and durably: what a request to delete a person's data needs.
+        /// `readStream` starts at `before`; the stream keeps its version.
+        /// The next `compact` takes their events out of the files, leaving
+        /// each one's place: a global `replay` steps over them from then,
+        /// and shows them until then.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn truncateStreamBefore(self: *Self, io: Io, stream: Stream, before: StreamVersion) TruncateStreamError!void {
+            return State.truncateStreamBefore(self.inner(), io, stream, before);
         }
 
         /// `appendAll`, only if the newest record is still `expected.last`:

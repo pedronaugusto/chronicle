@@ -54,6 +54,30 @@ pub fn ReplayOwner(comptime State: type, comptime PositionType: type) type {
     };
 }
 
+pub fn StreamReadOwner(comptime State: type) type {
+    return struct {
+        /// Private: the read, where the journal made it.
+        state: State.StreamRead,
+
+        const Self = @This();
+
+        /// Release the read and the record it last returned. Its journal
+        /// must still be alive.
+        pub fn deinit(walk: *Self) void {
+            const gpa = walk.state.journal.gpa;
+            walk.state.deinit();
+            gpa.destroy(walk);
+        }
+
+        /// The stream's next record, or null when the records it held when
+        /// the read began are done. It is valid until the next call to
+        /// `next` or to `deinit`.
+        pub fn next(walk: *Self, io: Io) State.StreamReadError!?State.Record {
+            return State.StreamRead.next(&walk.state, io);
+        }
+    };
+}
+
 pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
     return struct {
         /// Private: the reader, where the journal made it.

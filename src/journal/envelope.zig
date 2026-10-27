@@ -16,6 +16,7 @@ const aegis = @import("aegis");
 const jsonl = @import("jsonl.zig");
 const strand = jsonl.strand;
 const values = @import("values.zig");
+const streams = @import("streams.zig");
 
 const Seq = values.Seq;
 const Time = values.Time;
@@ -34,12 +35,24 @@ pub fn integerOf(comptime T: type, value: []const u8) ?T {
     return strand.json.intOf(T, value);
 }
 
-/// What a record's checksum covers, and the checksum.
+/// What a record's checksum covers, the checksum, and what the next record
+/// links back to.
 pub const Trailer = struct {
-    /// The line up to the separator before `c`: everything the object holds
-    /// before its last member.
+    /// The bytes the checksum covers: the line up to the separator before
+    /// `c` for a record, before `sc` for a removed record's stub.
     covered: []const u8,
+    /// What the next record's `p` names: the record's `c`. A stub keeps the
+    /// `c` of the record it stands for, so nothing after it changes.
     c: u32,
+    /// What `covered` must sum to: `c` for a record, `sc` for a stub.
+    sum: u32,
+};
+
+/// A record's place in its stream.
+pub const InStream = struct {
+    /// Borrowed from the line.
+    stream: streams.Stream,
+    version: streams.StreamVersion,
 };
 
 /// Where a record's event sits in its line, as a pair of offsets rather
@@ -69,6 +82,12 @@ pub const Head = struct {
     /// The atomic batch the record was written in, or null for one written
     /// on its own or in a group commit.
     batch: ?Batch = null,
+    /// Its stream, or null for a record in none.
+    in_stream: ?InStream = null,
+    /// Whether this is the stub of a record whose stream was truncated past
+    /// it: its place in the sequence and in its stream, without its event.
+    removed: bool = false,
+    /// Where the event is; empty for a stub.
     ev: Span,
 };
 
@@ -93,10 +112,14 @@ pub const Fields = struct {
     p: ?[]const u8 = null,
     bf: ?[]const u8 = null,
     bl: ?[]const u8 = null,
+    s: ?[]const u8 = null,
+    sv: ?[]const u8 = null,
+    x: ?[]const u8 = null,
+    sc: ?[]const u8 = null,
     ev: ?Span = null,
     /// The checksum when the object's last member is `c`, an integer that
-    /// fits a `u32`; null when it is not, which no record this package
-    /// writes is.
+    /// fits a `u32` (and, for a stub, the one before it `sc`); null when it
+    /// is not, which no record this package writes is.
     trailer: ?Trailer = null,
 
     /// The envelope, or `error.Corrupt` when the line lacks a member a
@@ -110,13 +133,27 @@ pub const Fields = struct {
             integerOf(i64, bf) orelse return error.Corrupt,
             integerOf(i64, fields.bl.?) orelse return error.Corrupt,
         ) orelse return error.Corrupt else null;
+        // Both members of a stream's place or neither.
+        if ((fields.s == null) != (fields.sv == null)) return error.Corrupt;
+        const in_stream: ?InStream = if (fields.s) |id| .{
+            .stream = streams.idOf(id) orelse return error.Corrupt,
+            .version = .fromRaw(versionOf(fields.sv.?) orelse return error.Corrupt),
+        } else null;
+        // A stub is a stream's record with no event, and its `sc`; a record
+        // has its event and no `sc`.
+        const removed = fields.x != null;
+        if (removed) {
+            if (integerOf(u8, fields.x.?) != 1 or in_stream == null or fields.ev != null or fields.sc == null) return error.Corrupt;
+        } else if (fields.sc != null) return error.Corrupt;
         return .{
             .seq = seq,
             .batch = batch,
+            .in_stream = in_stream,
+            .removed = removed,
             .at = .fromRaw(integerOf(i64, fields.at orelse return error.Corrupt) orelse return error.Corrupt),
             .v = integerOf(u32, fields.v orelse return error.Corrupt) orelse return error.Corrupt,
             .p = integerOf(u32, fields.p orelse return error.Corrupt) orelse return error.Corrupt,
-            .ev = fields.ev orelse return error.Corrupt,
+            .ev = if (removed) .{ .from = 0, .to = 0 } else fields.ev orelse return error.Corrupt,
         };
     }
 
@@ -141,6 +178,13 @@ pub const Fields = struct {
     }
 };
 
+/// A stream version: an integer from 1 to `maxInt(i64)`.
+fn versionOf(value: []const u8) ?u64 {
+    const version = integerOf(i64, value) orelse return null;
+    if (version < 1) return null;
+    return aegis.int.cast(u64, version) catch null;
+}
+
 /// A sequence number: an integer from 1 to `maxInt(i64)`.
 fn seqOf(value: []const u8) ?Seq {
     const seq = integerOf(i64, value) orelse return null;
@@ -156,17 +200,20 @@ pub fn read(_: void, line: []const u8) NotRecord!Fields {
     members.init(line, .{ .limits = .sized(line.len) });
     var fields: Fields = .{};
     var last: ?strand.json.Member = null;
+    var before_last: ?strand.json.Member = null;
     var checksum = false;
     while (members.next() catch return error.NotRecord) |member| {
+        before_last = last;
         last = member;
-        const index = member.which(&.{ "seq", "at", "v", "p", "bf", "bl", "ev", "c" }) orelse continue;
+        const names = .{ "seq", "at", "v", "p", "bf", "bl", "s", "sv", "x", "sc" };
+        const index = member.which(&(names ++ .{ "ev", "c" })) orelse continue;
         switch (index) {
-            inline 0...5 => |i| {
-                const name = comptime (&[_][]const u8{ "seq", "at", "v", "p", "bf", "bl" })[i];
+            inline 0...names.len - 1 => |i| {
+                const name = names[i];
                 if (@field(fields, name) != null) return error.NotRecord;
                 @field(fields, name) = member.value;
             },
-            6 => {
+            names.len => {
                 if (fields.ev != null) return error.NotRecord;
                 fields.ev = .{ .from = member.value_start, .to = member.valueEnd() };
             },
@@ -178,7 +225,15 @@ pub fn read(_: void, line: []const u8) NotRecord!Fields {
     }
     _ = members.finish() catch return error.NotRecord;
     if (last) |member| if (member.is("c")) {
-        if (integerOf(u32, member.value)) |c| fields.trailer = .{ .covered = line[0..member.separator], .c = c };
+        if (integerOf(u32, member.value)) |c| {
+            // A stub's own checksum is the member before its `c`, and covers
+            // everything before it.
+            if (fields.x != null) {
+                if (before_last) |sc| if (sc.is("sc")) {
+                    if (integerOf(u32, sc.value)) |sum| fields.trailer = .{ .covered = line[0..sc.separator], .c = c, .sum = sum };
+                };
+            } else fields.trailer = .{ .covered = line[0..member.separator], .c = c, .sum = c };
+        }
     };
     return fields;
 }
