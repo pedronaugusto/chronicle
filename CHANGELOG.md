@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- `Journal`, `Journal.Batch`, `Journal.Readers`, `Journal.Replay` and `Journal.Tailer` are structs, each holding its state in one private field, where they were opaque types the journal converted its state's pointer to. They are handed out by pointer as before, and every method is the same; what changes is a consumer that names them as opaque (`@typeInfo`) or holds one by value, which compiles now and must not be done: the state is bound to where it was made. The walks and listings the journal makes for itself (`verify`, the replay a subscriber's catch-up reads, `minCursor`'s listing) live on the stack and allocate no handle.
+
 ## [0.9.6] - 2026-10-25
 
 ### Changed

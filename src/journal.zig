@@ -100,7 +100,7 @@ pub fn Journal(comptime Event: type) type {
     return struct {
         const Self = @This();
 
-        // Only the opaque journal facade hands out access to this state.
+        // Only the journal facade hands out access to this state.
 
         /// The configuration supplied at open, which a caller sees through
         /// `openedWith`. Fixed for the journal's life, so the journal itself
@@ -224,7 +224,7 @@ pub fn Journal(comptime Event: type) type {
             bytes: []const u8,
         };
 
-        /// Only the opaque batch facade hands out access to this state.
+        /// Only the batch facade hands out access to this state.
         pub const Batch = struct {
             /// The records, oldest first. Empty when the cursor is caught up.
             records: []const Record,
@@ -239,9 +239,8 @@ pub fn Journal(comptime Event: type) type {
 
             /// Release every record and all its referenced data together.
             pub fn deinit(batch: *Batch) void {
-                const gpa = batch.arena.child_allocator;
                 batch.arena.deinit();
-                gpa.destroy(batch);
+                batch.* = undefined;
             }
         };
 
@@ -446,11 +445,6 @@ pub fn Journal(comptime Event: type) type {
             }
         };
 
-        pub const Opened = struct {
-            journal: *Self,
-            snapshot: ?Snapshot,
-        };
-
         pub const ReadError = Allocator.Error || MigrateError || Log.ScanError ||
             error{ ChecksumMismatch, CorruptRecord, TruncatedRecord, DiscontinuousSeq, BrokenChain, BrokenBatch, NewerSchema, OlderSchema };
 
@@ -560,19 +554,18 @@ pub fn Journal(comptime Event: type) type {
         // Opening.
         //====================================================================
 
-        pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!*Self {
-            const self = try openUnsettled(gpa, io, path, options);
+        /// Opens the journal in `self`, where it stays until its `deinit`:
+        /// its log's handles are bound to where it is.
+        pub fn open(self: *Self, gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!void {
+            try self.openUnsettled(gpa, io, path, options);
             errdefer self.abandon(io);
             try self.settle(io);
-            return self;
         }
 
         /// `open` up to the repairs the log found (`Log.settle`): a caller
         /// that may still refuse the journal settles once it has accepted it,
         /// and `abandon` leaves the files as they were found.
-        fn openUnsettled(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!*Self {
-            const self = try gpa.create(Self);
-            errdefer gpa.destroy(self);
+        fn openUnsettled(self: *Self, gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!void {
             self.* = .{
                 .gpa = gpa,
                 .config = options,
@@ -622,16 +615,17 @@ pub fn Journal(comptime Event: type) type {
                 try self.fillTail(s, io);
             }
             if (options.verify == .full) _ = try self.verify(io);
-            return self;
         }
 
+        /// `open`, and the snapshot the journal holds.
         pub fn openWithSnapshot(
+            self: *Self,
             gpa: Allocator,
             io: Io,
             path: []const u8,
             options: Options,
-        ) OpenWithSnapshotError!Opened {
-            const self = try openUnsettled(gpa, io, path, options);
+        ) OpenWithSnapshotError!?Snapshot {
+            try self.openUnsettled(gpa, io, path, options);
             errdefer self.abandon(io);
             const found = snapshot_read: {
                 var guard = try self.state.acquire(io);
@@ -640,7 +634,7 @@ pub fn Journal(comptime Event: type) type {
                 break :snapshot_read try self.readSnapshot(s, io);
             };
             try self.settle(io);
-            return .{ .journal = self, .snapshot = found };
+            return found;
         }
 
         fn settle(self: *Self, io: Io) OpenError!void {
@@ -664,10 +658,7 @@ pub fn Journal(comptime Event: type) type {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
             var guard = self.state.acquireUncancelable(io);
-            defer {
-                guard.deinit(io);
-                self.gpa.destroy(self);
-            }
+            defer guard.deinit(io);
             const s = guard.value();
             s.log.deinit(io);
             self.release(s);
@@ -679,10 +670,7 @@ pub fn Journal(comptime Event: type) type {
             const protection = io.swapCancelProtection(.blocked);
             defer _ = io.swapCancelProtection(protection);
             var guard = self.state.acquireUncancelable(io);
-            defer {
-                guard.deinit(io);
-                self.gpa.destroy(self);
-            }
+            defer guard.deinit(io);
             const s = guard.value();
             s.log.abandon(io);
             self.release(s);
@@ -884,12 +872,13 @@ pub fn Journal(comptime Event: type) type {
         // Reading.
         //====================================================================
 
-        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: Seq) CopyError!*Batch {
+        /// Copies into `batch`, which stays where it is until its `deinit`:
+        /// the records' allocator is its arena.
+        pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: Seq, batch: *Batch) CopyError!void {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
             const window = s.tailSince(cursor);
-            const batch = try gpa.create(Batch);
             batch.* = .{ .records = &.{}, .complete = window.complete, .arena = .init(gpa) };
             errdefer batch.deinit();
             const a = batch.arena.allocator();
@@ -906,7 +895,6 @@ pub fn Journal(comptime Event: type) type {
                 };
             }
             batch.records = copied;
-            return batch;
         }
 
         pub fn waitPast(self: *Self, io: Io, cursor: Seq) Io.Cancelable!Seq {
@@ -965,8 +953,6 @@ pub fn Journal(comptime Event: type) type {
             whole_through: Seq,
 
             pub fn deinit(walk: *Replay, io: Io) void {
-                const gpa = walk.scan.gpa;
-                defer gpa.destroy(walk);
                 walk.scan.deinit(io);
                 walk.arena.deinit();
                 walk.* = undefined;
@@ -1066,19 +1052,18 @@ pub fn Journal(comptime Event: type) type {
             }
         };
 
-        pub fn replay(self: *Self, io: Io, cursor: Seq) ReplayError!*Replay {
+        pub fn replay(self: *Self, io: Io, cursor: Seq, walk: *Replay) ReplayError!void {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
-            return self.replayFrom(s, io, cursor, false);
+            return self.replayFrom(s, io, cursor, false, walk);
         }
 
         /// `replay`, saying whether the walk may build an index it finds
         /// missing. The scan is chosen under the lock `s` is held through,
-        /// whether or not it may build an index.
-        fn replayFrom(self: *Self, s: *State, io: Io, cursor: Seq, may_write: bool) ReplayError!*Replay {
-            const walk = try self.gpa.create(Replay);
-            errdefer self.gpa.destroy(walk);
+        /// whether or not it may build an index. The walk is made in `walk`,
+        /// which stays where it is until its `deinit`.
+        fn replayFrom(self: *Self, s: *State, io: Io, cursor: Seq, may_write: bool, walk: *Replay) ReplayError!void {
             var scan = try s.log.scanFrom(io, cursor, .{ .may_write = may_write });
             errdefer scan.deinit(io);
             walk.* = .{
@@ -1089,19 +1074,16 @@ pub fn Journal(comptime Event: type) type {
                 .run = .{ .cursor = cursor },
                 .whole_through = s.seq,
             };
-            return walk;
         }
 
-        pub fn replayAt(self: *Self, io: Io, position: Position) ReplayAtError!*Replay {
-            const walk = initialized: {
+        pub fn replayAt(self: *Self, io: Io, position: Position, walk: *Replay) ReplayAtError!void {
+            {
                 var guard = try self.state.acquire(io);
                 defer guard.deinit(io);
                 const s = guard.value();
-                const result = try self.gpa.create(Replay);
-                errdefer self.gpa.destroy(result);
                 var scan = try s.log.scanIdle();
                 errdefer scan.deinit(io);
-                result.* = .{
+                walk.* = .{
                     .journal = self,
                     .decoder = self.captureDecoder(),
                     .scan = scan,
@@ -1109,20 +1091,19 @@ pub fn Journal(comptime Event: type) type {
                     .run = .{ .cursor = position.cursor },
                     .whole_through = s.seq,
                 };
-                break :initialized result;
-            };
+            }
             errdefer walk.deinit(io);
             try walk.rearmAt(io, position);
-            return walk;
         }
 
         pub fn verify(self: *Self, io: Io) ReplayError!Records {
-            var walk = chosen: {
+            var walk: Replay = undefined;
+            {
                 var guard = try self.state.acquire(io);
                 defer guard.deinit(io);
                 const s = guard.value();
-                break :chosen try self.replayFrom(s, io, s.log.baseSeq(), false);
-            };
+                try self.replayFrom(s, io, s.log.baseSeq(), false, &walk);
+            }
             defer walk.deinit(io);
             var seen = values.no_records;
             while (try walk.next(io)) |_| seen = values.plus(seen, .fromRaw(1));
@@ -1281,7 +1262,8 @@ pub fn Journal(comptime Event: type) type {
             if (sinks.len == 0 or !values.below(cursor, s.seq)) return;
             var delivered = cursor;
             if (!s.tailSince(cursor).complete) {
-                var walk = try self.replayFrom(s, io, cursor, true);
+                var walk: Replay = undefined;
+                try self.replayFrom(s, io, cursor, true, &walk);
                 defer walk.deinit(io);
                 while (try walk.next(io)) |record| {
                     for (sinks) |sink| sink.f(sink.ctx, record);
@@ -1331,18 +1313,16 @@ pub fn Journal(comptime Event: type) type {
             }
 
             pub fn deinit(tail: *Tailer) void {
-                const gpa = tail.gpa;
-                defer gpa.destroy(tail);
                 tail.gpa.free(tail.name);
                 tail.* = undefined;
             }
 
-            pub fn replay(tail: *Tailer, io: Io) ReplayError!*Replay {
+            pub fn replay(tail: *Tailer, io: Io, walk: *Replay) ReplayError!void {
                 const self = tail.journal;
                 var guard = try self.state.acquire(io);
                 defer guard.deinit(io);
                 const s = guard.value();
-                return self.replayFrom(s, io, tail.committed, false);
+                return self.replayFrom(s, io, tail.committed, false, walk);
             }
 
             pub fn commit(tail: *Tailer, io: Io, seq: Seq) TailerError!void {
@@ -1384,24 +1364,24 @@ pub fn Journal(comptime Event: type) type {
             cursor: Seq,
         };
 
-        /// Only the opaque readers facade hands out access to this state.
+        /// Only the readers facade hands out access to this state.
         pub const Readers = struct {
             items: []const Reader,
             arena: std.heap.ArenaAllocator,
 
             pub fn deinit(list: *Readers) void {
-                const gpa = list.arena.child_allocator;
                 list.arena.deinit();
-                gpa.destroy(list);
+                list.* = undefined;
             }
         };
 
-        pub fn readers(self: *Self, gpa: Allocator, io: Io) TailerError!*Readers {
+        /// Lists into `list`, which stays where it is until its `deinit`:
+        /// the names are its arena's.
+        pub fn readers(self: *Self, gpa: Allocator, io: Io, list: *Readers) TailerError!void {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
 
-            const list = try gpa.create(Readers);
             list.* = .{ .items = &.{}, .arena = .init(gpa) };
             errdefer list.deinit();
             const a = list.arena.allocator();
@@ -1420,11 +1400,11 @@ pub fn Journal(comptime Event: type) type {
                 try found.append(a, .{ .name = try a.dupe(u8, name), .cursor = cursor });
             }
             list.items = try found.toOwnedSlice(a);
-            return list;
         }
 
         pub fn minCursor(self: *Self, io: Io) TailerError!?Seq {
-            const list = try self.readers(self.gpa, io);
+            var list: Readers = undefined;
+            try self.readers(self.gpa, io, &list);
             defer list.deinit();
             var lowest: ?Seq = null;
             for (list.items) |reader| {
@@ -1433,17 +1413,14 @@ pub fn Journal(comptime Event: type) type {
             return lowest;
         }
 
-        pub fn tailer(self: *Self, io: Io, name: []const u8) TailerError!*Tailer {
+        pub fn tailer(self: *Self, io: Io, name: []const u8, tail: *Tailer) TailerError!void {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
             if (!validTailerName(name)) return error.InvalidName;
-            const tail = try self.gpa.create(Tailer);
-            errdefer self.gpa.destroy(tail);
             const owned = try self.gpa.dupe(u8, name);
             errdefer self.gpa.free(owned);
             tail.* = .{ .journal = self, .gpa = self.gpa, .name = owned, .committed = try self.readCursor(s, io, owned) };
-            return tail;
         }
 
         /// One path component of lowercase letters, digits, `-` and `_`: the

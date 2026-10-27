@@ -41,7 +41,7 @@ const implementation = @import("journal.zig");
 const chronicle_clone_available = @import("journal/clone.zig").available;
 
 fn journalState(owner: anytype) *implementation.Journal(@FieldType(@typeInfo(@TypeOf(owner)).pointer.child.Record, "event")) {
-    return @ptrCast(@alignCast(owner));
+    return &owner.state;
 }
 
 /// A journal's state with no lock taken, for a test that looks inside it
@@ -51,7 +51,7 @@ fn quiescent(owner: anytype) @TypeOf(journalState(owner).state.teardown()) {
 }
 
 fn replayState(comptime E: type, walk: *chronicle.Journal(E).Replay) *implementation.Journal(E).Replay {
-    return @ptrCast(@alignCast(walk));
+    return &walk.state;
 }
 
 /// A fold: the state the log adds up to. Two folds of the same records are
@@ -6972,7 +6972,13 @@ const LockProbe = struct {
 
     /// The plan entry that runs `check` before every `call`.
     fn at(probe: *LockProbe, call: shakedown.IoCall) shakedown.IoPlan.Entry {
-        return .{ .at = .{ .nth = .{ .call = call, .n = 1 } }, .fault = .{ .call = .{ .ctx = probe, .f = check } }, .times = 0 };
+        return probe.from(call, 1);
+    }
+
+    /// The plan entry that runs `check` before the `n`th `call` and every
+    /// one after it.
+    fn from(probe: *LockProbe, call: shakedown.IoCall, n: u32) shakedown.IoPlan.Entry {
+        return .{ .at = .{ .nth = .{ .call = call, .n = n } }, .fault = .{ .call = .{ .ctx = probe, .f = check } }, .times = 0 };
     }
 };
 
@@ -6986,7 +6992,9 @@ test "starting a positioned replay observes its journal only under the lock" {
     defer journal.deinit(io);
     _ = try journal.append(io, .fromRaw(1), created(1, "one"));
     var probe: LockProbe = .{ .journal = journal };
-    try fio.setPlan(&.{probe.at(.alloc)});
+    // The walk's own place comes first, the caller's memory, taken before
+    // the lock; what chooses the walk comes after it.
+    try fio.setPlan(&.{probe.from(.alloc, 2)});
     const started = journal.replayAt(io, .after(Seq.fromRaw(0)));
     try fio.setPlan(&.{});
     const walk = try started;
@@ -7376,39 +7384,42 @@ test "encoding owns the cause of every allocation failure with and without a tai
     }
 }
 
+/// Whether `Owner` is a handle that holds its state and nothing else, in
+/// its one private field: what the public API hands out by pointer.
+fn ownsOnlyItsState(comptime Owner: type) bool {
+    const names = @typeInfo(Owner).@"struct".field_names;
+    return names.len == 1 and std.mem.eql(u8, names[0], "state");
+}
+
 test "managed journal exposes no writable state or live value storage" {
-    try testing.expect(@typeInfo(Journal) == .@"opaque");
+    try testing.expect(ownsOnlyItsState(Journal));
     try testing.expect(@typeInfo(@typeInfo(@TypeOf(Journal.open)).@"fn".return_type.?).error_union.payload == *Journal);
     try testing.expect(@FieldType(Journal.Opened, "journal") == *Journal);
 }
 
 test "managed replay exposes no writable state or live value storage" {
-    try testing.expect(@typeInfo(Journal.Replay) == .@"opaque");
+    try testing.expect(ownsOnlyItsState(Journal.Replay));
     inline for (.{ Journal.replay, Journal.replayAt, Journal.Tailer.replay }) |make| {
         try testing.expect(@typeInfo(@typeInfo(@TypeOf(make)).@"fn".return_type.?).error_union.payload == *Journal.Replay);
     }
 }
 
 test "managed tailer exposes no writable state or live value storage" {
-    try testing.expect(@typeInfo(Journal.Tailer) == .@"opaque");
+    try testing.expect(ownsOnlyItsState(Journal.Tailer));
     try testing.expect(@typeInfo(@typeInfo(@TypeOf(Journal.tailer)).@"fn".return_type.?).error_union.payload == *Journal.Tailer);
 }
 
 test "managed result batch exposes no writable state or live value storage" {
-    try testing.expect(@typeInfo(Journal.Batch) == .@"opaque");
+    try testing.expect(ownsOnlyItsState(Journal.Batch));
     try testing.expect(@typeInfo(@typeInfo(@TypeOf(Journal.copySince)).@"fn".return_type.?).error_union.payload == *Journal.Batch);
-    if (comptime @typeInfo(Journal.Batch) == .@"opaque") {
-        try testing.expect(@TypeOf(Journal.Batch.records) == fn (*const Journal.Batch) []const Journal.Record);
-        try testing.expect(@TypeOf(Journal.Batch.complete) == fn (*const Journal.Batch) bool);
-    }
+    try testing.expect(@TypeOf(Journal.Batch.records) == fn (*const Journal.Batch) []const Journal.Record);
+    try testing.expect(@TypeOf(Journal.Batch.complete) == fn (*const Journal.Batch) bool);
 }
 
 test "managed result readers expose no writable state or live value storage" {
-    try testing.expect(@typeInfo(Journal.Readers) == .@"opaque");
+    try testing.expect(ownsOnlyItsState(Journal.Readers));
     try testing.expect(@typeInfo(@typeInfo(@TypeOf(Journal.readers)).@"fn".return_type.?).error_union.payload == *Journal.Readers);
-    if (comptime @typeInfo(Journal.Readers) == .@"opaque") {
-        try testing.expect(@TypeOf(Journal.Readers.items) == fn (*const Journal.Readers) []const Journal.Reader);
-    }
+    try testing.expect(@TypeOf(Journal.Readers.items) == fn (*const Journal.Readers) []const Journal.Reader);
 }
 
 test "managed result readers own their observations after the journal closes" {

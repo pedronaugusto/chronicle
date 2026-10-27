@@ -1,45 +1,28 @@
-//! Opaque owners for replay walks and named readers.
+//! The owners of replay walks and named readers.
 const std = @import("std");
 const Io = std.Io;
 const Seq = @import("values.zig").Seq;
 
-/// The one conversion between an opaque owner and the state it names. An
-/// owner is its state's own allocation under another type, made by the
-/// journal and held until the owner's `deinit`: the same pointer, never a
-/// copy, so every owner converts here and nowhere else.
-pub fn Hidden(comptime Owner: type, comptime State: type) type {
-    return struct {
-        pub fn hide(state: *State) *Owner {
-            return @ptrCast(state); // aegis: design: an owner is its state's allocation, named opaquely
-        }
-        pub fn reveal(owner: *Owner) *State {
-            return @ptrCast(@alignCast(owner)); // aegis: design: every owner was made by hide from its state's allocation
-        }
-        pub fn view(owner: *const Owner) *const State {
-            return @ptrCast(@alignCast(owner)); // aegis: design: every owner was made by hide from its state's allocation
-        }
-    };
-}
-
 pub fn ReplayOwner(comptime State: type, comptime PositionType: type) type {
-    return opaque {
+    return struct {
+        /// Private: the walk, where the journal made it. It stays here:
+        /// its records' allocator is its own arena.
+        state: State.Replay,
+
         /// Where a walk is, for `rearmAt` and `Journal.replayAt`.
         pub const Position = PositionType;
         const Self = @This();
-        const hidden = Hidden(Self, State.Replay);
         fn inner(self: *Self) *State.Replay {
-            return hidden.reveal(self);
-        }
-        /// Private: the owner over the walk a journal built.
-        pub fn from(state: *State.Replay) *Self {
-            return hidden.hide(state);
+            return &self.state;
         }
         fn view(self: *const Self) *const State.Replay {
-            return hidden.view(self);
+            return &self.state;
         }
         /// Release the walk and every record it owns. Its journal must still be alive.
         pub fn deinit(walk: *Self, io: Io) void {
-            return State.Replay.deinit(walk.inner(), io);
+            const gpa = walk.state.scan.gpa;
+            walk.state.deinit(io);
+            gpa.destroy(walk);
         }
 
         /// Start another pass after `position`, keeping this walk's scan
@@ -72,17 +55,15 @@ pub fn ReplayOwner(comptime State: type, comptime PositionType: type) type {
 }
 
 pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
-    return opaque {
+    return struct {
+        /// Private: the reader, where the journal made it.
+        state: State.Tailer,
+
         /// The walk `replay` returns.
         pub const Replay = ReplayType;
         const Self = @This();
-        const hidden = Hidden(Self, State.Tailer);
         fn inner(self: *Self) *State.Tailer {
-            return hidden.reveal(self);
-        }
-        /// Private: the owner over the reader a journal built.
-        pub fn from(state: *State.Tailer) *Self {
-            return hidden.hide(state);
+            return &self.state;
         }
         /// Where this reader has got to, copied under the journal lock.
         /// Safe to call from any task or thread, except from inside a sink.
@@ -93,7 +74,9 @@ pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
         /// Release the owner and its name. The cursor file stays on disk; that is
         /// the point of it.
         pub fn deinit(tail: *Self) void {
-            return State.Tailer.deinit(tail.inner());
+            const gpa = tail.state.gpa;
+            tail.state.deinit();
+            gpa.destroy(tail);
         }
 
         /// A walk over every record after the committed cursor, read from
@@ -101,7 +84,10 @@ pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
         /// The cursor and scan are taken under the journal's lock, so
         /// a concurrent `commit` cannot move the cursor during the choice.
         pub fn replay(tail: *Self, io: Io) State.ReplayError!*Replay {
-            return Replay.from(try State.Tailer.replay(tail.inner(), io));
+            const walk = try tail.state.gpa.create(Replay);
+            errdefer tail.state.gpa.destroy(walk);
+            try State.Tailer.replay(tail.inner(), io, &walk.state);
+            return walk;
         }
 
         /// Record `seq` as where this reader has got to, durably, and move
@@ -127,7 +113,7 @@ pub fn TailerOwner(comptime State: type, comptime ReplayType: type) type {
 
         /// This reader's immutable name, borrowed until deinit.
         pub fn name(tail: *const Self) []const u8 {
-            return hidden.view(tail).name;
+            return tail.state.name;
         }
     };
 }

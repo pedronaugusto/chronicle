@@ -165,8 +165,9 @@ pub const Position = implementation.Position;
 /// `open` or `openWithSnapshot` and release it with `deinit`, after `finish`
 /// where the shutdown write must be known to have happened.
 ///
-/// Construction returns a pointer to an opaque owner. Its state stays at one
-/// address; keep and pass that pointer, and release the owner exactly once.
+/// Construction returns a pointer to the owner, which holds its state at one
+/// address; keep and pass that pointer, never a copy of what it points at,
+/// and release the owner exactly once. Its fields are private.
 /// The allocator must outlive it. Finish every replay and tailer operation
 /// before closing the journal; release replays and tailers first.
 ///
@@ -178,16 +179,16 @@ pub const Position = implementation.Position;
 /// meaning of its own declares strand's `strandSerialize` and
 /// `strandDeserialize`.
 pub fn Journal(comptime Event: type) type {
-    return opaque {
+    return struct {
+        /// Private: the journal, where `open` made it. It stays here: its
+        /// log's handles are bound to where it is.
+        state: State,
+
         const Self = @This();
         const State = implementation.Journal(Event);
 
-        const hidden = facade.Hidden(Self, State);
         fn inner(self: *Self) *State {
-            return hidden.reveal(self);
-        }
-        fn from(state: *State) *Self {
-            return hidden.hide(state);
+            return &self.state;
         }
         /// One entry of the log, as held in memory.
         ///
@@ -202,13 +203,13 @@ pub fn Journal(comptime Event: type) type {
         /// Keep its pointer and release the owner exactly once with `deinit`,
         /// before the allocator passed to `copySince`. Every pointer alias and
         /// record borrow becomes invalid on release.
-        pub const Batch = opaque {
-            const hidden_batch = facade.Hidden(Batch, State.Batch);
+        pub const Batch = struct {
+            /// Private: the copy, where `copySince` made it. It stays here:
+            /// its records' allocator is its own arena.
+            state: State.Batch,
+
             fn inner(batch: *const Batch) *const State.Batch {
-                return hidden_batch.view(batch);
-            }
-            fn from(batch: *State.Batch) *Batch {
-                return hidden_batch.hide(batch);
+                return &batch.state;
             }
 
             /// The records, oldest first. Empty when the cursor is caught up.
@@ -227,7 +228,9 @@ pub fn Journal(comptime Event: type) type {
             /// Release the owner, every record and all its referenced data.
             /// Call only after every user of this batch has finished.
             pub fn deinit(batch: *Batch) void {
-                hidden_batch.reveal(batch).deinit();
+                const gpa = batch.state.arena.child_allocator;
+                batch.state.deinit();
+                gpa.destroy(batch);
             }
         };
 
@@ -452,13 +455,13 @@ pub fn Journal(comptime Event: type) type {
         /// release the owner exactly once with `deinit`, before the allocator
         /// passed to `open`. Every pointer alias and item borrow becomes
         /// invalid on release.
-        pub const Readers = opaque {
-            const hidden_readers = facade.Hidden(Readers, State.Readers);
+        pub const Readers = struct {
+            /// Private: the listing, where `readers` made it. It stays here:
+            /// its names are its own arena's.
+            state: State.Readers,
+
             fn inner(list: *const Readers) *const State.Readers {
-                return hidden_readers.view(list);
-            }
-            fn from(list: *State.Readers) *Readers {
-                return hidden_readers.hide(list);
+                return &list.state;
             }
 
             /// The readers at the time of the listing, in directory order.
@@ -470,7 +473,9 @@ pub fn Journal(comptime Event: type) type {
             /// Release the owner, the list and every reader name together.
             /// Call only after every user of this list has finished.
             pub fn deinit(list: *Readers) void {
-                hidden_readers.reveal(list).deinit();
+                const gpa = list.state.arena.child_allocator;
+                list.state.deinit();
+                gpa.destroy(list);
             }
         };
 
@@ -500,7 +505,10 @@ pub fn Journal(comptime Event: type) type {
         /// `path` may be relative to the current directory or absolute. Release
         /// with `deinit`.
         pub fn open(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenError!*Self {
-            return from(try State.open(gpa, io, path, options));
+            const self = try gpa.create(Self);
+            errdefer gpa.destroy(self);
+            try self.state.open(gpa, io, path, options);
+            return self;
         }
 
         /// `open`, plus the snapshot written beside the journal by a previous
@@ -511,8 +519,10 @@ pub fn Journal(comptime Event: type) type {
         /// number to `subscribeFrom`. The snapshot is the caller's to release with
         /// `Snapshot.deinit`.
         pub fn openWithSnapshot(gpa: Allocator, io: Io, path: []const u8, options: Options) OpenWithSnapshotError!Opened {
-            const opened = try State.openWithSnapshot(gpa, io, path, options);
-            return .{ .journal = from(opened.journal), .snapshot = opened.snapshot };
+            const self = try gpa.create(Self);
+            errdefer gpa.destroy(self);
+            const found = try self.state.openWithSnapshot(gpa, io, path, options);
+            return .{ .journal = self, .snapshot = found };
         }
 
         /// Make everything appended so far durable, and report it: flush the
@@ -537,7 +547,9 @@ pub fn Journal(comptime Event: type) type {
         /// only after every caller and replay has stopped; owned batches,
         /// reader lists and snapshot state remain valid.
         pub fn deinit(self: *Self, io: Io) void {
-            return State.deinit(self.inner(), io);
+            const gpa = self.state.gpa;
+            self.state.deinit(io);
+            gpa.destroy(self);
         }
 
         /// Serialise `event`, write it, make it durable, publish it.
@@ -710,7 +722,10 @@ pub fn Journal(comptime Event: type) type {
         /// stored bytes and original schema versions are preserved separately.
         /// Safe to call from any task or thread, except from inside a sink.
         pub fn copySince(self: *Self, gpa: Allocator, io: Io, cursor: Seq) CopyError!*Batch {
-            return Batch.from(try State.copySince(self.inner(), gpa, io, cursor));
+            const batch = try gpa.create(Batch);
+            errdefer gpa.destroy(batch);
+            try State.copySince(self.inner(), gpa, io, cursor, &batch.state);
+            return batch;
         }
 
         /// Block until there is a record after `cursor`, or until `nudge`, then
@@ -752,7 +767,10 @@ pub fn Journal(comptime Event: type) type {
         /// returned walk owns its scan metadata and reads without that lock.
         /// Safe to call from any task or thread, except from inside a sink.
         pub fn replay(self: *Self, io: Io, cursor: Seq) ReplayError!*Replay {
-            return Replay.from(try State.replay(self.inner(), io, cursor));
+            const walk = try self.state.gpa.create(Replay);
+            errdefer self.state.gpa.destroy(walk);
+            try State.replay(self.inner(), io, cursor, &walk.state);
+            return walk;
         }
 
         /// A walk over every record after `position`, starting at the byte
@@ -785,7 +803,10 @@ pub fn Journal(comptime Event: type) type {
         /// from what is committed then; the walk itself reads without it.
         /// Safe to call from any task or thread, except from inside a sink.
         pub fn replayAt(self: *Self, io: Io, position: Position) ReplayAtError!*Replay {
-            return Replay.from(try State.replayAt(self.inner(), io, position));
+            const walk = try self.state.gpa.create(Replay);
+            errdefer self.state.gpa.destroy(walk);
+            try State.replayAt(self.inner(), io, position, &walk.state);
+            return walk;
         }
 
         /// Read every record of every segment back, through the checks a
@@ -976,7 +997,10 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// Safe to call from any task or thread.
         pub fn readers(self: *Self, gpa: Allocator, io: Io) TailerError!*Readers {
-            return Readers.from(try State.readers(self.inner(), gpa, io));
+            const list = try gpa.create(Readers);
+            errdefer gpa.destroy(list);
+            try State.readers(self.inner(), gpa, io, &list.state);
+            return list;
         }
 
         /// The lowest cursor any named reader has committed, or null when no
@@ -1003,7 +1027,10 @@ pub fn Journal(comptime Event: type) type {
         ///
         /// Safe to call from any task or thread.
         pub fn tailer(self: *Self, io: Io, name: []const u8) TailerError!*Tailer {
-            return Tailer.from(try State.tailer(self.inner(), io, name));
+            const tail = try self.state.gpa.create(Tailer);
+            errdefer self.state.gpa.destroy(tail);
+            try State.tailer(self.inner(), io, name, &tail.state);
+            return tail;
         }
 
         /// Write `state_bytes` and the current sequence number to
@@ -1127,10 +1154,10 @@ pub fn Journal(comptime Event: type) type {
             return State.backup(self.inner(), io, dest);
         }
 
-        /// What `replay` returns: an opaque, allocated walk over the log.
+        /// What `replay` returns: an allocated walk over the log, its fields private.
         /// Keep its pointer and release it exactly once, before the journal.
         pub const Replay = facade.ReplayOwner(State, Position);
-        /// An opaque, allocated named reader and the cursor it has committed.
+        /// An allocated named reader and the cursor it has committed, its fields private.
         /// Keep its pointer and release it exactly once, before the journal.
         ///
         /// A cursor is a `Seq` — the sequence number a reader has finished
