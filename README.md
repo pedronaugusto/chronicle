@@ -112,6 +112,26 @@ verification checks the history. Failed persistence blocks later appends until
 `reconcile` determines whether the attempted write survived. Schema versions newer than
 the reader are refused; older records require a migration hook or an `unknown` arm.
 
+Many streams share one journal, as an event store's do. `appendTo` and `appendAllTo`
+append into a `chronicle.Stream` at its next versions only while the stream holds what the
+caller expected (`.any`, `.no_stream`, `.exists`, or `.exact` with a version), and
+otherwise return `error.WrongExpectedVersion` and write nothing. A stream's id is 1 to 255
+bytes of printable ASCII without `"` or `\`, so it has one spelling in JSON. Each record
+carries its stream and `StreamVersion` (`s`, `sv`) inside its checksum, and a global
+`replay` sees them in `Record.stream`. `readStream` reads one stream oldest first. Beside
+each sealed segment a stream index (`.sdx`) holds a bloom filter over its streams and each
+stream's records, so a read opens only the segments that may hold the stream; a missing or
+damaged index is rebuilt from its segment. `Options.stream_heads` bounds the stream heads
+kept in memory.
+
+`truncateStreamBefore` makes a stream's older records unreadable at once and durably; the
+stream keeps its version. The next `compact` rewrites the segments holding them, replacing
+each record with a stub: its place in the sequence and in its stream, a checksum of its
+own (`sc`), and the original record's `c` unchanged, so the chain and every record after it
+still verify. Until that compaction a global `replay` still shows the records; afterwards
+it steps over the stubs. A segment with stubs is format 2, which chronicle 0.10 and older
+refuse by its header.
+
 `subscribe` streams disk history and then live appends through the same sink under the
 journal lock. Sink records last for the callback, which must not call back into the
 journal. Replay records last until the next read, re-arm or replay release. `position`
@@ -137,7 +157,8 @@ exercises schema migration.
 - It does not provide transactions spanning journals, or across appends: one atomic
   batch is the unit that is all or nothing.
 - It does not replicate a journal or coordinate writers across machines.
-- It does not query event fields or build application indexes.
+- It does not query event fields or build application indexes; the stream index finds a
+  stream's records, nothing more.
 - It does not serialize the application's snapshot state for it.
 - It does not choose retention policy or protect history automatically from compaction.
 

@@ -791,7 +791,7 @@ pub fn Journal(comptime Event: type) type {
             if (self.config.access == .read) return error.ReadOnly;
             if (s.write_failed) return error.PersistenceFailed;
             if (!streamed) try s.expect(expected);
-            const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = try self.nextVersion(s, io, in, 1) } else null;
+            const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = (try self.placeAppend(s, io, in, 1)).last } else null;
             const next = try values.successor(s.seq);
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
@@ -847,8 +847,8 @@ pub fn Journal(comptime Event: type) type {
             if (self.config.access == .read) return error.ReadOnly;
             if (s.write_failed) return error.PersistenceFailed;
             if (!streamed) try s.expect(expected);
-            const first_version: StreamVersion = if (streamed) try self.nextVersion(s, io, in, entries.len) else no_version;
-            if (entries.len == 0) return if (streamed) .{ .seq = s.seq, .version = .fromRaw(first_version.raw() - 1) } else s.seq;
+            const run: Run = if (streamed) try self.placeAppend(s, io, in, entries.len) else .{ .head = no_version, .last = no_version };
+            if (entries.len == 0) return if (streamed) .{ .seq = s.seq, .version = run.last } else s.seq;
             const last = try values.advance(s.seq, .fromRaw(entries.len));
 
             // Reserved before anything is written: after the bytes are
@@ -877,7 +877,7 @@ pub fn Journal(comptime Event: type) type {
             const staged_from = s.log.mark();
             for (entries, 0..) |entry, i| {
                 const numbered = values.advance(before, .fromRaw(i + 1)) catch unreachable; // unreachable: the last of them, `last`, was numbered above
-                const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = .fromRaw(first_version.raw() + i) } else null;
+                const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = run.head.advance(.fromRaw(i + 1)) catch unreachable } else null; // unreachable: the last of them, `run.last`, was placed above
                 var item = self.encode(s, numbered, entry.at, link, entry.event, batch, place) catch |err| {
                     s.unstage(io, staged_from);
                     return err;
@@ -910,7 +910,7 @@ pub fn Journal(comptime Event: type) type {
             s.seq = last;
             self.wake(io);
             self.trimTail(s);
-            return if (streamed) .{ .seq = last, .version = .fromRaw(first_version.raw() + entries.len - 1) } else last;
+            return if (streamed) .{ .seq = last, .version = run.last } else last;
         }
 
         pub fn reconcile(self: *Self, io: Io) ReconcileError!Seq {
@@ -1785,6 +1785,49 @@ pub fn Journal(comptime Event: type) type {
             };
         }
 
+        /// The record's line written into `encoding` as strand writes a
+        /// `Line`, null optionals included, and left open: the checksum is
+        /// its last member. Its shape is the one for what the record is in:
+        /// a batch, a stream, both or neither.
+        fn openLine(self: *const Self, encoding: *Encoding, seq: Seq, at: Time, back_link: u32, event: Event, batch: ?envelope.Batch, place: ?StreamAt) AppendError!json.OpenObject {
+            const out = &encoding.output;
+            const value_options: json.WriteOptions = .{ .limits = .sized(values.limit(self.config.max_record_bytes)) };
+            const v = self.config.schema_version;
+            return (if (batch) |b| (if (place) |in| json.writeObjectOpen(&out.writer, LineInStreamBatch{
+                .seq = seq.raw(),
+                .at = at.raw(),
+                .v = v,
+                .p = back_link,
+                .bf = b.first.raw(),
+                .bl = b.last.raw(),
+                .s = in.id,
+                .sv = in.version.raw(),
+                .ev = event,
+            }, value_options) else json.writeObjectOpen(&out.writer, LineInBatch{
+                .seq = seq.raw(),
+                .at = at.raw(),
+                .v = v,
+                .p = back_link,
+                .bf = b.first.raw(),
+                .bl = b.last.raw(),
+                .ev = event,
+            }, value_options)) else if (place) |in| json.writeObjectOpen(&out.writer, LineInStream{
+                .seq = seq.raw(),
+                .at = at.raw(),
+                .v = v,
+                .p = back_link,
+                .s = in.id,
+                .sv = in.version.raw(),
+                .ev = event,
+            }, value_options) else json.writeObjectOpen(&out.writer, Line{
+                .seq = seq.raw(),
+                .at = at.raw(),
+                .v = v,
+                .p = back_link,
+                .ev = event,
+            }, value_options)) catch |err| return refused(encoding, err);
+        }
+
         /// Serialise one record.
         ///
         /// Where something will read the record back — a tail, a sink, or the
@@ -1824,43 +1867,7 @@ pub fn Journal(comptime Event: type) type {
             } else {
                 out.clearRetainingCapacity();
             }
-            // The record is `Line` written by strand, null optionals
-            // included, left open: the checksum is its last member.
-            const value_options: json.WriteOptions = .{ .limits = .sized(values.limit(self.config.max_record_bytes)) };
-            const v = self.config.schema_version;
-            var record = (if (batch) |b| (if (place) |in| json.writeObjectOpen(&out.writer, LineInStreamBatch{
-                .seq = seq.raw(),
-                .at = at.raw(),
-                .v = v,
-                .p = back_link,
-                .bf = b.first.raw(),
-                .bl = b.last.raw(),
-                .s = in.id,
-                .sv = in.version.raw(),
-                .ev = event,
-            }, value_options) else json.writeObjectOpen(&out.writer, LineInBatch{
-                .seq = seq.raw(),
-                .at = at.raw(),
-                .v = v,
-                .p = back_link,
-                .bf = b.first.raw(),
-                .bl = b.last.raw(),
-                .ev = event,
-            }, value_options)) else if (place) |in| json.writeObjectOpen(&out.writer, LineInStream{
-                .seq = seq.raw(),
-                .at = at.raw(),
-                .v = v,
-                .p = back_link,
-                .s = in.id,
-                .sv = in.version.raw(),
-                .ev = event,
-            }, value_options) else json.writeObjectOpen(&out.writer, Line{
-                .seq = seq.raw(),
-                .at = at.raw(),
-                .v = v,
-                .p = back_link,
-                .ev = event,
-            }, value_options)) catch |err| return refused(&encoding, err);
+            var record = try self.openLine(&encoding, seq, at, back_link, event, batch, place);
             // The checksum covers everything the record says except the
             // checksum itself: the object so far, before `,"c":<crc>}` closes
             // it.
@@ -2050,7 +2057,7 @@ pub fn Journal(comptime Event: type) type {
             const head = try self.streamHead(s, io, stream.bytes);
             try s.streams.setTruncation(stream.bytes, before);
             self.writeTruncations(s, io) catch |err| {
-                s.streams.setTruncation(stream.bytes, now) catch {};
+                s.streams.restoreTruncation(stream.bytes, now);
                 return err;
             };
             s.streams.heads.put(stream.bytes, .{ .version = head });
@@ -2140,9 +2147,8 @@ pub fn Journal(comptime Event: type) type {
             const segments = s.log.segments.items;
             if (segments.len == 0) return;
             for (segments[0 .. segments.len - 1]) |segment| {
-                const bytes = try self.streamIndex(s, io, segment) orelse continue;
-                defer self.gpa.free(bytes);
-                const index = streams.Index.parse(bytes, segment.base_seq, segment.bytes) catch continue;
+                const index = try self.streamIndex(s, io, segment) orelse continue;
+                defer index.deinit(self.gpa);
                 const section = index.find(stream.bytes) orelse continue;
                 for (0..section.len()) |i| {
                     const entry = section.at(i);
@@ -2176,9 +2182,8 @@ pub fn Journal(comptime Event: type) type {
                     while (i > 0) {
                         i -= 1;
                         const segment = segments[i];
-                        const bytes = try self.streamIndex(s, io, segment) orelse continue;
-                        defer self.gpa.free(bytes);
-                        const index = streams.Index.parse(bytes, segment.base_seq, segment.bytes) catch continue;
+                        const index = try self.streamIndex(s, io, segment) orelse continue;
+                        defer index.deinit(self.gpa);
                         if (index.find(id)) |section| {
                             v = section.last().version;
                             break;
@@ -2188,15 +2193,19 @@ pub fn Journal(comptime Event: type) type {
                 book.heads.put(id, .{ .version = v });
                 break :found v;
             };
-            const floor = book.truncation(id);
-            if (floor == no_version) return found;
-            const below_floor: StreamVersion = .fromRaw(floor.raw() - 1);
-            return if ((found.compare(below_floor) == .lt)) below_floor else found;
+            // A stream truncated before `floor` stands at least just below
+            // it; one never truncated has no floor, and no version before it.
+            const below_floor = book.truncation(id).predecessor() catch return found;
+            return if (found.compare(below_floor) == .lt) below_floor else found;
         }
 
-        /// The version an append of `count` records into `in` starts at,
-        /// once the stream is what `in.expected` says.
-        fn nextVersion(self: *Self, s: *State, io: Io, in: Target, count: usize) StreamAppendError!StreamVersion {
+        /// The versions an append of `count` records into `in` takes: those
+        /// after `head`, up to `last`.
+        const Run = struct { head: StreamVersion, last: StreamVersion };
+
+        /// Where an append of `count` records into `in` goes, once the
+        /// stream is what `in.expected` says.
+        fn placeAppend(self: *Self, s: *State, io: Io, in: Target, count: usize) StreamAppendError!Run {
             const head = try self.streamHead(s, io, in.stream.bytes);
             switch (in.expected) {
                 .any => {},
@@ -2204,10 +2213,9 @@ pub fn Journal(comptime Event: type) type {
                 .exists => if (head == no_version) return error.WrongExpectedVersion,
                 .exact => |v| if (head != v) return error.WrongExpectedVersion,
             }
-            // Written as a JSON integer, so `maxInt(i64)` is the last.
-            const last = std.math.add(u64, head.raw(), count) catch return error.StreamVersionExhausted;
-            if (last > std.math.maxInt(i64)) return error.StreamVersionExhausted;
-            return .fromRaw(head.raw() + 1);
+            const last = head.advance(.fromRaw(count)) catch return error.StreamVersionExhausted;
+            if (last.compare(streams.last_version) == .gt) return error.StreamVersionExhausted;
+            return .{ .head = head, .last = last };
         }
 
         /// Note a record just staged: a stream's record joins the active
@@ -2258,19 +2266,24 @@ pub fn Journal(comptime Event: type) type {
         }
 
         /// Segment `segment`'s stream index, read whole and owned by the
-        /// caller: the one beside it when it describes the segment's bytes,
-        /// else one built from the segment (and written beside it, when the
-        /// journal writes). Null for a segment holding no stream's record.
-        fn streamIndex(self: *Self, s: *State, io: Io, segment: Log.Segment) OpenError!?[]u8 {
+        /// caller (`deinit`): the one beside it when it describes the
+        /// segment's bytes, else one built from the segment (and written
+        /// beside it, when the journal writes). Null for a segment holding
+        /// no stream's record.
+        fn streamIndex(self: *Self, s: *State, io: Io, segment: Log.Segment) OpenError!?streams.Index {
+            const of: streams.Index.Of = .{ .base_seq = segment.base_seq, .bytes = segment.bytes };
             const name = Log.segmentName(Log.stream_index_extension, segment.base_seq);
-            const limit: Io.Limit = .limited(values.limit(segment.bytes) + 4096);
-            if (s.log.dir.borrow().readFileAlloc(io, &name, self.gpa, limit)) |bytes| {
-                if (streams.Index.parse(bytes, segment.base_seq, segment.bytes)) |index| {
+            // An index is never longer than its segment and a header: each
+            // record it places took more bytes in the segment than its
+            // entry does. A longer file is not its index.
+            const limit = segment.bytes.add(.fromRaw(4096)) catch values.furthest;
+            if (aegis.own.readFile(io, s.log.dir.borrow().*, &name, self.gpa, limit)) |bytes| {
+                if (streams.Index.parse(.init(bytes), of)) |index| {
                     if (index.streams == 0) {
                         self.gpa.free(bytes);
                         return null;
                     }
-                    return bytes;
+                    return index;
                 } else |_| self.gpa.free(bytes);
             } else |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -2300,11 +2313,19 @@ pub fn Journal(comptime Event: type) type {
             var out: std.ArrayList(u8) = .empty;
             defer out.deinit(self.gpa);
             try streams.encode(self.gpa, segment.base_seq, segment.bytes, placed.items, &out);
-            if (self.config.access == .write) s.log.dir.borrow().writeFile(io, .{ .sub_path = &name, .data = out.items }) catch |err| {
+            const bytes = try out.toOwnedSlice(self.gpa);
+            errdefer self.gpa.free(bytes);
+            // A segment that gives a stream's versions out of order is not
+            // one this journal wrote: no index of it would be read.
+            const index = streams.Index.parse(.init(bytes), of) catch return error.CorruptRecord;
+            if (self.config.access == .write) s.log.dir.borrow().writeFile(io, .{ .sub_path = &name, .data = bytes }) catch |err| {
                 std.log.debug("optional stream index maintenance: {t}", .{err});
             };
-            if (placed.items.len == 0) return null;
-            return try out.toOwnedSlice(self.gpa);
+            if (placed.items.len == 0) {
+                index.deinit(self.gpa);
+                return null;
+            }
+            return index;
         }
 
         /// Read the active segment's records in streams again, if the book
@@ -2362,11 +2383,10 @@ pub fn Journal(comptime Event: type) type {
             for (segments[0 .. segments.len - 1]) |segment| {
                 if (segment.base_seq.compare(cut) == .gt) break;
                 if (which == .whole_segments and segment.last_seq.compare(cut) == .gt) break;
-                const bytes = try self.streamIndex(s, io, segment) orelse continue;
-                defer self.gpa.free(bytes);
-                const index = streams.Index.parse(bytes, segment.base_seq, segment.bytes) catch continue;
+                const index = try self.streamIndex(s, io, segment) orelse continue;
+                defer index.deinit(self.gpa);
                 var it = index.iterator();
-                while (it.next() catch null) |section| {
+                while (it.next()) |section| {
                     var top = no_version;
                     for (0..section.len()) |i| {
                         const entry = section.at(i);
@@ -2381,7 +2401,7 @@ pub fn Journal(comptime Event: type) type {
             var changed = false;
             var it = newest.iterator();
             while (it.next()) |found| {
-                const past: StreamVersion = .fromRaw(found.value_ptr.raw() + 1);
+                const past = found.value_ptr.successor() catch unreachable; // unreachable: a version read is at most `last_version`
                 if (s.streams.truncation(found.key_ptr.*).compare(past) != .lt) continue;
                 try s.streams.setTruncation(found.key_ptr.*, past);
                 changed = true;
@@ -2420,7 +2440,7 @@ pub fn Journal(comptime Event: type) type {
             while (i + 1 < s.log.segments.items.len) : (i += 1) {
                 const segment = s.log.segments.items[i];
                 if (!try self.holdsTruncated(s, io, segment)) continue;
-                if (try s.log.redactSegment(io, segment.base_seq, .{ .ctx = s, .stub = stubOf })) rewrote = true;
+                if (try s.log.redactSegment(io, segment.base_seq, s, stubOf)) rewrote = true;
             }
             if (rewrote) try s.log.reload(io);
         }
@@ -2428,9 +2448,8 @@ pub fn Journal(comptime Event: type) type {
         /// Whether `segment`'s stream index has a record below its stream's
         /// truncation point that is not a stub already.
         fn holdsTruncated(self: *Self, s: *State, io: Io, segment: Log.Segment) OpenError!bool {
-            const bytes = try self.streamIndex(s, io, segment) orelse return false;
-            defer self.gpa.free(bytes);
-            const index = streams.Index.parse(bytes, segment.base_seq, segment.bytes) catch return false;
+            const index = try self.streamIndex(s, io, segment) orelse return false;
+            defer index.deinit(self.gpa);
             var points = s.streams.truncations.iterator();
             while (points.next()) |point| {
                 const section = index.find(point.key_ptr.*) orelse continue;
@@ -2443,8 +2462,7 @@ pub fn Journal(comptime Event: type) type {
         /// `out`: `seq`, `at`, `v`, `p`, the batch it was in, `s`, `sv`,
         /// then `"x":1`, `sc` (the checksum of all before it) and the
         /// record's own `c`, which the record after it links back to.
-        fn stubOf(ctx: *anyopaque, line: []const u8, out: *std.ArrayList(u8)) error{ OutOfMemory, CorruptRecord }!bool {
-            const s: *State = @ptrCast(@alignCast(ctx)); // safe: `redactTruncated` passes its state
+        fn stubOf(s: *State, line: []const u8, out: *std.ArrayList(u8)) error{ OutOfMemory, CorruptRecord }!bool {
             const header = parseHeader({}, line) catch return error.CorruptRecord;
             if (header.removed) return false;
             const in = header.in_stream orelse return false;
@@ -2464,7 +2482,9 @@ pub fn Journal(comptime Event: type) type {
         /// Each truncated stream's point, from the file that keeps them.
         fn loadTruncations(self: *Self, s: *State, io: Io) OpenError!void {
             s.streams.clearTruncations();
-            const bytes = s.log.dir.borrow().readFileAlloc(io, truncations_name, self.gpa, .unlimited) catch |err| switch (err) {
+            // As long as the streams truncated are many: the journal's own
+            // file, held whole in memory once read, as the book holds it.
+            const bytes = aegis.own.readFile(io, s.log.dir.borrow().*, truncations_name, self.gpa, values.furthest) catch |err| switch (err) {
                 error.FileNotFound => return,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
@@ -2553,12 +2573,9 @@ pub fn Journal(comptime Event: type) type {
             const t = fields.trailer orelse return error.CorruptRecord;
             if (checksum(t.covered) != t.sum) return error.ChecksumMismatch;
             const head = fields.head() catch return error.CorruptRecord;
-            // The id is a slice of `line`; kept as where it sits, so a record
-            // built from a copy of the line takes it from the copy.
-            const in_stream: ?InStream = if (head.in_stream) |place| .{
-                .id = .{ .from = @intFromPtr(place.stream.bytes.ptr) - @intFromPtr(line.ptr), .to = @intFromPtr(place.stream.bytes.ptr) - @intFromPtr(line.ptr) + place.stream.bytes.len },
-                .version = place.version,
-            } else null;
+            // The id kept as where it sits, so a record built from a copy of
+            // the line takes it from the copy.
+            const in_stream: ?InStream = if (head.in_stream) |place| .{ .id = place.id, .version = place.version } else null;
             return .{ .seq = head.seq, .at = head.at, .version = head.v, .p = head.p, .c = t.c, .batch = head.batch, .in_stream = in_stream, .removed = head.removed, .ev = head.ev };
         }
 

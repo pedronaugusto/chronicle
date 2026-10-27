@@ -21,12 +21,7 @@ const streams = @import("streams.zig");
 const Seq = values.Seq;
 const Time = values.Time;
 
-/// A line as it lies in a file: bytes nothing has read yet, which are a record,
-/// a segment's first line or damage until one of the readers in this file or in
-/// `Log.zig` has said which. Everything that comes off a disk is one of these,
-/// and `parse` hands it to a reader whose answer is a refined value or a named
-/// refusal.
-pub const Unparsed = aegis.input.Untrusted([]const u8);
+pub const Unparsed = values.Unparsed;
 
 /// A member's value as a `T` when it is an integer written as one — no
 /// fraction, no exponent, not a string — that `T` holds. Null for anything
@@ -52,6 +47,8 @@ pub const Trailer = struct {
 pub const InStream = struct {
     /// Borrowed from the line.
     stream: streams.Stream,
+    /// Where the stream's id sits in the line, between its quotes.
+    id: Span,
     version: streams.StreamVersion,
 };
 
@@ -116,6 +113,8 @@ pub const Fields = struct {
     sv: ?[]const u8 = null,
     x: ?[]const u8 = null,
     sc: ?[]const u8 = null,
+    /// Where `s`'s value sits in the line, its quotes included.
+    s_at: ?Span = null,
     ev: ?Span = null,
     /// The checksum when the object's last member is `c`, an integer that
     /// fits a `u32` (and, for a stub, the one before it `sc`); null when it
@@ -135,9 +134,15 @@ pub const Fields = struct {
         ) orelse return error.Corrupt else null;
         // Both members of a stream's place or neither.
         if ((fields.s == null) != (fields.sv == null)) return error.Corrupt;
-        const in_stream: ?InStream = if (fields.s) |id| .{
-            .stream = streams.idOf(id) orelse return error.Corrupt,
-            .version = .fromRaw(versionOf(fields.sv.?) orelse return error.Corrupt),
+        const in_stream: ?InStream = if (fields.s) |id| in: {
+            const stream = streams.idOf(id) orelse return error.Corrupt;
+            // An id has one spelling: its bytes, between two quotes.
+            const value = fields.s_at orelse return error.Corrupt;
+            break :in .{
+                .stream = stream,
+                .id = .{ .from = value.from + 1, .to = value.from + 1 + stream.bytes.len },
+                .version = .fromRaw(versionOf(fields.sv.?) orelse return error.Corrupt),
+            };
         } else null;
         // A stub is a stream's record with no event, and its `sc`; a record
         // has its event and no `sc`.
@@ -212,6 +217,7 @@ pub fn read(_: void, line: []const u8) NotRecord!Fields {
                 const name = names[i];
                 if (@field(fields, name) != null) return error.NotRecord;
                 @field(fields, name) = member.value;
+                if (comptime std.mem.eql(u8, name, "s")) fields.s_at = .{ .from = member.value_start, .to = member.valueEnd() };
             },
             names.len => {
                 if (fields.ev != null) return error.NotRecord;

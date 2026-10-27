@@ -49,7 +49,7 @@ const Place = struct {
 fn sdxName(buf: *[64]u8, base: u64) []const u8 {
     const log_name = chronicle.segmentName(.fromRaw(base));
     const stem = log_name[0 .. log_name.len - chronicle.segment_extension.len];
-    return std.fmt.bufPrint(buf, "{s}.sdx", .{stem}) catch unreachable; // unreachable: 64 bytes hold any segment's name
+    return std.mem.print(buf, "{s}.sdx", .{stem}) catch unreachable; // unreachable: 64 bytes hold any segment's name
 }
 
 /// The amounts of `id`'s records from `from` on, in order.
@@ -58,12 +58,12 @@ fn amounts(journal: *Journal, id: []const u8, from: StreamVersion, out: []u32) !
     const walk = try journal.readStream(io, stream(id), from);
     defer walk.deinit();
     var n: usize = 0;
-    var expect_version: ?u64 = null;
+    var expect_version: ?StreamVersion = null;
     while (try walk.next(io)) |record| {
         const at = record.stream.?;
         try testing.expectEqualStrings(id, at.id);
-        if (expect_version) |v| try testing.expectEqual(v, at.version.raw());
-        expect_version = at.version.raw() + 1;
+        if (expect_version) |v| try testing.expectEqual(v, at.version);
+        expect_version = try at.version.successor();
         out[n] = record.event.deposited.amount;
         n += 1;
     }
@@ -194,13 +194,13 @@ test "streams past the heads kept in memory are found in the segments, each at i
     var name: [16]u8 = undefined;
     for (0..3) |round| {
         for (0..12) |i| {
-            const id = try std.fmt.bufPrint(&name, "s{d}", .{i});
+            const id = try std.mem.print(&name, "s{d}", .{i});
             const appended = try journal.appendTo(io, stream(id), .{ .exact = .fromRaw(round) }, .fromRaw(0), deposit(@intCast(i)));
             try testing.expectEqual(StreamVersion.fromRaw(round + 1), appended.version);
         }
     }
     for (0..12) |i| {
-        const id = try std.fmt.bufPrint(&name, "s{d}", .{i});
+        const id = try std.mem.print(&name, "s{d}", .{i});
         try testing.expectEqual(StreamVersion.fromRaw(3), try journal.streamVersion(io, stream(id)));
     }
     try testing.expectEqual(chronicle.no_version, try journal.streamVersion(io, stream("s12")));
@@ -357,7 +357,7 @@ test "a backup carries the streams' truncation points" {
     const io = testing.io;
     var place = try Place.init();
     defer place.deinit();
-    const copy = try std.fmt.allocPrint(testing.allocator, "{s}-copy", .{place.path});
+    const copy = try testing.allocator.print("{s}-copy", .{place.path});
     defer testing.allocator.free(copy);
     {
         const journal = try Journal.open(testing.allocator, io, place.path, .{});

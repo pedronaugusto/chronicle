@@ -3005,13 +3005,6 @@ pub fn compact(log: *Self, io: Io, keep_after_seq: Seq) Self.CompactError!void {
     try log.settle(io);
 }
 
-/// What a rewrite asks of each record of a segment: the stub it becomes,
-/// written into `out`, or false to keep it as it is.
-pub const Redactor = struct {
-    ctx: *anyopaque,
-    stub: *const fn (ctx: *anyopaque, line: []const u8, out: *std.ArrayList(u8)) error{ OutOfMemory, CorruptRecord }!bool,
-};
-
 /// Seal the active segment, if it holds a record, so that a rewrite can
 /// reach every record: the next append starts a new one.
 pub fn sealActive(log: *Self, io: Io) CompactError!void {
@@ -3022,13 +3015,20 @@ pub fn sealActive(log: *Self, io: Io) CompactError!void {
     try log.rotate(io);
 }
 
-/// Rewrite sealed segment `base_seq` with each record `redactor` names
-/// replaced by its stub, through a temporary renamed over it, so that a
-/// crash leaves the old segment or the new one. A segment with a stub in
-/// it says so in its header (`stub_format`). Its index and stream index
-/// describe the old bytes, and go. False when no record changed: the file
-/// is left alone. Call `reload` once the rewrites are done.
-pub fn redactSegment(log: *Self, io: Io, base_seq: Seq, redactor: Redactor) CompactError!bool {
+/// Rewrite sealed segment `base_seq` with each of its records that
+/// `stubOf(context, line, out)` writes a stub for (into `out`; false keeps
+/// the record) replaced by that stub, through a temporary renamed over it,
+/// so that a crash leaves the old segment or the new one. A segment with a
+/// stub in it says so in its header (`stub_format`). Its index and stream
+/// index describe the old bytes, and go. False when no record changed: the
+/// file is left alone. Call `reload` once the rewrites are done.
+pub fn redactSegment(
+    log: *Self,
+    io: Io,
+    base_seq: Seq,
+    context: anytype,
+    comptime stubOf: fn (@TypeOf(context), []const u8, *std.ArrayList(u8)) error{ OutOfMemory, CorruptRecord }!bool,
+) CompactError!bool {
     if (log.options.access == .read) return error.ReadOnly;
     const at = log.segmentIndex(base_seq) orelse return false;
     // The active segment is written to; `sealActive` first.
@@ -3054,7 +3054,7 @@ pub fn redactSegment(log: *Self, io: Io, base_seq: Seq, redactor: Redactor) Comp
     while (try scan.next(io)) |line| {
         stub.clearRetainingCapacity();
         const bytes = line.readForParse();
-        if (try redactor.stub(redactor.ctx, bytes, &stub)) {
+        if (try stubOf(context, bytes, &stub)) {
             changed = true;
             try writer.writeAll(stub.items);
         } else try writer.writeAll(bytes);

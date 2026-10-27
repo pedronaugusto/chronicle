@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Breaking
+
+- A journal holds many streams, and a segment `compact` rewrote to take a truncated stream's events out says so in its header as format 2: chronicle 0.10 and older refuse such a segment by its header (`UnsupportedFormat`) rather than misread a stub. A journal no stream was truncated in keeps format 1 throughout.
+- `DropError` and `CompactError` also carry what reading the stream indexes and writing the `truncations` file can meet: a cut that drops a stream's records first raises the stream's truncation point, so its version never goes back.
+
+### Added
+
+- Streams in one journal, as an event store has them. `appendTo(io, stream, expected, at, event)` and `appendAllTo(io, stream, expected, entries, commit)` append a record or a batch at a stream's next versions when the stream holds what `expected` (`StreamExpected`: `.any`, `.no_stream`, `.exists` or `.exact`) says, else `WrongExpectedVersion` and nothing written; they return `Appended`, the seq and version of the last record. A record in a stream carries its id and version (`s`, `sv`) inside its checksum, and `Record.stream` gives them back (`StreamAt`). `Stream` is a checked id (`Stream.of`: 1 to 255 bytes of printable ASCII, neither `"` nor `\`, so that it has one spelling in JSON; `Stream.Invalid`, `Stream.eql`), `StreamVersion` an aegis id apart from `Seq`, `no_version` the place before a stream's first record. Errors: `StreamAppendError`, `StreamReadError`, `TruncateStreamError`.
+- `readStream(io, stream, from)` reads one stream oldest first (`StreamRead`), and `streamVersion(io, stream)` gives its newest version. Each sealed segment has a stream index beside it (`.sdx`): a bloom filter over its streams, about ten bits each, then each stream's records by version with where they are. A read opens a segment only when the filter says the stream may be in it. An index missing, damaged or of other bytes is built again from its segment. The heads of the streams last asked about are kept, as many as `Options.stream_heads` (4096).
+- `truncateStreamBefore(io, stream, before)`: the stream's records below `before` are unreadable at once and durably (the `truncations` file, which a backup copies), and the stream keeps its version. The next `compact` rewrites each segment that holds one, through a temporary renamed over it, with each such record replaced by a stub: its `seq`, `at`, `v`, `p`, batch, `s` and `sv`, `"x":1`, a checksum of the stub (`sc`) and the record's own `c`, so the chain through it and every record after it is unchanged and `verify` passes. A global `replay` shows a truncated record until the compaction, and steps over its stub after.
+
 ### Fixed
 
 - A cancel reaches an open, a replay's look-ahead and a backup's clone while they run: a segment's scan takes it at each line (a buffered read reached the file once a buffer, so a long segment ran to its end), and a clone interrupted by a signal on macOS takes it before trying again.

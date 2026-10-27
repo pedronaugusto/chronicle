@@ -21,16 +21,28 @@ const Crc32c = @import("warp").Crc32c;
 
 const Seq = values.Seq;
 const Bytes = values.Bytes;
+const Unparsed = values.Unparsed;
 
-const Position = struct {};
+const Version = struct {};
+const Position = struct {
+    /// What versions are moved by: a number of a stream's records.
+    pub const Step = Versions;
+};
 
 /// Where a record sits in its stream: the stream's first record is 1, and
 /// each one after it is the next. Zero is the place before the first, what
 /// a stream that has no record stands at.
 pub const StreamVersion = aegis.id.Id(Position, u64);
 
+/// A number of a stream's records: what a version moves by.
+pub const Versions = aegis.units.Count(Version, u64);
+
 /// The place before a stream's first record.
 pub const no_version: StreamVersion = .fromRaw(0);
+
+/// The last version a record can have: a version is written as a JSON
+/// integer, so it ends where `i64` does.
+pub const last_version: StreamVersion = .fromRaw(std.math.maxInt(i64));
 
 /// The longest stream id.
 pub const max_id_bytes = 255;
@@ -167,6 +179,9 @@ const Header = extern struct {
 
 const header_bytes = @sizeOf(Header);
 
+/// A record in a stream's section: its version, seq and offset.
+const entry_bytes = 24;
+
 /// The index file of a segment holding `placed` (in the order they were
 /// appended), into `out`: the header, the filter, then each stream sorted by
 /// id with its records in order, then a CRC-32C of everything before it.
@@ -246,6 +261,9 @@ fn appendInt(gpa: Allocator, out: *std.ArrayList(u8), comptime T: type, value: T
 
 /// A stream index read whole, checked against what it must describe.
 pub const Index = struct {
+    /// The file, owned by whoever read it (`deinit`).
+    file: []const u8,
+    /// The file without its checksum.
     bytes: []const u8,
     streams: u32,
     /// Where the streams' sections start.
@@ -253,30 +271,68 @@ pub const Index = struct {
 
     pub const Refused = error{NotStreamIndex};
 
-    /// `bytes` (an index file read whole, borrowed) when it is an index of
-    /// segment `base_seq` at `segment_bytes` long, whole and unaltered.
-    pub fn parse(bytes: []const u8, base_seq: Seq, segment_bytes: Bytes) Refused!Index {
-        if (bytes.len < header_bytes + 4) return error.NotStreamIndex;
-        const body = bytes[0 .. bytes.len - 4];
-        if (Crc32c.hash(body) != std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little)) return error.NotStreamIndex;
+    /// The segment an index must describe: its first record, and the
+    /// length of its file the index was made from.
+    pub const Of = struct { base_seq: Seq, bytes: Bytes };
+
+    /// The index in `text` (an index file read whole) when it is one of
+    /// segment `of`, whole and unaltered: its checksum holds, it names the
+    /// segment, and its sections are what `encode` writes, each lying
+    /// inside the file, each stream once and in order of id, each stream's
+    /// records in order of version. Borrows `text`.
+    pub fn parse(text: Unparsed, of: Of) Refused!Index {
+        return text.parse(of, parseFile);
+    }
+
+    fn parseFile(of: Of, file: []const u8) Refused!Index {
+        if (file.len < header_bytes + 4) return error.NotStreamIndex;
+        const body = file[0 .. file.len - 4];
+        if (Crc32c.hash(body) != std.mem.readInt(u32, file[file.len - 4 ..][0..4], .little)) return error.NotStreamIndex;
         var header: Header = undefined;
         @memcpy(std.mem.asBytes(&header), body[0..header_bytes]);
         if (!std.mem.eql(u8, &header.magic, &magic) or header.format != format) return error.NotStreamIndex;
-        if (header.base_seq != base_seq.raw() or header.segment_bytes != segment_bytes.raw()) return error.NotStreamIndex;
+        if (!of.base_seq.eql(.fromRaw(header.base_seq)) or !of.bytes.eql(.fromRaw(header.segment_bytes))) return error.NotStreamIndex;
         const filter_end = std.math.add(usize, header_bytes, std.math.mul(usize, header.words, 8) catch return error.NotStreamIndex) catch return error.NotStreamIndex;
         if (filter_end > body.len) return error.NotStreamIndex;
-        const index: Index = .{
-            .bytes = body,
-            .streams = header.streams,
-            .sections = filter_end,
-        };
-        // Every section has to lie inside the body, so a walk never reads
-        // past it.
-        var it = index.iterator();
+        var at = filter_end;
         var n: u32 = 0;
-        while (it.next() catch return error.NotStreamIndex) |_| n += 1;
-        if (n != header.streams or it.at != body.len) return error.NotStreamIndex;
-        return index;
+        var previous: ?[]const u8 = null;
+        while (at != body.len) {
+            const section = try sectionAt(body, &at);
+            if (previous) |p| if (std.mem.order(u8, p, section.id) != .lt) return error.NotStreamIndex;
+            previous = section.id;
+            var version = no_version;
+            for (0..section.len()) |i| {
+                const v = section.at(i).version;
+                if (v.compare(version) != .gt or v.compare(last_version) == .gt) return error.NotStreamIndex;
+                version = v;
+            }
+            n = std.math.add(u32, n, 1) catch return error.NotStreamIndex;
+        }
+        if (n != header.streams) return error.NotStreamIndex;
+        return .{ .file = file, .bytes = body, .streams = header.streams, .sections = filter_end };
+    }
+
+    /// The section at `at.*` in `body`, `at.*` moved past it; refused when
+    /// it does not lie whole inside `body` or names no valid stream.
+    fn sectionAt(body: []const u8, at: *usize) Refused!Section {
+        const rest = body[at.*..];
+        if (rest.len < 1) return error.NotStreamIndex;
+        // At most 1 + 255 + 4: no sum here can overflow.
+        const id_end = 1 + @as(usize, rest[0]);
+        const records_at = id_end + 4;
+        if (rest.len < records_at) return error.NotStreamIndex;
+        const id = rest[1..id_end];
+        const count = std.mem.readInt(u32, rest[id_end..][0..4], .little);
+        const records_len = std.math.mul(usize, count, entry_bytes) catch return error.NotStreamIndex;
+        if (count == 0 or !valid(id) or rest.len - records_at < records_len) return error.NotStreamIndex;
+        at.* += records_at + records_len;
+        return .{ .id = id, .records = rest[records_at..][0..records_len] };
+    }
+
+    /// The file given back to `gpa`, which read it.
+    pub fn deinit(index: Index, gpa: Allocator) void {
+        gpa.free(index.file);
     }
 
     /// Whether the index's filter says `id` may be in the segment.
@@ -298,7 +354,7 @@ pub const Index = struct {
     pub fn find(index: Index, id: []const u8) ?Section {
         if (!index.mayHold(id)) return null;
         var it = index.iterator();
-        while (it.next() catch return null) |section| {
+        while (it.next()) |section| {
             switch (std.mem.order(u8, section.id, id)) {
                 .lt => continue,
                 .eq => return section,
@@ -312,23 +368,14 @@ pub const Index = struct {
         return .{ .bytes = index.bytes, .at = index.sections };
     }
 
+    /// The sections of an index `parse` checked, in order of id.
     pub const Iterator = struct {
         bytes: []const u8,
         at: usize,
 
-        pub fn next(it: *Iterator) Refused!?Section {
+        pub fn next(it: *Iterator) ?Section {
             if (it.at == it.bytes.len) return null;
-            const rest = it.bytes[it.at..];
-            if (rest.len < 1) return error.NotStreamIndex;
-            const len = rest[0];
-            if (rest.len < 1 + len + 4) return error.NotStreamIndex;
-            const id = rest[1 .. 1 + len];
-            const count = std.mem.readInt(u32, rest[1 + len ..][0..4], .little);
-            const records_at = 1 + len + 4;
-            const records_len = std.math.mul(usize, count, 24) catch return error.NotStreamIndex;
-            if (rest.len - records_at < records_len or count == 0 or !valid(id)) return error.NotStreamIndex;
-            it.at += records_at + records_len;
-            return .{ .id = id, .records = rest[records_at..][0..records_len] };
+            return sectionAt(it.bytes, &it.at) catch unreachable; // unreachable: `parse` walked every section
         }
     };
 
@@ -338,11 +385,11 @@ pub const Index = struct {
         records: []const u8,
 
         pub fn len(section: Section) usize {
-            return section.records.len / 24;
+            return section.records.len / entry_bytes;
         }
 
         pub fn at(section: Section, i: usize) Entry {
-            const r = section.records[i * 24 ..][0..24];
+            const r = section.records[i * entry_bytes ..][0..entry_bytes];
             return .{
                 .version = .fromRaw(std.mem.readInt(u64, r[0..8], .little)),
                 .seq = .fromRaw(std.mem.readInt(u64, r[8..16], .little)),
@@ -574,6 +621,15 @@ pub const Book = struct {
         slot.value_ptr.* = before;
     }
 
+    /// Stream `id`'s truncation point put back to `was`, what it was before
+    /// `setTruncation` moved it: allocates nothing, so an undo cannot fail.
+    pub fn restoreTruncation(book: *Book, id: []const u8, was: StreamVersion) void {
+        if (was == no_version) {
+            const removed = book.truncations.fetchRemove(id) orelse return;
+            book.gpa.free(removed.key);
+        } else if (book.truncations.getPtr(id)) |point| point.* = was;
+    }
+
     pub fn clearTruncations(book: *Book) void {
         var it = book.truncations.keyIterator();
         while (it.next()) |key| book.gpa.free(key.*);
@@ -608,12 +664,12 @@ test "a filter never forgets a stream it holds, and refuses most it does not" {
     const ids = 2000;
     var words: [Filter.wordsFor(ids)]u64 = @splat(0);
     var name: [16]u8 = undefined;
-    for (0..ids) |i| Filter.add(&words, std.fmt.bufPrint(&name, "in-{d}", .{i}) catch unreachable);
+    for (0..ids) |i| Filter.add(&words, std.mem.print(&name, "in-{d}", .{i}) catch unreachable);
     const filter: Filter = .{ .words = &words };
-    for (0..ids) |i| try testing.expect(filter.mayHold(std.fmt.bufPrint(&name, "in-{d}", .{i}) catch unreachable));
+    for (0..ids) |i| try testing.expect(filter.mayHold(std.mem.print(&name, "in-{d}", .{i}) catch unreachable));
     var wrong: usize = 0;
     for (0..ids) |i| {
-        if (filter.mayHold(std.fmt.bufPrint(&name, "out-{d}", .{i}) catch unreachable)) wrong += 1;
+        if (filter.mayHold(std.mem.print(&name, "out-{d}", .{i}) catch unreachable)) wrong += 1;
     }
     // About 1%; 3% is far outside what ten bits a stream gives.
     try testing.expect(wrong < ids * 3 / 100);
@@ -629,7 +685,8 @@ test "a stream index finds each stream's records and refuses one of other bytes"
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try encode(gpa, .fromRaw(10), .fromRaw(200), &placed, &out);
-    const index = try Index.parse(out.items, .fromRaw(10), .fromRaw(200));
+    const of: Index.Of = .{ .base_seq = .fromRaw(10), .bytes = .fromRaw(200) };
+    const index = try Index.parse(.init(out.items), of);
     try testing.expectEqual(@as(u32, 2), index.streams);
     const b = index.find("b").?;
     try testing.expectEqual(@as(usize, 2), b.len());
@@ -637,9 +694,63 @@ test "a stream index finds each stream's records and refuses one of other bytes"
     try testing.expectEqual(Bytes.fromRaw(40), b.at(0).offset);
     try testing.expectEqual(Seq.fromRaw(11), index.find("a").?.at(0).seq);
     try testing.expect(index.find("c") == null);
-    try testing.expectError(error.NotStreamIndex, Index.parse(out.items, .fromRaw(10), .fromRaw(201)));
+    try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), .{ .base_seq = .fromRaw(10), .bytes = .fromRaw(201) }));
     out.items[out.items.len - 10] ^= 1;
-    try testing.expectError(error.NotStreamIndex, Index.parse(out.items, .fromRaw(10), .fromRaw(200)));
+    try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
+}
+
+/// `out`'s checksum written again over what is before it, as if the index
+/// had been written with what it now says.
+fn reseal(out: []u8) void {
+    std.mem.writeInt(u32, out[out.len - 4 ..][0..4], Crc32c.hash(out[0 .. out.len - 4]), .little);
+}
+
+test "a stream index whose checksum holds is still refused when its sections are not what encode writes" {
+    const gpa = testing.allocator;
+    const placed = [_]Placed{
+        .{ .id = "a", .entry = .{ .version = .fromRaw(1), .seq = .fromRaw(10), .offset = .fromRaw(0) } },
+        .{ .id = "a", .entry = .{ .version = .fromRaw(2), .seq = .fromRaw(11), .offset = .fromRaw(50) } },
+        .{ .id = "b", .entry = .{ .version = .fromRaw(1), .seq = .fromRaw(12), .offset = .fromRaw(100) } },
+    };
+    const of: Index.Of = .{ .base_seq = .fromRaw(10), .bytes = .fromRaw(200) };
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    try encode(gpa, of.base_seq, of.bytes, &placed, &out);
+    const good = try gpa.dupe(u8, out.items);
+    defer gpa.free(good);
+    _ = try Index.parse(.init(out.items), of);
+    const sections = (try Index.parse(.init(good), of)).sections;
+    const b_at = sections + 1 + 1 + 4 + 2 * entry_bytes;
+
+    // Stream "b" renamed "a": the same stream twice.
+    out.items[b_at + 1] = 'a';
+    reseal(out.items);
+    try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
+
+    // Stream "a"'s second version made its first's again.
+    @memcpy(out.items, good);
+    std.mem.writeInt(u64, out.items[sections + 1 + 1 + 4 + entry_bytes ..][0..8], 1, .little);
+    reseal(out.items);
+    try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
+
+    // Stream "b" said to hold more records than the file has room for.
+    @memcpy(out.items, good);
+    std.mem.writeInt(u32, out.items[b_at + 1 + 1 ..][0..4], std.math.maxInt(u32), .little);
+    reseal(out.items);
+    try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
+}
+
+test "a truncation point put back is the one it was, an absent one absent again" {
+    var book = Book.init(testing.allocator, 4);
+    defer book.deinit();
+    try book.setTruncation("a", .fromRaw(3));
+    try book.setTruncation("a", .fromRaw(7));
+    book.restoreTruncation("a", .fromRaw(3));
+    try testing.expectEqual(StreamVersion.fromRaw(3), book.truncation("a"));
+    try book.setTruncation("b", .fromRaw(5));
+    book.restoreTruncation("b", no_version);
+    try testing.expectEqual(no_version, book.truncation("b"));
+    try testing.expect(book.truncations.get("b") == null);
 }
 
 test "the heads keep the streams touched most recently, up to their capacity" {

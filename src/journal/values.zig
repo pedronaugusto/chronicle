@@ -51,6 +51,13 @@ pub fn limit(count: anytype) usize {
     return aegis.int.cast(usize, count.raw()) catch std.math.maxInt(usize);
 }
 
+/// Bytes as they lie in a file: nothing has read them yet, so they are a
+/// record, a segment's first line, an index or damage until one of the
+/// readers has said which. Everything that comes off a disk is one of these,
+/// and `parse` hands it to a reader whose answer is a refined value or a
+/// named refusal.
+pub const Unparsed = aegis.input.Untrusted([]const u8);
+
 /// The largest length there is: what stands for "as far as the file goes".
 pub const furthest: Bytes = .fromRaw(std.math.maxInt(u64));
 pub const no_bytes: Bytes = .fromRaw(0);

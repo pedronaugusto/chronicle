@@ -88,13 +88,14 @@ count.
 
 ## Bytes off a disk
 
-Everything a scan returns is an `envelope.Unparsed`
+Everything a scan returns, and every file read whole, is a `values.Unparsed`
 (`aegis.input.Untrusted([]const u8)`). It cannot be read as a record, a segment
 header or a sequence number without handing it to the reader that answers for it,
 whose result is a refined value or a named refusal: `envelope.read` for a
 record's members (`Fields`, from which `head`, `stamp`, `backLink` and `batchOf`
 are taken), `parseHeader` for a record's envelope with its checksum checked,
-`parseSegmentHeader` for a file's first line. The places that use the bytes
+`parseSegmentHeader` for a file's first line, `streams.Index.parse` for a
+stream index. The places that use the bytes
 themselves (copying a record into a compacted segment, keeping a copy in the tail)
 say why in a comment.
 
@@ -111,6 +112,53 @@ else it holds.
 
 A header's event span is cut from the line it was read from; handing `eventFrom`
 a pair that do not belong together is refused in every build, not only in Debug.
+
+## Streams
+
+A record in a stream carries `s` (its id) and `sv` (its version) before `ev`,
+inside the checksum. Ids are restricted to printable ASCII without `"` or `\`, so
+an id has one spelling in JSON and the bytes between its quotes are the id: the
+envelope reports where they sit (`InStream.id`), and a record built from a copy
+of the line takes its id from the copy.
+
+Versions are an aegis id of their own (`StreamVersion`, moved by `Versions`), so
+a stream's version cannot stand for a `Seq`. They are written as JSON integers and
+end at `last_version` (`maxInt(i64)`); an append that would pass it is
+`StreamVersionExhausted`. Every step from one version to the next is checked.
+
+**Where a stream's records are.** The active segment's are kept in memory (the
+book's `placed`, read again from the segment whenever the book may be stale, such
+as after an append that failed). Each sealed segment has a stream index beside it,
+written when it is sealed: a header naming the segment's first record and length,
+a bloom filter (ten bits a stream, seven probes from one Wyhash), then each stream
+in order of id with its records in order of version, then a CRC-32C. The index is
+read whole through `aegis.own.readFile`, at most the segment's length and a
+header, and `Index.parse` is its one reader: the checksum, the segment it names,
+and every section lying whole inside the file, each stream once and in order,
+each stream's versions rising. What it refuses is rebuilt from the segment; a
+segment that cannot give an index `parse` accepts is `CorruptRecord`. An index
+`parse` accepted is walked without checks.
+
+**Heads.** A stream's newest version is the active segment's, else the newest
+segment whose index holds it, read newest first. The ones found are kept in an
+LRU sized by `Options.stream_heads`; one that could not be kept is looked up again.
+
+**Truncation.** `truncateStreamBefore` records the point in the `truncations` file
+(one `{"s":..,"tb":..}` line each, written through a temporary renamed into place)
+before it returns; a read starts at the point. Should the file not be written,
+the point in memory is put back as it was, which allocates nothing. `compact` and
+`dropSegmentsBefore` raise the point of every stream whose records they drop to
+just past the newest dropped, before dropping them: a stream's version is the
+newest of its records or its point, so it never goes back.
+
+**Stubs.** `compact` rewrites each sealed segment holding a record below its
+stream's point (the active segment is sealed first) through airlock's
+publish-by-rename. Such a record becomes `{seq,at,v,p,[bf,bl],s,sv,"x":1,"sc":..,"c":..}`:
+`sc` is the checksum of the stub's bytes before it and `c` is the record's own,
+unchanged, which the record after it links to. Nothing after a stub is
+rewritten, and `verify` checks a stub against `sc` and the chain through `c`. A
+segment with a stub in it is format 2 in its header, so chronicle 0.10 refuses it
+rather than read a stub as a record.
 
 ## State that is checked in every build
 
