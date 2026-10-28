@@ -208,7 +208,7 @@ pub const flush: Flush = airlock.Reached.expected(.full);
 /// thread, as `Io.File.sync` does. An interrupted call is made again; a
 /// failure is reported, never answered with a weaker call. A filesystem that
 /// declines the call gets the strongest one it takes, and the answer says so.
-fn syncFile(io: Io, blocking: ?airlock.Blocking, file: Io.File, level: airlock.Level) Io.File.SyncError!Flush {
+fn syncFile(io: Io, blocking: ?*airlock.Blocking, file: Io.File, level: airlock.Level) Io.File.SyncError!Flush {
     return airlock.syncFile(io, file, .{ .level = level, .blocking = blocking });
 }
 
@@ -347,7 +347,7 @@ pub const Options = struct {
     preallocate_bytes: Bytes = .fromRaw(0),
     index_interval_bytes: Bytes = .fromRaw(4096),
     max_record_bytes: Bytes = .fromRaw(1024 * 1024),
-    blocking: ?airlock.Blocking = null,
+    blocking: ?*airlock.Blocking = null,
 };
 
 pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
@@ -1355,7 +1355,7 @@ fn placeholderHeader(base_seq: Seq, interval: Bytes) [index_header_len]u8 {
 /// Stamp a finished index with everything that proves it and make it durable,
 /// which is what turns it from a cache being filled into one a later process
 /// may take.
-fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync, blocking: ?airlock.Blocking) SealError!void {
+fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync, blocking: ?*airlock.Blocking) SealError!void {
     try file.writePositionalAll(io, &header.bytes(), 0);
     // Under `.never` the log itself is not asked to reach the drive, and a
     // seal that outlives its segment is one the next open checks against the
@@ -1504,11 +1504,11 @@ fn lineAtFrom(log: *Self, io: Io, file: Io.File, segment: Segment, offset: Bytes
     // by whoever asked for it.
     var lines: strand.jsonl.LineReader = .resumeAt(log.gpa, &bounded.interface, .{ .offset = offset.raw() }, framing(std.math.maxInt(usize)));
     defer lines.deinit();
-    const line = lines.next() catch |err| switch (err) {
+    const line = (lines.next() catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
         error.OutOfMemory => return error.OutOfMemory,
         error.LineTooLong, error.ControlByte, error.MissingSeparator => unreachable,
-    } orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = false };
+    }) orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = false };
     return .{ .bytes = try log.gpa.dupe(u8, line.line), .terminated = true };
 }
 
@@ -1538,13 +1538,13 @@ fn lastLineFrom(log: *Self, io: Io, file: Io.File, segment: Segment) OpenError!L
         .block_bytes = .literal("4KiB"),
     });
     defer tail.deinit();
-    const line = tail.prevRaw() catch |err| switch (err) {
+    const line = (tail.prevRaw() catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
         error.SeekFailed => return reader.seek_err.?,
         error.Truncated => return error.TruncatedRecord,
         error.OutOfMemory => return error.OutOfMemory,
         error.MalformedLine, error.ControlByte, error.MissingSeparator, error.LineTooLong => unreachable,
-    } orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = terminated };
+    }) orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = terminated };
     return .{ .bytes = try log.gpa.dupe(u8, line.line), .terminated = terminated };
 }
 
@@ -1682,14 +1682,14 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
         // A segment read through a buffer reads the file once a buffer:
         // a cancel is taken at each line, not only at those reads.
         try io.checkCancel();
-        const line = lines.next() catch |err| switch (err) {
+        const line = (lines.next() catch |err| switch (err) {
             // Past what a record may be, and the segment ends inside it: the
             // tail after the last newline, measured below.
             error.LineTooLong => if (lines.unfinished) break else return error.RecordTooLarge,
             error.ReadFailed => return reader.err.?,
             error.OutOfMemory => return error.OutOfMemory,
             error.ControlByte, error.MissingSeparator => unreachable,
-        } orelse break;
+        }) orelse break;
         const start: Bytes = .fromRaw(line.offset);
         const end = values.plus(start, .fromRaw(line.line.len + 1));
         const text: Unparsed = .init(line.line);
@@ -1912,7 +1912,7 @@ pub const Scan = struct {
             // it reads through is the one in it now.
             scan.lines.input = &scan.reader.interface;
             const newest = scan.at + 1 == scan.bases.len;
-            const line = scan.lines.next() catch |err| switch (err) {
+            const line = (scan.lines.next() catch |err| switch (err) {
                 error.ReadFailed => return scan.reader.err.?,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.LineTooLong => {
@@ -1928,7 +1928,7 @@ pub const Scan = struct {
                     return error.RecordTooLarge;
                 },
                 error.ControlByte, error.MissingSeparator => unreachable,
-            } orelse {
+            }) orelse {
                 // No newline, and bytes before the end of the file: a record
                 // the writer has not finished, which for a reader beside it
                 // is the end of the log, and anywhere else is damage. A
@@ -2835,7 +2835,7 @@ pub fn syncDir(log: *Self, io: Io) Self.SyncDirError!void {
     return syncDirHandle(io, log.options.blocking, log.dir.borrow().*);
 }
 
-fn syncDirHandle(io: Io, blocking: ?airlock.Blocking, dir: Io.Dir) SyncDirError!void {
+fn syncDirHandle(io: Io, blocking: ?*airlock.Blocking, dir: Io.Dir) SyncDirError!void {
     _ = try airlock.syncDir(io, dir, .{ .level = .full, .blocking = blocking });
 }
 
@@ -3307,7 +3307,7 @@ const backup_name_bytes = name_digits + index_extension.len;
 const Copies = struct {
     dest: Io.Dir,
     /// Where the batch runs its syncs: the log's `Options.blocking`.
-    blocking: ?airlock.Blocking,
+    blocking: ?*airlock.Blocking,
     batch: airlock.Batch,
     slots: [backup_batch + 1]airlock.Batch.Slot,
     /// Copies the batch syncs through their own handles, closed once it has.
@@ -3318,7 +3318,7 @@ const Copies = struct {
     names_len: usize,
 
     /// In place: the batch keeps a pointer to `slots`.
-    fn init(c: *Copies, dest: Io.Dir, blocking: ?airlock.Blocking) void {
+    fn init(c: *Copies, dest: Io.Dir, blocking: ?*airlock.Blocking) void {
         c.dest = dest;
         c.blocking = blocking;
         c.batch = .init(&c.slots);

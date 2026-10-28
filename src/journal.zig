@@ -456,9 +456,10 @@ pub fn Journal(comptime Event: type) type {
             /// them (`airlock.Blocking`). A sync holds the thread that makes
             /// it until the drive answers: on an evented `Io` that thread is
             /// a worker other tasks are waiting for, so a program on a
-            /// reactor runtime gives its sync lane, `.{ .run =
-            /// reactor.syncLane }`. Null makes them on the calling thread.
-            blocking: ?Log.Blocking = null,
+            /// reactor runtime gives its sync lane: a `Blocking` it keeps,
+            /// `reactor.syncLaneFor(airlock.Blocking)`, by its address. Null
+            /// makes them on the calling thread.
+            blocking: ?*Log.Blocking = null,
         };
 
         pub const Snapshot = struct {
@@ -1574,7 +1575,7 @@ pub fn Journal(comptime Event: type) type {
             const Document = struct { seq: u64 };
             // A cursor is a number with a name on it. Nothing this package
             // writes there is longer than this, so nothing longer is read.
-            const document = readDocument(
+            const document = (readDocument(
                 s,
                 io,
                 arena.allocator(),
@@ -1586,7 +1587,7 @@ pub fn Journal(comptime Event: type) type {
                 error.Canceled => return error.Canceled,
                 error.UnsupportedFormat => return error.UnsupportedFormat,
                 else => return error.CorruptCursor,
-            } orelse return null;
+            }) orelse return null;
             // Any number is a place to have got to, so this is a position
             // read off a disk and not a record to look up.
             return .fromRaw(document.seq);
@@ -1681,7 +1682,7 @@ pub fn Journal(comptime Event: type) type {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
             const Document = struct { seq: u64 };
-            const document = readDocument(
+            const document = (readDocument(
                 s,
                 io,
                 arena.allocator(),
@@ -1692,7 +1693,7 @@ pub fn Journal(comptime Event: type) type {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
                 else => return,
-            } orelse return;
+            }) orelse return;
             if (values.below(seq, .fromRaw(document.seq))) try s.log.removeSnapshot(io);
         }
 
