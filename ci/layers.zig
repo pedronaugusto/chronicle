@@ -68,22 +68,10 @@ pub const required = [_][]const u8{
     "src/tests.zig",
 };
 
-/// Tokens only their owners may spell: durability and file identity are
-/// airlock's, so nothing here spells them; the JSON codec is strand's, and
-/// only the tests may spell `std.json`'s.
+/// Tokens only their owners may spell: the JSON codec is strand's, and only
+/// the tests may spell `std.json`'s. Durability is preflight's door and file
+/// identity the `disallowed` entries of ci/preflight.json, each by what a
+/// reference resolves to.
 pub const owned: []const gantry.rules.TokenRule = &.{
-    .{ .name = "durability belongs to airlock", .tokens = &.{
-        "fsync",
-        "fdatasync",
-        "F_FULLFSYNC",
-        "FULLFSYNC",
-        "F_BARRIERFSYNC",
-        "BARRIERFSYNC",
-        "FlushFileBuffers",
-        "NtFlushBuffersFile",
-        "NtFlushBuffersFileEx",
-        "createFileAtomic",
-    } },
-    .{ .name = "file identity belongs to airlock", .tokens = &.{ "statx", "fstat", "fstatat", "FILE_ID_INFO" } },
     .{ .name = "json owner", .tokens = &.{ "Stringify", "parseFromSlice", "parseFromSliceLeaky" }, .owners = &.{"src/*_test.zig"} },
 };

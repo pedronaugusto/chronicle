@@ -32,7 +32,11 @@
     ]
   ],
   "glint": {
-    "rules": [{"id": "P003", "level": "gate"},
+    "rules": [
+      {
+        "id": "P003",
+        "level": "gate"
+      },
       {
         "id": "A004",
         "level": "gate"
@@ -40,6 +44,61 @@
       {
         "id": "Z026",
         "level": "gate"
+      }
+    ],
+    "disallowed": [
+      {
+        "source": "std",
+        "declaration": "os.linux.statx",
+        "reason": "file identity belongs to airlock: only it says which file a handle is",
+        "replacement": "airlock.FileId.of",
+        "scope": "production"
+      },
+      {
+        "source": "std",
+        "declaration": "c.statx",
+        "reason": "file identity belongs to airlock: only it says which file a handle is",
+        "replacement": "airlock.FileId.of",
+        "scope": "production"
+      },
+      {
+        "source": "std",
+        "declaration": "c.fstat",
+        "reason": "file identity belongs to airlock: only it says which file a handle is",
+        "replacement": "airlock.FileId.of",
+        "scope": "production"
+      },
+      {
+        "source": "std",
+        "declaration": "c.fstatat",
+        "reason": "file identity belongs to airlock: only it says which file a handle is",
+        "replacement": "airlock.FileId.of",
+        "scope": "production"
+      },
+      {
+        "declaration": "statx",
+        "reason": "file identity belongs to airlock: only it says which file a handle is",
+        "replacement": "airlock.FileId.of",
+        "scope": "production"
+      },
+      {
+        "declaration": "fstat",
+        "reason": "file identity belongs to airlock: only it says which file a handle is",
+        "replacement": "airlock.FileId.of",
+        "scope": "production"
+      },
+      {
+        "declaration": "fstatat",
+        "reason": "file identity belongs to airlock: only it says which file a handle is",
+        "replacement": "airlock.FileId.of",
+        "scope": "production"
+      },
+      {
+        "source": "std",
+        "declaration": "Io.Dir.createFileAtomic",
+        "reason": "a file chronicle publishes is made durable by airlock: only it says what a sync reached",
+        "replacement": "airlock.create and its commit",
+        "scope": "production"
       }
     ]
   }

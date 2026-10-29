@@ -421,7 +421,9 @@ pub const Head = struct {
 pub const Heads = struct {
     gpa: Allocator,
     capacity: u32,
-    map: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Node indexes, hashed and compared by the ids their nodes hold:
+    /// `nodes` moves when it grows, so the map keeps no pointer into it.
+    map: std.HashMapUnmanaged(u32, void, Keys, std.hash_map.default_max_load_percentage) = .empty,
     nodes: std.ArrayList(Node) = .empty,
     /// Most recent first; `none` ends a list.
     first: u32 = none,
@@ -443,6 +445,40 @@ pub const Heads = struct {
         }
     };
 
+    /// The map's context: a node's index stands for the id it holds.
+    const Keys = struct {
+        nodes: []const Node,
+
+        pub fn hash(k: Keys, i: u32) u64 {
+            return std.hash_map.hashString(k.nodes[i].key());
+        }
+
+        pub fn eql(k: Keys, a: u32, b: u32) bool {
+            return std.mem.eql(u8, k.nodes[a].key(), k.nodes[b].key());
+        }
+    };
+
+    /// A lookup by id.
+    const ById = struct {
+        nodes: []const Node,
+
+        pub fn hash(_: ById, id: []const u8) u64 {
+            return std.hash_map.hashString(id);
+        }
+
+        pub fn eql(k: ById, id: []const u8, i: u32) bool {
+            return std.mem.eql(u8, id, k.nodes[i].key());
+        }
+    };
+
+    fn keys(heads: *const Heads) Keys {
+        return .{ .nodes = heads.nodes.items };
+    }
+
+    fn find(heads: *const Heads, id: []const u8) ?u32 {
+        return heads.map.getKeyAdapted(id, ById{ .nodes = heads.nodes.items });
+    }
+
     pub fn init(gpa: Allocator, capacity: u32) Heads {
         return .{ .gpa = gpa, .capacity = capacity };
     }
@@ -463,7 +499,7 @@ pub const Heads = struct {
     }
 
     pub fn get(heads: *Heads, id: []const u8) ?Head {
-        const i = heads.map.get(id) orelse return null;
+        const i = heads.find(id) orelse return null;
         heads.touch(i);
         return heads.nodes.items[i].head;
     }
@@ -471,7 +507,7 @@ pub const Heads = struct {
     /// Keep `head` for `id`, as the most recent, when there is room.
     pub fn put(heads: *Heads, id: []const u8, head: Head) void {
         if (heads.capacity == 0) return;
-        if (heads.map.get(id)) |i| {
+        if (heads.find(id)) |i| {
             heads.nodes.items[i].head = head;
             heads.touch(i);
             return;
@@ -480,20 +516,21 @@ pub const Heads = struct {
             if (heads.used == heads.nodes.items.len) {
                 heads.nodes.append(heads.gpa, .{}) catch return;
             }
-            heads.map.ensureUnusedCapacity(heads.gpa, 1) catch return;
+            // After the append: a rehash reads the nodes where they are now.
+            heads.map.ensureUnusedCapacityContext(heads.gpa, 1, heads.keys()) catch return;
             heads.used += 1;
             break :blk heads.used - 1;
         } else blk: {
             // The stream touched longest ago gives up its place.
             const oldest = heads.last;
             heads.unlink(oldest);
-            _ = heads.map.remove(heads.nodes.items[oldest].key());
+            _ = heads.map.removeAdapted(heads.nodes.items[oldest].key(), ById{ .nodes = heads.nodes.items });
             break :blk oldest;
         };
         const node = &heads.nodes.items[i];
         node.* = .{ .len = @intCast(id.len), .head = head };
         @memcpy(node.id[0..id.len], id);
-        heads.map.putAssumeCapacity(node.key(), i);
+        heads.map.putAssumeCapacityNoClobberContext(i, {}, heads.keys());
         heads.pushFront(i);
     }
 
@@ -751,6 +788,17 @@ test "a truncation point put back is the one it was, an absent one absent again"
     book.restoreTruncation("b", no_version);
     try testing.expectEqual(no_version, book.truncation("b"));
     try testing.expect(book.truncations.get("b") == null);
+}
+
+test "the heads find every stream they keep after their memory grew and moved" {
+    var heads = Heads.init(testing.allocator, 1000);
+    defer heads.deinit();
+    var buf: [16]u8 = undefined;
+    for (0..1000) |i| heads.put(try std.mem.print(&buf, "s-{d}", .{i}), .{ .version = .fromRaw(i + 1) });
+    for (0..1000) |i| {
+        const head = heads.get(try std.mem.print(&buf, "s-{d}", .{i})) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(StreamVersion.fromRaw(i + 1), head.version);
+    }
 }
 
 test "the heads keep the streams touched most recently, up to their capacity" {

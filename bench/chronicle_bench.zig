@@ -17,7 +17,11 @@
 //! batches as a group), `append_if` and `append_if_baseline`, `replay_all`,
 //! `replay_from_n FROM [REPETITIONS]`, `follow_replay`, `follow_resume` and
 //! `follow_rearm` `[WAKES]`, `clean_reopen [REPETITIONS]`, `raw_prepare`,
-//! `raw_append` and `raw_replay_all`.
+//! `raw_append` and `raw_replay_all`; and over streams, the records spread
+//! round robin over a thousand of them (fewer when COUNT is less):
+//! `append_to` (each append expecting the stream's exact version),
+//! `stream_prepare`, then `read_stream [REPETITIONS]` (one whole stream) and
+//! `stream_version [REPETITIONS]` (every stream's) over what it wrote.
 /// Set once by `main` from `--smoke`: every workload once, at its smallest,
 /// reading no clock, as `zig build test` runs it to keep it working.
 var smoke = false;
@@ -267,6 +271,102 @@ fn follow(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []co
     try printMetric(io, workload, "per_wake", elapsed * 1_000_000.0 / @as(f64, @floatFromInt(wakes)), "us");
 }
 
+/// The streams a streams workload spreads its records over, round robin.
+const max_streams: usize = 1000;
+
+/// The ids of `count` records' streams, `s-0` to `s-999`, owned by `names`.
+const Streams = struct {
+    names: [][16]u8,
+    ids: []chronicle.Stream,
+
+    fn init(gpa: std.mem.Allocator, count: usize) !Streams {
+        const n = @min(max_streams, count);
+        const names = try gpa.alloc([16]u8, n);
+        errdefer gpa.free(names);
+        const ids = try gpa.alloc(chronicle.Stream, n);
+        errdefer gpa.free(ids);
+        for (names, ids, 0..) |*name, *id, i| id.* = try .of(try std.mem.print(name, "s-{d}", .{i}));
+        return .{ .names = names, .ids = ids };
+    }
+
+    fn deinit(streams: *Streams, gpa: std.mem.Allocator) void {
+        gpa.free(streams.ids);
+        gpa.free(streams.names);
+    }
+
+    /// The records stream `j` holds after `count` were spread.
+    fn held(streams: Streams, count: usize, j: usize) usize {
+        const n = streams.ids.len;
+        return count / n + @intFromBool(j < count % n);
+    }
+};
+
+/// Record `i` appended to its stream, expecting the version the records
+/// before it there left: none, then its count of them.
+fn appendToStream(journal: *Journal, io: std.Io, streams: Streams, input: Input, i: usize) !void {
+    const n = streams.ids.len;
+    const expected: Journal.StreamExpected = if (i < n) .no_stream else .{ .exact = .fromRaw(i / n) };
+    _ = try journal.appendTo(io, streams.ids[i % n], expected, .fromRaw(@intCast(i + 1)), input.event);
+}
+
+/// `append_to` (timed, into a fresh journal) or `stream_prepare` (untimed,
+/// for the reads).
+fn streamAppend(io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []const u8, count: usize, workload: []const u8) !void {
+    var input = try Input.load(io, gpa, input_path, count);
+    defer input.deinit(gpa);
+    var streams = try Streams.init(gpa, count);
+    defer streams.deinit(gpa);
+    scrub(io, path);
+    const journal = try Journal.open(gpa, io, path, options(.never, .write));
+    defer journal.deinit(io);
+    const started = benchmarkNow(io);
+    for (0..count) |i| try appendToStream(journal, io, streams, input, i);
+    const elapsed = seconds(started, io);
+    if (std.mem.eql(u8, workload, "append_to")) {
+        try printMetric(io, workload, "records_per_second", @as(f64, @floatFromInt(count)) / elapsed, "records/s");
+    }
+}
+
+/// One whole stream read `repetitions` times, a different stream each,
+/// from a journal `stream_prepare` wrote with `count` records.
+fn readStream(io: std.Io, gpa: std.mem.Allocator, path: []const u8, count: usize, repetitions: usize) !void {
+    var streams = try Streams.init(gpa, count);
+    defer streams.deinit(gpa);
+    const journal = try Journal.open(gpa, io, path, options(.never, .read));
+    defer journal.deinit(io);
+    var elapsed: f64 = 0;
+    var records: usize = 0;
+    for (0..repetitions) |r| {
+        const j = (r * 7) % streams.ids.len;
+        const started = benchmarkNow(io);
+        const walk = try journal.readStream(io, streams.ids[j], chronicle.no_version);
+        var seen: usize = 0;
+        while (try walk.next(io)) |_| seen += 1;
+        walk.deinit();
+        elapsed += seconds(started, io);
+        if (seen != streams.held(count, j)) return error.FoldMismatch;
+        records += seen;
+    }
+    try printMetric(io, "read_stream", "per_stream", elapsed * 1000.0 / @as(f64, @floatFromInt(repetitions)), "ms");
+    try printMetric(io, "read_stream", "records_per_second", @as(f64, @floatFromInt(records)) / elapsed, "records/s");
+}
+
+/// Every stream's version, `repetitions` times over, from a journal
+/// `stream_prepare` wrote with `count` records.
+fn streamVersion(io: std.Io, gpa: std.mem.Allocator, path: []const u8, count: usize, repetitions: usize) !void {
+    var streams = try Streams.init(gpa, count);
+    defer streams.deinit(gpa);
+    const journal = try Journal.open(gpa, io, path, options(.never, .read));
+    defer journal.deinit(io);
+    const started = benchmarkNow(io);
+    for (0..repetitions) |_| for (streams.ids, 0..) |id, j| {
+        const version = try journal.streamVersion(io, id);
+        if (version != chronicle.StreamVersion.fromRaw(streams.held(count, j))) return error.FoldMismatch;
+    };
+    const calls = repetitions * streams.ids.len;
+    try printMetric(io, "stream_version", "per_call", seconds(started, io) * 1_000_000_000.0 / @as(f64, @floatFromInt(calls)), "ns");
+}
+
 fn reopen(io: std.Io, gpa: std.mem.Allocator, path: []const u8, repetitions: usize) !void {
     var elapsed: f64 = 0;
     for (0..repetitions) |_| {
@@ -382,6 +482,14 @@ pub fn main(init: std.process.Init) !void {
         const wakes = if (args.next()) |text| try std.fmt.parseInt(usize, text, 10) else 10_000;
         return follow(io, gpa, input_path, path, count, wakes, workload);
     }
+    if (std.mem.eql(u8, workload, "append_to") or std.mem.eql(u8, workload, "stream_prepare")) {
+        return streamAppend(io, gpa, input_path, path, count, workload);
+    }
+    if (std.mem.eql(u8, workload, "read_stream") or std.mem.eql(u8, workload, "stream_version")) {
+        const repetitions = if (args.next()) |text| try std.fmt.parseInt(usize, text, 10) else 1;
+        if (std.mem.eql(u8, workload, "read_stream")) return readStream(io, gpa, path, count, repetitions);
+        return streamVersion(io, gpa, path, count, repetitions);
+    }
     if (std.mem.eql(u8, workload, "clean_reopen")) {
         const repetitions = if (args.next()) |text| try std.fmt.parseInt(usize, text, 10) else 1;
         return reopen(io, gpa, path, repetitions);
@@ -390,8 +498,8 @@ pub fn main(init: std.process.Init) !void {
 }
 
 /// Every workload in turn, in the working directory: the input, each append
-/// into a fresh journal, then the reads over one prepared journal, and the
-/// raw-event case over the same input.
+/// into a fresh journal, then the reads over one prepared journal, the
+/// raw-event case over the same input, and the streams.
 fn everyWorkload(io: std.Io, gpa: std.mem.Allocator) !void {
     const count: usize = if (smoke) 10 else 1_000_000;
     const synced: usize = if (smoke) 2 else 10_000;
@@ -414,9 +522,15 @@ fn everyWorkload(io: std.Io, gpa: std.mem.Allocator) !void {
     const raw = "raw";
     try rawWorkload(io, gpa, input, raw, count, "raw_append");
     try rawWorkload(io, gpa, input, raw, count, "raw_replay_all");
+    const streamed = "streams";
+    try streamAppend(io, gpa, input, scratch, count, "append_to");
+    try streamAppend(io, gpa, input, streamed, count, "stream_prepare");
+    try readStream(io, gpa, streamed, count, if (smoke) 2 else 100);
+    try streamVersion(io, gpa, streamed, count, if (smoke) 1 else 100);
     scrub(io, scratch);
     scrub(io, prepared);
     scrub(io, raw);
+    scrub(io, streamed);
 }
 
 // Smoke exercises correctness without sampling a benchmark clock.
