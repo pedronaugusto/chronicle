@@ -965,9 +965,7 @@ pub fn Journal(comptime Event: type) type {
                 copy.bytes = try a.dupe(u8, record.bytes);
                 copy.event = strand.core.cloneLeaky(a, record.event, .sized(record.bytes.len)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    // The event was read from these bytes under these bounds,
-                    // so a copy of it fits them.
-                    else => unreachable,
+                    else => unreachable, // aegis: no-danger: the event was read from these bytes under these bounds, so a copy of it fits them
                 };
             }
             batch.records = copied;
