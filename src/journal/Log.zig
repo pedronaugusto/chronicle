@@ -24,7 +24,6 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
 const Crc32c = @import("warp").Crc32c;
-const clone = @import("clone.zig");
 const envelopes = @import("envelope.zig");
 const jsonl = @import("jsonl.zig");
 const strand = jsonl.strand;
@@ -944,7 +943,7 @@ const IndexHeader = struct {
     entries_checksum: u32,
 
     fn bytes(header: IndexHeader) [index_header_len]u8 {
-        aegis.assert.pre(header.base_seq != values.beginning, "an index belongs to a segment, and a segment is named for a record");
+        aegis.assert.invariant(header.base_seq != values.beginning, "an index belongs to a segment, and a segment is named for a record");
         var out: [index_header_len]u8 = @splat(0);
         @memcpy(out[0..index_magic.len], index_magic);
         std.mem.writeInt(u64, out[8..16], header.segment_bytes.raw(), .little);
@@ -993,7 +992,7 @@ const IndexEntry = struct {
     at: Time,
 
     fn bytes(entry: IndexEntry) [index_entry_len]u8 {
-        aegis.assert.pre(entry.seq != values.beginning, "an index entry names a record");
+        aegis.assert.invariant(entry.seq != values.beginning, "an index entry names a record");
         var out: [index_entry_len]u8 = undefined;
         std.mem.writeInt(u64, out[0..8], entry.seq.raw(), .little);
         std.mem.writeInt(u64, out[8..16], entry.offset.raw(), .little);
@@ -1022,7 +1021,7 @@ const Builder = struct {
     last_offset: Bytes,
 
     fn init(base_seq: Seq, interval: Bytes) Builder {
-        aegis.assert.pre(base_seq != values.beginning, "an index belongs to a segment, and a segment is named for a record");
+        aegis.assert.invariant(base_seq != values.beginning, "an index belongs to a segment, and a segment is named for a record");
         return .{
             .base_seq = base_seq,
             .interval = interval,
@@ -1103,7 +1102,7 @@ const IndexProof = struct {
 /// the entries that follow it. An index that agrees with all three was built
 /// from exactly these bytes and nothing has changed since.
 fn readIndex(log: *Self, io: Io, segment: Segment) Io.Cancelable!?Indexed {
-    const file = ((try log.holdIndex(io, segment.base_seq)) orelse return null).get();
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     return readIndexFrom(io, file, segment);
 }
 
@@ -1224,9 +1223,9 @@ fn releaseIndex(log: *Self, io: Io) void {
 
 /// The open index of a sealed segment, opening it if the one being held is
 /// another segment's.
-fn holdIndex(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?OwnedFile.Lending {
+fn holdIndex(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?Io.File {
     if (log.held_index) |*held| {
-        if (held.base_seq == base_seq) return held.file.lend();
+        if (held.base_seq == base_seq) return held.file.borrow().*;
         log.releaseIndex(io);
     }
     log.index_opens += 1;
@@ -1235,7 +1234,7 @@ fn holdIndex(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?OwnedFile.Lending
         return null;
     };
     log.held_index = .{ .base_seq = base_seq, .file = .init(file) };
-    return log.held_index.?.file.lend();
+    return log.held_index.?.file.borrow().*;
 }
 
 /// What a sealed segment's index says, proved against the segment once.
@@ -1306,7 +1305,7 @@ fn indexedOffset(log: *Self, io: Io, at: usize, seq: Seq, may_write: bool) Io.Ca
     const indexed = (try log.provenIndex(io, at, may_write)) orelse return null;
     if (indexed.last_seq != segment.last_seq) return null;
 
-    const file = ((try log.holdIndex(io, segment.base_seq)) orelse return null).get();
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     const slot = (try log.bisectSeq(io, file, indexed.entries, seq)) orelse return null;
     const entry = (try log.indexEntryAt(io, file, slot)) orelse return null;
     return entry.offset;
@@ -1391,7 +1390,7 @@ fn resumeIndex(log: *Self, io: Io, segment: Segment) OpenError!?Resumed {
 
     // The running checksum has to carry on from the entries already there,
     // and the bisection has to know where the last one sits.
-    const held = ((try log.holdIndex(io, segment.base_seq)) orelse return null).get();
+    const held = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     var builder: Builder = .init(segment.base_seq, indexed.interval);
     builder.entries = indexed.entries;
     // The entries are as many as the proof counted from this file's length,
@@ -1798,7 +1797,7 @@ pub const Scan = struct {
 
     gpa: Allocator,
     /// The log's directory, which the log closes.
-    dir: OwnedDir.Lending,
+    dir: Io.Dir,
     /// The base sequence numbers of the segments still to walk, oldest first.
     bases: []Seq,
     /// Allocated storage retained when a scan is armed again.
@@ -1901,7 +1900,7 @@ pub const Scan = struct {
                 continue;
             }
             if (scan.file == null) {
-                const file = try scan.dir.get().openFile(io, &segmentName(segment_extension, scan.bases[scan.at]), .{});
+                const file = try scan.dir.openFile(io, &segmentName(segment_extension, scan.bases[scan.at]), .{});
                 scan.file = .init(file);
                 scan.reader = file.reader(io, scan.buffer);
                 if (scan.position != values.no_bytes) try scan.reader.seekTo(scan.position.raw());
@@ -2039,7 +2038,7 @@ fn scanOver(log: *Self, segments: []const Segment, position: Bytes, extent: Scan
 
     return .{
         .gpa = log.gpa,
-        .dir = log.dir.lend(),
+        .dir = log.dir.borrow().*,
         .bases = bases,
         .bases_storage = bases_storage,
         .limits = limits,
@@ -2169,7 +2168,7 @@ fn indexedSeqAtOrAfter(log: *Self, io: Io, at: usize, want: Time) OpenError!?Seq
     const segment = log.segments.items[at];
     const indexed = (try log.provenIndex(io, at, true)) orelse return null;
     if (indexed.entries == values.no_records) return null;
-    const file = ((try log.holdIndex(io, segment.base_seq)) orelse return null).get();
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
 
     if (indexed.times.rising) {
         // The timestamps do not fall, so the entry to start from is found by
@@ -3176,7 +3175,7 @@ pub fn syncBeforeSnapshot(log: *Self, io: Io) Self.SnapshotError!void {
 // Copying a running log.
 //========================================================================
 
-pub const BackupError = OpenError || airlock.FileId.Error || airlock.Batch.Error || error{BackupInPlace};
+pub const BackupError = OpenError || airlock.FileId.Error || airlock.Batch.Error || airlock.CreateError || airlock.CopyFromError || airlock.PruneError || error{BackupInPlace};
 
 /// Copy a consistent view of the log into the directory `dest_path`, creating
 /// it if it is not there, and report the newest sequence number the copy
@@ -3297,12 +3296,19 @@ const backup_batch = 64;
 /// The longest name a backup copies: a segment or an index.
 const backup_name_bytes = name_digits + index_extension.len;
 
-/// A backup's copies, made durable together through one airlock `Batch`: a
-/// writeout per file and one flush of the device, where a sync per file would
-/// flush it once per file. A copy is synced through the handle that wrote it,
-/// which sees its writeback errors; a clone, which nothing here wrote, by
-/// name. The batch is committed a chunk at a time, so the copies held open
-/// never pass `backup_batch`, and the last commit also syncs the destination
+/// The prefix of a backup's temps: a copy is written under one beside its
+/// name and renamed over it once whole, and a backup that crashed leaves
+/// them for the next one to remove.
+const backup_temp_prefix = ".backup-";
+
+/// A backup's copies, made durable together through one airlock `Batch`,
+/// where a commit per copy would flush the device once per copy. Each is a
+/// pending: a temp beside its name, cloned where the filesystem shares
+/// extents and copied otherwise (airlock's `Pending.copyFrom`), synced
+/// through its own handle, which sees its writeback errors, and renamed
+/// over the name, so nothing is ever under a backup's name torn. The batch
+/// is committed a chunk at a time, so the temps held open never pass
+/// `backup_batch`, and the last commit also syncs the destination
 /// directory, which makes every name created or removed there durable.
 const Copies = struct {
     dest: Io.Dir,
@@ -3310,52 +3316,45 @@ const Copies = struct {
     blocking: ?*airlock.Blocking,
     batch: airlock.Batch,
     slots: [backup_batch + 1]airlock.Batch.Slot,
-    /// Copies the batch syncs through their own handles, closed once it has.
-    open: [backup_batch]Io.File,
-    open_len: usize,
-    /// The names of clones the batch syncs by name.
+    /// The copies of this chunk, each until the batch publishes it.
+    pendings: [backup_batch]airlock.Pending,
+    /// Their names, which a pending borrows until it ends.
     names: [backup_batch][backup_name_bytes]u8,
-    names_len: usize,
+    len: usize,
 
-    /// In place: the batch keeps a pointer to `slots`.
+    /// In place: the batch keeps a pointer to `slots`, and to each pending.
     fn init(c: *Copies, dest: Io.Dir, blocking: ?*airlock.Blocking) void {
         c.dest = dest;
         c.blocking = blocking;
         c.batch = .init(&c.slots);
-        c.open_len = 0;
-        c.names_len = 0;
+        c.len = 0;
     }
 
-    /// A copy, written through `file`, which the batch now owns.
-    fn addCopy(c: *Copies, io: Io, file: Io.File) BackupError!void {
-        if (c.open_len + c.names_len == backup_batch) c.flush(io, .files) catch |err| {
-            file.close(io);
-            return err;
-        };
-        c.batch.addFile(file) catch |err| {
-            file.close(io);
-            return err;
-        };
-        c.open[c.open_len] = file;
-        c.open_len += 1;
-    }
-
-    /// A clone, synced by name.
-    fn addClone(c: *Copies, io: Io, name: []const u8) BackupError!void {
-        if (c.open_len + c.names_len == backup_batch) try c.flush(io, .files);
-        const stored = c.names[c.names_len][0..name.len];
+    /// `from` copied under `name`: its first `limit` bytes, or the whole of
+    /// it, which may be a clone.
+    fn add(c: *Copies, io: Io, from: Io.File, name: []const u8, limit: ?Bytes) BackupError!airlock.By {
+        if (c.len == backup_batch) try c.flush(io, .files);
+        const stored = c.names[c.len][0..name.len];
         @memcpy(stored, name);
-        try c.batch.addPath(c.dest, stored);
-        c.names_len += 1;
+        const p = &c.pendings[c.len];
+        p.* = try airlock.create(io, c.dest, stored, .{ .temp = .{ .random = backup_temp_prefix } });
+        c.len += 1;
+        const by = p.copyFrom(io, from, .{ .limit = if (limit) |l| l.raw() else null }) catch |err| switch (err) {
+            // The file was longer a moment ago. Something is rewriting the
+            // directory underneath this copy.
+            error.EndOfStream => return error.TruncatedRecord,
+            else => |e| return e,
+        };
+        c.batch.addPending(io, p, .replace);
+        return by;
     }
 
-    /// The files added so far made durable, and with `.directory` the
-    /// destination's names too.
+    /// The copies added so far made durable and published, and with
+    /// `.directory` the destination's names too.
     fn flush(c: *Copies, io: Io, what: enum { files, directory }) BackupError!void {
-        if (what == .directory) try c.batch.addDir(c.dest);
+        if (what == .directory) c.batch.addDir(c.dest);
         _ = try c.batch.commit(io, .{ .level = .data, .blocking = c.blocking });
-        c.closeOpen(io);
-        c.names_len = 0;
+        c.endAll(io);
     }
 
     /// Every copy and the destination directory made durable.
@@ -3363,16 +3362,16 @@ const Copies = struct {
         return c.flush(io, .directory);
     }
 
-    /// After a failure: whatever the batch still holds, let go.
+    /// After a failure: whatever the batch still holds, let go, and the
+    /// temps not published removed.
     fn release(c: *Copies, io: Io) void {
         c.batch.reset(io);
-        c.closeOpen(io);
-        c.names_len = 0;
+        c.endAll(io);
     }
 
-    fn closeOpen(c: *Copies, io: Io) void {
-        for (c.open[0..c.open_len]) |file| file.close(io);
-        c.open_len = 0;
+    fn endAll(c: *Copies, io: Io) void {
+        for (c.pendings[0..c.len]) |*p| p.discard(io);
+        c.len = 0;
     }
 };
 
@@ -3380,64 +3379,17 @@ const Copies = struct {
 /// False when there is no such file, which is not an error for a snapshot or
 /// an index — neither is part of the log.
 fn copyFile(log: *Self, io: Io, copies: *Copies, name: [:0]const u8, bytes: ?Bytes) BackupError!bool {
-    const dest = copies.dest;
-    // The filesystem's own copy first, where there is one. A sealed segment
-    // is bytes that will never change again, and sharing their extents makes
-    // a backup of a year of them the size of a directory entry. The clone is
-    // made durable with the copies, as a copy would be.
-    if (bytes == null and clone.available) cloned: {
-        dest.deleteFile(io, name) catch |err| switch (err) {
-            error.FileNotFound => {}, // A new destination needs no removal.
-            else => |e| return e,
-        };
-        clone.whole(io, log.dir.borrow().*, dest, name) catch |err| switch (err) {
-            // This platform or this pair of directories shares no extents.
-            error.Unsupported => break :cloned,
-            error.FileNotFound => return false,
-            error.ShortSource => unreachable, // unreachable: a whole copy asks for the length it measured
-            else => |e| return e,
-        };
-        log.clones += 1;
-        try copies.addClone(io, name);
-        return true;
-    }
-
     const from = log.dir.borrow().openFile(io, name, .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
         else => |e| return e,
     };
     defer from.close(io);
-    const length = bytes orelse Bytes.fromRaw(try from.length(io));
-
-    const to = try dest.createFile(io, name, .{ .truncate = true });
-    var handed = false;
-    errdefer if (!handed) to.close(io);
-
-    // A prefix of a file -- the newest segment, up to its last whole record
-    // -- can still go through the filesystem where the platform takes a
-    // length.
-    if (clone.range(to, from, length.raw())) |_| {} else |err| {
-        switch (err) {
-            error.Unsupported => {},
-            error.ShortSource => return error.TruncatedRecord,
-            else => |e| return e,
-        }
-        const chunk = try log.allocateReadBuffer();
-        defer log.gpa.free(chunk);
-
-        var at = values.no_bytes;
-        while (values.below(at, length)) {
-            const want = @min(chunk.len, values.limit(values.minus(length, at)));
-            const read = try from.readPositionalAll(io, chunk[0..want], at.raw());
-            // The file was longer a moment ago. Something is rewriting the
-            // directory underneath this copy.
-            if (read == 0) return error.TruncatedRecord;
-            try to.writePositionalAll(io, chunk[0..read], at.raw());
-            at = values.plus(at, .fromRaw(read));
-        }
-    }
-    handed = true;
-    try copies.addCopy(io, to);
+    // A whole file goes as a clone where the filesystem makes one: a sealed
+    // segment is bytes that will never change again, and sharing their
+    // extents makes a backup of a year of them the size of a directory
+    // entry. A prefix -- the newest segment, up to its last whole record,
+    // while a writer may still be appending -- is copied.
+    if (try copies.add(io, from, name, bytes) == .clone) log.clones += 1;
     return true;
 }
 
@@ -3460,6 +3412,9 @@ fn clearBackup(log: *Self, io: Io, dest: Io.Dir) OpenError!void {
         if (managed) try names.append(a, try a.dupe(u8, entry.name));
     }
     for (names.items) |name| try dest.deleteFile(io, name);
+    // The temps of a backup that crashed. One running now into the same
+    // destination would be removing these files too.
+    _ = try airlock.pruneTemps(io, dest, backup_temp_prefix, .{ .older_than = .zero });
 }
 
 /// Whether `dest` is the directory this log lives in, by the filesystem's

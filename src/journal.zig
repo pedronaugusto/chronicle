@@ -1838,11 +1838,11 @@ pub fn Journal(comptime Event: type) type {
         fn encode(self: *Self, s: *State, seq: Seq, at: Time, back_link: u32, event: Event, batch: ?envelope.Batch, place: ?StreamAt) AppendError!Built {
             // A record numbered outside what a reader accepts would be durable
             // before anything noticed, so these hold in every build.
-            aegis.assert.pre(seq != values.beginning, "a record is numbered from one");
-            aegis.assert.pre(values.atMost(seq, values.newest_possible), "a record is numbered no higher than an i64");
+            aegis.assert.invariant(seq != values.beginning, "a record is numbered from one");
+            aegis.assert.invariant(values.atMost(seq, values.newest_possible), "a record is numbered no higher than an i64");
             if (batch) |bounds| {
-                aegis.assert.pre(values.atMost(bounds.first, seq), "a batch starts at or before its record");
-                aegis.assert.pre(values.atMost(seq, bounds.last), "a batch ends at or after its record");
+                aegis.assert.invariant(values.atMost(bounds.first, seq), "a batch starts at or before its record");
+                aegis.assert.invariant(values.atMost(seq, bounds.last), "a batch ends at or after its record");
             }
             const needs_record = self.needsRecord(s);
             const arena: ?*std.heap.ArenaAllocator = if (needs_record) try createArena(self.gpa) else null;
@@ -2616,7 +2616,7 @@ pub fn Journal(comptime Event: type) type {
             // The span came out of reading a line, and is cut from the bytes
             // it is handed here; a pair that do not belong together would slice
             // past the line in a build that does not check.
-            aegis.assert.pre(ev.from <= ev.to and ev.to <= line.len, "an event's span lies inside the line it was read from");
+            aegis.assert.invariant(ev.from <= ev.to and ev.to <= line.len, "an event's span lies inside the line it was read from");
             if (version == decoding.schema_version) {
                 return json.parseLeaky(Event, arena, line[ev.from..ev.to], eventParse(line.len)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,

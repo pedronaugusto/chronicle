@@ -1237,10 +1237,12 @@ pub fn Journal(comptime Event: type) type {
         /// The lock is not copied, and neither are the cursor files of named
         /// readers: those belong to the readers of *this* directory.
         ///
-        /// The copies are made durable together, a shared clone as much as a
-        /// copied file, with the destination directory: one airlock batch, a
-        /// writeout of each file and one flush of the device on macOS and
-        /// Windows, where a sync of each would flush it once per file.
+        /// Each copy is written under a temporary beside its name, a shared
+        /// clone where the filesystem makes one, and the copies are made
+        /// durable together with the destination directory: one airlock
+        /// batch, a writeout of each file and one flush of the device on
+        /// macOS and Windows, where a sync of each would flush it once per
+        /// file. Nothing is under a copy's name until the whole copy is.
         ///
         /// Safe to call from any task or thread.
         pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!Seq {

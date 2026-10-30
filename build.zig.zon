@@ -14,8 +14,8 @@
 
         // Durable files: every sync, atomic replace, batch and file identity.
         .airlock = .{
-            .url = "git+https://github.com/pedronaugusto/airlock?ref=v0.6.0#0931b6512b1d7c2e03e822bc82870ec8f98fa91e",
-            .hash = "airlock-0.6.0-rfvu6JUEBwD8DeigCmlj5NDNiglUZzUy2HSsKAeYRs3E",
+            .url = "git+https://github.com/pedronaugusto/airlock?ref=reflink-lock#384af238c1c69eb44cc576c98824845594f1084e",
+            .hash = "airlock-0.6.0-rfvu6McJCACgmHJQjFRBk2NWY9gFujkHbRBvV7UurSmP",
         },
 
         // Test doubles, for the tests alone: no module a consumer builds
@@ -28,8 +28,8 @@
         },
 
         .aegis = .{
-            .url = "git+https://github.com/pedronaugusto/aegis?ref=v0.2.3#b3ac31e78d8215f6852f848ddb473faa604161d4",
-            .hash = "aegis-0.2.3-rsxoukEHCQDqAUV05fUDmUQPv7l6XABkCp-gW5kGM2H5",
+            .url = "git+https://github.com/pedronaugusto/aegis#52eed3f06a10240efa65da8d0da0c707a1e25c25",
+            .hash = "aegis-0.2.4-rsxoumovCQBQ64pOyuStfezukS__gCZ4JPp3cdcvR2eW",
         },
     },
     .paths = .{

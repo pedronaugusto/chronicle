@@ -38,7 +38,6 @@ const temporary_prefix = ".chronicle-tmp-";
 const temporary_name = temporary_prefix ++ shakedown.corpus.repeat("a", 26);
 
 const implementation = @import("journal.zig");
-const chronicle_clone_available = @import("journal/clone.zig").available;
 
 fn journalState(owner: anytype) *implementation.Journal(@FieldType(@typeInfo(@TypeOf(owner)).pointer.child.Record, "event")) {
     return &owner.state;
@@ -3956,8 +3955,7 @@ test "a backup shares the bytes of a sealed segment where the filesystem can" {
     try testing.expectEqualStrings(here, there);
 }
 
-test "a backup returns what stops the filesystem's copy, and copies the bytes only where it cannot share them" {
-    if (!chronicle_clone_available) return error.SkipZigTest;
+test "a backup returns what stops a copy, and leaves no temp and no torn copy behind" {
     const fio = try shakedown.FaultIo.init(testing.allocator, testing.io, .{});
     defer fio.deinit();
     const io = fio.io();
@@ -3968,22 +3966,25 @@ test "a backup returns what stops the filesystem's copy, and copies the bytes on
     defer journal.deinit(io);
     for (1..13) |i| _ = try journal.append(io, .fromRaw(@intCast(i)), created(@intCast(i), "n"));
     const first: []const u8 = &chronicle.segmentName(Seq.fromRaw(1));
+    const dest = try ws.beside("copy");
+    try testing.expectEqual(Seq.fromRaw(12), try journal.backup(io, dest));
 
-    // The old copy in the way cannot be removed: the clone after it would
-    // meet it, and the byte copy would write over a file this process may
-    // not remove. Before, both were tried and the backup reported success.
+    // The earlier backup's segment cannot be removed: the new one stops
+    // there rather than leave it beside a backup it is not part of.
     try fio.setPlan(&.{.{ .at = .{ .nth = .{ .call = .dirDeleteFile, .n = 1, .path = .{ .suffix = first } } }, .fault = .{ .fail = error.AccessDenied } }});
-    try testing.expectError(error.AccessDenied, journal.backup(io, try ws.beside("refused")));
+    try testing.expectError(error.AccessDenied, journal.backup(io, dest));
 
-    // Linux opens the segment to hand it to the kernel (after measuring it):
-    // a failure there is the backup's, not a reason to read it again.
-    if (builtin.target.os.tag == .linux) {
-        try fio.setPlan(&.{.{ .at = .{ .nth = .{ .call = .dirOpenFile, .n = 2, .path = .{ .suffix = first } } }, .fault = .{ .fail = error.SystemResources } }});
-        try testing.expectError(error.SystemResources, journal.backup(io, try ws.beside("short")));
-    }
+    // A source that cannot be opened is the backup's failure, and the copies
+    // already made in its chunk are not published.
+    try fio.setPlan(&.{.{ .at = .{ .nth = .{ .call = .dirOpenFile, .n = 1, .path = .{ .suffix = first } } }, .fault = .{ .fail = error.SystemResources } }});
+    try testing.expectError(error.SystemResources, journal.backup(io, dest));
+    var dir = try std.Io.Dir.cwd().openDir(testing.io, dest, .{ .iterate = true });
+    defer dir.close(testing.io);
+    var it = dir.iterate();
+    while (try it.next(testing.io)) |entry| try testing.expect(!std.mem.startsWith(u8, entry.name, ".backup-"));
 
     try fio.setPlan(&.{});
-    try testing.expectEqual(Seq.fromRaw(12), try journal.backup(io, try ws.beside("copy")));
+    try testing.expectEqual(Seq.fromRaw(12), try journal.backup(io, dest));
 }
 
 test "a second backup removes segments no longer in the source" {
