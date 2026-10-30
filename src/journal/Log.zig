@@ -3216,21 +3216,21 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
     // is that directory: creating the path refuses an existing link with
     // `NotDir` where `mkdir -p` would follow it. A new destination's
     // directories are made durable, as the copy in them will be.
-    var dest = cwd.openDir(io, dest_path, .{ .iterate = true }) catch |err| switch (err) {
+    var dest: OwnedDir = .init(cwd.openDir(io, dest_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => created: {
             _ = try airlock.makePath(io, cwd, dest_path, .{ .sync = .{ .level = .full, .blocking = log.options.blocking } });
             break :created try cwd.openDir(io, dest_path, .{ .iterate = true });
         },
         else => |e| return e,
-    };
-    defer dest.close(io);
+    });
+    defer dest.deinit(io);
     // Copying a directory over itself would truncate the segments it was
     // reading. Nothing else here can tell the two apart.
-    if (try sameDirectory(io, log.dir.borrow().*, dest)) return error.BackupInPlace;
-    try log.clearBackup(io, dest);
+    if (try sameDirectory(io, log.dir.borrow().*, dest.borrow().*)) return error.BackupInPlace;
+    try log.clearBackup(io, dest.borrow().*);
 
     var copies: Copies = undefined;
-    copies.init(dest, log.options.blocking);
+    copies.init(dest.lend(), log.options.blocking);
     defer copies.release(io);
     if (log.segments.items.len == 0) {
         try copies.finish(io);
@@ -3247,7 +3247,7 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
     // State: a truncated stream stays truncated in its copy. A reader may
     // take one newer than the segments it copies, which hides no more than
     // the journal already does.
-    if (!try log.copyFile(io, &copies, truncations_name, null)) dest.deleteFile(io, truncations_name) catch |err| switch (err) {
+    if (!try log.copyFile(io, &copies, truncations_name, null)) dest.borrow().deleteFile(io, truncations_name) catch |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
     };
@@ -3257,7 +3257,7 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
         // A reader cannot hold a concurrent writer still between observing a
         // snapshot and measuring the copied log. Leaving this optional cache
         // out is the only way to ensure it is never ahead of the backup.
-        dest.deleteFile(io, snapshot_name) catch |err| switch (err) {
+        dest.borrow().deleteFile(io, snapshot_name) catch |err| switch (err) {
             error.FileNotFound => {},
             else => |e| return e,
         };
@@ -3305,20 +3305,21 @@ const backup_name_bytes = name_digits + index_extension.len;
 /// never pass `backup_batch`, and the last commit also syncs the destination
 /// directory, which makes every name created or removed there durable.
 const Copies = struct {
-    dest: Io.Dir,
+    /// `backup`'s, which closes it once the batch is done with it.
+    dest: OwnedDir.Lending,
     /// Where the batch runs its syncs: the log's `Options.blocking`.
     blocking: ?*airlock.Blocking,
     batch: airlock.Batch,
     slots: [backup_batch + 1]airlock.Batch.Slot,
     /// Copies the batch syncs through their own handles, closed once it has.
-    open: [backup_batch]Io.File,
+    open: [backup_batch]OwnedFile,
     open_len: usize,
     /// The names of clones the batch syncs by name.
     names: [backup_batch][backup_name_bytes]u8,
     names_len: usize,
 
     /// In place: the batch keeps a pointer to `slots`.
-    fn init(c: *Copies, dest: Io.Dir, blocking: ?*airlock.Blocking) void {
+    fn init(c: *Copies, dest: OwnedDir.Lending, blocking: ?*airlock.Blocking) void {
         c.dest = dest;
         c.blocking = blocking;
         c.batch = .init(&c.slots);
@@ -3336,7 +3337,7 @@ const Copies = struct {
             file.close(io);
             return err;
         };
-        c.open[c.open_len] = file;
+        c.open[c.open_len] = .init(file);
         c.open_len += 1;
     }
 
@@ -3345,14 +3346,14 @@ const Copies = struct {
         if (c.open_len + c.names_len == backup_batch) try c.flush(io, .files);
         const stored = c.names[c.names_len][0..name.len];
         @memcpy(stored, name);
-        try c.batch.addPath(c.dest, stored);
+        try c.batch.addPath(c.dest.get(), stored);
         c.names_len += 1;
     }
 
     /// The files added so far made durable, and with `.directory` the
     /// destination's names too.
     fn flush(c: *Copies, io: Io, what: enum { files, directory }) BackupError!void {
-        if (what == .directory) try c.batch.addDir(c.dest);
+        if (what == .directory) try c.batch.addDir(c.dest.get());
         _ = try c.batch.commit(io, .{ .level = .data, .blocking = c.blocking });
         c.closeOpen(io);
         c.names_len = 0;
@@ -3371,7 +3372,7 @@ const Copies = struct {
     }
 
     fn closeOpen(c: *Copies, io: Io) void {
-        for (c.open[0..c.open_len]) |file| file.close(io);
+        for (c.open[0..c.open_len]) |*file| file.deinit(io);
         c.open_len = 0;
     }
 };
@@ -3380,7 +3381,7 @@ const Copies = struct {
 /// False when there is no such file, which is not an error for a snapshot or
 /// an index — neither is part of the log.
 fn copyFile(log: *Self, io: Io, copies: *Copies, name: [:0]const u8, bytes: ?Bytes) BackupError!bool {
-    const dest = copies.dest;
+    const dest = copies.dest.get();
     // The filesystem's own copy first, where there is one. A sealed segment
     // is bytes that will never change again, and sharing their extents makes
     // a backup of a year of them the size of a directory entry. The clone is
