@@ -3,7 +3,6 @@ const gantry = @import("gantry");
 
 pub const layers: []const gantry.rules.Layer = &.{
     .{ .name = "primitives", .patterns = &.{
-        "src/journal/clone.zig",
         "src/journal/Encoding.zig",
         "src/journal/jsonl.zig",
         "src/journal/values.zig",
@@ -50,7 +49,6 @@ pub const references: []const gantry.rules.ReferenceRule = &.{
 };
 
 pub const required = [_][]const u8{
-    "src/journal/clone.zig",
     "src/journal/Encoding.zig",
     "src/journal/jsonl.zig",
     "src/journal/values.zig",

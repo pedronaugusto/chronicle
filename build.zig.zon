@@ -14,8 +14,8 @@
 
         // Durable files: every sync, atomic replace, batch and file identity.
         .airlock = .{
-            .url = "git+https://github.com/pedronaugusto/airlock#f0b59c41348ad772c984753ea819f9345a37130d",
-            .hash = "airlock-0.6.0-rfvu6PdDCAChN1RPjYEz_v65zNQ-wOiR6ANrRrxzIWLH",
+            .url = "git+https://github.com/pedronaugusto/airlock#55f0265ad74ceff3ea14a1fca316f82aa3f45ae8",
+            .hash = "airlock-0.6.0-rfvu6DdECADPsZW3JjI6jPRt-hpplrgrRaA4M4Ey7e8W",
         },
 
         // Test doubles, for the tests alone: no module a consumer builds

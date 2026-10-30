@@ -101,8 +101,10 @@ cursor are each made durable under their name, the directory included, on every
 platform: Windows flushes the directory too. Segments are removed one at a time, each
 removal durable before the next, so a crash never leaves a hole in the log. A snapshot, a cursor and a compacted segment are written under a
 temporary name drawn at random and renamed into place; a writer's open removes the
-temporaries a crash left once they are an hour old. A backup makes its copies durable
-together, a writeout of each and one flush of the device on macOS and Windows.
+temporaries a crash left once they are an hour old. A backup writes each copy under a
+temporary beside its name, a clone where the filesystem shares extents, and makes them
+durable together, a writeout of each and one flush of the device on macOS and Windows,
+before renaming each over its name.
 
 Opening repairs an unfinished final record by default: a line with no newline, or one
 whose newline reached the disk without all of its bytes, as a power cut can leave it.

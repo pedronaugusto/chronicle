@@ -27,6 +27,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Claims that held only in a safe build are checked in every build with aegis's contracts, where they were `std.debug.assert` or `unreachable` and undefined behaviour in ReleaseFast: a scan's and a log's state checks (`assertValid`), each error a caller's options rule out (an append that expects no sequence number, a line framing that rejects no control byte and has no separator), and each `catch unreachable` an earlier check or a measured length rules out. A broken claim stops the program with its message.
+- A backup never leaves a copy under its name torn: each copy is written under a temp beside it (`.backup-` and a random name), cloned where the filesystem shares extents and copied otherwise through airlock's `Pending.copyFrom`, and the backup's one airlock batch syncs each through its own handle, renames it over the name and flushes the device once. A crash mid-backup could leave a segment there short, under the name a restore reads. A later backup into the same directory removes the temps a crashed one left. `journal/clone.zig` (chronicle's own `clonefileat` and `copy_file_range`) is gone: one copy path, airlock's.
 - A cancel reaches an open, a replay's look-ahead and a backup's clone while they run: a segment's scan takes it at each line (a buffered read reached the file once a buffer, so a long segment ran to its end), and a clone interrupted by a signal on macOS takes it before trying again.
 
 ## [0.10.0] - 2026-10-27
