@@ -755,14 +755,14 @@ pub fn Journal(comptime Event: type) type {
 
         pub fn append(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
             return self.appendOne(io, null, false, {}, at, event, .now) catch |err| switch (err) {
-                error.WrongExpectedSeq => unreachable,
+                error.WrongExpectedSeq => aegis.assert.never("an append that expects no sequence number never mismatches one"),
                 else => |e| return e,
             };
         }
 
         pub fn appendDeferred(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
             return self.appendOne(io, null, false, {}, at, event, .deferred) catch |err| switch (err) {
-                error.WrongExpectedSeq => unreachable,
+                error.WrongExpectedSeq => aegis.assert.never("an append that expects no sequence number never mismatches one"),
                 else => |e| return e,
             };
         }
@@ -826,7 +826,7 @@ pub fn Journal(comptime Event: type) type {
 
         pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!Seq {
             return self.appendBatch(io, null, false, {}, entries, commit) catch |err| switch (err) {
-                error.WrongExpectedSeq => unreachable,
+                error.WrongExpectedSeq => aegis.assert.never("an append that expects no sequence number never mismatches one"),
                 else => |e| return e,
             };
         }
@@ -877,8 +877,8 @@ pub fn Journal(comptime Event: type) type {
             var link = s.log.chainTip();
             const staged_from = s.log.mark();
             for (entries, 0..) |entry, i| {
-                const numbered = values.advance(before, .fromRaw(i + 1)) catch unreachable; // unreachable: the last of them, `last`, was numbered above
-                const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = run.head.advance(.fromRaw(i + 1)) catch unreachable } else null; // unreachable: the last of them, `run.last`, was placed above
+                const numbered = values.advance(before, .fromRaw(i + 1)) catch aegis.assert.never("the last of them, `last`, was numbered above");
+                const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = run.head.advance(.fromRaw(i + 1)) catch aegis.assert.never("the last of them, `run.last`, was placed above") } else null;
                 var item = self.encode(s, numbered, entry.at, link, entry.event, batch, place) catch |err| {
                     s.unstage(io, staged_from);
                     return err;
@@ -2400,7 +2400,7 @@ pub fn Journal(comptime Event: type) type {
             var changed = false;
             var it = newest.iterator();
             while (it.next()) |found| {
-                const past = found.value_ptr.successor() catch unreachable; // unreachable: a version read is at most `last_version`
+                const past = found.value_ptr.successor() catch aegis.assert.never("a version read is at most `last_version`");
                 if (s.streams.truncation(found.key_ptr.*).compare(past) != .lt) continue;
                 try s.streams.setTruncation(found.key_ptr.*, past);
                 changed = true;
