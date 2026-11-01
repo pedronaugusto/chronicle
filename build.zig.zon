@@ -23,8 +23,8 @@
 
         // Record and index CRC-32C, with runtime CPU dispatch.
         .warp = .{
-            .url = "git+https://github.com/pedronaugusto/warp#17a41664247e95ba954192e569b1a66e96b88420",
-            .hash = "warp-0.4.5-JASxFZlYLABGyN2mfa-7ZnDqaIyXou4p8BXe1rfKPOp0",
+            .url = "git+https://github.com/pedronaugusto/warp#d8c31a1c7e26797724800633ad9477d284de25c8",
+            .hash = "warp-0.4.5-JASxFQcFLgCmKxid8XVdglFVUOcPlOFAhiCrb7LBqn1O",
         },
 
         .aegis = .{
