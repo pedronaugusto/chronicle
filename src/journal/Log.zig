@@ -208,7 +208,7 @@ pub const flush: Flush = airlock.Reached.expected(.full);
 /// thread, as `Io.File.sync` does. An interrupted call is made again; a
 /// failure is reported, never answered with a weaker call. A filesystem that
 /// declines the call gets the strongest one it takes, and the answer says so.
-fn syncFile(io: Io, blocking: ?airlock.Blocking, file: Io.File, level: airlock.Level) Io.File.SyncError!Flush {
+fn syncFile(io: Io, blocking: ?*airlock.Blocking, file: Io.File, level: airlock.Level) Io.File.SyncError!Flush {
     return airlock.syncFile(io, file, .{ .level = level, .blocking = blocking });
 }
 
@@ -347,7 +347,7 @@ pub const Options = struct {
     preallocate_bytes: Bytes = .fromRaw(0),
     index_interval_bytes: Bytes = .fromRaw(4096),
     max_record_bytes: Bytes = .fromRaw(1024 * 1024),
-    blocking: ?airlock.Blocking = null,
+    blocking: ?*airlock.Blocking = null,
 };
 
 pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
@@ -476,7 +476,7 @@ pub fn segmentName(
     // Zero-terminated: some of the calls a copy makes go to the operating
     // system by name rather than through an open file.
     var out: [name_digits + extension.len:0]u8 = undefined;
-    _ = std.mem.print(&out, "{d:0>20}" ++ extension, .{base_seq.raw()}) catch unreachable; // unreachable: every u64 fits in 20 decimal digits and the buffer includes extension.len
+    _ = std.mem.print(&out, "{d:0>20}" ++ extension, .{base_seq.raw()}) catch aegis.assert.never("every u64 fits in 20 decimal digits and the buffer includes extension.len");
     out[out.len] = 0;
     return out;
 }
@@ -983,7 +983,7 @@ const IndexHeader = struct {
 /// An index interval as the `u32` its header stores. `open` refuses an option
 /// that does not fit, and a header read back is a `u32` already.
 fn wireInterval(interval: Bytes) u32 {
-    return aegis.int.cast(u32, interval.raw()) catch unreachable; // unreachable: open refuses an interval past u32 and a header holds one
+    return aegis.int.cast(u32, interval.raw()) catch aegis.assert.never("open refuses an interval past u32 and a header holds one");
 }
 
 /// One entry: which record, where it is, and when it was.
@@ -1355,7 +1355,7 @@ fn placeholderHeader(base_seq: Seq, interval: Bytes) [index_header_len]u8 {
 /// Stamp a finished index with everything that proves it and make it durable,
 /// which is what turns it from a cache being filled into one a later process
 /// may take.
-fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync, blocking: ?airlock.Blocking) SealError!void {
+fn sealIndex(io: Io, file: Io.File, header: IndexHeader, sync: Sync, blocking: ?*airlock.Blocking) SealError!void {
     try file.writePositionalAll(io, &header.bytes(), 0);
     // Under `.never` the log itself is not asked to reach the drive, and a
     // seal that outlives its segment is one the next open checks against the
@@ -1504,11 +1504,11 @@ fn lineAtFrom(log: *Self, io: Io, file: Io.File, segment: Segment, offset: Bytes
     // by whoever asked for it.
     var lines: strand.jsonl.LineReader = .resumeAt(log.gpa, &bounded.interface, .{ .offset = offset.raw() }, framing(std.math.maxInt(usize)));
     defer lines.deinit();
-    const line = lines.next() catch |err| switch (err) {
+    const line = (lines.next() catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
         error.OutOfMemory => return error.OutOfMemory,
-        error.LineTooLong, error.ControlByte, error.MissingSeparator => unreachable,
-    } orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = false };
+        error.LineTooLong, error.ControlByte, error.MissingSeparator => aegis.assert.never("the framing rejects no control byte, has no separator and bounds no line"),
+    }) orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = false };
     return .{ .bytes = try log.gpa.dupe(u8, line.line), .terminated = true };
 }
 
@@ -1538,13 +1538,13 @@ fn lastLineFrom(log: *Self, io: Io, file: Io.File, segment: Segment) OpenError!L
         .block_bytes = .literal("4KiB"),
     });
     defer tail.deinit();
-    const line = tail.prevRaw() catch |err| switch (err) {
+    const line = (tail.prevRaw() catch |err| switch (err) {
         error.ReadFailed => return reader.err.?,
         error.SeekFailed => return reader.seek_err.?,
         error.Truncated => return error.TruncatedRecord,
         error.OutOfMemory => return error.OutOfMemory,
-        error.MalformedLine, error.ControlByte, error.MissingSeparator, error.LineTooLong => unreachable,
-    } orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = terminated };
+        error.MalformedLine, error.ControlByte, error.MissingSeparator, error.LineTooLong => aegis.assert.never("a raw tail parses nothing, rejects no control byte, has no separator and bounds no line"),
+    }) orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = terminated };
     return .{ .bytes = try log.gpa.dupe(u8, line.line), .terminated = terminated };
 }
 
@@ -1682,14 +1682,14 @@ fn scanSegment(log: *Self, io: Io, segment: Segment, index: ?*IndexSink) OpenErr
         // A segment read through a buffer reads the file once a buffer:
         // a cancel is taken at each line, not only at those reads.
         try io.checkCancel();
-        const line = lines.next() catch |err| switch (err) {
+        const line = (lines.next() catch |err| switch (err) {
             // Past what a record may be, and the segment ends inside it: the
             // tail after the last newline, measured below.
             error.LineTooLong => if (lines.unfinished) break else return error.RecordTooLarge,
             error.ReadFailed => return reader.err.?,
             error.OutOfMemory => return error.OutOfMemory,
-            error.ControlByte, error.MissingSeparator => unreachable,
-        } orelse break;
+            error.ControlByte, error.MissingSeparator => aegis.assert.never("the framing rejects no control byte and has no separator"),
+        }) orelse break;
         const start: Bytes = .fromRaw(line.offset);
         const end = values.plus(start, .fromRaw(line.line.len + 1));
         const text: Unparsed = .init(line.line);
@@ -1833,10 +1833,10 @@ pub const Scan = struct {
     tolerate_partial_tail: bool,
 
     fn assertValid(scan: *const Scan) void {
-        std.debug.assert(scan.bases.len == scan.limits.len);
-        std.debug.assert(scan.bases.len <= scan.bases_storage.len);
-        std.debug.assert(scan.limits.len <= scan.limits_storage.len);
-        std.debug.assert(scan.at <= scan.bases.len);
+        aegis.assert.invariant(scan.bases.len == scan.limits.len, "scan.bases.len == scan.limits.len");
+        aegis.assert.invariant(scan.bases.len <= scan.bases_storage.len, "scan.bases.len <= scan.bases_storage.len");
+        aegis.assert.invariant(scan.limits.len <= scan.limits_storage.len, "scan.limits.len <= scan.limits_storage.len");
+        aegis.assert.invariant(scan.at <= scan.bases.len, "scan.at <= scan.bases.len");
     }
 
     pub fn deinit(scan: *Scan, io: Io) void {
@@ -1912,7 +1912,7 @@ pub const Scan = struct {
             // it reads through is the one in it now.
             scan.lines.input = &scan.reader.interface;
             const newest = scan.at + 1 == scan.bases.len;
-            const line = scan.lines.next() catch |err| switch (err) {
+            const line = (scan.lines.next() catch |err| switch (err) {
                 error.ReadFailed => return scan.reader.err.?,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.LineTooLong => {
@@ -1927,8 +1927,8 @@ pub const Scan = struct {
                     }
                     return error.RecordTooLarge;
                 },
-                error.ControlByte, error.MissingSeparator => unreachable,
-            } orelse {
+                error.ControlByte, error.MissingSeparator => aegis.assert.never("the framing rejects no control byte and has no separator"),
+            }) orelse {
                 // No newline, and bytes before the end of the file: a record
                 // the writer has not finished, which for a reader beside it
                 // is the end of the log, and anywhere else is damage. A
@@ -1980,7 +1980,7 @@ pub const Scan = struct {
                 error.ReadFailed => return reader.err orelse error.ReadFailed,
                 error.OutOfMemory => return error.OutOfMemory,
                 error.LineTooLong => return false,
-                error.ControlByte, error.MissingSeparator => unreachable,
+                error.ControlByte, error.MissingSeparator => aegis.assert.never("the framing rejects no control byte and has no separator"),
             }) orelse return false;
             const found = envelopeOf(.init(line.line)) orelse continue;
             if (found.seq.compare(seq) != .lt) return true;
@@ -2250,13 +2250,13 @@ pub fn baseSeq(log: *const Self) Seq {
 }
 
 fn assertValid(log: *const Self) void {
-    std.debug.assert(log.segments.items.len <= log.segments.capacity);
+    aegis.assert.invariant(log.segments.items.len <= log.segments.capacity, "log.segments.items.len <= log.segments.capacity");
     if (log.active) |*active| {
-        std.debug.assert(log.options.access == .write);
-        std.debug.assert(log.segments.items.len != 0);
+        aegis.assert.invariant(log.options.access == .write, "log.options.access == .write");
+        aegis.assert.invariant(log.segments.items.len != 0, "log.segments.items.len != 0");
         const segment = log.segments.items[log.segments.items.len - 1];
-        std.debug.assert(active.builder.base_seq == segment.base_seq);
-        std.debug.assert(values.atMost(segment.header_bytes, segment.bytes));
+        aegis.assert.invariant(active.builder.base_seq == segment.base_seq, "active.builder.base_seq == segment.base_seq");
+        aegis.assert.invariant(values.atMost(segment.header_bytes, segment.bytes), "values.atMost(segment.header_bytes, segment.bytes)");
     }
 }
 
@@ -2835,7 +2835,7 @@ pub fn syncDir(log: *Self, io: Io) Self.SyncDirError!void {
     return syncDirHandle(io, log.options.blocking, log.dir.borrow().*);
 }
 
-fn syncDirHandle(io: Io, blocking: ?airlock.Blocking, dir: Io.Dir) SyncDirError!void {
+fn syncDirHandle(io: Io, blocking: ?*airlock.Blocking, dir: Io.Dir) SyncDirError!void {
     _ = try airlock.syncDir(io, dir, .{ .level = .full, .blocking = blocking });
 }
 
@@ -3216,21 +3216,21 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
     // is that directory: creating the path refuses an existing link with
     // `NotDir` where `mkdir -p` would follow it. A new destination's
     // directories are made durable, as the copy in them will be.
-    var dest = cwd.openDir(io, dest_path, .{ .iterate = true }) catch |err| switch (err) {
+    var dest: OwnedDir = .init(cwd.openDir(io, dest_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => created: {
             _ = try airlock.makePath(io, cwd, dest_path, .{ .sync = .{ .level = .full, .blocking = log.options.blocking } });
             break :created try cwd.openDir(io, dest_path, .{ .iterate = true });
         },
         else => |e| return e,
-    };
-    defer dest.close(io);
+    });
+    defer dest.deinit(io);
     // Copying a directory over itself would truncate the segments it was
     // reading. Nothing else here can tell the two apart.
-    if (try sameDirectory(io, log.dir.borrow().*, dest)) return error.BackupInPlace;
-    try log.clearBackup(io, dest);
+    if (try sameDirectory(io, log.dir.borrow().*, dest.borrow().*)) return error.BackupInPlace;
+    try log.clearBackup(io, dest.borrow().*);
 
     var copies: Copies = undefined;
-    copies.init(dest, log.options.blocking);
+    copies.init(dest.lend(), log.options.blocking);
     defer copies.release(io);
     if (log.segments.items.len == 0) {
         try copies.finish(io);
@@ -3247,7 +3247,7 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
     // State: a truncated stream stays truncated in its copy. A reader may
     // take one newer than the segments it copies, which hides no more than
     // the journal already does.
-    if (!try log.copyFile(io, &copies, truncations_name, null)) dest.deleteFile(io, truncations_name) catch |err| switch (err) {
+    if (!try log.copyFile(io, &copies, truncations_name, null)) dest.borrow().deleteFile(io, truncations_name) catch |err| switch (err) {
         error.FileNotFound => {},
         else => |e| return e,
     };
@@ -3257,7 +3257,7 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
         // A reader cannot hold a concurrent writer still between observing a
         // snapshot and measuring the copied log. Leaving this optional cache
         // out is the only way to ensure it is never ahead of the backup.
-        dest.deleteFile(io, snapshot_name) catch |err| switch (err) {
+        dest.borrow().deleteFile(io, snapshot_name) catch |err| switch (err) {
             error.FileNotFound => {},
             else => |e| return e,
         };
@@ -3305,20 +3305,21 @@ const backup_name_bytes = name_digits + index_extension.len;
 /// never pass `backup_batch`, and the last commit also syncs the destination
 /// directory, which makes every name created or removed there durable.
 const Copies = struct {
-    dest: Io.Dir,
+    /// `backup`'s, which closes it once the batch is done with it.
+    dest: OwnedDir.Lending,
     /// Where the batch runs its syncs: the log's `Options.blocking`.
-    blocking: ?airlock.Blocking,
+    blocking: ?*airlock.Blocking,
     batch: airlock.Batch,
     slots: [backup_batch + 1]airlock.Batch.Slot,
     /// Copies the batch syncs through their own handles, closed once it has.
-    open: [backup_batch]Io.File,
+    open: [backup_batch]OwnedFile,
     open_len: usize,
     /// The names of clones the batch syncs by name.
     names: [backup_batch][backup_name_bytes]u8,
     names_len: usize,
 
     /// In place: the batch keeps a pointer to `slots`.
-    fn init(c: *Copies, dest: Io.Dir, blocking: ?airlock.Blocking) void {
+    fn init(c: *Copies, dest: OwnedDir.Lending, blocking: ?*airlock.Blocking) void {
         c.dest = dest;
         c.blocking = blocking;
         c.batch = .init(&c.slots);
@@ -3336,7 +3337,7 @@ const Copies = struct {
             file.close(io);
             return err;
         };
-        c.open[c.open_len] = file;
+        c.open[c.open_len] = .init(file);
         c.open_len += 1;
     }
 
@@ -3345,14 +3346,14 @@ const Copies = struct {
         if (c.open_len + c.names_len == backup_batch) try c.flush(io, .files);
         const stored = c.names[c.names_len][0..name.len];
         @memcpy(stored, name);
-        try c.batch.addPath(c.dest, stored);
+        try c.batch.addPath(c.dest.get(), stored);
         c.names_len += 1;
     }
 
     /// The files added so far made durable, and with `.directory` the
     /// destination's names too.
     fn flush(c: *Copies, io: Io, what: enum { files, directory }) BackupError!void {
-        if (what == .directory) try c.batch.addDir(c.dest);
+        if (what == .directory) try c.batch.addDir(c.dest.get());
         _ = try c.batch.commit(io, .{ .level = .data, .blocking = c.blocking });
         c.closeOpen(io);
         c.names_len = 0;
@@ -3371,7 +3372,7 @@ const Copies = struct {
     }
 
     fn closeOpen(c: *Copies, io: Io) void {
-        for (c.open[0..c.open_len]) |file| file.close(io);
+        for (c.open[0..c.open_len]) |*file| file.deinit(io);
         c.open_len = 0;
     }
 };
@@ -3380,7 +3381,7 @@ const Copies = struct {
 /// False when there is no such file, which is not an error for a snapshot or
 /// an index — neither is part of the log.
 fn copyFile(log: *Self, io: Io, copies: *Copies, name: [:0]const u8, bytes: ?Bytes) BackupError!bool {
-    const dest = copies.dest;
+    const dest = copies.dest.get();
     // The filesystem's own copy first, where there is one. A sealed segment
     // is bytes that will never change again, and sharing their extents makes
     // a backup of a year of them the size of a directory entry. The clone is
@@ -3394,7 +3395,7 @@ fn copyFile(log: *Self, io: Io, copies: *Copies, name: [:0]const u8, bytes: ?Byt
             // This platform or this pair of directories shares no extents.
             error.Unsupported => break :cloned,
             error.FileNotFound => return false,
-            error.ShortSource => unreachable, // unreachable: a whole copy asks for the length it measured
+            error.ShortSource => aegis.assert.never("a whole copy asks for the length it measured"),
             else => |e| return e,
         };
         log.clones += 1;

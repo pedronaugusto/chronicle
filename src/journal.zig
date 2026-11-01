@@ -456,9 +456,10 @@ pub fn Journal(comptime Event: type) type {
             /// them (`airlock.Blocking`). A sync holds the thread that makes
             /// it until the drive answers: on an evented `Io` that thread is
             /// a worker other tasks are waiting for, so a program on a
-            /// reactor runtime gives its sync lane, `.{ .run =
-            /// reactor.syncLane }`. Null makes them on the calling thread.
-            blocking: ?Log.Blocking = null,
+            /// reactor runtime gives its sync lane: a `Blocking` it keeps,
+            /// `reactor.syncLaneFor(airlock.Blocking)`, by its address. Null
+            /// makes them on the calling thread.
+            blocking: ?*Log.Blocking = null,
         };
 
         pub const Snapshot = struct {
@@ -754,14 +755,14 @@ pub fn Journal(comptime Event: type) type {
 
         pub fn append(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
             return self.appendOne(io, null, false, {}, at, event, .now) catch |err| switch (err) {
-                error.WrongExpectedSeq => unreachable,
+                error.WrongExpectedSeq => aegis.assert.never("an append that expects no sequence number never mismatches one"),
                 else => |e| return e,
             };
         }
 
         pub fn appendDeferred(self: *Self, io: Io, at: Time, event: Event) AppendError!Seq {
             return self.appendOne(io, null, false, {}, at, event, .deferred) catch |err| switch (err) {
-                error.WrongExpectedSeq => unreachable,
+                error.WrongExpectedSeq => aegis.assert.never("an append that expects no sequence number never mismatches one"),
                 else => |e| return e,
             };
         }
@@ -825,7 +826,7 @@ pub fn Journal(comptime Event: type) type {
 
         pub fn appendAll(self: *Self, io: Io, entries: []const Entry, commit: Commit) AppendError!Seq {
             return self.appendBatch(io, null, false, {}, entries, commit) catch |err| switch (err) {
-                error.WrongExpectedSeq => unreachable,
+                error.WrongExpectedSeq => aegis.assert.never("an append that expects no sequence number never mismatches one"),
                 else => |e| return e,
             };
         }
@@ -876,8 +877,8 @@ pub fn Journal(comptime Event: type) type {
             var link = s.log.chainTip();
             const staged_from = s.log.mark();
             for (entries, 0..) |entry, i| {
-                const numbered = values.advance(before, .fromRaw(i + 1)) catch unreachable; // unreachable: the last of them, `last`, was numbered above
-                const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = run.head.advance(.fromRaw(i + 1)) catch unreachable } else null; // unreachable: the last of them, `run.last`, was placed above
+                const numbered = values.advance(before, .fromRaw(i + 1)) catch aegis.assert.never("the last of them, `last`, was numbered above");
+                const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = run.head.advance(.fromRaw(i + 1)) catch aegis.assert.never("the last of them, `run.last`, was placed above") } else null;
                 var item = self.encode(s, numbered, entry.at, link, entry.event, batch, place) catch |err| {
                     s.unstage(io, staged_from);
                     return err;
@@ -964,9 +965,7 @@ pub fn Journal(comptime Event: type) type {
                 copy.bytes = try a.dupe(u8, record.bytes);
                 copy.event = strand.core.cloneLeaky(a, record.event, .sized(record.bytes.len)) catch |err| switch (err) {
                     error.OutOfMemory => return error.OutOfMemory,
-                    // The event was read from these bytes under these bounds,
-                    // so a copy of it fits them.
-                    else => unreachable,
+                    else => unreachable, // aegis: no-danger: the event was read from these bytes under these bounds, so a copy of it fits them
                 };
             }
             batch.records = copied;
@@ -1574,7 +1573,7 @@ pub fn Journal(comptime Event: type) type {
             const Document = struct { seq: u64 };
             // A cursor is a number with a name on it. Nothing this package
             // writes there is longer than this, so nothing longer is read.
-            const document = readDocument(
+            const document = (readDocument(
                 s,
                 io,
                 arena.allocator(),
@@ -1586,7 +1585,7 @@ pub fn Journal(comptime Event: type) type {
                 error.Canceled => return error.Canceled,
                 error.UnsupportedFormat => return error.UnsupportedFormat,
                 else => return error.CorruptCursor,
-            } orelse return null;
+            }) orelse return null;
             // Any number is a place to have got to, so this is a position
             // read off a disk and not a record to look up.
             return .fromRaw(document.seq);
@@ -1681,7 +1680,7 @@ pub fn Journal(comptime Event: type) type {
             var arena: std.heap.ArenaAllocator = .init(self.gpa);
             defer arena.deinit();
             const Document = struct { seq: u64 };
-            const document = readDocument(
+            const document = (readDocument(
                 s,
                 io,
                 arena.allocator(),
@@ -1692,7 +1691,7 @@ pub fn Journal(comptime Event: type) type {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Canceled => return error.Canceled,
                 else => return,
-            } orelse return;
+            }) orelse return;
             if (values.below(seq, .fromRaw(document.seq))) try s.log.removeSnapshot(io);
         }
 
@@ -2401,7 +2400,7 @@ pub fn Journal(comptime Event: type) type {
             var changed = false;
             var it = newest.iterator();
             while (it.next()) |found| {
-                const past = found.value_ptr.successor() catch unreachable; // unreachable: a version read is at most `last_version`
+                const past = found.value_ptr.successor() catch aegis.assert.never("a version read is at most `last_version`");
                 if (s.streams.truncation(found.key_ptr.*).compare(past) != .lt) continue;
                 try s.streams.setTruncation(found.key_ptr.*, past);
                 changed = true;

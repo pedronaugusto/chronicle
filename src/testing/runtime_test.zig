@@ -19,15 +19,16 @@ const Blocking = @import("airlock").Blocking;
 /// syncs are proved to go through it, every one, off the runtime's workers.
 const Counted = struct {
     syncs: std.atomic.Value(u32) = .init(0),
+    lane: Blocking = .{ .run = run },
 
-    fn blocking(c: *Counted) Blocking {
-        return .{ .context = c, .run = run };
+    fn blocking(c: *Counted) *Blocking {
+        return &c.lane;
     }
 
-    fn run(io: Io, context: ?*anyopaque, function: *const fn (*anyopaque) void, argument: *anyopaque) Io.Cancelable!void {
-        const c: *Counted = @ptrCast(@alignCast(context.?)); // safe: `blocking` passed its own
+    fn run(lane: *Blocking, io: Io, job: *Blocking.Job) Io.Cancelable!void {
+        const c: *Counted = @alignCast(@fieldParentPtr("lane", lane));
         _ = c.syncs.fetchAdd(1, .monotonic);
-        return reactor.syncLane(io, null, function, argument);
+        return reactor.syncLane(io, job);
     }
 
     fn take(c: *Counted) u32 {

@@ -11,6 +11,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A journal holds many streams, and a segment `compact` rewrote to take a truncated stream's events out says so in its header as format 2: chronicle 0.10 and older refuse such a segment by its header (`UnsupportedFormat`) rather than misread a stub. A journal no stream was truncated in keeps format 1 throughout.
 - `DropError` and `CompactError` also carry what reading the stream indexes and writing the `truncations` file can meet: a cut that drops a stream's records first raises the stream's truncation point, so its version never goes back.
 
+- On the aegis 0.2 line: aegis 0.2.3, strand 0.15.0, airlock 0.6.0, warp 0.5.0. `Options.blocking` is a `?*airlock.Blocking`, the executor's embedded `Blocking` by address, as airlock 0.6.0 takes it: a runtime's sync lane is a `Blocking` the program keeps, `reactor.syncLaneFor(airlock.Blocking)`, where it was `.{ .run = reactor.syncLane }` by value.
+
 ### Added
 
 - Streams in one journal, as an event store has them. `appendTo(io, stream, expected, at, event)` and `appendAllTo(io, stream, expected, entries, commit)` append a record or a batch at a stream's next versions when the stream holds what `expected` (`StreamExpected`: `.any`, `.no_stream`, `.exists` or `.exact`) says, else `WrongExpectedVersion` and nothing written; they return `Appended`, the seq and version of the last record. A record in a stream carries its id and version (`s`, `sv`) inside its checksum, and `Record.stream` gives them back (`StreamAt`). `Stream` is a checked id (`Stream.of`: 1 to 255 bytes of printable ASCII, neither `"` nor `\`, so that it has one spelling in JSON; `Stream.Invalid`, `Stream.eql`), `StreamVersion` an aegis id apart from `Seq`, `no_version` the place before a stream's first record. Errors: `StreamAppendError`, `StreamReadError`, `TruncateStreamError`.
@@ -19,6 +21,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Claims that held only in a safe build are checked in every build with aegis's contracts, where they were `std.debug.assert` or `unreachable` and undefined behaviour in ReleaseFast: a scan's and a log's state checks (`assertValid`), each error a caller's options rule out (an append that expects no sequence number, a line framing that rejects no control byte and has no separator), and each `catch unreachable` an earlier check or a measured length rules out. A broken claim stops the program with its message.
 - A cancel reaches an open, a replay's look-ahead and a backup's clone while they run: a segment's scan takes it at each line (a buffered read reached the file once a buffer, so a long segment ran to its end), and a clone interrupted by a signal on macOS takes it before trying again.
 
 ## [0.10.0] - 2026-10-27
