@@ -2625,16 +2625,19 @@ test "a reader forgotten while the readers are listed is not listed at cursor ze
     // from another process looks like when it lands between the directory
     // listing `readers` reads and the open of the file it listed.
     const Forget = struct {
-        fn run(inner: Io, context: *anyopaque) void {
-            const dir: *const Io.Dir = @ptrCast(@alignCast(context)); // safe: the plan below hands this callback the journal directory
-            dir.deleteFile(inner, "gone" ++ chronicle.cursor_extension) catch @panic("could not forget the cursor");
+        dir: Io.Dir,
+        hook: shakedown.Hook = .{ .run = run },
+
+        fn run(hook: *shakedown.Hook, inner: Io) void {
+            const self: *@This() = @fieldParentPtr("hook", hook);
+            self.dir.deleteFile(inner, "gone" ++ chronicle.cursor_extension) catch @panic("could not forget the cursor");
         }
     };
-    var dir = try Io.Dir.cwd().openDir(io, ws.path, .{});
-    defer dir.close(io);
+    var forget: Forget = .{ .dir = try Io.Dir.cwd().openDir(io, ws.path, .{}) };
+    defer forget.dir.close(io);
     const fio = try shakedown.FaultIo.init(testing.allocator, io, .{ .plan = &.{.{
         .at = .{ .nth = .{ .call = .dirOpenFile, .n = 1, .path = .{ .suffix = "gone" ++ chronicle.cursor_extension } } },
-        .fault = .{ .call = .{ .ctx = &dir, .f = Forget.run } },
+        .fault = .{ .call = .{ .hook = &forget.hook } },
     }} });
     defer fio.deinit();
     const racing = fio.io();
@@ -6998,9 +7001,10 @@ const LockProbe = struct {
     journal: *Journal,
     calls: usize = 0,
     unlocked: bool = false,
+    hook: shakedown.Hook = .{ .run = check },
 
-    fn check(io: Io, context: *anyopaque) void {
-        const probe: *LockProbe = @ptrCast(@alignCast(context)); // safe: the plans below hand this callback a *LockProbe
+    fn check(hook: *shakedown.Hook, io: Io) void {
+        const probe: *LockProbe = @fieldParentPtr("hook", hook);
         probe.calls += 1;
         if (journalState(probe.journal).state.tryAcquire()) |free| {
             var guard = free;
@@ -7017,7 +7021,7 @@ const LockProbe = struct {
     /// The plan entry that runs `check` before the `n`th `call` and every
     /// one after it.
     fn from(probe: *LockProbe, call: shakedown.IoCall, n: u32) shakedown.IoPlan.Entry {
-        return .{ .at = .{ .nth = .{ .call = call, .n = n } }, .fault = .{ .call = .{ .ctx = probe, .f = check } }, .times = 0 };
+        return .{ .at = .{ .nth = .{ .call = call, .n = n } }, .fault = .{ .call = .{ .hook = &probe.hook } }, .times = 0 };
     }
 };
 

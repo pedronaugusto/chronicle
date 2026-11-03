@@ -944,7 +944,7 @@ const IndexHeader = struct {
     entries_checksum: u32,
 
     fn bytes(header: IndexHeader) [index_header_len]u8 {
-        aegis.assert.pre(header.base_seq != values.beginning, "an index belongs to a segment, and a segment is named for a record");
+        aegis.assert.invariant(header.base_seq != values.beginning, "an index belongs to a segment, and a segment is named for a record");
         var out: [index_header_len]u8 = @splat(0);
         @memcpy(out[0..index_magic.len], index_magic);
         std.mem.writeInt(u64, out[8..16], header.segment_bytes.raw(), .little);
@@ -993,7 +993,7 @@ const IndexEntry = struct {
     at: Time,
 
     fn bytes(entry: IndexEntry) [index_entry_len]u8 {
-        aegis.assert.pre(entry.seq != values.beginning, "an index entry names a record");
+        aegis.assert.invariant(entry.seq != values.beginning, "an index entry names a record");
         var out: [index_entry_len]u8 = undefined;
         std.mem.writeInt(u64, out[0..8], entry.seq.raw(), .little);
         std.mem.writeInt(u64, out[8..16], entry.offset.raw(), .little);
@@ -1022,7 +1022,7 @@ const Builder = struct {
     last_offset: Bytes,
 
     fn init(base_seq: Seq, interval: Bytes) Builder {
-        aegis.assert.pre(base_seq != values.beginning, "an index belongs to a segment, and a segment is named for a record");
+        aegis.assert.invariant(base_seq != values.beginning, "an index belongs to a segment, and a segment is named for a record");
         return .{
             .base_seq = base_seq,
             .interval = interval,
@@ -1103,7 +1103,7 @@ const IndexProof = struct {
 /// the entries that follow it. An index that agrees with all three was built
 /// from exactly these bytes and nothing has changed since.
 fn readIndex(log: *Self, io: Io, segment: Segment) Io.Cancelable!?Indexed {
-    const file = ((try log.holdIndex(io, segment.base_seq)) orelse return null).get();
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     return readIndexFrom(io, file, segment);
 }
 
@@ -1224,9 +1224,9 @@ fn releaseIndex(log: *Self, io: Io) void {
 
 /// The open index of a sealed segment, opening it if the one being held is
 /// another segment's.
-fn holdIndex(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?OwnedFile.Lending {
+fn holdIndex(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?Io.File {
     if (log.held_index) |*held| {
-        if (held.base_seq == base_seq) return held.file.lend();
+        if (held.base_seq == base_seq) return held.file.borrow().*;
         log.releaseIndex(io);
     }
     log.index_opens += 1;
@@ -1235,7 +1235,7 @@ fn holdIndex(log: *Self, io: Io, base_seq: Seq) Io.Cancelable!?OwnedFile.Lending
         return null;
     };
     log.held_index = .{ .base_seq = base_seq, .file = .init(file) };
-    return log.held_index.?.file.lend();
+    return log.held_index.?.file.borrow().*;
 }
 
 /// What a sealed segment's index says, proved against the segment once.
@@ -1306,7 +1306,7 @@ fn indexedOffset(log: *Self, io: Io, at: usize, seq: Seq, may_write: bool) Io.Ca
     const indexed = (try log.provenIndex(io, at, may_write)) orelse return null;
     if (indexed.last_seq != segment.last_seq) return null;
 
-    const file = ((try log.holdIndex(io, segment.base_seq)) orelse return null).get();
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     const slot = (try log.bisectSeq(io, file, indexed.entries, seq)) orelse return null;
     const entry = (try log.indexEntryAt(io, file, slot)) orelse return null;
     return entry.offset;
@@ -1391,7 +1391,7 @@ fn resumeIndex(log: *Self, io: Io, segment: Segment) OpenError!?Resumed {
 
     // The running checksum has to carry on from the entries already there,
     // and the bisection has to know where the last one sits.
-    const held = ((try log.holdIndex(io, segment.base_seq)) orelse return null).get();
+    const held = (try log.holdIndex(io, segment.base_seq)) orelse return null;
     var builder: Builder = .init(segment.base_seq, indexed.interval);
     builder.entries = indexed.entries;
     // The entries are as many as the proof counted from this file's length,
@@ -1543,6 +1543,7 @@ fn lastLineFrom(log: *Self, io: Io, file: Io.File, segment: Segment) OpenError!L
         error.SeekFailed => return reader.seek_err.?,
         error.Truncated => return error.TruncatedRecord,
         error.OutOfMemory => return error.OutOfMemory,
+        error.Canceled => return error.Canceled,
         error.MalformedLine, error.ControlByte, error.MissingSeparator, error.LineTooLong => aegis.assert.never("a raw tail parses nothing, rejects no control byte, has no separator and bounds no line"),
     }) orelse return .{ .bytes = try log.gpa.alloc(u8, 0), .terminated = terminated };
     return .{ .bytes = try log.gpa.dupe(u8, line.line), .terminated = terminated };
@@ -1798,7 +1799,7 @@ pub const Scan = struct {
 
     gpa: Allocator,
     /// The log's directory, which the log closes.
-    dir: OwnedDir.Lending,
+    dir: Io.Dir,
     /// The base sequence numbers of the segments still to walk, oldest first.
     bases: []Seq,
     /// Allocated storage retained when a scan is armed again.
@@ -1901,7 +1902,7 @@ pub const Scan = struct {
                 continue;
             }
             if (scan.file == null) {
-                const file = try scan.dir.get().openFile(io, &segmentName(segment_extension, scan.bases[scan.at]), .{});
+                const file = try scan.dir.openFile(io, &segmentName(segment_extension, scan.bases[scan.at]), .{});
                 scan.file = .init(file);
                 scan.reader = file.reader(io, scan.buffer);
                 if (scan.position != values.no_bytes) try scan.reader.seekTo(scan.position.raw());
@@ -2039,7 +2040,7 @@ fn scanOver(log: *Self, segments: []const Segment, position: Bytes, extent: Scan
 
     return .{
         .gpa = log.gpa,
-        .dir = log.dir.lend(),
+        .dir = log.dir.borrow().*,
         .bases = bases,
         .bases_storage = bases_storage,
         .limits = limits,
@@ -2169,7 +2170,7 @@ fn indexedSeqAtOrAfter(log: *Self, io: Io, at: usize, want: Time) OpenError!?Seq
     const segment = log.segments.items[at];
     const indexed = (try log.provenIndex(io, at, true)) orelse return null;
     if (indexed.entries == values.no_records) return null;
-    const file = ((try log.holdIndex(io, segment.base_seq)) orelse return null).get();
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
 
     if (indexed.times.rising) {
         // The timestamps do not fall, so the entry to start from is found by
@@ -3230,7 +3231,7 @@ pub fn backup(log: *Self, io: Io, dest_path: []const u8) Self.BackupError!Seq {
     try log.clearBackup(io, dest.borrow().*);
 
     var copies: Copies = undefined;
-    copies.init(dest.lend(), log.options.blocking);
+    copies.init(dest.borrow().*, log.options.blocking);
     defer copies.release(io);
     if (log.segments.items.len == 0) {
         try copies.finish(io);
@@ -3306,7 +3307,7 @@ const backup_name_bytes = name_digits + index_extension.len;
 /// directory, which makes every name created or removed there durable.
 const Copies = struct {
     /// `backup`'s, which closes it once the batch is done with it.
-    dest: OwnedDir.Lending,
+    dest: Io.Dir,
     /// Where the batch runs its syncs: the log's `Options.blocking`.
     blocking: ?*airlock.Blocking,
     batch: airlock.Batch,
@@ -3319,7 +3320,7 @@ const Copies = struct {
     names_len: usize,
 
     /// In place: the batch keeps a pointer to `slots`.
-    fn init(c: *Copies, dest: OwnedDir.Lending, blocking: ?*airlock.Blocking) void {
+    fn init(c: *Copies, dest: Io.Dir, blocking: ?*airlock.Blocking) void {
         c.dest = dest;
         c.blocking = blocking;
         c.batch = .init(&c.slots);
@@ -3333,10 +3334,7 @@ const Copies = struct {
             file.close(io);
             return err;
         };
-        c.batch.addFile(file) catch |err| {
-            file.close(io);
-            return err;
-        };
+        c.batch.addFile(file);
         c.open[c.open_len] = .init(file);
         c.open_len += 1;
     }
@@ -3346,14 +3344,14 @@ const Copies = struct {
         if (c.open_len + c.names_len == backup_batch) try c.flush(io, .files);
         const stored = c.names[c.names_len][0..name.len];
         @memcpy(stored, name);
-        try c.batch.addPath(c.dest.get(), stored);
+        c.batch.addPath(c.dest, stored);
         c.names_len += 1;
     }
 
     /// The files added so far made durable, and with `.directory` the
     /// destination's names too.
     fn flush(c: *Copies, io: Io, what: enum { files, directory }) BackupError!void {
-        if (what == .directory) try c.batch.addDir(c.dest.get());
+        if (what == .directory) c.batch.addDir(c.dest);
         _ = try c.batch.commit(io, .{ .level = .data, .blocking = c.blocking });
         c.closeOpen(io);
         c.names_len = 0;
@@ -3381,7 +3379,7 @@ const Copies = struct {
 /// False when there is no such file, which is not an error for a snapshot or
 /// an index — neither is part of the log.
 fn copyFile(log: *Self, io: Io, copies: *Copies, name: [:0]const u8, bytes: ?Bytes) BackupError!bool {
-    const dest = copies.dest.get();
+    const dest = copies.dest;
     // The filesystem's own copy first, where there is one. A sealed segment
     // is bytes that will never change again, and sharing their extents makes
     // a backup of a year of them the size of a directory entry. The clone is

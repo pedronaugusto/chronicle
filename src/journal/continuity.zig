@@ -41,11 +41,11 @@ pub fn State(comptime Header: type, comptime ReadError: type, comptime Boundary:
             // The header comes off a disk by way of the envelope reader, which
             // refuses anything else; a walk that is handed one that is not has
             // a broken reader, and stops rather than number records from it.
-            aegis.assert.pre(header.seq != values.beginning, "a record is numbered from one");
-            aegis.assert.pre(header.seq.compare(values.newest_possible) != .gt, "a record is numbered no higher than an i64");
+            aegis.assert.invariant(header.seq != values.beginning, "a record is numbered from one");
+            aegis.assert.invariant(header.seq.compare(values.newest_possible) != .gt, "a record is numbered no higher than an i64");
             if (header.batch) |batch| {
-                aegis.assert.pre(batch.first.compare(header.seq) != .gt, "a batch starts at or before its record");
-                aegis.assert.pre(header.seq.compare(batch.last) != .gt, "a batch ends at or after its record");
+                aegis.assert.invariant(batch.first.compare(header.seq) != .gt, "a batch starts at or before its record");
+                aegis.assert.invariant(header.seq.compare(batch.last) != .gt, "a batch ends at or after its record");
             }
             if (walk.expected) |want| {
                 if (header.seq != want) return error.DiscontinuousSeq;
