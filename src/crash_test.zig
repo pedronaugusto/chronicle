@@ -160,6 +160,12 @@ pub const Operation = struct {
 };
 
 fn everyCrash(kind: Kind) !void {
+    try everyCrashIn(kind, .{});
+}
+
+/// The crash points of `shard` alone: a long operation's sweep runs as
+/// several tests, each well inside the runner's watchdog.
+fn everyCrashIn(kind: Kind, shard: shakedown.EveryCrashOptions.Shard) !void {
     var ctx: Operation = .{ .kind = kind };
     var report: shakedown.EveryFaultReport = .{};
     defer report.deinit();
@@ -168,6 +174,7 @@ fn everyCrash(kind: Kind) !void {
         .max_states = 512,
         .max_steps = 1_000_000,
         .diagnostics = &report,
+        .shard = shard,
     });
     const done = result catch |err| {
         if (report.failure) |f| {
@@ -187,8 +194,73 @@ test "every crash: a group commit, then appends" {
     try everyCrash(.group);
 }
 
-test "every crash: a compaction" {
-    try everyCrash(.compact);
+// A compaction's sweep is the longest: about 3,500 crash states, half of
+// them left by the points of its fifth eighth, which in eight ranges ran
+// past the runner's 120 s watchdog on a loaded machine. In sixteen, the
+// densest range leaves about as many as the whole truncation sweep, which
+// runs as one test.
+test "every crash: a compaction, points 1 of 16" {
+    try everyCrashIn(.compact, .{ .index = 0, .count = 16 });
+}
+
+test "every crash: a compaction, points 2 of 16" {
+    try everyCrashIn(.compact, .{ .index = 1, .count = 16 });
+}
+
+test "every crash: a compaction, points 3 of 16" {
+    try everyCrashIn(.compact, .{ .index = 2, .count = 16 });
+}
+
+test "every crash: a compaction, points 4 of 16" {
+    try everyCrashIn(.compact, .{ .index = 3, .count = 16 });
+}
+
+test "every crash: a compaction, points 5 of 16" {
+    try everyCrashIn(.compact, .{ .index = 4, .count = 16 });
+}
+
+test "every crash: a compaction, points 6 of 16" {
+    try everyCrashIn(.compact, .{ .index = 5, .count = 16 });
+}
+
+test "every crash: a compaction, points 7 of 16" {
+    try everyCrashIn(.compact, .{ .index = 6, .count = 16 });
+}
+
+test "every crash: a compaction, points 8 of 16" {
+    try everyCrashIn(.compact, .{ .index = 7, .count = 16 });
+}
+
+test "every crash: a compaction, points 9 of 16" {
+    try everyCrashIn(.compact, .{ .index = 8, .count = 16 });
+}
+
+test "every crash: a compaction, points 10 of 16" {
+    try everyCrashIn(.compact, .{ .index = 9, .count = 16 });
+}
+
+test "every crash: a compaction, points 11 of 16" {
+    try everyCrashIn(.compact, .{ .index = 10, .count = 16 });
+}
+
+test "every crash: a compaction, points 12 of 16" {
+    try everyCrashIn(.compact, .{ .index = 11, .count = 16 });
+}
+
+test "every crash: a compaction, points 13 of 16" {
+    try everyCrashIn(.compact, .{ .index = 12, .count = 16 });
+}
+
+test "every crash: a compaction, points 14 of 16" {
+    try everyCrashIn(.compact, .{ .index = 13, .count = 16 });
+}
+
+test "every crash: a compaction, points 15 of 16" {
+    try everyCrashIn(.compact, .{ .index = 14, .count = 16 });
+}
+
+test "every crash: a compaction, points 16 of 16" {
+    try everyCrashIn(.compact, .{ .index = 15, .count = 16 });
 }
 
 test "every crash: a truncation" {

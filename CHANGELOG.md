@@ -19,6 +19,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `readStream(io, stream, from)` reads one stream oldest first (`StreamRead`), and `streamVersion(io, stream)` gives its newest version. Each sealed segment has a stream index beside it (`.sdx`): a bloom filter over its streams, about ten bits each, then each stream's records by version with where they are. A read opens a segment only when the filter says the stream may be in it. An index missing, damaged or of other bytes is built again from its segment. The heads of the streams last asked about are kept, as many as `Options.stream_heads` (4096).
 - `truncateStreamBefore(io, stream, before)`: the stream's records below `before` are unreadable at once and durably (the `truncations` file, which a backup copies), and the stream keeps its version. The next `compact` rewrites each segment that holds one, through a temporary renamed over it, with each such record replaced by a stub: its `seq`, `at`, `v`, `p`, batch, `s` and `sv`, `"x":1`, a checksum of the stub (`sc`) and the record's own `c`, so the chain through it and every record after it is unchanged and `verify` passes. A global `replay` shows a truncated record until the compaction, and steps over its stub after.
 
+### Changed
+
+- Development: a compaction's every-crash sweep runs as sixteen tests, each one range of its crash points (shakedown's `EveryCrashOptions.shard`); whole, and in eight ranges, it ran past the test runner's 120 s watchdog on a loaded machine. Pins shakedown's main (d2d81a8), which has the shards.
+
 ### Fixed
 
 - Claims that held only in a safe build are checked in every build with aegis's contracts, where they were `std.debug.assert` or `unreachable` and undefined behaviour in ReleaseFast: a scan's and a log's state checks (`assertValid`), each error a caller's options rule out (an append that expects no sequence number, a line framing that rejects no control byte and has no separator), and each `catch unreachable` an earlier check or a measured length rules out. A broken claim stops the program with its message.
