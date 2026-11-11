@@ -327,6 +327,7 @@ fn refresh(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
 const Stamp = aegis.units.Instant(.awake, .nanosecond, i64);
 const Records = aegis.units.Count(enum { record }, u64);
 const Ended = enum(u8) { no, yes };
+const Latency = aegis.units.Duration(.nanosecond, i64);
 
 const Waiter = struct {
     sent_at: aegis.Atomic(Stamp) = .init(.fromRaw(0)),
@@ -334,7 +335,7 @@ const Waiter = struct {
     /// Set by the waiter however it ends, so that the appender stops
     /// waiting for a record it will never take and awaits the error.
     ended: aegis.Atomic(Ended) = .init(.no),
-    latency: u64 = 0,
+    latency: Latency = .fromRaw(0),
 };
 
 fn stamp(io: Io) i64 {
@@ -357,7 +358,8 @@ fn wait(io: Io, gpa: std.mem.Allocator, journal: *J, rounds: u64, waiter: *Waite
                 break;
             }
         }
-        waiter.latency += @intCast(@max(stamp(io) - waiter.sent_at.load(.acquire).raw(), 0));
+        const took = waiter.sent_at.load(.acquire).saturatingDurationTo(.fromRaw(stamp(io)));
+        if (took.compare(.fromRaw(0)) == .gt) waiter.latency = waiter.latency.saturatingAdd(took);
         waiter.done.store(.fromRaw(i + 1), .release);
     }
 }
@@ -372,14 +374,14 @@ fn waitPast(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     for (0..rounds) |i| {
         waiter.sent_at.store(.fromRaw(stamp(io)), .release);
         _ = try journal.append(io, .fromRaw(@intCast(1001 + i)), .{ .value = 1, .padding = padding });
-        while (waiter.done.load(.acquire).raw() < i + 1) {
+        while (waiter.done.load(.acquire).compare(.fromRaw(i + 1)) == .lt) {
             if (waiter.ended.load(.acquire) == .yes) break;
             std.atomic.spinLoopHint();
         }
-        if (waiter.done.load(.acquire).raw() < i + 1) break;
+        if (waiter.done.load(.acquire).compare(.fromRaw(i + 1)) == .lt) break;
     }
     try task.await(io);
-    try row("wait-past", "latency", @as(f64, @floatFromInt(waiter.latency)) / @as(f64, @floatFromInt(rounds)) / 1e3, "us");
+    try row("wait-past", "latency", waiter.latency.toSeconds(f64) * 1e6 / @as(f64, @floatFromInt(rounds)), "us");
     try check("wait-past", "records", waiter.done.load(.acquire).raw());
 }
 
