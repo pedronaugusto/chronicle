@@ -953,6 +953,25 @@ pub fn Journal(comptime Event: type) type {
             return State.seqAtOrAfter(self.inner(), io, at);
         }
 
+        /// The highest sequence number whose record carries an `at` at or
+        /// before `at`, or null when none does: the mirror of `seqAtOrAfter`.
+        ///
+        /// `at` need not rise with the sequence numbers, so a record with a
+        /// later `at` may sit below the answer: this is the newest record at
+        /// or before the moment, not the end of a prefix of the log that is.
+        /// A segment whose lowest `at` is past the moment is skipped without
+        /// opening it; the segment that holds the answer is read from its
+        /// index, halved when its timestamps rise, or walked otherwise, and
+        /// the active segment is walked when its timestamps say it could hold
+        /// one. Indexes are rebuilt on the way as `seqAtOrAfter` rebuilds
+        /// them, and a record carrying no readable `at` is
+        /// `error.CorruptRecord`.
+        ///
+        /// Safe to call from any task or thread.
+        pub fn seqAtOrBefore(self: *Self, io: Io, at: Time) SeekError!?Seq {
+            return State.seqAtOrBefore(self.inner(), io, at);
+        }
+
         /// Read the directory again: pick up segments another process has
         /// added, and rebuild the tail from what is there now.
         ///

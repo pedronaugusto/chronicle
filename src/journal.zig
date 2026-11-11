@@ -1199,6 +1199,13 @@ pub fn Journal(comptime Event: type) type {
             return s.log.seqAtOrAfter(io, at);
         }
 
+        pub fn seqAtOrBefore(self: *Self, io: Io, at: Time) SeekError!?Seq {
+            var guard = try self.state.acquire(io);
+            defer guard.deinit(io);
+            const s = guard.value();
+            return s.log.seqAtOrBefore(io, at);
+        }
+
         pub fn refresh(self: *Self, io: Io) OpenError!void {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);

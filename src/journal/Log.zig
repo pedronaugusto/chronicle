@@ -2233,6 +2233,116 @@ fn scannedSeqAtOrAfter(
     return null;
 }
 
+/// The highest sequence number whose record carries an `at` at or before
+/// `want`, or null when no record in the log does: the mirror of
+/// `seqAtOrAfter`.
+///
+/// The timestamps are not assumed to rise with the sequence numbers, so a
+/// record with a later `at` may sit below the answer. The answer is in the
+/// newest segment holding any record at or before `want`, so the segments are
+/// looked at newest first, and one whose lowest `at` is past `want` holds
+/// nothing that can qualify and is skipped whole, without its file being
+/// opened. Inside the segment that holds the answer: its last record when its
+/// highest `at` is at or before `want`; the index halved when its timestamps
+/// rise; the segment read otherwise.
+pub fn seqAtOrBefore(log: *Self, io: Io, want: Time) Self.OpenError!?Seq {
+    var i = log.segments.items.len;
+    while (i > 0) {
+        i -= 1;
+        const segment = &log.segments.items[i];
+        if (segment.count() == values.no_records) continue;
+        const active = i + 1 == log.segments.items.len;
+        if (!segment.times.known() and !active) {
+            // A sealed segment whose index did not describe it at open. Build
+            // one now and keep what it says, so a second lookup is free.
+            if (try log.provenIndex(io, i, true)) |indexed| segment.times = indexed.times;
+        }
+        if (segment.times.known()) {
+            if (values.below(want, segment.times.lowest)) continue;
+            if (!values.below(want, segment.times.highest)) return segment.last_seq;
+            if (!active) {
+                if (try log.indexedSeqAtOrBefore(io, i, want)) |seq| return seq;
+            }
+        }
+        if (try log.scannedSeqAtOrBefore(io, segment.*, want, segment.header_bytes, segment.base_seq, false)) |seq| return seq;
+    }
+    return null;
+}
+
+/// The last sequence number at or before `want` inside one segment, read from
+/// the timestamps in its index; null when the index cannot say, and the
+/// segment is read instead.
+fn indexedSeqAtOrBefore(log: *Self, io: Io, at: usize, want: Time) OpenError!?Seq {
+    const segment = log.segments.items[at];
+    const indexed = (try log.provenIndex(io, at, true)) orelse return null;
+    if (indexed.entries == values.no_records) return null;
+    const file = (try log.holdIndex(io, segment.base_seq)) orelse return null;
+
+    if (indexed.times.rising) {
+        // The timestamps do not fall: the first entry past `want` is found by
+        // halving, and the answer is in the run of records before it.
+        var low: u64 = 0;
+        var high: u64 = indexed.entries.raw();
+        while (low < high) {
+            const middle = low + (high - low) / 2;
+            const entry = (try log.indexEntryAt(io, file, middle)) orelse return null;
+            if (values.below(want, entry.at)) {
+                high = middle;
+            } else {
+                low = middle + 1;
+            }
+        }
+        if (low == 0) return null;
+        const entry = (try log.indexEntryAt(io, file, low - 1)) orelse return null;
+        if (indexed.interval == values.no_bytes) return entry.seq;
+        // One entry covers a run of records: the answer is the last of the
+        // run at or before `want`, at most `interval` bytes on.
+        return log.scannedSeqAtOrBefore(io, segment, want, entry.offset, entry.seq, true);
+    }
+
+    if (indexed.interval != values.no_bytes) {
+        // The entries name some of the records, and any of the others could
+        // be the answer.
+        return null;
+    }
+    var slot = indexed.entries.raw();
+    while (slot > 0) {
+        slot -= 1;
+        const entry = (try log.indexEntryAt(io, file, slot)) orelse return null;
+        if (!values.below(want, entry.at)) return entry.seq;
+    }
+    return null;
+}
+
+/// The same answer read out of the segment itself, from `from_offset`: the
+/// last record at or before `want`. With `rising`, the first record past
+/// `want` ends the walk. A record with no readable `at` is
+/// `error.CorruptRecord`, as in `scannedSeqAtOrAfter`.
+fn scannedSeqAtOrBefore(
+    log: *Self,
+    io: Io,
+    segment: Segment,
+    want: Time,
+    from_offset: Bytes,
+    from_seq: Seq,
+    rising: bool,
+) OpenError!?Seq {
+    var scan = try log.scanOver(&.{segment}, from_offset, .live);
+    defer scan.deinit(io);
+    var index = values.no_records;
+    var found: ?Seq = null;
+    while (try scan.next(io)) |line| : (index = values.plus(index, .fromRaw(1))) {
+        const envelope = envelopeOf(line) orelse return error.CorruptRecord;
+        const at = envelope.at orelse return error.CorruptRecord;
+        if (values.below(want, at)) {
+            if (rising) break;
+            continue;
+        }
+        found = values.advance(from_seq, index) catch return error.CorruptRecord;
+    }
+    return found;
+}
+
 //========================================================================
 // Writing.
 //========================================================================

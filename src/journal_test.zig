@@ -3247,6 +3247,185 @@ test "a lookup by time halves the index when the timestamps rise" {
     try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[52..56], .little));
 }
 
+test "seqAtOrBefore finds the last record at or before a moment" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+        defer journal.deinit(io);
+
+        // An empty log has nothing at any moment.
+        try testing.expectEqual(@as(?Seq, null), try journal.seqAtOrBefore(io, .fromRaw(0)));
+
+        // Nine records at 100, 200, ... 900, over three segments.
+        for (1..10) |i| _ = try journal.append(io, .fromRaw(@intCast(i * 100)), created(@intCast(i), "n"));
+
+        // Before everything there is nothing, not record one.
+        try testing.expectEqual(@as(?Seq, null), try journal.seqAtOrBefore(io, .fromRaw(std.math.minInt(i64))));
+        try testing.expectEqual(@as(?Seq, null), try journal.seqAtOrBefore(io, .fromRaw(99)));
+        // Exactly on a record, and between two of them.
+        try testing.expectEqual(@as(?Seq, Seq.fromRaw(1)), try journal.seqAtOrBefore(io, .fromRaw(100)));
+        try testing.expectEqual(@as(?Seq, Seq.fromRaw(1)), try journal.seqAtOrBefore(io, .fromRaw(199)));
+        try testing.expectEqual(@as(?Seq, Seq.fromRaw(5)), try journal.seqAtOrBefore(io, .fromRaw(500)));
+        try testing.expectEqual(@as(?Seq, Seq.fromRaw(8)), try journal.seqAtOrBefore(io, .fromRaw(899)));
+        // At and past the newest record, the newest.
+        try testing.expectEqual(@as(?Seq, Seq.fromRaw(9)), try journal.seqAtOrBefore(io, .fromRaw(900)));
+        try testing.expectEqual(@as(?Seq, Seq.fromRaw(9)), try journal.seqAtOrBefore(io, .fromRaw(std.math.maxInt(i64))));
+    }
+
+    // The answer survives a reopen, where the timestamps of the sealed
+    // segments come back from their index headers rather than from appends.
+    const reopened = try Journal.open(testing.allocator, io, ws.path, small(3, 1024));
+    defer reopened.deinit(io);
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(3)), try reopened.seqAtOrBefore(io, .fromRaw(350)));
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(8)), try reopened.seqAtOrBefore(io, .fromRaw(850)));
+    try testing.expectEqual(@as(?Seq, null), try reopened.seqAtOrBefore(io, .fromRaw(99)));
+}
+
+test "seqAtOrBefore answers the newest record at or before a moment when the timestamps do not rise" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, small(2, 1024));
+    defer journal.deinit(io);
+
+    // Record 2 is older than record 1, and record 5 is older than everything
+    // before it, so a record with a later `at` sits below most answers.
+    const stamps = [_]i64{ 500, 100, 600, 700, 50, 800 };
+    for (stamps, 1..) |at, i| _ = try journal.append(io, .fromRaw(at), created(@intCast(i), "n"));
+
+    try testing.expectEqual(@as(?Seq, null), try journal.seqAtOrBefore(io, .fromRaw(49)));
+    // Record 5, at 50, is the newest record at or before every moment from 50
+    // to 799: a search that assumed the stamps rose would answer 1, 2, 3 or 4.
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(5)), try journal.seqAtOrBefore(io, .fromRaw(50)));
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(5)), try journal.seqAtOrBefore(io, .fromRaw(100)));
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(5)), try journal.seqAtOrBefore(io, .fromRaw(700)));
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(6)), try journal.seqAtOrBefore(io, .fromRaw(800)));
+
+    // A negative timestamp is a timestamp.
+    var back = try Workspace.init("back");
+    defer back.deinit();
+    const earlier = try Journal.open(testing.allocator, io, back.path, small(2, 1024));
+    defer earlier.deinit(io);
+    for ([_]i64{ -500, -100, -900 }, 1..) |at, i| {
+        _ = try earlier.append(io, .fromRaw(at), created(@intCast(i), "n"));
+    }
+    try testing.expectEqual(@as(?Seq, null), try earlier.seqAtOrBefore(io, .fromRaw(-1_000)));
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(3)), try earlier.seqAtOrBefore(io, .fromRaw(-900)));
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(3)), try earlier.seqAtOrBefore(io, .fromRaw(-101)));
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(3)), try earlier.seqAtOrBefore(io, .fromRaw(0)));
+}
+
+test "seqAtOrBefore equals the newest record at or before the moment, read from every record" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // Timestamps that mostly rise and sometimes jump back, over segments of
+    // four records with an index entry every 64 bytes, so every path is taken:
+    // segments skipped whole, a segment's last record, a rising segment's
+    // index halved and its run walked, a falling one walked, the active one.
+    var prng: std.Random.DefaultPrng = .init(0x7365_7142_6566);
+    const random = prng.random();
+    const count = 41;
+    var stamps: [count]i64 = undefined;
+    var clock: i64 = 0;
+    for (&stamps) |*at| {
+        clock += random.intRangeAtMost(i64, 1, 30);
+        at.* = if (random.uintLessThan(u8, 5) == 0) clock - random.intRangeAtMost(i64, 0, 200) else clock;
+    }
+    const options: Journal.Options = .{ .sync = .never, .max_segment_records = Records.fromRaw(4), .index_interval_bytes = Bytes.fromRaw(64), .tail_records = Records.fromRaw(2) };
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        for (stamps, 1..) |at, i| _ = try journal.append(io, .fromRaw(at), created(@intCast(i), "n"));
+        try expectEveryMoment(journal, &stamps);
+    }
+    const reopened = try Journal.open(testing.allocator, io, ws.path, options);
+    defer reopened.deinit(io);
+    try expectEveryMoment(reopened, &stamps);
+}
+
+fn expectEveryMoment(journal: *Journal, stamps: []const i64) !void {
+    var want: i64 = -250;
+    const last = stamps[stamps.len - 1] + 5;
+    while (want <= last) : (want += 1) {
+        var expected: ?Seq = null;
+        for (stamps, 1..) |at, i| if (at <= want) {
+            expected = Seq.fromRaw(i);
+        };
+        try testing.expectEqual(expected, try journal.seqAtOrBefore(testing.io, .fromRaw(want)));
+    }
+}
+
+test "seqAtOrBefore rebuilds a stale index and halves it when the timestamps rise" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    const count = 4_000;
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, .{
+            .sync = .never,
+            .index_interval_bytes = Bytes.fromRaw(0),
+            .max_segment_records = Records.fromRaw(count),
+        });
+        defer journal.deinit(io);
+        for (1..count + 1) |i| _ = try journal.append(io, .fromRaw(@intCast(i * 10)), created(@intCast(i), "n"));
+        // One more, to seal the segment above by rotating away from it.
+        _ = try journal.append(io, .fromRaw((count + 1) * 10), created(1, "n"));
+    }
+    // The sealed segment's index gone: the lookup builds it on the way.
+    try ws.root.deleteFile(io, try ws.index(1));
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{
+        .sync = .never,
+        .index_interval_bytes = Bytes.fromRaw(0),
+        .max_segment_records = Records.fromRaw(count),
+        .tail_records = Records.fromRaw(1),
+    });
+    defer journal.deinit(io);
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(2_999)), try journal.seqAtOrBefore(io, .fromRaw(29_995)));
+
+    // Rebuilt, the index is halved: a dozen reads and a bit, not four thousand.
+    const before = quiescent(journal).log.index_reads;
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(3_000)), try journal.seqAtOrBefore(io, .fromRaw(30_005)));
+    try testing.expect(quiescent(journal).log.index_reads - before <= 20);
+}
+
+test "seqAtOrBefore names a record with no timestamp rather than stepping over it" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    var untimed: Handwritten = try .init(1, 1);
+    defer untimed.deinit();
+    try untimed.record(1, 10, 1,
+        \\{"removed":{"id":1}}
+    );
+    try untimed.raw("{\"seq\":2,\"v\":1,\"p\":0,\"ev\":{\"removed\":{\"id\":2}},\"c\":0}\n");
+    untimed.link = 0;
+    try untimed.record(3, 30, 1,
+        \\{"removed":{"id":3}}
+    );
+    try ws.write(try ws.segment(1), untimed.written());
+    try ws.writeRecords(4, untimed.link, &.{.{ .seq = 4, .at = 40, .ev =
+        \\{"removed":{"id":4}}
+    }});
+
+    const journal = try Journal.open(testing.allocator, io, ws.path, .{ .tail_records = Records.fromRaw(0) });
+    defer journal.deinit(io);
+
+    // The newest segment answers when it can, without the one before it.
+    try testing.expectEqual(@as(?Seq, Seq.fromRaw(4)), try journal.seqAtOrBefore(io, .fromRaw(45)));
+    // Below its lowest, the lookup goes into the segment holding the untimed
+    // record and says what it found.
+    try testing.expectError(error.CorruptRecord, journal.seqAtOrBefore(io, .fromRaw(35)));
+}
+
 test "an index of one entry per interval is a fortieth of one per record" {
     const io = testing.io;
     var ws = try Workspace.init("log");
