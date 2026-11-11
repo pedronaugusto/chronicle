@@ -6520,7 +6520,7 @@ pub const CountedEvent = struct {
             return .{ .ctx = fold, .f = struct {
                 fn accept(ctx: *anyopaque, record: J.Record) void {
                     const f: *Fold = @ptrCast(@alignCast(ctx));
-                    std.debug.assert(record.seq == Seq.fromRaw(f.seen + 1));
+                    aegis.assert.invariant(record.seq == Seq.fromRaw(f.seen + 1), "records arrive in seq order");
                     f.seen = record.seq.raw();
                 }
             }.accept };

@@ -298,9 +298,9 @@ pub fn Journal(comptime Event: type) type {
             }
 
             fn appendAssumeCapacity(tail: *Tail, owned: OwnedRecord) void {
-                std.debug.assert(tail.entries.items.len < tail.entries.capacity);
+                aegis.assert.invariant(tail.entries.items.len < tail.entries.capacity, "the tail has room for the record");
                 if (tail.entries.items.len != 0) {
-                    std.debug.assert(values.below(tail.entries.items[tail.entries.items.len - 1].record.seq, owned.record.seq));
+                    aegis.assert.invariant(values.below(tail.entries.items[tail.entries.items.len - 1].record.seq, owned.record.seq), "the tail's records rise by seq");
                 }
                 tail.entries.appendAssumeCapacity(owned);
                 tail.bytes += owned.record.bytes.len;
@@ -322,7 +322,7 @@ pub fn Journal(comptime Event: type) type {
 
             /// Release the prefix and move the surviving owners together.
             fn removePrefix(tail: *Tail, drop: usize) void {
-                std.debug.assert(drop <= tail.entries.items.len);
+                aegis.assert.invariant(drop <= tail.entries.items.len, "the prefix dropped is in the tail");
                 if (drop == 0) return;
                 for (tail.entries.items[0..drop]) |*owned| {
                     tail.bytes -= owned.record.bytes.len;

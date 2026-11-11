@@ -117,7 +117,7 @@ pub const SegmentHeader = struct {
     pub fn line(header: SegmentHeader, buffer: *[96]u8) []const u8 {
         var out: std.Io.Writer = .fixed(buffer);
         strand.json.write(&out, Shape{ .chronicle = header.version, .base = header.base_seq.raw(), .root = header.root }, .{}) catch unreachable; // unreachable: three bounded unsigned integers and fixed JSON punctuation fit in 96 bytes
-        std.debug.assert(out.end <= buffer.len);
+        aegis.assert.invariant(out.end <= buffer.len, "the header line is inside its buffer");
         return out.buffered();
     }
 };
@@ -261,8 +261,8 @@ pub const Times = struct {
         times.last = at;
         times.lowest = values.lesser(times.lowest, at);
         times.highest = values.greater(times.highest, at);
-        std.debug.assert(values.atMost(times.lowest, times.last));
-        std.debug.assert(values.atMost(times.last, times.highest));
+        aegis.assert.invariant(values.atMost(times.lowest, times.last), "the lowest time is at most the last");
+        aegis.assert.invariant(values.atMost(times.last, times.highest), "the last time is at most the highest");
     }
 };
 
@@ -3532,8 +3532,8 @@ fn release(log: *Self, io: Io) void {
 }
 
 comptime {
-    std.debug.assert(index_magic.len == @sizeOf(u64));
-    std.debug.assert(index_entry_len == 2 * @sizeOf(u64) + @sizeOf(i64));
-    std.debug.assert(index_header_len == 12 * @sizeOf(u64));
-    std.debug.assert(name_digits >= 20);
+    aegis.assert.invariant(index_magic.len == @sizeOf(u64), "the index magic is one word");
+    aegis.assert.invariant(index_entry_len == 2 * @sizeOf(u64) + @sizeOf(i64), "an index entry is a seq, an offset and a time");
+    aegis.assert.invariant(index_header_len == 12 * @sizeOf(u64), "the index header is twelve words");
+    aegis.assert.invariant(name_digits >= 20, "a segment name holds any record's seq");
 }
