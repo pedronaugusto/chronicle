@@ -534,8 +534,10 @@ fn everyWorkload(io: std.Io, gpa: std.mem.Allocator) !void {
 }
 
 // Smoke exercises correctness without sampling a benchmark clock.
-var smoke_ticks = std.atomic.Value(i64).init(0);
+/// The smoke run's clock: one tick a reading, so a smoke run times nothing.
+var smoke_ticks: aegis.Atomic(Ticks) = .init(.fromRaw(0));
+const Ticks = aegis.units.Count(enum { tick }, i64);
 fn benchmarkNow(io: std.Io) std.Io.Timestamp {
-    if (smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
+    if (smoke) return .{ .nanoseconds = smoke_ticks.fetchAddWrapping(.fromRaw(1), .monotonic).raw() };
     return std.Io.Clock.awake.now(io);
 }

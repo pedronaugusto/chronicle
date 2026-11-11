@@ -15,6 +15,8 @@ const airlock = @import("airlock");
 const shakedown = @import("shakedown");
 const gen = shakedown.gen;
 const aegis = @import("aegis");
+/// A one-way flag between a test and the task it starts: down until the task says.
+const Flag = enum(u8) { down, up };
 const seam = @import("airlock.testing");
 const Seam = seam.Seam;
 /// The lock helper's path, from the build: `zig build test` compiles it
@@ -131,7 +133,8 @@ fn processId() u64 {
 
 /// Counts the workspaces this process has made, so that two of them in the
 /// same test binary cannot share a name either.
-var workspaces: std.atomic.Value(u64) = .init(0);
+var workspaces: aegis.Atomic(Workspaces) = .init(.fromRaw(0));
+const Workspaces = aegis.units.Count(enum { workspace }, u64);
 
 /// A directory name no other process can choose.
 ///
@@ -150,7 +153,7 @@ fn workspaceName(buffer: *[64]u8) []const u8 {
     testing.io.randomSecure(&fresh) catch testing.io.random(&fresh);
     return std.mem.print(buffer, ".zig-cache/tmp/chronicle-{d}-{d}-{x}", .{
         processId(),
-        workspaces.fetchAdd(1, .monotonic),
+        workspaces.fetchAddWrapping(.fromRaw(1), .monotonic).raw(),
         std.mem.readInt(u64, &fresh, .little),
     }) catch unreachable;
 }
@@ -1013,10 +1016,10 @@ test "refresh wakes a waiter and hands a read journal's sinks what arrived" {
     var fold: Sequenced = .{};
     try reader.subscribe(io, fold.sink());
 
-    var returned: std.atomic.Value(bool) = .init(false);
+    var returned: aegis.Atomic(Flag) = .init(.down);
     const wait = struct {
-        fn run(inner: Io, j: *Journal, done: *std.atomic.Value(bool)) Io.Cancelable!Seq {
-            defer done.store(true, .release);
+        fn run(inner: Io, j: *Journal, done: *aegis.Atomic(Flag)) Io.Cancelable!Seq {
+            defer done.store(.up, .release);
             return j.waitPast(inner, Seq.fromRaw(0));
         }
     }.run;
@@ -1031,10 +1034,10 @@ test "refresh wakes a waiter and hands a read journal's sinks what arrived" {
     try reader.refresh(io);
     // Bounded: a waiter refresh did not wake would sleep until a nudge.
     var waited: usize = 0;
-    while (!returned.load(.acquire) and waited < 5000) : (waited += 1) {
+    while (returned.load(.acquire) != .up and waited < 5000) : (waited += 1) {
         try io.sleep(.fromMilliseconds(1), .awake);
     }
-    try testing.expect(returned.load(.acquire));
+    try testing.expect(returned.load(.acquire) == .up);
     try testing.expectEqual(Seq.fromRaw(1), try future.await(io));
     try testing.expect(fold.ok);
     try testing.expectEqual(@as(u64, 1), fold.last);
@@ -1931,10 +1934,10 @@ test "waitPast is woken by a nudge with no record behind it" {
     // A nudge wakes whoever is waiting when it happens and is not remembered
     // for a waiter that arrives later, so the nudger repeats until the waiter
     // reports through.
-    var woken: std.atomic.Value(bool) = .init(false);
+    var woken: aegis.Atomic(Flag) = .init(.down);
     const nudger = struct {
-        fn f(inner: Io, j: *Journal, done: *std.atomic.Value(bool)) void {
-            while (!done.load(.acquire)) {
+        fn f(inner: Io, j: *Journal, done: *aegis.Atomic(Flag)) void {
+            while (done.load(.acquire) != .up) {
                 j.nudge(inner);
                 std.atomic.spinLoopHint();
             }
@@ -1949,7 +1952,7 @@ test "waitPast is woken by a nudge with no record behind it" {
     // so a wait that failed would otherwise leave it spinning under the
     // group's cancel.
     const nothing = nothing: {
-        defer woken.store(true, .release);
+        defer woken.store(.up, .release);
         break :nothing try journal.waitPast(io, Seq.fromRaw(0));
     };
     try testing.expectEqual(Seq.fromRaw(0), nothing);
@@ -1970,28 +1973,28 @@ test "a reader stopped as a record arrives is stopped" {
     // 0.16.0 let the broadcast swallow the cancel and hung here within a
     // few hundred rounds; awaiting cancelation must finish every round.
     const reader = struct {
-        fn f(inner: Io, j: *Journal, waiting: *std.atomic.Value(bool)) Io.Cancelable!void {
+        fn f(inner: Io, j: *Journal, waiting: *aegis.Atomic(Flag)) Io.Cancelable!void {
             while (true) {
-                waiting.store(true, .release);
+                waiting.store(.up, .release);
                 _ = try j.waitPast(inner, try j.lastSeq(inner));
             }
         }
     }.f;
     const nudger = struct {
-        fn f(inner: Io, j: *Journal, go: *std.atomic.Value(bool), spins: u32) void {
-            while (!go.load(.acquire)) std.atomic.spinLoopHint();
+        fn f(inner: Io, j: *Journal, go: *aegis.Atomic(Flag), spins: u32) void {
+            while (go.load(.acquire) != .up) std.atomic.spinLoopHint();
             for (0..spins) |_| std.atomic.spinLoopHint();
             j.nudge(inner);
         }
     }.f;
 
     for (0..3000) |round| {
-        var waiting: std.atomic.Value(bool) = .init(false);
-        var go: std.atomic.Value(bool) = .init(false);
+        var waiting: aegis.Atomic(Flag) = .init(.down);
+        var go: aegis.Atomic(Flag) = .init(.down);
         var future = try io.concurrent(reader, .{ io, journal, &waiting });
-        while (!waiting.load(.acquire)) std.atomic.spinLoopHint();
+        while (waiting.load(.acquire) != .up) std.atomic.spinLoopHint();
         const other = try std.Thread.spawn(.{}, nudger, .{ io, journal, &go, @as(u32, @intCast(round % 64)) * 50 });
-        go.store(true, .release);
+        go.store(.up, .release);
         future.cancel(io) catch |err| {
             // Cancellation joins the task; its error is expected during cleanup or was checked by await.
             std.log.debug("task cleanup: {t}", .{err});
@@ -2018,9 +2021,9 @@ test "a walk canceled as it reads an index is canceled" {
     // the second, the walk went on from the segment's start and never saw
     // the cancel again. The task must report the cancel when it is awaited.
     const reader = struct {
-        fn f(inner: Io, j: *Journal, started: *std.atomic.Value(bool)) Journal.ReplayError!void {
+        fn f(inner: Io, j: *Journal, started: *aegis.Atomic(Flag)) Journal.ReplayError!void {
             while (true) {
-                started.store(true, .release);
+                started.store(.up, .release);
                 const walk = try j.replay(inner, Seq.fromRaw(150));
                 defer walk.deinit(inner);
                 while (try walk.next(inner)) |_| {}
@@ -2029,9 +2032,9 @@ test "a walk canceled as it reads an index is canceled" {
     }.f;
 
     for (0..500) |round| {
-        var started: std.atomic.Value(bool) = .init(false);
+        var started: aegis.Atomic(Flag) = .init(.down);
         var future = try io.concurrent(reader, .{ io, journal, &started });
-        while (!started.load(.acquire)) std.atomic.spinLoopHint();
+        while (started.load(.acquire) != .up) std.atomic.spinLoopHint();
         for (0..(round % 32) * 20) |_| std.atomic.spinLoopHint();
         if (future.cancel(io)) |_| {} else |err| try testing.expectEqual(error.Canceled, err);
     }
@@ -6820,10 +6823,10 @@ test "starting a replay waits for the writer and can be canceled there" {
     defer journal.deinit(io);
     var held = journalState(journal).state.acquireUncancelable(io);
     defer held.deinit(io);
-    var started: std.atomic.Value(bool) = .init(false);
+    var started: aegis.Atomic(Flag) = .init(.down);
     const Reader = struct {
-        fn f(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
-            ready.store(true, .release);
+        fn f(inner: Io, j: *Journal, ready: *aegis.Atomic(Flag)) !void {
+            ready.store(.up, .release);
             // An empty journal needs no file operation to choose its scan:
             // cancellation must reach the lock protecting that choice.
             const walk = try j.replay(inner, Seq.fromRaw(0));
@@ -6831,7 +6834,7 @@ test "starting a replay waits for the writer and can be canceled there" {
         }
     };
     var future = try io.concurrent(Reader.f, .{ io, journal, &started });
-    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    while (started.load(.acquire) != .up) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
 
@@ -6953,10 +6956,10 @@ fn canceledInventoryObservation(comptime observation: enum { oldest, segments })
     defer journal.deinit(io);
     var held = journalState(journal).state.acquireUncancelable(io);
     defer held.deinit(io);
-    var started: std.atomic.Value(bool) = .init(false);
+    var started: aegis.Atomic(Flag) = .init(.down);
     const Reader = struct {
-        fn read(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
-            ready.store(true, .release);
+        fn read(inner: Io, j: *Journal, ready: *aegis.Atomic(Flag)) !void {
+            ready.store(.up, .release);
             switch (observation) {
                 .oldest => _ = try j.oldestSeq(inner),
                 .segments => _ = try j.segmentCount(inner),
@@ -6964,7 +6967,7 @@ fn canceledInventoryObservation(comptime observation: enum { oldest, segments })
         }
     };
     var future = try io.concurrent(Reader.read, .{ io, journal, &started });
-    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    while (started.load(.acquire) != .up) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
 
@@ -6984,15 +6987,15 @@ test "observing persistence status waits for the journal lock" {
     defer journal.deinit(io);
     var held = journalState(journal).state.acquireUncancelable(io);
     defer held.deinit(io);
-    var started: std.atomic.Value(bool) = .init(false);
+    var started: aegis.Atomic(Flag) = .init(.down);
     const Reader = struct {
-        fn read(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
-            ready.store(true, .release);
+        fn read(inner: Io, j: *Journal, ready: *aegis.Atomic(Flag)) !void {
+            ready.store(.up, .release);
             _ = try j.status(inner);
         }
     };
     var future = try io.concurrent(Reader.read, .{ io, journal, &started });
-    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    while (started.load(.acquire) != .up) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
 
@@ -7117,16 +7120,16 @@ test "observing configuration waits for the journal lock" {
     try testing.expectEqual(Records.fromRaw(7), observed.tail_records);
     var held = journalState(journal).state.acquireUncancelable(io);
     defer held.deinit(io);
-    var started: std.atomic.Value(bool) = .init(false);
+    var started: aegis.Atomic(Flag) = .init(.down);
     const Reader = struct {
-        fn read(inner: Io, j: *Journal, ready: *std.atomic.Value(bool)) !void {
-            ready.store(true, .release);
+        fn read(inner: Io, j: *Journal, ready: *aegis.Atomic(Flag)) !void {
+            ready.store(.up, .release);
             const config = try j.openedWith(inner);
             try testing.expectEqual(Records.fromRaw(7), config.tail_records);
         }
     };
     var future = try io.concurrent(Reader.read, .{ io, journal, &started });
-    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    while (started.load(.acquire) != .up) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
 
@@ -7143,16 +7146,16 @@ test "observing a tailer cursor waits for the journal lock" {
     try testing.expectEqual(Seq.fromRaw(7), observed);
     var held = journalState(journal).state.acquireUncancelable(io);
     defer held.deinit(io);
-    var started: std.atomic.Value(bool) = .init(false);
+    var started: aegis.Atomic(Flag) = .init(.down);
     const Reader = struct {
-        fn read(inner: Io, tail: *Journal.Tailer, ready: *std.atomic.Value(bool)) !void {
-            ready.store(true, .release);
+        fn read(inner: Io, tail: *Journal.Tailer, ready: *aegis.Atomic(Flag)) !void {
+            ready.store(.up, .release);
             const seq = try tail.cursor(inner);
             try testing.expectEqual(Seq.fromRaw(7), seq);
         }
     };
     var future = try io.concurrent(Reader.read, .{ io, tailer, &started });
-    while (!started.load(.acquire)) std.atomic.spinLoopHint();
+    while (started.load(.acquire) != .up) std.atomic.spinLoopHint();
     try testing.expectError(error.Canceled, future.cancel(io));
 }
 

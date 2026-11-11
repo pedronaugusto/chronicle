@@ -4,6 +4,7 @@
 //! the runtime to a journal's whole life on it, the parts that wait (a
 //! reader parked for the next record, its cancel) above all.
 const std = @import("std");
+const aegis = @import("aegis");
 const testing = std.testing;
 const Io = std.Io;
 const reactor = @import("reactor");
@@ -17,8 +18,10 @@ const Blocking = @import("airlock").Blocking;
 /// The runtime's sync lane (`reactor.syncLane`), as an application wires it
 /// into `Options.blocking`, counting each sync on its way: the journal's
 /// syncs are proved to go through it, every one, off the runtime's workers.
+const Syncs = aegis.units.Count(enum { sync }, u32);
+
 const Counted = struct {
-    syncs: std.atomic.Value(u32) = .init(0),
+    syncs: aegis.Atomic(Syncs) = .init(.fromRaw(0)),
     lane: Blocking = .{ .run = run },
 
     fn blocking(c: *Counted) *Blocking {
@@ -27,12 +30,12 @@ const Counted = struct {
 
     fn run(lane: *Blocking, io: Io, job: *Blocking.Job) Io.Cancelable!void {
         const c: *Counted = @alignCast(@fieldParentPtr("lane", lane));
-        _ = c.syncs.fetchAdd(1, .monotonic);
+        _ = c.syncs.fetchAddWrapping(.fromRaw(1), .monotonic);
         return reactor.syncLane(io, job);
     }
 
     fn take(c: *Counted) u32 {
-        return c.syncs.swap(0, .monotonic);
+        return c.syncs.swap(.fromRaw(0), .monotonic).raw();
     }
 };
 

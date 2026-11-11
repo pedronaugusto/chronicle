@@ -18,6 +18,7 @@
 //! `backup DATA DEST`, `backup-copy DATA DEST` (the files copied byte for
 //! byte and synced, the floor) and `finish SCRATCH`.
 const std = @import("std");
+const aegis = @import("aegis");
 const chronicle = @import("chronicle");
 const airlock = @import("airlock");
 /// Set once by `main` from `--smoke`: every mode once, at its smallest,
@@ -36,10 +37,12 @@ fn scrub(io: std.Io, path: []const u8) void {
 }
 
 fn now(io: Io) Io.Timestamp {
-    if (smoke) return .{ .nanoseconds = smoke_ticks.fetchAdd(1, .monotonic) };
+    if (smoke) return .{ .nanoseconds = smoke_ticks.fetchAddWrapping(.fromRaw(1), .monotonic).raw() };
     return Io.Clock.awake.now(io);
 }
-var smoke_ticks = std.atomic.Value(i64).init(0);
+/// The smoke run's clock: one tick a reading, so a smoke run times nothing.
+var smoke_ticks: aegis.Atomic(Ticks) = .init(.fromRaw(0));
+const Ticks = aegis.units.Count(enum { tick }, i64);
 fn since(io: Io, started: Io.Timestamp) u64 {
     if (smoke) return 1;
     return @intCast(@max(started.untilNow(io, .awake).toNanoseconds(), 1));
@@ -321,12 +324,16 @@ fn refresh(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     try check("refresh", "last", last);
 }
 
+const Stamp = aegis.units.Instant(.awake, .nanosecond, i64);
+const Records = aegis.units.Count(enum { record }, u64);
+const Ended = enum(u8) { no, yes };
+
 const Waiter = struct {
-    sent_at: std.atomic.Value(i64) = .init(0),
-    done: std.atomic.Value(u64) = .init(0),
+    sent_at: aegis.Atomic(Stamp) = .init(.fromRaw(0)),
+    done: aegis.Atomic(Records) = .init(.fromRaw(0)),
     /// Set by the waiter however it ends, so that the appender stops
     /// waiting for a record it will never take and awaits the error.
-    ended: std.atomic.Value(bool) = .init(false),
+    ended: aegis.Atomic(Ended) = .init(.no),
     latency: u64 = 0,
 };
 
@@ -337,7 +344,7 @@ fn stamp(io: Io) i64 {
 /// Wait past each new record and take it in hand: `waitPast`, then
 /// `copySince`.
 fn wait(io: Io, gpa: std.mem.Allocator, journal: *J, rounds: u64, waiter: *Waiter) !void {
-    defer waiter.ended.store(true, .release);
+    defer waiter.ended.store(.yes, .release);
     var cursor: chronicle.Seq = .fromRaw(1000);
     for (0..rounds) |i| {
         while (true) {
@@ -350,8 +357,8 @@ fn wait(io: Io, gpa: std.mem.Allocator, journal: *J, rounds: u64, waiter: *Waite
                 break;
             }
         }
-        waiter.latency += @intCast(@max(stamp(io) - waiter.sent_at.load(.acquire), 0));
-        waiter.done.store(i + 1, .release);
+        waiter.latency += @intCast(@max(stamp(io) - waiter.sent_at.load(.acquire).raw(), 0));
+        waiter.done.store(.fromRaw(i + 1), .release);
     }
 }
 
@@ -363,17 +370,17 @@ fn waitPast(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     var waiter: Waiter = .{};
     var task = try io.concurrent(wait, .{ io, gpa, journal, rounds, &waiter });
     for (0..rounds) |i| {
-        waiter.sent_at.store(stamp(io), .release);
+        waiter.sent_at.store(.fromRaw(stamp(io)), .release);
         _ = try journal.append(io, .fromRaw(@intCast(1001 + i)), .{ .value = 1, .padding = padding });
-        while (waiter.done.load(.acquire) < i + 1) {
-            if (waiter.ended.load(.acquire)) break;
+        while (waiter.done.load(.acquire).raw() < i + 1) {
+            if (waiter.ended.load(.acquire) == .yes) break;
             std.atomic.spinLoopHint();
         }
-        if (waiter.done.load(.acquire) < i + 1) break;
+        if (waiter.done.load(.acquire).raw() < i + 1) break;
     }
     try task.await(io);
     try row("wait-past", "latency", @as(f64, @floatFromInt(waiter.latency)) / @as(f64, @floatFromInt(rounds)) / 1e3, "us");
-    try check("wait-past", "records", waiter.done.load(.acquire));
+    try check("wait-past", "records", waiter.done.load(.acquire).raw());
 }
 
 /// Under `.always`, deferred appends, then one durable append that makes
