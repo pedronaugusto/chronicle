@@ -6,10 +6,16 @@ folding them into state.
 
 ## Install
 
-Requires Zig 0.17.0. Fetch with `zig fetch --save
+Requires Zig 0.17. Fetch with `zig fetch --save
 git+https://github.com/pedronaugusto/chronicle`, then obtain the `chronicle` module
 through `b.dependency` and add it to your executable's imports. Forward your target and
 optimize settings.
+
+## Stability
+
+chronicle is 0.x and tracks Zig 0.17.x. A breaking change comes only in a minor release
+(0.10 to 0.11), with a CHANGELOG entry saying what changed and what to write instead; a
+patch release never breaks.
 
 ## Usage
 

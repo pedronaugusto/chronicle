@@ -21,6 +21,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- The README states chronicle's stability policy (0.x, tracking Zig 0.17.x; a breaking change only in a minor release, with its CHANGELOG entry; a patch release never breaks).
 - Development: a compaction's every-crash sweep runs as sixteen tests, each one range of its crash points (shakedown's `EveryCrashOptions.shard`); whole, and in eight ranges, it ran past the test runner's 120 s watchdog on a loaded machine. Pins shakedown's main (d2d81a8), which has the shards.
 - aegis 0.3, which has one way to lend (`borrow`): the log's directory and a held index file are lent by value (`std.Io.Dir`, `std.Io.File`) where they were an `Owned.Lending`; contracts are `assert.invariant` where `assert.pre` and `assert.post` were, and a journal's wait for change is its guard's (`guard.wait(&condition, io, .none)`). Pins aegis breaking-0.3 (a34e694), and on it strand (cc6918d), airlock (f0b59c4), warp (569a2f8), reactor (c6921bd) and shakedown (4979fa9), the commits relic main pins. A backup's batch takes its adds as airlock's reflink-lock line has them, with no error (its slots hold the batch and the directory), and a cancel that lands while the last line of a segment is read is `Canceled`, as strand's tail now says.
 
