@@ -295,14 +295,15 @@ test "compaction takes a truncated stream's events out of the files and leaves e
         // Until the compaction the events are still in the files.
         const before = try segmentBytes(place.path, testing.allocator);
         defer testing.allocator.free(before);
-        try testing.expect(std.mem.find(u8, before, "1000") != null);
+        try testing.expect(std.mem.find(u8, before, "\"amount\":1000") != null);
 
         try journal.compact(io, chronicle.beginning);
         const after = try segmentBytes(place.path, testing.allocator);
         defer testing.allocator.free(after);
-        // person-7's versions 1 to 3 were the amounts 1000, 1002, 1004.
-        for ([_][]const u8{ "1000", "1002", "1004" }) |gone| try testing.expect(std.mem.find(u8, after, gone) == null);
-        try testing.expect(std.mem.find(u8, after, "1006") != null);
+        // person-7's versions 1 to 3 were the amounts 1000, 1002, 1004, looked for
+        // as the event writes them: a bare number can be a time's or a checksum's digits.
+        for ([_][]const u8{ "\"amount\":1000", "\"amount\":1002", "\"amount\":1004" }) |gone| try testing.expect(std.mem.find(u8, after, gone) == null);
+        try testing.expect(std.mem.find(u8, after, "\"amount\":1006") != null);
         try testing.expect(std.mem.find(u8, after, "\"chronicle\":2") != null);
 
         // The global walk steps over the stubs; the sequence keeps its places.
