@@ -1025,6 +1025,10 @@ pub fn Journal(comptime Event: type) type {
             /// found whole since. A record of a batch past it is handed on
             /// only once the batch's last record is in the file.
             whole_through: Seq,
+            /// The moments a walk of `replayBetween` hands on, both ends in:
+            /// a record whose `at` is outside is stepped over before its
+            /// event is read, its place in the sequence and the chain kept.
+            window: ?Window = null,
 
             pub fn deinit(walk: *Replay, io: Io) void {
                 walk.scan.deinit(io);
@@ -1100,6 +1104,10 @@ pub fn Journal(comptime Event: type) type {
                         walk.last = walk.lastRead(header);
                         continue;
                     }
+                    if (walk.window) |window| if (!window.holds(header.at)) {
+                        walk.last = walk.lastRead(header);
+                        continue;
+                    };
                     _ = walk.arena.reset(.retain_capacity);
                     // The envelope has read and checked this line; what is left
                     // is its event, which is the header's span of the same bytes.
@@ -1149,6 +1157,31 @@ pub fn Journal(comptime Event: type) type {
                 .run = .{ .cursor = cursor },
                 .whole_through = s.seq,
             };
+        }
+
+        /// The moments, both ends in, a walk of `replayBetween` hands on.
+        const Window = struct {
+            lo: Time,
+            hi: Time,
+
+            fn holds(window: Window, at: Time) bool {
+                return values.atMost(window.lo, at) and values.atMost(at, window.hi);
+            }
+        };
+
+        /// `replay` of the records whose `at` is in `[lo, hi]`, oldest first.
+        /// It starts at the lowest sequence number whose `at` reaches `lo`
+        /// (`seqAtOrAfter`), since no record below it can be in the window;
+        /// past it, every record is read and those outside are stepped over.
+        pub fn replayBetween(self: *Self, io: Io, lo: Time, hi: Time, walk: *Replay) SeekError!void {
+            var guard = try self.state.acquire(io);
+            defer guard.deinit(io);
+            const s = guard.value();
+            const first = if (values.atMost(lo, hi)) try s.log.seqAtOrAfter(io, lo) else null;
+            // With nothing in the window, the walk starts at the end.
+            const cursor = if (first) |seq| values.predecessor(seq) orelse values.beginning else s.seq;
+            try self.replayFrom(s, io, cursor, false, walk);
+            walk.window = .{ .lo = lo, .hi = hi };
         }
 
         pub fn replayAt(self: *Self, io: Io, position: Position, walk: *Replay) ReplayAtError!void {

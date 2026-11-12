@@ -3361,6 +3361,52 @@ fn expectEveryMoment(journal: *Journal, stamps: []const i64) !void {
     }
 }
 
+/// Every record `replayBetween(lo, hi)` hands on, in order, against the
+/// records of `stamps` whose `at` is in the window, read from every record.
+fn expectWindow(journal: *Journal, stamps: []const i64, lo: i64, hi: i64) !void {
+    var expected: std.ArrayList(Seq) = .empty;
+    defer expected.deinit(testing.allocator);
+    for (stamps, 1..) |at, i| if (lo <= at and at <= hi) try expected.append(testing.allocator, Seq.fromRaw(i));
+    const walk = try journal.replayBetween(testing.io, .fromRaw(lo), .fromRaw(hi));
+    defer walk.deinit(testing.io);
+    var handed: std.ArrayList(Seq) = .empty;
+    defer handed.deinit(testing.allocator);
+    while (try walk.next(testing.io)) |record| try handed.append(testing.allocator, record.seq);
+    try testing.expectEqualSlices(Seq, expected.items, handed.items);
+}
+
+test "replayBetween hands on the records whose at is in the window, read from every record" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+
+    // As seqAtOrBefore's model: timestamps that mostly rise and sometimes jump
+    // back, over segments of four records, so a window's records lie across
+    // segments, below records outside it, and in the active segment.
+    var prng: std.Random.DefaultPrng = .init(0x6265_7477_6565_6e00);
+    const random = prng.random();
+    const count = 41;
+    var stamps: [count]i64 = undefined;
+    var clock: i64 = 0;
+    for (&stamps) |*at| {
+        clock += random.intRangeAtMost(i64, 1, 30);
+        at.* = if (random.uintLessThan(u8, 5) == 0) clock - random.intRangeAtMost(i64, 0, 200) else clock;
+    }
+    const options: Journal.Options = .{ .sync = .never, .max_segment_records = Records.fromRaw(4), .index_interval_bytes = Bytes.fromRaw(64), .tail_records = Records.fromRaw(2) };
+    const journal = try Journal.open(testing.allocator, io, ws.path, options);
+    defer journal.deinit(io);
+    for (stamps, 1..) |at, i| _ = try journal.append(io, .fromRaw(at), created(@intCast(i), "n"));
+
+    const last = stamps[count - 1];
+    // The edges: the whole log, a single moment, nothing before it, nothing
+    // after it, and a window whose low end is above its high end.
+    for ([_][2]i64{ .{ -1_000, last + 1_000 }, .{ stamps[7], stamps[7] }, .{ -1_000, -1 }, .{ last + 1, last + 1_000 }, .{ 300, 200 } }) |window| try expectWindow(journal, &stamps, window[0], window[1]);
+    for (0..300) |_| {
+        const lo = random.intRangeAtMost(i64, -250, last + 5);
+        try expectWindow(journal, &stamps, lo, lo + random.intRangeAtMost(i64, 0, 400));
+    }
+}
+
 test "seqAtOrBefore rebuilds a stale index and halves it when the timestamps rise" {
     const io = testing.io;
     var ws = try Workspace.init("log");

@@ -902,6 +902,27 @@ pub fn Journal(comptime Event: type) type {
             return walk;
         }
 
+        /// A walk over the records whose `at` is in `[lo, hi]`, both ends in:
+        /// the records `replay` gives, checked the same way, in sequence order,
+        /// not time order, those outside the window stepped over before their
+        /// events are read.
+        ///
+        /// `at` need not rise with the sequence numbers, so the window is not a
+        /// run of the log: the walk starts at the lowest sequence number whose
+        /// `at` reaches `lo` (`seqAtOrAfter`, with what it costs), below which
+        /// no record can be in the window, and reads every record after it to
+        /// the end of the log, handing on those inside. `lo` above `hi` is an
+        /// empty window. The segments it will cross are decided under the
+        /// journal's lock, as `replay`'s are, and `rearmAt` keeps the window.
+        ///
+        /// Safe to call from any task or thread, except from inside a sink.
+        pub fn replayBetween(self: *Self, io: Io, lo: Time, hi: Time) SeekError!*Replay {
+            const walk = try self.state.gpa.create(Replay);
+            errdefer self.state.gpa.destroy(walk);
+            try State.replayBetween(self.inner(), io, lo, hi, &walk.state);
+            return walk;
+        }
+
         /// Read every record of every segment back, through the checks a
         /// replay makes — the checksum, the envelope, the schema version and
         /// the sequence — and report how many there were.
