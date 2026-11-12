@@ -910,9 +910,17 @@ pub fn Journal(comptime Event: type) type {
         /// `at` need not rise with the sequence numbers, so the window is not a
         /// run of the log: the walk starts at the lowest sequence number whose
         /// `at` reaches `lo` (`seqAtOrAfter`, with what it costs), below which
-        /// no record can be in the window, and reads every record after it to
-        /// the end of the log, handing on those inside. `lo` above `hi` is an
-        /// empty window. The segments it will cross are decided under the
+        /// no record can be in the window. Past it, a segment whose lowest and
+        /// highest `at` miss the window is left out without being opened, a
+        /// segment whose `at` rose is left at its first record past `hi`, and
+        /// any other segment is read whole, its records outside the window
+        /// stepped over. Where the times rise, the walk so ends at the first
+        /// record past `hi`. Across a segment it left out, the walk takes the
+        /// checksum chain up again at the next segment's header, since there is
+        /// nothing before it to check its first record against. The newest
+        /// segment of a journal opened with `Options.access = .read` is read
+        /// past what was known when the walk was made, so it is never left out
+        /// or left early. `lo` above `hi` is an empty window. The segments it will cross are decided under the
         /// journal's lock, as `replay`'s are, and `rearmAt` keeps the window.
         ///
         /// Safe to call from any task or thread, except from inside a sink.

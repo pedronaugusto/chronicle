@@ -3393,17 +3393,88 @@ test "replayBetween hands on the records whose at is in the window, read from ev
         at.* = if (random.uintLessThan(u8, 5) == 0) clock - random.intRangeAtMost(i64, 0, 200) else clock;
     }
     const options: Journal.Options = .{ .sync = .never, .max_segment_records = Records.fromRaw(4), .index_interval_bytes = Bytes.fromRaw(64), .tail_records = Records.fromRaw(2) };
-    const journal = try Journal.open(testing.allocator, io, ws.path, options);
-    defer journal.deinit(io);
-    for (stamps, 1..) |at, i| _ = try journal.append(io, .fromRaw(at), created(@intCast(i), "n"));
-
     const last = stamps[count - 1];
     // The edges: the whole log, a single moment, nothing before it, nothing
     // after it, and a window whose low end is above its high end.
-    for ([_][2]i64{ .{ -1_000, last + 1_000 }, .{ stamps[7], stamps[7] }, .{ -1_000, -1 }, .{ last + 1, last + 1_000 }, .{ 300, 200 } }) |window| try expectWindow(journal, &stamps, window[0], window[1]);
-    for (0..300) |_| {
+    const edges = [_][2]i64{ .{ -1_000, last + 1_000 }, .{ stamps[7], stamps[7] }, .{ -1_000, -1 }, .{ last + 1, last + 1_000 }, .{ 300, 200 } };
+    var windows: [300][2]i64 = undefined;
+    for (&windows) |*window| {
         const lo = random.intRangeAtMost(i64, -250, last + 5);
-        try expectWindow(journal, &stamps, lo, lo + random.intRangeAtMost(i64, 0, 400));
+        window.* = .{ lo, lo + random.intRangeAtMost(i64, 0, 400) };
+    }
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        for (stamps, 1..) |at, i| _ = try journal.append(io, .fromRaw(at), created(@intCast(i), "n"));
+        for (edges ++ windows) |window| try expectWindow(journal, &stamps, window[0], window[1]);
+    }
+    // Reopened, the sealed segments' times come from their index headers;
+    // read-only, the newest segment is read past the inventory, never left
+    // out or left early, since a writer may add to it.
+    for ([_]chronicle.Access{ .write, .read }) |access| {
+        var reopened_options = options;
+        reopened_options.access = access;
+        const reopened = try Journal.open(testing.allocator, io, ws.path, reopened_options);
+        defer reopened.deinit(io);
+        for (edges ++ windows) |window| try expectWindow(reopened, &stamps, window[0], window[1]);
+    }
+}
+
+test "replayBetween over rising times opens no segment past the window and reads nothing after its first record past hi" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const options: Journal.Options = .{ .sync = .never, .max_segment_records = Records.fromRaw(4), .index_interval_bytes = Bytes.fromRaw(64), .tail_records = Records.fromRaw(2) };
+    {
+        const journal = try Journal.open(testing.allocator, io, ws.path, options);
+        defer journal.deinit(io);
+        // Forty records at 10, 20, ... 400, over ten segments of four.
+        for (1..41) |i| _ = try journal.append(io, .fromRaw(@intCast(i * 10)), created(@intCast(i), "n"));
+    }
+    const journal = try Journal.open(testing.allocator, io, ws.path, options);
+    defer journal.deinit(io);
+    // Every segment file the walk opens, by its base.
+    const Opens = struct {
+        bases: std.ArrayList(u64) = .empty,
+
+        const Layer = shakedown.Layer(@This(), .{ .dirOpenFile = open });
+
+        fn open(u: ?*anyopaque, dir: Io.Dir, path: []const u8, opts: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
+            const layer = Layer.of(u);
+            if (std.mem.endsWith(u8, path, chronicle.segment_extension)) {
+                const base = std.fmt.parseInt(u64, path[0 .. path.len - chronicle.segment_extension.len], 10) catch 0;
+                layer.state.bases.append(testing.allocator, base) catch return error.SystemResources;
+            }
+            return layer.base.vtable.dirOpenFile(layer.base.userdata, dir, path, opts);
+        }
+    };
+    var opens: Opens.Layer = .init(io, .{});
+    defer opens.state.bases.deinit(testing.allocator);
+    // The walk's reads alone: the seek before it (`seqAtOrAfter`) is given
+    // the plain Io, and opens what it opens to find the first record.
+    // [125, 205]: records 13 to 20, the segments based at 13 and 17 whole.
+    // The next, from 21 at 210, is past the window by its times and is left
+    // out unopened, and every one after it.
+    {
+        const walk = try journal.replayBetween(io, .fromRaw(125), .fromRaw(205));
+        defer walk.deinit(opens.io());
+        var seq: u64 = 13;
+        while (try walk.next(opens.io())) |record| : (seq += 1) try testing.expectEqual(Seq.fromRaw(seq), record.seq);
+        try testing.expectEqual(@as(u64, 21), seq);
+        try testing.expectEqualSlices(u64, &.{ 13, 17 }, opens.state.bases.items);
+        try testing.expectEqual(Seq.fromRaw(20), walk.position().cursor);
+    }
+    // [135, 195]: the window ends inside a segment, at 19 (190); 20 at 200
+    // is past it, and nothing after it is read, the rest of the log unopened.
+    opens.state.bases.clearRetainingCapacity();
+    {
+        const walk = try journal.replayBetween(io, .fromRaw(135), .fromRaw(195));
+        defer walk.deinit(opens.io());
+        var seq: u64 = 14;
+        while (try walk.next(opens.io())) |record| : (seq += 1) try testing.expectEqual(Seq.fromRaw(seq), record.seq);
+        try testing.expectEqual(@as(u64, 20), seq);
+        try testing.expectEqualSlices(u64, &.{ 13, 17 }, opens.state.bases.items);
+        try testing.expectEqual(Seq.fromRaw(20), walk.position().cursor);
     }
 }
 

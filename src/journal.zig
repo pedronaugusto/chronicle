@@ -1028,7 +1028,7 @@ pub fn Journal(comptime Event: type) type {
             /// The moments a walk of `replayBetween` hands on, both ends in:
             /// a record whose `at` is outside is stepped over before its
             /// event is read, its place in the sequence and the chain kept.
-            window: ?Window = null,
+            window: ?Log.Window = null,
 
             pub fn deinit(walk: *Replay, io: Io) void {
                 walk.scan.deinit(io);
@@ -1085,7 +1085,10 @@ pub fn Journal(comptime Event: type) type {
 
             pub fn next(walk: *Replay, io: Io) ReplayError!?Record {
                 while (try walk.scan.next(io)) |line| {
-                    if (walk.scan.takeBoundary()) |boundary| try walk.run.beginSegment(boundary);
+                    if (walk.scan.takeBoundary()) |boundary| {
+                        if (boundary.after_gap) walk.run.restart();
+                        try walk.run.beginSegment(boundary);
+                    }
                     const header = try line.parse({}, parseHeader);
                     if (header.batch) |batch| if (values.below(walk.whole_through, batch.last)) {
                         // A batch being written beside this walk, or one a
@@ -1106,6 +1109,9 @@ pub fn Journal(comptime Event: type) type {
                     }
                     if (walk.window) |window| if (!window.holds(header.at)) {
                         walk.last = walk.lastRead(header);
+                        // Past the window in a segment whose times rose:
+                        // nothing after it in the segment is in the window.
+                        if (values.below(window.hi, header.at) and walk.scan.rising()) walk.scan.skipRest(io);
                         continue;
                     };
                     _ = walk.arena.reset(.retain_capacity);
@@ -1139,15 +1145,15 @@ pub fn Journal(comptime Event: type) type {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
-            return self.replayFrom(s, io, cursor, false, walk);
+            return self.replayFrom(s, io, cursor, .{}, walk);
         }
 
         /// `replay`, saying whether the walk may build an index it finds
         /// missing. The scan is chosen under the lock `s` is held through,
         /// whether or not it may build an index. The walk is made in `walk`,
         /// which stays where it is until its `deinit`.
-        fn replayFrom(self: *Self, s: *State, io: Io, cursor: Seq, may_write: bool, walk: *Replay) ReplayError!void {
-            var scan = try s.log.scanFrom(io, cursor, .{ .may_write = may_write });
+        fn replayFrom(self: *Self, s: *State, io: Io, cursor: Seq, options: Log.ScanOptions, walk: *Replay) ReplayError!void {
+            var scan = try s.log.scanFrom(io, cursor, options);
             errdefer scan.deinit(io);
             walk.* = .{
                 .journal = self,
@@ -1159,29 +1165,22 @@ pub fn Journal(comptime Event: type) type {
             };
         }
 
-        /// The moments, both ends in, a walk of `replayBetween` hands on.
-        const Window = struct {
-            lo: Time,
-            hi: Time,
-
-            fn holds(window: Window, at: Time) bool {
-                return values.atMost(window.lo, at) and values.atMost(at, window.hi);
-            }
-        };
-
-        /// `replay` of the records whose `at` is in `[lo, hi]`, oldest first.
-        /// It starts at the lowest sequence number whose `at` reaches `lo`
-        /// (`seqAtOrAfter`), since no record below it can be in the window;
-        /// past it, every record is read and those outside are stepped over.
+        /// `replay` of the records whose `at` is in `[lo, hi]`, in sequence
+        /// order. It starts at the lowest sequence number whose `at` reaches
+        /// `lo` (`seqAtOrAfter`), since no record below it can be in the
+        /// window; past it, a segment whose times miss the window is left out
+        /// unopened, one whose times rose is left at its first record past
+        /// `hi`, and in the rest the records outside are stepped over.
         pub fn replayBetween(self: *Self, io: Io, lo: Time, hi: Time, walk: *Replay) SeekError!void {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
+            const window: Log.Window = .{ .lo = lo, .hi = hi };
             const first = if (values.atMost(lo, hi)) try s.log.seqAtOrAfter(io, lo) else null;
             // With nothing in the window, the walk starts at the end.
             const cursor = if (first) |seq| values.predecessor(seq) orelse values.beginning else s.seq;
-            try self.replayFrom(s, io, cursor, false, walk);
-            walk.window = .{ .lo = lo, .hi = hi };
+            try self.replayFrom(s, io, cursor, .{ .window = window }, walk);
+            walk.window = window;
         }
 
         pub fn replayAt(self: *Self, io: Io, position: Position, walk: *Replay) ReplayAtError!void {
@@ -1210,7 +1209,7 @@ pub fn Journal(comptime Event: type) type {
                 var guard = try self.state.acquire(io);
                 defer guard.deinit(io);
                 const s = guard.value();
-                try self.replayFrom(s, io, s.log.baseSeq(), false, &walk);
+                try self.replayFrom(s, io, s.log.baseSeq(), .{}, &walk);
             }
             defer walk.deinit(io);
             var seen = values.no_records;
@@ -1378,7 +1377,7 @@ pub fn Journal(comptime Event: type) type {
             var delivered = cursor;
             if (!s.tailSince(cursor).complete) {
                 var walk: Replay = undefined;
-                try self.replayFrom(s, io, cursor, true, &walk);
+                try self.replayFrom(s, io, cursor, .{ .may_write = true }, &walk);
                 defer walk.deinit(io);
                 while (try walk.next(io)) |record| {
                     for (sinks) |sink| sink.f(sink.ctx, record);
@@ -1437,7 +1436,7 @@ pub fn Journal(comptime Event: type) type {
                 var guard = try self.state.acquire(io);
                 defer guard.deinit(io);
                 const s = guard.value();
-                return self.replayFrom(s, io, tail.committed, false, walk);
+                return self.replayFrom(s, io, tail.committed, .{}, walk);
             }
 
             pub fn commit(tail: *Tailer, io: Io, seq: Seq) TailerError!void {

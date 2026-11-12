@@ -35,6 +35,16 @@ pub fn State(comptime Header: type, comptime ReadError: type, comptime Boundary:
             walk.link = boundary.root;
         }
 
+        /// Takes the walk up again at a segment whose predecessors, or the
+        /// rest of whose predecessor, it left out: its first record has
+        /// nothing before it to be checked against. A batch is never split
+        /// across segments, so one the walk left is over.
+        pub fn restart(walk: *Self) void {
+            walk.expected = null;
+            walk.link = null;
+            walk.batch = null;
+        }
+
         /// Whether this record is one to hand on. False means it is at or
         /// behind the cursor and has been stepped over.
         pub fn accept(walk: *Self, header: RecordHeader) Error!bool {
