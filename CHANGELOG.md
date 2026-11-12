@@ -23,6 +23,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Pins aegis c8982a8, still 0.2.4: six additive commits after 3c0b13e (the role declarations a linter reads, `lint_rules`), the aegis the development build's preflight selects. Nothing chronicle calls changed.
 - The README states chronicle's stability policy (0.x, tracking Zig 0.17.x; a breaking change only in a minor release, with its CHANGELOG entry; a patch release never breaks).
 - The journal's contracts left on `std.debug.assert` (the tail's room and order, the header line, the time bounds, the index layout; a staged line's newline check, a scan of the line, stays a debug assertion until it is measured) are `aegis.assert.invariant`: they hold in every build, where they were undefined behaviour in ReleaseFast.
 - Development: the tests' and benches' flags, counters and stamps are `aegis.Atomic` cells of a two-state enum, a `units.Count` or a `units.Instant`, where they were raw `std.atomic.Value`s.

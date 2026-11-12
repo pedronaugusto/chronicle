@@ -159,7 +159,7 @@ pub fn dev(b: *std.Build, tools: type) void {
                 .{ .name = "work-bench", .source = "bench/work_bench.zig" },
                 .{ .name = "cover-bench", .source = "bench/cover_bench.zig" },
             },
-            .imports = benchImports,
+            .imports = tools.preflight.Bench.importsFrom(benchImports),
             .target = target,
             .optimize = optimize,
         },
