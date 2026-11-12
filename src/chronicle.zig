@@ -1288,9 +1288,11 @@ pub fn Journal(comptime Event: type) type {
         /// Each copy is written under a temporary beside its name, a shared
         /// clone where the filesystem makes one, and the copies are made
         /// durable together with the destination directory: one airlock
-        /// batch, a writeout of each file and one flush of the device on
-        /// macOS and Windows, where a sync of each would flush it once per
-        /// file. Nothing is under a copy's name until the whole copy is.
+        /// batch, a writeout of each file and the device calls airlock plans
+        /// for a batch (`airlock.Batch.device_calls`: a barrier and one flush
+        /// on macOS, a flush before the renames and one after on Windows),
+        /// where a sync of each would flush the device once per file.
+        /// Nothing is under a copy's name until the whole copy is.
         ///
         /// Safe to call from any task or thread.
         pub fn backup(self: *Self, io: Io, dest: []const u8) BackupError!Seq {

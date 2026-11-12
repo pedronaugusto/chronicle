@@ -1203,7 +1203,7 @@ test "a sync that fails on an append latches the journal, and nothing is synced 
     try testing.expectEqual(before + 1, hooked.syncs());
 }
 
-test "a backup makes every copy durable, a clone too, with one flush of the device" {
+test "a backup makes every copy durable, a clone too, with the device flushes airlock's batch plan takes" {
     const io = testing.io;
     var ws = try Workspace.init("log");
     defer ws.deinit();
@@ -1224,12 +1224,14 @@ test "a backup makes every copy durable, a clone too, with one flush of the devi
     while (try walk.next(io)) |_| copied += 1;
     try testing.expect(copied >= 4);
 
-    // Each file is synced once, shared extents or not: a writeout of each
-    // and one flush of the device where the platform has a cheaper call
-    // than the flush (macOS, Windows), a data sync of each on Linux.
+    // Each file is synced once, shared extents or not: a writeout of each where the platform
+    // has a cheaper call than a flush (macOS, Windows), a data sync of each on Linux. The
+    // device calls are one batch's, as airlock plans them: a barrier and one flush on macOS,
+    // a flush before the renames and one after on Windows, none on Linux.
     const per_file: seam.Call = if (builtin.target.os.tag == .linux) .sync_data else .sync_writeout;
     try testing.expect(hooked.count(per_file) >= copied);
-    try testing.expectEqual(@as(u32, if (builtin.target.os.tag == .linux) 0 else 1), hooked.count(.sync_full));
+    try testing.expectEqual(airlock.Batch.device_calls.full, hooked.count(.sync_full));
+    try testing.expectEqual(airlock.Batch.device_calls.barrier, hooked.count(.sync_barrier));
 }
 
 test "writing a file beside the log never writes into another writer's temporary" {
