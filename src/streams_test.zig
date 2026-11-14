@@ -7,6 +7,7 @@ const std = @import("std");
 const testing = std.testing;
 const Io = std.Io;
 const chronicle = @import("chronicle.zig");
+const shakedown = @import("shakedown");
 
 const Event = union(enum) {
     deposited: struct { amount: u32 },
@@ -371,4 +372,78 @@ test "a backup carries the streams' truncation points" {
     defer journal.deinit(io);
     var buf: [8]u32 = undefined;
     try testing.expectEqualSlices(u32, &.{ 2, 3 }, try amounts(journal, "p", chronicle.no_version, &buf));
+}
+
+/// Appends into three streams with any expectation, a reopen now and then,
+/// against a model of each stream's version and records: an append writes
+/// only while its stream holds what it expected, all of a batch or none,
+/// and otherwise is `WrongExpectedVersion` with nothing written; each stream
+/// reads back its own records in order, the global sequence holding them all.
+fn streamProgram(_: void, c: *shakedown.Case) anyerror!void {
+    const io = testing.io;
+    const s = c.source;
+    var place = try Place.init();
+    defer place.deinit();
+    const options: Journal.Options = .{ .max_segment_records = .fromRaw(3) };
+    var journal = try Journal.open(testing.allocator, io, place.path, options);
+    defer journal.deinit(io);
+    const ids = [_][]const u8{ "s0", "s1", "s2" };
+    var versions: [3]u64 = @splat(0);
+    var written: [3][64]u32 = undefined;
+    var counts: [3]usize = @splat(0);
+    var seq: u64 = 0;
+    var next: u32 = 1;
+    var time: i64 = 1;
+    while (s.more(30)) {
+        if (shakedown.gen.intRange(s, u8, 0, 9) == 0) {
+            journal.deinit(io);
+            journal = try Journal.open(testing.allocator, io, place.path, options);
+            continue;
+        }
+        const k = shakedown.gen.intRange(s, usize, 0, ids.len - 1);
+        const expected: Journal.StreamExpected = switch (shakedown.gen.intRange(s, u8, 0, 3)) {
+            0 => .any,
+            1 => .no_stream,
+            2 => .exists,
+            else => .{ .exact = .fromRaw(shakedown.gen.intRange(s, u64, 1, versions[k] + 1)) },
+        };
+        const holds = switch (expected) {
+            .any => true,
+            .no_stream => versions[k] == 0,
+            .exists => versions[k] != 0,
+            .exact => |v| v.raw() == versions[k],
+        };
+        const n = shakedown.gen.intRange(s, usize, 1, 3);
+        if (counts[k] + n > written[k].len) break;
+        var entries: [3]Journal.Entry = undefined;
+        for (entries[0..n], 0..) |*e, i| e.* = .{ .at = .fromRaw(time + @as(i64, @intCast(i))), .event = deposit(next + @as(u32, @intCast(i))) };
+        const result = if (n == 1 and shakedown.gen.boolean(s))
+            journal.appendTo(io, stream(ids[k]), expected, entries[0].at, entries[0].event)
+        else
+            journal.appendAllTo(io, stream(ids[k]), expected, entries[0..n], if (shakedown.gen.boolean(s)) .atomic else .group);
+        if (!holds) {
+            try testing.expectError(error.WrongExpectedVersion, result);
+        } else {
+            const appended = try result;
+            seq += n;
+            versions[k] += n;
+            try testing.expectEqual(Seq.fromRaw(seq), appended.seq);
+            try testing.expectEqual(StreamVersion.fromRaw(versions[k]), appended.version);
+            for (0..n) |i| written[k][counts[k] + i] = next + @as(u32, @intCast(i));
+            counts[k] += n;
+        }
+        next += @intCast(n);
+        time += @intCast(n);
+        try testing.expectEqual(Seq.fromRaw(seq), try journal.lastSeq(io));
+    }
+    var buf: [64]u32 = undefined;
+    for (ids, 0..) |id, k| {
+        try testing.expectEqualSlices(u32, written[k][0..counts[k]], try amounts(journal, id, chronicle.no_version, &buf));
+        const version = try journal.streamVersion(io, stream(id));
+        if (versions[k] == 0) try testing.expectEqual(chronicle.no_version, version) else try testing.expectEqual(StreamVersion.fromRaw(versions[k]), version);
+    }
+}
+
+test "appends into streams hold to their expectations, all or none, against a model" {
+    try shakedown.check(testing.allocator, {}, streamProgram, .{ .cases = 150 });
 }
