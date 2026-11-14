@@ -375,7 +375,7 @@ pub const Index = struct {
 
         pub fn next(it: *Iterator) ?Section {
             if (it.at == it.bytes.len) return null;
-            return sectionAt(it.bytes, &it.at) catch unreachable; // `parse` walked every section of these bytes, and refused them otherwise
+            return sectionAt(it.bytes, &it.at) catch unreachable; // glint-ignore: Z026 -- `parse` walked every section of these bytes, and refused them otherwise
         }
     };
 
@@ -514,9 +514,11 @@ pub const Heads = struct {
         }
         const i: u32 = if (heads.used < heads.capacity) blk: {
             if (heads.used == heads.nodes.items.len) {
+                // glint-ignore: Z026 -- out of memory, the head is not kept: a head is kept only when there is room
                 heads.nodes.append(heads.gpa, .{}) catch return;
             }
             // After the append: a rehash reads the nodes where they are now.
+            // glint-ignore: Z026 -- as the append above: no room, no head kept
             heads.map.ensureUnusedCapacityContext(heads.gpa, 1, heads.keys()) catch return;
             heads.used += 1;
             break :blk heads.used - 1;
