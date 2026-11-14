@@ -116,7 +116,7 @@ pub const SegmentHeader = struct {
     /// and ten of `root`.
     pub fn line(header: SegmentHeader, buffer: *[96]u8) []const u8 {
         var out: std.Io.Writer = .fixed(buffer);
-        strand.json.write(&out, Shape{ .chronicle = header.version, .base = header.base_seq.raw(), .root = header.root }, .{}) catch unreachable; // unreachable: three bounded unsigned integers and fixed JSON punctuation fit in 96 bytes
+        strand.json.write(&out, Shape{ .chronicle = header.version, .base = header.base_seq.raw(), .root = header.root }, .{}) catch unreachable; // glint-ignore: Z026 -- three bounded unsigned integers and fixed JSON punctuation fit in 96 bytes
         aegis.assert.invariant(out.end <= buffer.len, "the header line is inside its buffer");
         return out.buffered();
     }
@@ -2481,7 +2481,7 @@ pub fn chainTip(log: *const Self) u32 {
 pub fn stageLine(log: *Self, io: Io, bytes: []const u8, at: Time, checksum: u32, rotation: Rotation) Self.StageError!void {
     log.assertValid();
     if (log.active == null) return error.ReadOnly;
-    std.debug.assert(std.mem.findScalar(u8, bytes, '\n') == null);
+    aegis.assert.invariant(std.mem.findScalar(u8, bytes, '\n') == null, "std.mem.findScalar(u8, bytes, '\\n') == null");
     var segment = &log.segments.items[log.segments.items.len - 1];
 
     const needed: Bytes = .fromRaw(bytes.len + 1);
