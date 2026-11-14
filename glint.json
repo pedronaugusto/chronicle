@@ -53,5 +53,21 @@
       "replacement": "airlock.create and its commit",
       "scope": "production"
     }
+  ],
+  "seams": [
+    {
+      "file": "src/journal/Log.zig",
+      "rules": [
+        "A009"
+      ],
+      "reason": "the log's own files read back: segments, the snapshot and the truncation record, each record checked by its CRC-32C before it is used and refused as corrupt otherwise"
+    },
+    {
+      "file": "src/journal.zig",
+      "rules": [
+        "A009"
+      ],
+      "reason": "the journal's reads of its log's files: a record's line, a snapshot and a backup's copy, each parsed and checked by the log's checksum before it is trusted"
+    }
   ]
 }

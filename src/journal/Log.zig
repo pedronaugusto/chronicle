@@ -1826,7 +1826,7 @@ pub const Scan = struct {
 
     gpa: Allocator,
     /// The log's directory, which the log closes.
-    dir: Io.Dir,
+    dir: aegis.own.Unowned(Io.Dir),
     /// The base sequence numbers of the segments still to walk, oldest first.
     bases: []Seq,
     /// Allocated storage retained when a scan is armed again.
@@ -1974,7 +1974,7 @@ pub const Scan = struct {
                 continue;
             }
             if (scan.file == null) {
-                const file = try scan.dir.openFile(io, &segmentName(segment_extension, scan.bases[scan.at]), .{});
+                const file = try scan.dir.get().openFile(io, &segmentName(segment_extension, scan.bases[scan.at]), .{});
                 scan.file = .init(file);
                 scan.reader = file.reader(io, scan.buffer);
                 if (scan.position != values.no_bytes) try scan.reader.seekTo(scan.position.raw());
@@ -2108,7 +2108,7 @@ fn scanOver(log: *Self, segments: []const Segment, position: Bytes, extent: Scan
 
     var scan: Scan = .{
         .gpa = log.gpa,
-        .dir = log.dir.borrow().*,
+        .dir = .of(log.dir.borrow().*),
         .bases = bases_storage[0..0],
         .bases_storage = bases_storage,
         .limits = limits_storage[0..0],
@@ -3499,7 +3499,7 @@ const backup_temp_prefix = ".backup-";
 /// directory, which makes every name created or removed there durable.
 const Copies = struct {
     /// `backup`'s, which closes it once the batch is done with it.
-    dest: Io.Dir,
+    dest: aegis.own.Unowned(Io.Dir),
     /// Where the batch runs its syncs: the log's `Options.blocking`.
     blocking: ?*airlock.Blocking,
     batch: airlock.Batch,
@@ -3512,7 +3512,7 @@ const Copies = struct {
 
     /// In place: the batch keeps a pointer to `slots`, and to each pending.
     fn init(c: *Copies, dest: Io.Dir, blocking: ?*airlock.Blocking) void {
-        c.dest = dest;
+        c.dest = .of(dest);
         c.blocking = blocking;
         c.batch = .init(&c.slots);
         c.len = 0;
@@ -3525,7 +3525,7 @@ const Copies = struct {
         const stored = c.names[c.len][0..name.len];
         @memcpy(stored, name);
         const p = &c.pendings[c.len];
-        p.* = try airlock.create(io, c.dest, stored, .{ .temp = .{ .random = backup_temp_prefix } });
+        p.* = try airlock.create(io, c.dest.get(), stored, .{ .temp = .{ .random = backup_temp_prefix } });
         c.len += 1;
         const by = p.copyFrom(io, from, .{ .limit = if (limit) |l| l.raw() else null }) catch |err| switch (err) {
             // The file was longer a moment ago. Something is rewriting the
@@ -3540,7 +3540,7 @@ const Copies = struct {
     /// The copies added so far made durable and published, and with
     /// `.directory` the destination's names too.
     fn flush(c: *Copies, io: Io, what: enum { files, directory }) BackupError!void {
-        if (what == .directory) c.batch.addDir(c.dest);
+        if (what == .directory) c.batch.addDir(c.dest.get());
         _ = try c.batch.commit(io, .{ .level = .data, .blocking = c.blocking });
         c.endAll(io);
     }

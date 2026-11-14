@@ -2138,8 +2138,8 @@ pub fn Journal(comptime Event: type) type {
                         break :line try s.log.lineOf(io, place.segment, place.offset) orelse continue;
                     };
                     defer self.gpa.free(line);
+                    // glint-ignore: Z026 -- a record rewritten or gone since the read began is passed over
                     const header = parseHeader({}, line) catch |err| switch (err) {
-                        // A record rewritten or gone since the read began.
                         error.CorruptRecord, error.ChecksumMismatch => continue,
                     };
                     const in = header.in_stream orelse continue;
