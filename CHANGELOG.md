@@ -24,6 +24,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Development on preflight's ci-standard f991816 and shakedown 327bc61, whose fuzz runner takes the options preflight passes it.
 - Pins airlock 52aac37, still 0.6.0, for `Batch.device_calls`: the backup test asserts the device calls airlock plans for a batch, where it expected one flush on Windows too (Windows has no barrier, so a batch flushes before its renames and after); the backup's documentation says the same.
 - Pins aegis c8982a8, still 0.2.4: six additive commits after 3c0b13e (the role declarations a linter reads, `lint_rules`), the aegis the development build's preflight selects. Nothing chronicle calls changed.
 - The README states chronicle's stability policy (0.x, tracking Zig 0.17.x; a breaking change only in a minor release, with its CHANGELOG entry; a patch release never breaks).
