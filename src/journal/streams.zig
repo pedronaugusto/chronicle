@@ -18,7 +18,7 @@ const log = std.log.scoped(.chronicle);
 const aegis = @import("aegis");
 const Allocator = std.mem.Allocator;
 const values = @import("values.zig");
-const Crc32c = @import("warp").Crc32c;
+const format = @import("index.zig").format;
 
 const Seq = values.Seq;
 const Bytes = values.Bytes;
@@ -81,67 +81,6 @@ pub fn idOf(value: []const u8) ?Stream {
 }
 
 //=========================================================================
-// The filter.
-//=========================================================================
-
-/// A bloom filter over stream ids: about ten bits a stream and seven probes,
-/// about one false positive in a hundred, and never a false negative.
-pub const Filter = struct {
-    words: []const u64,
-
-    pub const probes = 7;
-    pub const bits_per_stream = 10;
-
-    /// How many 64-bit words a filter over `streams` streams takes.
-    pub fn wordsFor(streams: usize) usize {
-        const bits = @max(64, streams *| bits_per_stream);
-        return (bits + 63) / 64;
-    }
-
-    /// Set the bits of `id` in `words`.
-    pub fn add(words: []u64, id: []const u8) void {
-        var it = Probes.init(id, words.len * 64);
-        for (0..probes) |_| {
-            const bit = it.next();
-            words[bit / 64] |= @as(u64, 1) << @intCast(bit % 64);
-        }
-    }
-
-    /// Whether `id` may be among the streams: false is certain.
-    pub fn mayHold(filter: Filter, id: []const u8) bool {
-        if (filter.words.len == 0) return false;
-        var it = Probes.init(id, filter.words.len * 64);
-        for (0..probes) |_| {
-            const bit = it.next();
-            if (filter.words[bit / 64] & (@as(u64, 1) << @intCast(bit % 64)) == 0) return false;
-        }
-        return true;
-    }
-
-    /// Double hashing over two independent 64-bit hashes of the id.
-    const Probes = struct {
-        h1: u64,
-        h2: u64,
-        bits: u64,
-        i: u64 = 0,
-
-        fn init(id: []const u8, bits: usize) Probes {
-            return .{
-                .h1 = std.hash.Wyhash.hash(0x6368726f6e69636c, id),
-                .h2 = std.hash.Wyhash.hash(0x73747265616d7321, id) | 1,
-                .bits = bits,
-            };
-        }
-
-        fn next(p: *Probes) usize {
-            const at = (p.h1 +% p.i *% p.h2) % p.bits;
-            p.i += 1;
-            return @intCast(at);
-        }
-    };
-};
-
-//=========================================================================
 // The stream index of a sealed segment.
 //=========================================================================
 
@@ -162,113 +101,29 @@ pub const Placed = struct {
 
 pub const extension = ".sdx";
 
-const magic = "chronsdx".*;
-const format: u32 = 1;
-
-/// The header: what the index describes, so an index of other bytes is
-/// refused and rebuilt.
-const Header = extern struct {
-    magic: [8]u8,
-    format: u32,
-    streams: u32,
-    words: u32,
-    pad: u32 = 0,
-    base_seq: u64,
-    /// The length of the segment's file the index was made from.
-    segment_bytes: u64,
-};
-
-const header_bytes = @sizeOf(Header);
-
-/// A record in a stream's section: its version, seq and offset.
-const entry_bytes = 24;
-
-/// The index file of a segment holding `placed` (in the order they were
-/// appended), into `out`: the header, the filter, then each stream sorted by
-/// id with its records in order, then a CRC-32C of everything before it.
-///
-/// A stream's section: the id's length (one byte), the id, how many records
-/// (u32), then each record's version, seq and offset (u64 each). Little
-/// endian throughout.
-pub fn encode(gpa: Allocator, base_seq: Seq, segment_bytes: Bytes, placed: []const Placed, out: *std.ArrayList(u8)) Allocator.Error!void {
-    // The streams, each once, sorted by id; the records of each keep their
-    // order, which is the order of their versions.
-    const order = try gpa.alloc(usize, placed.len);
-    defer gpa.free(order);
-    for (order, 0..) |*o, i| o.* = i;
-    std.sort.pdq(usize, order, placed, struct {
-        fn lessThan(p: []const Placed, a: usize, b: usize) bool {
-            return switch (std.mem.order(u8, p[a].id, p[b].id)) {
-                .lt => true,
-                .gt => false,
-                .eq => a < b,
-            };
-        }
-    }.lessThan);
-    var streams: usize = 0;
-    for (order, 0..) |o, i| {
-        if (i == 0 or !std.mem.eql(u8, placed[order[i - 1]].id, placed[o].id)) streams += 1;
-    }
-    const words = Filter.wordsFor(streams);
-
-    out.clearRetainingCapacity();
-    const header: Header = .{
-        .magic = magic,
-        .format = format,
-        .streams = @intCast(streams),
-        .words = @intCast(words),
-        .base_seq = base_seq.raw(),
-        .segment_bytes = segment_bytes.raw(),
-    };
-    try out.appendSlice(gpa, std.mem.asBytes(&header));
-    const filter_at = out.items.len;
-    try out.appendNTimes(gpa, 0, words * 8);
-
-    var i: usize = 0;
-    while (i < order.len) {
-        const id = placed[order[i]].id;
-        var end = i + 1;
-        while (end < order.len and std.mem.eql(u8, placed[order[end]].id, id)) end += 1;
-        try out.append(gpa, @intCast(id.len));
-        try out.appendSlice(gpa, id);
-        try appendInt(gpa, out, u32, @intCast(end - i));
-        for (order[i..end]) |o| {
-            const e = placed[o].entry;
-            try appendInt(gpa, out, u64, e.version.raw());
-            try appendInt(gpa, out, u64, e.seq.raw());
-            try appendInt(gpa, out, u64, e.offset.raw());
-        }
-        i = end;
-    }
-    // The filter, set from the ids now that the buffer has stopped moving.
-    {
-        const bits = try gpa.alloc(u64, words);
-        defer gpa.free(bits);
-        @memset(bits, 0);
-        var j: usize = 0;
-        while (j < order.len) : (j += 1) {
-            if (j == 0 or !std.mem.eql(u8, placed[order[j - 1]].id, placed[order[j]].id)) Filter.add(bits, placed[order[j]].id);
-        }
-        for (bits, 0..) |w, k| std.mem.writeInt(u64, out.items[filter_at + k * 8 ..][0..8], w, .little);
-    }
-    try appendInt(gpa, out, u32, Crc32c.hash(out.items));
+/// The stream index is the field index format's (`index/format.zig`): the
+/// exact index named `stream`, whose keys are the streams' ids, kept whole,
+/// and whose extra column is each record's version. Version 1 of it; a stream
+/// index in the format before, one of its own, reads as no index and is
+/// rebuilt.
+fn indexOf(base_seq: Seq, segment_bytes: Bytes) format.Of {
+    return .{ .base_seq = base_seq, .segment_bytes = segment_bytes, .name = "stream", .version = 1, .kind = .exact, .extra = true };
 }
 
-fn appendInt(gpa: Allocator, out: *std.ArrayList(u8), comptime T: type, value: T) Allocator.Error!void {
-    var bytes: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &bytes, value, .little);
-    try out.appendSlice(gpa, &bytes);
+/// The index file of a segment holding `placed` (in the order they were
+/// appended), into `out`.
+pub fn encode(gpa: Allocator, base_seq: Seq, segment_bytes: Bytes, placed: []const Placed, out: *std.ArrayList(u8)) Allocator.Error!void {
+    const entries = try gpa.alloc(format.Entry, placed.len);
+    defer gpa.free(entries);
+    for (entries, placed) |*e, p| e.* = .exact(p.id, p.entry.seq, p.entry.offset, p.entry.version.raw());
+    return format.encode(gpa, indexOf(base_seq, segment_bytes), entries, out);
 }
 
 /// A stream index read whole, checked against what it must describe.
 pub const Index = struct {
-    /// The file, owned by whoever read it (`deinit`).
-    file: []const u8,
-    /// The file without its checksum.
-    bytes: []const u8,
+    index: format.Index,
+    /// How many streams the segment holds.
     streams: u32,
-    /// Where the streams' sections start.
-    sections: usize,
 
     pub const Refused = error{NotStreamIndex};
 
@@ -277,127 +132,72 @@ pub const Index = struct {
     pub const Of = struct { base_seq: Seq, bytes: Bytes };
 
     /// The index in `text` (an index file read whole) when it is one of
-    /// segment `of`, whole and unaltered: its checksum holds, it names the
-    /// segment, and its sections are what `encode` writes, each lying
-    /// inside the file, each stream once and in order of id, each stream's
-    /// records in order of version. Borrows `text`.
+    /// segment `of`, as `format.Index.parse` checks it, and its streams'
+    /// records are what a journal writes: each id a valid stream id, each
+    /// stream's versions rising from 1 and at most `last_version`. Borrows
+    /// `text`.
     pub fn parse(text: Unparsed, of: Of) Refused!Index {
-        return text.parse(of, parseFile);
-    }
-
-    fn parseFile(of: Of, file: []const u8) Refused!Index {
-        if (file.len < header_bytes + 4) return error.NotStreamIndex;
-        const body = file[0 .. file.len - 4];
-        if (Crc32c.hash(body) != std.mem.readInt(u32, file[file.len - 4 ..][0..4], .little)) return error.NotStreamIndex;
-        var header: Header = undefined;
-        @memcpy(std.mem.asBytes(&header), body[0..header_bytes]);
-        if (!std.mem.eql(u8, &header.magic, &magic) or header.format != format) return error.NotStreamIndex;
-        if (!of.base_seq.eql(.fromRaw(header.base_seq)) or !of.bytes.eql(.fromRaw(header.segment_bytes))) return error.NotStreamIndex;
-        const filter_end = std.math.add(usize, header_bytes, std.math.mul(usize, header.words, 8) catch return error.NotStreamIndex) catch return error.NotStreamIndex;
-        if (filter_end > body.len) return error.NotStreamIndex;
-        var at = filter_end;
-        var n: u32 = 0;
-        var previous: ?[]const u8 = null;
-        while (at != body.len) {
-            const section = try sectionAt(body, &at);
-            if (previous) |p| if (std.mem.order(u8, p, section.id) != .lt) return error.NotStreamIndex;
-            previous = section.id;
+        const index = format.Index.parse(text, indexOf(of.base_seq, of.bytes)) catch return error.NotStreamIndex;
+        for (0..index.keys) |k| {
+            if (!valid(index.keyAt(k))) return error.NotStreamIndex;
+            const run = index.postingsOf(k);
             var version = no_version;
-            for (0..section.len()) |i| {
-                const v = section.at(i).version;
+            for (run.first..run.end) |i| {
+                const v: StreamVersion = .fromRaw(index.at(i).extra);
                 if (v.compare(version) != .gt or v.compare(last_version) == .gt) return error.NotStreamIndex;
                 version = v;
             }
-            n = std.math.add(u32, n, 1) catch return error.NotStreamIndex;
         }
-        if (n != header.streams) return error.NotStreamIndex;
-        return .{ .file = file, .bytes = body, .streams = header.streams, .sections = filter_end };
-    }
-
-    /// The section at `at.*` in `body`, `at.*` moved past it; refused when
-    /// it does not lie whole inside `body` or names no valid stream.
-    fn sectionAt(body: []const u8, at: *usize) Refused!Section {
-        const rest = body[at.*..];
-        if (rest.len < 1) return error.NotStreamIndex;
-        // At most 1 + 255 + 4: no sum here can overflow.
-        const id_end = 1 + @as(usize, rest[0]);
-        const records_at = id_end + 4;
-        if (rest.len < records_at) return error.NotStreamIndex;
-        const id = rest[1..id_end]; // id_end < records_at <= rest.len, checked above
-        const count = std.mem.readInt(u32, rest[id_end..][0..4], .little); // id_end + 4 = records_at <= rest.len, checked above
-        const records_len = std.math.mul(usize, count, entry_bytes) catch return error.NotStreamIndex;
-        if (count == 0 or !valid(id) or rest.len - records_at < records_len) return error.NotStreamIndex;
-        at.* += records_at + records_len; // records_at + records_len <= rest.len = body.len - at, checked above
-        return .{ .id = id, .records = rest[records_at..][0..records_len] };
+        return .{ .index = index, .streams = index.keys };
     }
 
     /// The file given back to `gpa`, which read it.
     pub fn deinit(index: Index, gpa: Allocator) void {
-        gpa.free(index.file);
+        gpa.free(index.index.file);
     }
 
     /// Whether the index's filter says `id` may be in the segment.
     pub fn mayHold(index: Index, id: []const u8) bool {
-        const words_at = header_bytes;
-        const words = (index.sections - words_at) / 8;
-        if (words == 0) return false;
-        var it = Filter.Probes.init(id, words * 64);
-        for (0..Filter.probes) |_| {
-            const bit = it.next();
-            const word = std.mem.readInt(u64, index.bytes[words_at + (bit / 64) * 8 ..][0..8], .little);
-            if (word & (@as(u64, 1) << @intCast(bit % 64)) == 0) return false;
-        }
-        return true;
+        return index.index.mayHold(id);
     }
 
     /// The records of stream `id` in the segment, oldest first, or null when
     /// it holds none.
     pub fn find(index: Index, id: []const u8) ?Section {
-        if (!index.mayHold(id)) return null;
-        var it = index.iterator();
-        while (it.next()) |section| {
-            switch (std.mem.order(u8, section.id, id)) {
-                .lt => continue,
-                .eq => return section,
-                .gt => return null,
-            }
-        }
-        return null;
+        const run = index.index.find(id);
+        if (run.first == run.end) return null;
+        return .{ .id = id, .index = index.index, .run = run };
     }
 
     pub fn iterator(index: Index) Iterator {
-        return .{ .bytes = index.bytes, .at = index.sections };
+        return .{ .index = index.index };
     }
 
-    /// The sections of an index `parse` checked, in order of id.
+    /// The streams of an index, in order of id.
     pub const Iterator = struct {
-        bytes: []const u8,
-        at: usize,
+        index: format.Index,
+        at: usize = 0,
 
         pub fn next(it: *Iterator) ?Section {
-            if (it.at == it.bytes.len) return null;
-            // `parse` walked every section of these bytes and refused them
-            // otherwise: a section that did not read would end the walk.
-            return sectionAt(it.bytes, &it.at) catch null;
+            if (it.at == it.index.keys) return null;
+            defer it.at += 1;
+            return .{ .id = it.index.keyAt(it.at), .index = it.index, .run = it.index.postingsOf(it.at) };
         }
     };
 
     /// One stream's records in a segment.
     pub const Section = struct {
         id: []const u8,
-        records: []const u8,
+        index: format.Index,
+        run: format.Index.Run,
 
         pub fn len(section: Section) usize {
-            return section.records.len / entry_bytes;
+            return section.run.end - section.run.first;
         }
 
         pub fn at(section: Section, i: usize) Entry {
-            const r = section.records[i * entry_bytes ..][0..entry_bytes];
-            return .{
-                .version = .fromRaw(std.mem.readInt(u64, r[0..8], .little)),
-                .seq = .fromRaw(std.mem.readInt(u64, r[8..16], .little)),
-                .offset = .fromRaw(std.mem.readInt(u64, r[16..24], .little)),
-            };
+            const p = section.index.at(section.run.first + i);
+            return .{ .version = .fromRaw(p.extra), .seq = p.seq, .offset = p.offset };
         }
 
         pub fn last(section: Section) Entry {
@@ -700,21 +500,6 @@ test "a stream id is printable ASCII with neither quote nor backslash, 1 to 255 
     try testing.expect(idOf("7") == null);
 }
 
-test "a filter never forgets a stream it holds, and refuses most it does not" {
-    const ids = 2000;
-    var words: [Filter.wordsFor(ids)]u64 = @splat(0);
-    var name: [16]u8 = undefined;
-    for (0..ids) |i| Filter.add(&words, std.mem.print(&name, "in-{d}", .{i}) catch unreachable);
-    const filter: Filter = .{ .words = &words };
-    for (0..ids) |i| try testing.expect(filter.mayHold(std.mem.print(&name, "in-{d}", .{i}) catch unreachable));
-    var wrong: usize = 0;
-    for (0..ids) |i| {
-        if (filter.mayHold(std.mem.print(&name, "out-{d}", .{i}) catch unreachable)) wrong += 1;
-    }
-    // About 1%; 3% is far outside what ten bits a stream gives.
-    try testing.expect(wrong < ids * 3 / 100);
-}
-
 test "a stream index finds each stream's records and refuses one of other bytes" {
     const gpa = testing.allocator;
     const placed = [_]Placed{
@@ -739,45 +524,26 @@ test "a stream index finds each stream's records and refuses one of other bytes"
     try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
 }
 
-/// `out`'s checksum written again over what is before it, as if the index
-/// had been written with what it now says.
-fn reseal(out: []u8) void {
-    std.mem.writeInt(u32, out[out.len - 4 ..][0..4], Crc32c.hash(out[0 .. out.len - 4]), .little);
-}
-
-test "a stream index whose checksum holds is still refused when its sections are not what encode writes" {
+test "a field index whose checksum holds is still no stream index when its ids or versions are not a journal's" {
     const gpa = testing.allocator;
-    const placed = [_]Placed{
-        .{ .id = "a", .entry = .{ .version = .fromRaw(1), .seq = .fromRaw(10), .offset = .fromRaw(0) } },
-        .{ .id = "a", .entry = .{ .version = .fromRaw(2), .seq = .fromRaw(11), .offset = .fromRaw(50) } },
-        .{ .id = "b", .entry = .{ .version = .fromRaw(1), .seq = .fromRaw(12), .offset = .fromRaw(100) } },
-    };
     const of: Index.Of = .{ .base_seq = .fromRaw(10), .bytes = .fromRaw(200) };
+    const cases = [_][2]format.Entry{
+        // Versions falling within a stream.
+        .{ .exact("a", .fromRaw(10), .fromRaw(0), 2), .exact("a", .fromRaw(11), .fromRaw(50), 1) },
+        // A version repeated.
+        .{ .exact("a", .fromRaw(10), .fromRaw(0), 1), .exact("a", .fromRaw(11), .fromRaw(50), 1) },
+        // A version of zero, and one past the last a record can have.
+        .{ .exact("a", .fromRaw(10), .fromRaw(0), 0), .exact("b", .fromRaw(11), .fromRaw(50), 1) },
+        .{ .exact("a", .fromRaw(10), .fromRaw(0), 1), .exact("b", .fromRaw(11), .fromRaw(50), last_version.raw() + 1) },
+        // An id no stream can have.
+        .{ .exact("a\"b", .fromRaw(10), .fromRaw(0), 1), .exact("b", .fromRaw(11), .fromRaw(50), 1) },
+    };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
-    try encode(gpa, of.base_seq, of.bytes, &placed, &out);
-    const good = try gpa.dupe(u8, out.items);
-    defer gpa.free(good);
-    _ = try Index.parse(.init(out.items), of);
-    const sections = (try Index.parse(.init(good), of)).sections;
-    const b_at = sections + 1 + 1 + 4 + 2 * entry_bytes;
-
-    // Stream "b" renamed "a": the same stream twice.
-    out.items[b_at + 1] = 'a';
-    reseal(out.items);
-    try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
-
-    // Stream "a"'s second version made its first's again.
-    @memcpy(out.items, good);
-    std.mem.writeInt(u64, out.items[sections + 1 + 1 + 4 + entry_bytes ..][0..8], 1, .little);
-    reseal(out.items);
-    try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
-
-    // Stream "b" said to hold more records than the file has room for.
-    @memcpy(out.items, good);
-    std.mem.writeInt(u32, out.items[b_at + 1 + 1 ..][0..4], std.math.maxInt(u32), .little);
-    reseal(out.items);
-    try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
+    for (cases) |entries| {
+        try format.encode(gpa, indexOf(of.base_seq, of.bytes), &entries, &out);
+        try testing.expectError(error.NotStreamIndex, Index.parse(.init(out.items), of));
+    }
 }
 
 test "a truncation point put back is the one it was, an absent one absent again" {

@@ -129,15 +129,16 @@ end at `last_version` (`maxInt(i64)`); an append that would pass it is
 **Where a stream's records are.** The active segment's are kept in memory (the
 book's `placed`, read again from the segment whenever the book may be stale, such
 as after an append that failed). Each sealed segment has a stream index beside it,
-written when it is sealed: a header naming the segment's first record and length,
-a bloom filter (ten bits a stream, seven probes from one Wyhash), then each stream
-in order of id with its records in order of version, then a CRC-32C. The index is
-read whole through `aegis.own.readFile`, at most the segment's length and a
-header, and `Index.parse` is its one reader: the checksum, the segment it names,
-and every section lying whole inside the file, each stream once and in order,
-each stream's versions rising. What it refuses is rebuilt from the segment; a
-segment that cannot give an index `parse` accepts is `CorruptRecord`. An index
-`parse` accepted is walked without checks.
+`<base>.sdx`, written when it is sealed: the field index format's exact index
+named `stream` (below, under Field indexes), its keys the streams' ids, kept
+whole, its extra column each record's version, written under a temporary name
+and renamed into place with no sync. It is read whole through
+`aegis.own.readFile`, at most the segment's length and a header, and
+`streams.Index.parse` is its one reader: the field index's checks, then each id a
+valid stream id and each stream's versions rising from 1. What it refuses is
+rebuilt from the segment, a stream index in the format before among it;
+a segment that cannot give an index `parse` accepts is `CorruptRecord`. An index
+`parse` accepted is walked without checks, and lists the streams a segment holds.
 
 **Heads.** A stream's newest version is the active segment's, else the newest
 segment whose index holds it, read newest first. The ones found are kept in an

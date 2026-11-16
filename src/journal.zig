@@ -2294,11 +2294,11 @@ pub fn Journal(comptime Event: type) type {
             book.resetActive(segments[segments.len - 1].base_seq);
         }
 
-        fn writeStreamIndex(self: *Self, s: *State, io: Io, segment: Log.Segment, placed: []const streams.Placed) (Allocator.Error || Io.Dir.WriteFileError)!void {
+        fn writeStreamIndex(self: *Self, s: *State, io: Io, segment: Log.Segment, placed: []const streams.Placed) (Allocator.Error || Log.WriteFileError)!void {
             const buf = &s.streams.buf;
             try streams.encode(self.gpa, segment.base_seq, segment.bytes, placed, buf);
             const name = Log.segmentName(Log.stream_index_extension, segment.base_seq);
-            try s.log.dir.borrow().writeFile(io, .{ .sub_path = &name, .data = buf.items });
+            try s.log.writeCache(io, &name, buf.items);
         }
 
         /// Segment `segment`'s stream index, read whole and owned by the
@@ -2354,7 +2354,7 @@ pub fn Journal(comptime Event: type) type {
             // A segment that gives a stream's versions out of order is not
             // one this journal wrote: no index of it would be read.
             const index = streams.Index.parse(.init(bytes), of) catch return error.CorruptRecord;
-            if (self.config.access == .write) s.log.dir.borrow().writeFile(io, .{ .sub_path = &name, .data = bytes }) catch |err| {
+            if (self.config.access == .write) s.log.writeCache(io, &name, bytes) catch |err| {
                 std.log.debug("optional stream index maintenance: {t}", .{err});
             };
             if (placed.items.len == 0) {

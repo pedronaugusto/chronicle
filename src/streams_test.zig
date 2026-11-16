@@ -186,6 +186,54 @@ test "a stream index that is missing or damaged is rebuilt from its segment" {
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5 }, try amounts(journal, "s", chronicle.no_version, &buf));
 }
 
+/// A stream index in the format before, as its encoder wrote it, of segment `base` whose file is `segment_bytes` long: one stream,
+/// `id`, with one record at `version`, `seq` and `offset`.
+fn oldStreamIndex(buf: []u8, base: u64, segment_bytes: u64, id: []const u8, version: u64, seq: u64, offset: u64) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    w.writeAll("chronsdx") catch unreachable; // unreachable: the tests give room
+    for ([_]u32{ 1, 1, 1, 0 }) |v| w.writeInt(u32, v, .little) catch unreachable; // format, streams, filter words, pad
+    w.writeInt(u64, base, .little) catch unreachable;
+    w.writeInt(u64, segment_bytes, .little) catch unreachable;
+    w.writeInt(u64, std.math.maxInt(u64), .little) catch unreachable; // a filter that holds every id
+    w.writeByte(@intCast(id.len)) catch unreachable;
+    w.writeAll(id) catch unreachable;
+    w.writeInt(u32, 1, .little) catch unreachable;
+    for ([_]u64{ version, seq, offset }) |v| w.writeInt(u64, v, .little) catch unreachable;
+    const body = w.buffered();
+    w.writeInt(u32, std.hash.crc.@"CRC-32/ISCSI".hash(body), .little) catch unreachable;
+    return w.buffered();
+}
+
+test "a stream index of the format before, whole and checked as it was, is read as none and rebuilt" {
+    const io = testing.io;
+    var place = try Place.init();
+    defer place.deinit();
+    const options: Journal.Options = .{ .max_segment_records = .fromRaw(2) };
+    {
+        const journal = try Journal.open(testing.allocator, io, place.path, options);
+        defer journal.deinit(io);
+        for (0..6) |i| _ = try journal.appendTo(io, stream("s"), .any, .fromRaw(@intCast(i)), deposit(@intCast(i)));
+    }
+    var dir = try Io.Dir.cwd().openDir(io, place.path, .{ .iterate = true });
+    defer dir.close(io);
+    var name: [64]u8 = undefined;
+    // Segment 1's index in the old format, saying what its records do not: stream "s" at version 9.
+    const segment = try dir.readFileAlloc(io, &chronicle.segmentName(.fromRaw(1)), testing.allocator, .unlimited);
+    defer testing.allocator.free(segment);
+    var old: [128]u8 = undefined;
+    try dir.writeFile(io, .{ .sub_path = sdxName(&name, 1), .data = oldStreamIndex(&old, 1, segment.len, "s", 9, 1, 0) });
+
+    const journal = try Journal.open(testing.allocator, io, place.path, options);
+    defer journal.deinit(io);
+    var buf: [8]u32 = undefined;
+    try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 5 }, try amounts(journal, "s", chronicle.no_version, &buf));
+    try testing.expectEqual(StreamVersion.fromRaw(6), try journal.streamVersion(io, stream("s")));
+    // The one read in its place is this format's.
+    const rebuilt = try dir.readFileAlloc(io, sdxName(&name, 1), testing.allocator, .unlimited);
+    defer testing.allocator.free(rebuilt);
+    try testing.expectEqualStrings("chroncdx", rebuilt[0..8]);
+}
+
 test "streams past the heads kept in memory are found in the segments, each at its version" {
     const io = testing.io;
     var place = try Place.init();
