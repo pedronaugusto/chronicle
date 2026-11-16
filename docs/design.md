@@ -160,6 +160,39 @@ rewritten, and `verify` checks a stub against `sc` and the chain through `c`. A
 segment with a stub in it is format 2 in its header, so chronicle 0.10 refuses it
 rather than read a stub as a record.
 
+## Field indexes
+
+A field index of a sealed segment is a file of its own beside it,
+`<base>.<name>.cdx` (`journal/index/format.zig`), and like the stream index a
+cache: written when the segment seals and rebuilt from it whenever it does not
+describe it. Its header binds it to the segment (first record, length) and to
+the index (name, version, kind, whether it keeps an extra column); then the
+index's name, its summary, its keys and its postings, every part of a fixed
+width so a lookup bisects in place, and a CRC-32C.
+
+An exact index compares keys for equality. Its summary is a split-block Bloom
+filter (`journal/index/filter.zig`, Parquet's layout: 256-bit blocks, eight
+salted bits a key, so a lookup reads one cache line), sized at twelve bits a key,
+about one false positive in two hundred, never a false negative; its hash is
+std's XxHash3 with a seed of its own, a hash for a filter and not a checksum. Its
+keys are sorted, each with where its postings start and how many, a key of up to
+eight bytes stored as it is and a longer one as its hash, which a reader checks
+against the record. A posting is a seq, an offset and, where the index keeps
+one, an extra `u64`. An ordered index keeps keys with an order as `u64`s that
+keep it (a signed integer's sign bit flipped); its summary is the lowest and the
+highest key, and its postings, each a key, seq and offset, are sorted by key and
+then seq, which a range bisects.
+
+`Index.parse` is the one reader, of untrusted bytes: the checksum, the segment and
+index named, the parts filling the file exactly (every size and count checked as
+read), keys in strict order each with at least one posting taken in turn, each
+key's seqs rising, every seq at or after the segment's first and every offset
+inside it, an ordered index's postings in order between its lowest and highest,
+every exact key in its filter. What it refuses is no index. The tests hold a
+round trip by key and by range against the entries given, refuse every shorter
+file and every flipped bit, and fuzz the reader with any bytes and with good
+files changed and their checksum made to hold again.
+
 ## State that is checked in every build
 
 - `Segment.count` is `span(base_seq, last_seq)` and a segment's last record is

@@ -7,6 +7,13 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/journal/jsonl.zig",
         "src/journal/values.zig",
     } },
+    .{ .name = "index format", .patterns = &.{
+        "src/journal/index/filter.zig",
+        "src/journal/index/format.zig",
+    } },
+    .{ .name = "index entry", .patterns = &.{
+        "src/journal/index.zig",
+    } },
     .{ .name = "streams", .patterns = &.{
         "src/journal/streams.zig",
     } },
@@ -43,7 +50,7 @@ pub const references: []const gantry.rules.ReferenceRule = &.{
         "warp",
     } },
     .{ .name = "source siblings", .suffix = ".zig", .relative = true, .except_targets = &.{"src/**"} },
-    .{ .name = "checksum owner", .target = "warp", .except_from = &.{ "src/journal.zig", "src/journal/Log.zig", "src/journal/streams.zig", "src/crc32c_test.zig" } },
+    .{ .name = "checksum owner", .target = "warp", .except_from = &.{ "src/journal.zig", "src/journal/Log.zig", "src/journal/streams.zig", "src/journal/index/format.zig", "src/crc32c_test.zig", "src/index_format_test.zig" } },
     .{ .name = "strand owner", .target = "strand", .except_from = &.{"src/journal/jsonl.zig"} },
     .{ .name = "airlock owner", .target = "airlock", .except_from = &.{ "src/journal/Log.zig", "src/journal_test.zig", "src/testing/**" } },
 };
@@ -52,6 +59,9 @@ pub const required = [_][]const u8{
     "src/journal/Encoding.zig",
     "src/journal/jsonl.zig",
     "src/journal/values.zig",
+    "src/journal/index/filter.zig",
+    "src/journal/index/format.zig",
+    "src/journal/index.zig",
     "src/journal/streams.zig",
     "src/journal/envelope.zig",
     "src/journal/continuity.zig",
