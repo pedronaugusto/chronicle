@@ -7,7 +7,9 @@
 
 pub const filter = @import("index/filter.zig");
 pub const format = @import("index/format.zig");
+pub const build = @import("index/build.zig");
 
 test {
     _ = filter;
+    _ = build;
 }

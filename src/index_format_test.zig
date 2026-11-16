@@ -24,8 +24,7 @@ fn encoded(entries: []const Entry, of: format.Of) ![]u8 {
     return out.toOwnedSlice(testing.allocator);
 }
 
-/// Keys from a small alphabet, 0 to 12 bytes long, so some repeat, some are
-/// stored whole and some by their hash.
+/// Keys from a small alphabet, 0 to 12 bytes long, so some repeat.
 fn drawKey(s: *shakedown.Source, buffer: []u8) []const u8 {
     const len = gen.intRange(s, usize, 0, 12);
     for (buffer[0..len]) |*b| b.* = "abc"[gen.intRange(s, usize, 0, 2)];
@@ -64,7 +63,7 @@ fn exactOne(_: void, case: *shakedown.Case) anyerror!void {
         const run = index.find(key);
         var at = run.first;
         for (entries[0..n]) |e| {
-            if (e.key.order(format.Stored.of(key)) != .eq) continue;
+            if (!std.mem.eql(u8, e.bytes, key)) continue;
             try testing.expect(at < run.end);
             const p = index.at(at);
             try testing.expect(p.seq.eql(e.seq) and p.offset.eql(e.offset));
@@ -94,13 +93,13 @@ fn orderedOne(_: void, case: *shakedown.Case) anyerror!void {
     // The range holds exactly the entries with a key in it, by key and then seq.
     var expected: [40]Entry = undefined;
     var m: usize = 0;
-    for (entries[0..n]) |e| if (lo <= e.key.word and e.key.word <= hi) {
+    for (entries[0..n]) |e| if (lo <= e.word and e.word <= hi) {
         expected[m] = e;
         m += 1;
     };
     std.sort.pdq(Entry, expected[0..m], {}, struct {
         fn lessThan(_: void, a: Entry, b: Entry) bool {
-            return a.key.word < b.key.word or (a.key.word == b.key.word and a.seq.compare(b.seq) == .lt);
+            return a.word < b.word or (a.word == b.word and a.seq.compare(b.seq) == .lt);
         }
     }.lessThan);
     try testing.expectEqual(m, run.end - run.first);

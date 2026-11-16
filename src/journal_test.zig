@@ -1204,6 +1204,29 @@ test "a sync that fails on an append latches the journal, and nothing is synced 
     try testing.expectEqual(before + 1, hooked.syncs());
 }
 
+test "a cache's file is renamed into place whole, with no sync" {
+    const io = testing.io;
+    var ws = try Workspace.init("log");
+    defer ws.deinit();
+    const hooked = try Seam.create(testing.allocator, io, .{});
+    defer hooked.destroy();
+    const journal = try Journal.open(testing.allocator, hooked.io(), ws.path, .{});
+    defer journal.deinit(hooked.io());
+    const log = &quiescent(journal).log;
+    const before = hooked.syncs();
+    try log.writeCache(hooked.io(), "00000000000000000001.kind.cdx", "first");
+    try log.writeCache(hooked.io(), "00000000000000000001.kind.cdx", "second, longer");
+    try testing.expectEqual(before, hooked.syncs());
+    const bytes = try ws.root.readFileAlloc(io, "log/00000000000000000001.kind.cdx", testing.allocator, .limited(64));
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("second, longer", bytes);
+    // No temporary is left beside it.
+    var listing = try ws.root.openDir(io, "log", .{ .iterate = true });
+    defer listing.close(io);
+    var walk = listing.iterate();
+    while (try walk.next(io)) |entry| try testing.expect(!std.mem.startsWith(u8, entry.name, ".chronicle-tmp-"));
+}
+
 test "a backup makes every copy durable, a clone too, with the device flushes airlock's batch plan takes" {
     const io = testing.io;
     var ws = try Workspace.init("log");

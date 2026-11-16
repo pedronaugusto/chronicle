@@ -7,20 +7,22 @@
 //! Two kinds:
 //!
 //! - exact: keys compared for equality (bytes, or integers as their eight
-//!   little-endian bytes). The summary is a split-block Bloom filter over the
-//!   keys (`filter.zig`); then the keys, sorted, each with where its
-//!   postings start and how many it has; then the postings, each a record's
-//!   seq and offset and, where the index keeps one, an extra `u64` (the
-//!   stream index's version). A key of up to 8 bytes is stored as it is, a
-//!   longer one as its 64-bit hash, which a reader checks against the record.
+//!   little-endian bytes), each stored whole, at most `max_key_bytes`. The
+//!   summary is a split-block Bloom filter over the keys (`filter.zig`); then
+//!   the keys' table, sorted by key, each with where its bytes lie in the
+//!   key heap after it, where its postings start and how many; the heap; then
+//!   the postings, each a record's seq and offset and, where the index keeps
+//!   one, an extra `u64` (the stream index's version). So an index lists its
+//!   keys, and a lookup is exact.
 //! - ordered: keys with an order (integers, instants, ids), each mapped to a
 //!   `u64` that keeps it (`orderedKey`). The summary is the lowest and the
 //!   highest key; then the postings, each a key, seq and offset, sorted by key
 //!   and then seq, which a range bisects.
 //!
 //! The layout, little endian throughout: the header, the index's name, the
-//! summary, the keys (exact), the postings, and a CRC-32C of everything
-//! before it. Every part has a fixed width, so a lookup bisects in place.
+//! summary, the keys' table and heap (exact), the postings, and a CRC-32C of
+//! everything before it. The table and the postings have fixed widths, so a
+//! lookup bisects in place.
 //!
 //! This file is internal. `chronicle.zig` is the package.
 
@@ -51,38 +53,8 @@ pub fn validName(name: []const u8) bool {
     return true;
 }
 
-/// A key as an exact index stores it: up to 8 bytes as they are, read as a
-/// big-endian word so the words sort as the bytes do, with its length; a
-/// longer key as its 64-bit hash, marked `hashed`.
-pub const Stored = struct {
-    len: u8,
-    word: u64,
-
-    pub const hashed: u8 = 0xff;
-
-    pub fn of(key: []const u8) Stored {
-        if (key.len > 8) return .{ .len = hashed, .word = filter.hash(key) };
-        var bytes: [8]u8 = @splat(0);
-        @memcpy(bytes[0..key.len], key);
-        return .{ .len = @intCast(key.len), .word = std.mem.readInt(u64, &bytes, .big) };
-    }
-
-    pub fn order(a: Stored, b: Stored) std.math.Order {
-        return switch (std.math.order(a.word, b.word)) {
-            .eq => std.math.order(a.len, b.len),
-            else => |o| o,
-        };
-    }
-
-    /// The key's hash, as the filter reads it: a short key's bytes hashed
-    /// again, a long one's hash as stored.
-    pub fn filterHash(s: Stored) u64 {
-        if (s.len == hashed) return s.word;
-        var bytes: [8]u8 = undefined;
-        std.mem.writeInt(u64, &bytes, s.word, .big);
-        return filter.hash(bytes[0..s.len]);
-    }
-};
+/// The longest key an exact index holds: a stream id's longest.
+pub const max_key_bytes = 255;
 
 /// An ordered key as its `u64`, keeping its order: an unsigned integer as
 /// it is, a signed one with its sign bit flipped.
@@ -97,19 +69,28 @@ pub fn orderedKey(value: anytype) u64 {
 
 /// A record with a key, as a builder gives it.
 pub const Entry = struct {
-    /// The exact key stored, or the ordered key in `word` (`len` 0).
-    key: Stored,
+    /// An exact index's key, borrowed: at most `max_key_bytes`.
+    bytes: []const u8 = "",
+    /// An ordered index's key.
+    word: u64 = 0,
     seq: Seq,
     /// Where the record's line starts in the segment.
     offset: Bytes,
     extra: u64 = 0,
 
     pub fn exact(key: []const u8, seq: Seq, offset: Bytes, extra: u64) Entry {
-        return .{ .key = .of(key), .seq = seq, .offset = offset, .extra = extra };
+        return .{ .bytes = key, .seq = seq, .offset = offset, .extra = extra };
     }
 
     pub fn ordered(key: u64, seq: Seq, offset: Bytes) Entry {
-        return .{ .key = .{ .len = 0, .word = key }, .seq = seq, .offset = offset };
+        return .{ .word = key, .seq = seq, .offset = offset };
+    }
+
+    fn keyOrder(a: Entry, b: Entry) std.math.Order {
+        return switch (std.mem.order(u8, a.bytes, b.bytes)) {
+            .eq => std.math.order(a.word, b.word),
+            else => |o| o,
+        };
     }
 };
 
@@ -142,15 +123,15 @@ const Header = extern struct {
     keys: u32,
     postings: u32,
     summary_bytes: u32,
-    pad2: u32 = 0,
+    heap_bytes: u32,
     base_seq: u64,
     segment_bytes: u64,
 };
 
 const header_bytes = @sizeOf(Header);
-/// A key in an exact index's table: its length byte, its word, where its
-/// postings start and how many.
-const key_bytes = 1 + 8 + 4 + 4;
+/// A key in an exact index's table: where its bytes start in the heap, its
+/// length, where its postings start and how many.
+const key_bytes = 4 + 1 + 4 + 4;
 const ordered_summary_bytes = 16;
 
 fn postingBytes(kind: Kind, extra: bool) usize {
@@ -169,7 +150,7 @@ pub fn encode(gpa: Allocator, of: Of, entries: []const Entry, out: *std.ArrayLis
     defer gpa.free(order);
     std.sort.pdq(Entry, order, {}, struct {
         fn lessThan(_: void, a: Entry, b: Entry) bool {
-            return switch (a.key.order(b.key)) {
+            return switch (a.keyOrder(b)) {
                 .lt => true,
                 .gt => false,
                 .eq => a.seq.compare(b.seq) == .lt,
@@ -178,8 +159,13 @@ pub fn encode(gpa: Allocator, of: Of, entries: []const Entry, out: *std.ArrayLis
     }.lessThan);
     var keys: usize = 0;
     for (order, 0..) |e, i| {
-        if (i == 0 or order[i - 1].key.order(e.key) != .eq) keys += 1;
+        if (i == 0 or order[i - 1].keyOrder(e) != .eq) keys += 1;
     }
+    var heap_bytes: usize = 0;
+    if (of.kind == .exact) for (order, 0..) |e, i| {
+        aegis.assert.invariant(e.bytes.len <= max_key_bytes, "a key is at most max_key_bytes, refused before it is appended");
+        if (i == 0 or order[i - 1].keyOrder(e) != .eq) heap_bytes += e.bytes.len;
+    };
     const summary_bytes = switch (of.kind) {
         .exact => filter.blocksFor(keys) * filter.block_bytes,
         .ordered => ordered_summary_bytes,
@@ -195,6 +181,7 @@ pub fn encode(gpa: Allocator, of: Of, entries: []const Entry, out: *std.ArrayLis
         .keys = if (of.kind == .exact) @intCast(keys) else 0,
         .postings = @intCast(order.len),
         .summary_bytes = @intCast(summary_bytes),
+        .heap_bytes = @intCast(heap_bytes),
         .base_seq = of.base_seq.raw(),
         .segment_bytes = of.segment_bytes.raw(),
     };
@@ -205,17 +192,23 @@ pub fn encode(gpa: Allocator, of: Of, entries: []const Entry, out: *std.ArrayLis
     switch (of.kind) {
         .exact => {
             var first: u32 = 0;
+            var heap_at: u32 = 0;
             var i: usize = 0;
             while (i < order.len) {
                 var end = i + 1;
-                while (end < order.len and order[end].key.order(order[i].key) == .eq) end += 1;
-                try out.append(gpa, order[i].key.len);
-                try appendInt(gpa, out, u64, order[i].key.word);
+                while (end < order.len and order[end].keyOrder(order[i]) == .eq) end += 1;
+                try appendInt(gpa, out, u32, heap_at);
+                try out.append(gpa, @intCast(order[i].bytes.len));
                 try appendInt(gpa, out, u32, first);
                 try appendInt(gpa, out, u32, @intCast(end - i));
-                filter.add(out.items[summary_at..][0..summary_bytes], order[i].key.filterHash());
+                filter.add(out.items[summary_at..][0..summary_bytes], filter.hash(order[i].bytes));
                 first += @intCast(end - i);
+                heap_at += @intCast(order[i].bytes.len);
                 i = end;
+            }
+            i = 0;
+            while (i < order.len) : (i += 1) {
+                if (i == 0 or order[i - 1].keyOrder(order[i]) != .eq) try out.appendSlice(gpa, order[i].bytes);
             }
             for (order) |e| {
                 try appendInt(gpa, out, u64, e.seq.raw());
@@ -225,11 +218,11 @@ pub fn encode(gpa: Allocator, of: Of, entries: []const Entry, out: *std.ArrayLis
         },
         .ordered => {
             if (order.len != 0) {
-                std.mem.writeInt(u64, out.items[summary_at..][0..8], order[0].key.word, .little);
-                std.mem.writeInt(u64, out.items[summary_at + 8 ..][0..8], order[order.len - 1].key.word, .little);
+                std.mem.writeInt(u64, out.items[summary_at..][0..8], order[0].word, .little);
+                std.mem.writeInt(u64, out.items[summary_at + 8 ..][0..8], order[order.len - 1].word, .little);
             }
             for (order) |e| {
-                try appendInt(gpa, out, u64, e.key.word);
+                try appendInt(gpa, out, u64, e.word);
                 try appendInt(gpa, out, u64, e.seq.raw());
                 try appendInt(gpa, out, u64, e.offset.raw());
             }
@@ -253,8 +246,9 @@ pub const Index = struct {
     keys: u32,
     postings: u32,
     summary: []const u8,
-    /// The exact index's keys; empty for an ordered one.
+    /// The exact index's keys' table and their bytes; empty for an ordered one.
     table: []const u8,
+    heap: []const u8,
     /// The postings, each `postingBytes` wide.
     entries: []const u8,
 
@@ -282,13 +276,14 @@ pub const Index = struct {
         if (!std.mem.eql(u8, &header.magic, &magic) or header.format != format) return error.NotIndex;
         if (header.kind != @backingInt(of.kind) or header.extra != @intFromBool(of.extra) or header.version != of.version) return error.NotIndex;
         if (!of.base_seq.eql(.fromRaw(header.base_seq)) or !of.segment_bytes.eql(.fromRaw(header.segment_bytes))) return error.NotIndex;
-        if (of.kind == .ordered and (of.extra or header.keys != 0)) return error.NotIndex;
+        if (of.kind == .ordered and (of.extra or header.keys != 0 or header.heap_bytes != 0)) return error.NotIndex;
         const width = postingBytes(of.kind, of.extra);
         // Each part's end, every sum and product checked: the counts are the file's to say.
         const name_end = header_bytes + @as(usize, header.name_len);
         const summary_end = std.math.add(usize, name_end, header.summary_bytes) catch return error.NotIndex;
         const table_end = std.math.add(usize, summary_end, std.math.mul(usize, header.keys, key_bytes) catch return error.NotIndex) catch return error.NotIndex;
-        const entries_end = std.math.add(usize, table_end, std.math.mul(usize, header.postings, width) catch return error.NotIndex) catch return error.NotIndex;
+        const heap_end = std.math.add(usize, table_end, header.heap_bytes) catch return error.NotIndex;
+        const entries_end = std.math.add(usize, heap_end, std.math.mul(usize, header.postings, width) catch return error.NotIndex) catch return error.NotIndex;
         if (entries_end != body.len) return error.NotIndex;
         if (!std.mem.eql(u8, body[header_bytes..name_end], of.name)) return error.NotIndex;
         const index: Index = .{
@@ -299,7 +294,8 @@ pub const Index = struct {
             .postings = header.postings,
             .summary = body[name_end..summary_end],
             .table = body[summary_end..table_end],
-            .entries = body[table_end..entries_end],
+            .heap = body[table_end..heap_end],
+            .entries = body[heap_end..entries_end],
         };
         switch (of.kind) {
             .exact => try index.checkExact(of),
@@ -315,14 +311,18 @@ pub const Index = struct {
     fn checkExact(index: Index, of: Of) Refused!void {
         if (index.summary.len == 0 or index.summary.len % filter.block_bytes != 0) return error.NotIndex;
         var taken: u64 = 0;
-        var previous: ?Stored = null;
+        var heap_at: u64 = 0;
+        var previous: ?[]const u8 = null;
         for (0..index.keys) |k| {
-            const key = index.keyAt(k);
-            if (key.stored.len > 8 and key.stored.len != Stored.hashed) return error.NotIndex;
-            if (previous) |p| if (p.order(key.stored) != .lt) return error.NotIndex;
-            previous = key.stored;
+            const key = index.tableAt(k);
+            // The heap is the keys' bytes in order, each after the one before: it is all used.
+            if (key.at != heap_at or key.len > index.heap.len - heap_at) return error.NotIndex;
+            heap_at += key.len;
+            const bytes = index.heap[key.at..][0..key.len];
+            if (previous) |p| if (std.mem.order(u8, p, bytes) != .lt) return error.NotIndex;
+            previous = bytes;
             if (key.count == 0 or key.first != taken or key.count > index.postings - taken) return error.NotIndex;
-            if (!filter.mayHold(index.summary, key.stored.filterHash())) return error.NotIndex;
+            if (!filter.mayHold(index.summary, filter.hash(bytes))) return error.NotIndex;
             var seq: ?Seq = null;
             for (key.first..key.first + key.count) |i| {
                 const p = index.at(i);
@@ -332,7 +332,7 @@ pub const Index = struct {
             }
             taken += key.count;
         }
-        if (taken != index.postings) return error.NotIndex;
+        if (taken != index.postings or heap_at != index.heap.len) return error.NotIndex;
     }
 
     fn checkOrdered(index: Index, of: Of) Refused!void {
@@ -351,14 +351,27 @@ pub const Index = struct {
         }
     }
 
-    /// The `i`th key of an exact index's table.
-    fn keyAt(index: Index, i: usize) struct { stored: Stored, first: u64, count: u64 } {
+    /// The `i`th entry of an exact index's keys' table.
+    fn tableAt(index: Index, i: usize) struct { at: u64, len: u64, first: u64, count: u64 } {
         const r = index.table[i * key_bytes ..][0..key_bytes];
         return .{
-            .stored = .{ .len = r[0], .word = std.mem.readInt(u64, r[1..9], .little) },
-            .first = std.mem.readInt(u32, r[9..13], .little),
-            .count = std.mem.readInt(u32, r[13..17], .little),
+            .at = std.mem.readInt(u32, r[0..4], .little),
+            .len = r[4],
+            .first = std.mem.readInt(u32, r[5..9], .little),
+            .count = std.mem.readInt(u32, r[9..13], .little),
         };
+    }
+
+    /// The `i`th key of an exact index, which `parse` placed inside the heap.
+    pub fn keyAt(index: Index, i: usize) []const u8 {
+        const t = index.tableAt(i);
+        return index.heap[t.at..][0..t.len];
+    }
+
+    /// The postings of an exact index's `i`th key.
+    pub fn postingsOf(index: Index, i: usize) Run {
+        const t = index.tableAt(i);
+        return .{ .first = t.first, .end = t.first + t.count };
     }
 
     /// The key of an ordered index's `i`th posting.
@@ -388,20 +401,17 @@ pub const Index = struct {
     }
 
     /// The postings of `key` in an exact index, oldest first; empty when the
-    /// segment holds none. A key past 8 bytes is found by its hash, so its
-    /// records are to be checked for the key itself.
+    /// segment holds none.
     pub fn find(index: Index, key: []const u8) Run {
         if (index.kind != .exact or !index.mayHold(key)) return .{ .first = 0, .end = 0 };
-        const want = Stored.of(key);
         var low: usize = 0;
         var high: usize = index.keys;
         while (low < high) {
             const mid = low + (high - low) / 2;
-            const k = index.keyAt(mid);
-            switch (k.stored.order(want)) {
+            switch (std.mem.order(u8, index.keyAt(mid), key)) {
                 .lt => low = mid + 1,
                 .gt => high = mid,
-                .eq => return .{ .first = @intCast(k.first), .end = @intCast(k.first + k.count) },
+                .eq => return index.postingsOf(mid),
             }
         }
         return .{ .first = 0, .end = 0 };

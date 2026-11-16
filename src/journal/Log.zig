@@ -3339,6 +3339,18 @@ pub fn writeAtomic(log: *Self, io: Io, name: []const u8, bytes: []const u8) Self
     });
 }
 
+/// Write `bytes` under a temporary name beside `name` and rename them over
+/// it, with no sync: a cache's file (an index), which a crash may leave old,
+/// empty or torn, and which is rebuilt whenever it does not describe its
+/// segment, so a sync would cost the append path for nothing. A reader still
+/// sees the whole old file or the whole new one under the name.
+pub fn writeCache(log: *Self, io: Io, name: []const u8, bytes: []const u8) Self.WriteFileError!void {
+    _ = try airlock.writeFile(io, log.dir.borrow().*, name, bytes, .{
+        .create = .{ .temp = .{ .random = temp_prefix } },
+        .commit = .{ .level = .none, .blocking = log.options.blocking },
+    });
+}
+
 /// `writeAtomic` over `<path>/snapshot`, which only a writer may replace.
 pub fn writeSnapshot(log: *Self, io: Io, bytes: []const u8) Self.SnapshotError!void {
     if (log.options.access == .read) return error.ReadOnly;

@@ -11,6 +11,9 @@ pub const layers: []const gantry.rules.Layer = &.{
         "src/journal/index/filter.zig",
         "src/journal/index/format.zig",
     } },
+    .{ .name = "index build", .patterns = &.{
+        "src/journal/index/build.zig",
+    } },
     .{ .name = "index entry", .patterns = &.{
         "src/journal/index.zig",
     } },
@@ -61,6 +64,7 @@ pub const required = [_][]const u8{
     "src/journal/values.zig",
     "src/journal/index/filter.zig",
     "src/journal/index/format.zig",
+    "src/journal/index/build.zig",
     "src/journal/index.zig",
     "src/journal/streams.zig",
     "src/journal/envelope.zig",

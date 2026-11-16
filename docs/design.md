@@ -174,14 +174,26 @@ An exact index compares keys for equality. Its summary is a split-block Bloom
 filter (`journal/index/filter.zig`, Parquet's layout: 256-bit blocks, eight
 salted bits a key, so a lookup reads one cache line), sized at twelve bits a key,
 about one false positive in two hundred, never a false negative; its hash is
-std's XxHash3 with a seed of its own, a hash for a filter and not a checksum. Its
-keys are sorted, each with where its postings start and how many, a key of up to
-eight bytes stored as it is and a longer one as its hash, which a reader checks
-against the record. A posting is a seq, an offset and, where the index keeps
-one, an extra `u64`. An ordered index keeps keys with an order as `u64`s that
-keep it (a signed integer's sign bit flipped); its summary is the lowest and the
-highest key, and its postings, each a key, seq and offset, are sorted by key and
-then seq, which a range bisects.
+std's XxHash3 with a seed of its own, a hash for a filter and not a checksum.
+Every key is stored whole, at most 255 bytes (a stream id's longest): a table
+sorted by key, each entry where its bytes lie in the key heap after it, where its
+postings start and how many, so an index lists its keys and a lookup is exact. A
+posting is a seq, an offset and, where the index keeps one, an extra `u64`. An
+ordered index keeps keys with an order as `u64`s that keep it (a signed integer's
+sign bit flipped); its summary is the lowest and the highest key, and its
+postings, each a key, seq and offset, are sorted by key and then seq, which a
+range bisects.
+
+**The active segment's index** (`journal/index/build.zig`) is built in memory as
+records are appended: each distinct key once, whole, in a table found by the
+key's hash and compared byte for byte, and per record its key's number, seq,
+offset and extra column. Two keys sharing a hash are two entries of the table, so
+the seal files every record under its own key and reads nothing back. The
+records' entries and the distinct keys' bytes are charged to a budget
+(`Options.index_memory`), past which the active segment seals early. A key past
+255 bytes is refused before its record is written. Index files are written under
+a temporary name and renamed into place with no sync (`Log.writeCache`): a crash
+costs a rebuild, never a wrong answer.
 
 `Index.parse` is the one reader, of untrusted bytes: the checksum, the segment and
 index named, the parts filling the file exactly (every size and count checked as
