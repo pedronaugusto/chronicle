@@ -8,8 +8,8 @@
         // Encoding and decoding a line. Pinned to a commit; the hash is what
         // the build checks.
         .strand = .{
-            .url = "git+https://github.com/pedronaugusto/strand#8155bf9edf2c3d03d6a7dae45de583cb3f490a78",
-            .hash = "strand-0.15.0-8LNWVuWcNwBzCY0j67dSljKlrwe74pXDWJLQCYVnUctO",
+            .url = "git+https://github.com/pedronaugusto/strand#cb3d74c1d706376899172b921459f99958bb3159",
+            .hash = "strand-0.15.0-8LNWVs2dNwAUUxHJE0TrcXd-rO4EGm7paRc3lKe1ppzt",
         },
 
         // Durable files: every sync, atomic replace, batch and file identity.

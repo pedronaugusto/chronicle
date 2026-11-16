@@ -1192,8 +1192,9 @@ test "a sync that fails on an append latches the journal, and nothing is synced 
     defer journal.deinit(hooked.io());
     _ = try journal.append(hooked.io(), .fromRaw(1), created(1, "durable"));
 
-    // The disk loses the next record's sync, whichever level it asks for.
-    const failed = [_]seam.Plan.Entry{ seam.fail(.sync_full, 1, seam.io_error), seam.fail(.sync_data, 1, seam.io_error) };
+    // The disk loses the next record's sync, whichever call the platform makes for it: a
+    // full or data sync, or the BSDs' plain fsync.
+    const failed = [_]seam.Plan.Entry{ seam.fail(.sync_full, 1, seam.io_error), seam.fail(.sync_data, 1, seam.io_error), seam.fail(.sync_plain, 1, seam.io_error) };
     hooked.setPlan(&failed);
     const before = hooked.syncs();
     try testing.expectError(error.InputOutput, journal.append(hooked.io(), .fromRaw(2), created(2, "lost")));
@@ -1225,10 +1226,12 @@ test "a backup makes every copy durable, a clone too, with the device flushes ai
     try testing.expect(copied >= 4);
 
     // Each file is synced once, shared extents or not: a writeout of each where the platform
-    // has a cheaper call than a flush (macOS, Windows), a data sync of each on Linux. The
-    // device calls are one batch's, as airlock plans them: a barrier and one flush on macOS,
-    // a flush before the renames and one after on Windows, none on Linux.
-    const per_file: seam.Call = if (builtin.target.os.tag == .linux) .sync_data else .sync_writeout;
+    // has a cheaper call than a flush (macOS, Windows), a data sync of each on Linux, a plain
+    // fsync of each on the BSDs. The device calls are one batch's, as airlock plans them: a
+    // barrier and one flush on macOS, a flush before the renames and one after on Windows,
+    // none on Linux or the BSDs.
+    const os = builtin.target.os.tag;
+    const per_file: seam.Call = if (os == .linux) .sync_data else if (os.isDarwin() or os == .windows) .sync_writeout else .sync_plain;
     try testing.expect(hooked.count(per_file) >= copied);
     try testing.expectEqual(airlock.Batch.device_calls.full, hooked.count(.sync_full));
     try testing.expectEqual(airlock.Batch.device_calls.barrier, hooked.count(.sync_barrier));
