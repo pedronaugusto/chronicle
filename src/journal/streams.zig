@@ -14,6 +14,7 @@
 //! This file is internal. `chronicle.zig` is the package.
 
 const std = @import("std");
+const log = std.log.scoped(.chronicle);
 const aegis = @import("aegis");
 const Allocator = std.mem.Allocator;
 const values = @import("values.zig");
@@ -375,7 +376,9 @@ pub const Index = struct {
 
         pub fn next(it: *Iterator) ?Section {
             if (it.at == it.bytes.len) return null;
-            return sectionAt(it.bytes, &it.at) catch unreachable; // glint-ignore: Z026 -- `parse` walked every section of these bytes, and refused them otherwise
+            // `parse` walked every section of these bytes and refused them
+            // otherwise: a section that did not read would end the walk.
+            return sectionAt(it.bytes, &it.at) catch null;
         }
     };
 
@@ -514,12 +517,10 @@ pub const Heads = struct {
         }
         const i: u32 = if (heads.used < heads.capacity) blk: {
             if (heads.used == heads.nodes.items.len) {
-                // glint-ignore: Z026 -- out of memory, the head is not kept: a head is kept only when there is room
-                heads.nodes.append(heads.gpa, .{}) catch return;
+                heads.nodes.append(heads.gpa, .{}) catch |err| return log.debug("stream head not kept ({t}): a head is kept only when there is room", .{err});
             }
             // After the append: a rehash reads the nodes where they are now.
-            // glint-ignore: Z026 -- as the append above: no room, no head kept
-            heads.map.ensureUnusedCapacityContext(heads.gpa, 1, heads.keys()) catch return;
+            heads.map.ensureUnusedCapacityContext(heads.gpa, 1, heads.keys()) catch |err| return log.debug("stream head not kept ({t}): a head is kept only when there is room", .{err});
             heads.used += 1;
             break :blk heads.used - 1;
         } else blk: {

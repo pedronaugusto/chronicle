@@ -46,7 +46,7 @@ const input_line = prefix ++ @as([record_bytes - prefix.len - 3]u8, @splat('x'))
 /// Write `count` records to `path`.
 /// Removes a scratch directory, whether or not it is there.
 fn scrub(io: std.Io, path: []const u8) void {
-    std.Io.Dir.cwd().deleteTree(io, path) catch {}; // glint-ignore: Z026 -- scratch cleanup between measurements: a directory that stays costs the next run its first step, which clears it again
+    std.Io.Dir.cwd().deleteTree(io, path) catch |err| std.log.warn("{s}: not removed ({t}); the next run clears it", .{ path, err });
 }
 
 fn writeInput(io: std.Io, path: []const u8, count: usize) !void {

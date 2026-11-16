@@ -109,16 +109,23 @@ pub const SegmentHeader = struct {
     /// records are.
     root: u32,
 
-    /// The members the line holds, in the order it holds them.
-    const Shape = struct { chronicle: u32, base: u64, root: u32 };
-
     /// The line, without its newline. Long enough for twenty digits of `base`
     /// and ten of `root`.
     pub fn line(header: SegmentHeader, buffer: *[96]u8) []const u8 {
-        var out: std.Io.Writer = .fixed(buffer);
-        strand.json.write(&out, Shape{ .chronicle = header.version, .base = header.base_seq.raw(), .root = header.root }, .{}) catch unreachable; // glint-ignore: Z026 -- three bounded unsigned integers and fixed JSON punctuation fit in 96 bytes
-        aegis.assert.invariant(out.end <= buffer.len, "the header line is inside its buffer");
-        return out.buffered();
+        // Three unsigned integers of at most twenty digits and the members'
+        // fixed punctuation fit the buffer whatever their values.
+        var end: usize = 0;
+        for ([_]struct { []const u8, u64 }{
+            .{ "{\"chronicle\":", header.version },
+            .{ ",\"base\":", header.base_seq.raw() },
+            .{ ",\"root\":", header.root },
+        }) |member| {
+            @memcpy(buffer[end..][0..member[0].len], member[0]);
+            end += member[0].len;
+            end += std.fmt.printInt(buffer[end..], member[1], 10, .lower, .{});
+        }
+        buffer[end] = '}';
+        return buffer[0 .. end + 1];
     }
 };
 
