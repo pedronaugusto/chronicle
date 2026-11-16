@@ -451,6 +451,20 @@ pub fn Journal(comptime Event: type) type {
         /// before it can answer and so can fail at everything `open` can.
         pub const SeekError = State.SeekError;
 
+        /// What `buildIndexes` did: the segment whose index files it wrote, and
+        /// how many sealed segments still lack a current file of some index.
+        pub const BuildProgress = State.BuildProgress;
+
+        /// `buildIndexes`'s errors: reading and decoding a segment, writing
+        /// its files, and `ReadOnly` on a journal opened to read.
+        pub const BuildError = State.BuildError;
+
+        /// Per declared index (`IndexStatus.Index`): sealed segments with a
+        /// current file and without one, segments reads by key have read
+        /// whole, and files `buildIndexes` has written; and how many times the
+        /// active segment sealed early for its indexes' memory.
+        pub const IndexStatus = State.IndexStatus;
+
         /// Errors from `subscribe` and `subscribeFrom`, which replay the
         /// records a cursor has missed before they register the sink:
         /// `ReplayError`, `Canceled`, and `HistoryDropped` — the cursor is
@@ -1005,6 +1019,37 @@ pub fn Journal(comptime Event: type) type {
             errdefer self.state.gpa.destroy(walk);
             try State.readRange(self.inner(), io, name, lo, hi, from, &walk.state);
             return walk;
+        }
+
+        /// Writes the index files of the oldest sealed segment that lacks a
+        /// current file of some declared index: one sealed before the index
+        /// was declared or its version raised, one whose file was damaged,
+        /// removed or found not to describe it, one that sealed while its
+        /// indexes in memory could not hold all its records. Null when every
+        /// sealed segment has them. A program runs it on its own `Io`, a
+        /// segment a call, as long as it likes: reads by key are right
+        /// throughout, reading whole a segment that has no file yet.
+        ///
+        /// The segment is chosen and the files written under the journal's
+        /// lock; the segment is read without it, each record's event decoded
+        /// and its keys computed, so a build costs a replay of the segment.
+        /// A segment compacted, cut or dropped while it was read is left for
+        /// the next call. A cancel is taken at the reads and the writes. The
+        /// files are written as a seal writes them, renamed into place with
+        /// no sync. Checking which segments lack a file reads the files whose
+        /// summaries the journal does not hold.
+        pub fn buildIndexes(self: *Self, io: Io) BuildError!?BuildProgress {
+            return State.buildIndexes(self.inner(), io);
+        }
+
+        /// Per declared index, how many sealed segments have a current file
+        /// and how many lack one, how many segments reads by key have read
+        /// whole for want of one, and how many files `buildIndexes` has
+        /// written; and how many times the active segment sealed early
+        /// because its indexes passed `Options.index_memory`. It reads the
+        /// files whose summaries the journal does not hold.
+        pub fn indexStatus(self: *Self, io: Io) (Allocator.Error || Io.Cancelable)!IndexStatus {
+            return State.indexStatus(self.inner(), io);
         }
 
         /// Read every record of every segment back, through the checks a

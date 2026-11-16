@@ -246,6 +246,18 @@ key, over random appends, batches, reopens, cuts, compactions and index files
 removed, cut short, flipped and swapped, and one index whose checksum holds while
 its postings lie.
 
+**Building** (`buildIndexes`): a sealed segment lacks an index's file when the
+summaries hold a stale mark for it, or hold nothing and its file is missing or
+refused by `parse` (a file `parse` accepts has its summary kept, so the next
+check opens nothing). The oldest such segment is chosen under the lock, read
+without it (each record decoded, a stub passed over, its keys computed as an
+append computes them, an exact key too long being no key), and its files written
+under the lock, through `format.encode` as a seal does, so a built file and a
+sealed one are the same bytes; a segment whose length changed or that went while
+it was read is left for the next call. `indexStatus` counts per index the sealed
+segments with and without a current file by the same check, the segments reads
+read whole, the files built, and the early seals for `index_memory`.
+
 ## State that is checked in every build
 
 - `Segment.count` is `span(base_seq, last_seq)` and a segment's last record is

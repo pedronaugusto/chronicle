@@ -177,7 +177,7 @@ fn modelOne(_: void, case: *shakedown.Case) anyerror!void {
     defer rest.deinit(gpa);
 
     for (0..gen.intRange(s, usize, 1, 30)) |_| {
-        switch (gen.intRange(s, u8, 0, 9)) {
+        switch (gen.intRange(s, u8, 0, 10)) {
             0...3 => _ = try journal.append(io, .fromRaw(0), drawEvent(s)),
             4 => {
                 var entries: [4]Journal.Entry = undefined;
@@ -200,6 +200,17 @@ fn modelOne(_: void, case: *shakedown.Case) anyerror!void {
             7 => {
                 const last = (try journal.lastSeq(io)).raw();
                 try journal.compact(io, .fromRaw(gen.intRange(s, u64, 0, last)));
+            },
+            10 => {
+                // Built to the end: then no sealed segment lacks a file.
+                var calls: usize = 0;
+                while (try journal.buildIndexes(io)) |_| {
+                    calls += 1;
+                    // One segment a call: never more calls than segments.
+                    try testing.expect(calls <= 64);
+                }
+                const status = try journal.indexStatus(io);
+                for (status.indexes) |each| try testing.expectEqual(0, each.missing);
             },
             else => {
                 try damage(s, io, dir);
@@ -359,4 +370,150 @@ test "a read stopped at a position whose record has changed is StalePosition" {
     for (0..2) |_| _ = try journal.append(io, .fromRaw(0), .{ .closed = .{ .account = 2 } });
     try testing.expectError(error.StalePosition, journal.readIndexed(io, "account", 1, position));
     try testing.expectError(error.StalePosition, walk.rearmAt(io, position));
+}
+
+/// `Event` as a journal without indexes writes it: the same records.
+const Plain = union(enum) {
+    paid: struct { account: u64, amount: i64, note: []const u8 = "" },
+    closed: struct { account: u64 },
+};
+
+test "indexes declared on a journal that holds records: reads are right before they are built, and buildIndexes builds them a segment a call" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var place = try Place.init();
+    defer place.deinit();
+    {
+        const plain = try chronicle.Journal(Plain).open(gpa, io, place.path, .{ .max_segment_records = .fromRaw(3), .sync = .never });
+        defer plain.deinit(io);
+        // Segments 1 and 4 sealed, 7 active.
+        for (0..7) |i| _ = try plain.append(io, .fromRaw(0), .{ .paid = .{ .account = i % 3, .amount = @intCast(i) } });
+    }
+    const journal = try Journal.open(gpa, io, place.path, options);
+    defer journal.deinit(io);
+    var status = try journal.indexStatus(io);
+    try testing.expectEqualStrings("amount", status.indexes[1].name);
+    for (status.indexes) |each| try testing.expect(each.indexed == 0 and each.missing == 2);
+
+    var want: std.ArrayList(u64) = .empty;
+    defer want.deinit(gpa);
+    var got: std.ArrayList(u64) = .empty;
+    defer got.deinit(gpa);
+    const q: Query = .{ .account = 1 };
+    try modelled(journal, io, .fromRaw(0), q, &want);
+    try testing.expectEqualSlices(u64, &.{ 2, 5 }, want.items);
+    {
+        const walk = try q.read(journal, io, .after(.fromRaw(0)));
+        defer walk.deinit(io);
+        try readSeqs(walk, io, q, 10, &got);
+        try testing.expectEqualSlices(u64, want.items, got.items);
+    }
+    // Both sealed segments read whole, and the active one, whose indexes in memory the reopen left stale.
+    status = try journal.indexStatus(io);
+    try testing.expectEqual(3, status.indexes[0].scanned);
+
+    try testing.expectEqual(Journal.BuildProgress{ .segment = .fromRaw(1), .left = 1 }, (try journal.buildIndexes(io)).?);
+    try testing.expectEqual(Journal.BuildProgress{ .segment = .fromRaw(4), .left = 0 }, (try journal.buildIndexes(io)).?);
+    try testing.expect(try journal.buildIndexes(io) == null);
+    status = try journal.indexStatus(io);
+    for (status.indexes) |each| try testing.expect(each.indexed == 2 and each.missing == 0 and each.rebuilt == 2);
+    {
+        const walk = try q.read(journal, io, .after(.fromRaw(0)));
+        defer walk.deinit(io);
+        try readSeqs(walk, io, q, 10, &got);
+        try testing.expectEqualSlices(u64, want.items, got.items);
+    }
+    // Only the active segment was read whole this time.
+    status = try journal.indexStatus(io);
+    try testing.expectEqual(4, status.indexes[0].scanned);
+}
+
+test "a version raised makes every file of the index stale, and buildIndexes writes them again" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var place = try Place.init();
+    defer place.deinit();
+    {
+        const journal = try Journal.open(gpa, io, place.path, options);
+        defer journal.deinit(io);
+        for (0..7) |i| _ = try journal.append(io, .fromRaw(0), .{ .closed = .{ .account = i } });
+        const status = try journal.indexStatus(io);
+        try testing.expect(status.indexes[0].indexed == 2 and status.indexes[0].missing == 0);
+    }
+    const Raised = union(enum) {
+        paid: struct { account: u64, amount: i64, note: []const u8 = "" },
+        closed: struct { account: u64 },
+
+        pub const chronicle = .{ .indexes = &.{
+            index("account", 2, .exact, accountOf),
+            index("amount", 1, .ordered, amountOf),
+        } };
+
+        fn accountOf(e: @This()) ?u64 {
+            return switch (e) {
+                inline else => |v| v.account,
+            };
+        }
+        fn amountOf(e: @This()) ?i64 {
+            return switch (e) {
+                .paid => |p| p.amount,
+                .closed => null,
+            };
+        }
+    };
+    const journal = try chronicle.Journal(Raised).open(gpa, io, place.path, .{ .max_segment_records = .fromRaw(3), .sync = .never });
+    defer journal.deinit(io);
+    var status = try journal.indexStatus(io);
+    try testing.expect(status.indexes[0].missing == 2 and status.indexes[1].indexed == 2);
+    var calls: usize = 0;
+    while (try journal.buildIndexes(io)) |_| calls += 1;
+    try testing.expectEqual(2, calls);
+    status = try journal.indexStatus(io);
+    try testing.expect(status.indexes[0].indexed == 2 and status.indexes[0].rebuilt == 2 and status.indexes[1].rebuilt == 0);
+}
+
+test "a journal opened to read builds no index" {
+    const io = testing.io;
+    var place = try Place.init();
+    defer place.deinit();
+    {
+        const journal = try Journal.open(testing.allocator, io, place.path, options);
+        defer journal.deinit(io);
+        _ = try journal.append(io, .fromRaw(0), .{ .closed = .{ .account = 1 } });
+    }
+    var read_options = options;
+    read_options.access = .read;
+    const journal = try Journal.open(testing.allocator, io, place.path, read_options);
+    defer journal.deinit(io);
+    try testing.expectError(error.ReadOnly, journal.buildIndexes(io));
+}
+
+test "a segment's index files built from it are the files its seal wrote, byte for byte" {
+    const io = testing.io;
+    const gpa = testing.allocator;
+    var place = try Place.init();
+    defer place.deinit();
+    const journal = try Journal.open(gpa, io, place.path, options);
+    defer journal.deinit(io);
+    var prng: std.Random.DefaultPrng = .init(0x6275696c);
+    for (0..10) |_| {
+        const r = prng.random();
+        _ = try journal.append(io, .fromRaw(0), .{ .paid = .{ .account = r.uintLessThan(u64, 4), .amount = r.intRangeAtMost(i64, -3, 3), .note = notes[r.uintLessThan(usize, notes.len)] } });
+    }
+    var dir = try Io.Dir.cwd().openDir(io, place.path, .{});
+    defer dir.close(io);
+    const names = [_][]const u8{ "00000000000000000001.account.cdx", "00000000000000000004.amount.cdx", "00000000000000000007.note.cdx" };
+    var sealed: [names.len][]u8 = undefined;
+    for (names, &sealed) |name, *bytes| {
+        bytes.* = try dir.readFileAlloc(io, name, gpa, .unlimited);
+        try dir.deleteFile(io, name);
+    }
+    defer for (sealed) |bytes| gpa.free(bytes);
+    // The journal holds the summaries of none of them, so it finds them gone.
+    while (try journal.buildIndexes(io)) |_| {}
+    for (names, sealed) |name, bytes| {
+        const built = try dir.readFileAlloc(io, name, gpa, .unlimited);
+        defer gpa.free(built);
+        try testing.expectEqualSlices(u8, bytes, built);
+    }
 }

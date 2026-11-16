@@ -167,6 +167,26 @@ pub fn Declared(comptime Event: type) type {
             return false;
         }
 
+        /// `event`'s keys into `keys` as an index built from a segment keeps
+        /// them: an exact key past `format.max_key_bytes`, which an append
+        /// refuses but a key function changed since may give, is no key.
+        pub fn keysKept(event: *const Event, keys: *Keys) void {
+            inline for (0..n) |i| {
+                const D = @TypeOf(list[i]);
+                keys.has[i] = false;
+                if (D.keyOf(event.*)) |k| switch (D.index_kind) {
+                    .exact => if (exactKept(D.Key, k, &keys.held[i])) |bytes| {
+                        keys.bytes[i] = bytes;
+                        keys.has[i] = true;
+                    },
+                    .ordered => {
+                        keys.words[i] = orderedWord(D.Key, k);
+                        keys.has[i] = true;
+                    },
+                };
+            }
+        }
+
         /// One event's keys: for each index, whether it has one, and its key,
         /// an exact key's bytes (borrowed from the event, or held in `held`)
         /// or an ordered key's word.
@@ -193,11 +213,21 @@ pub fn Declared(comptime Event: type) type {
     };
 }
 
+/// An exact key's bytes, or null for one too long for an index.
+fn exactKept(comptime K: type, k: K, held: *[8]u8) ?[]const u8 {
+    const too_long = if (K == []const u8) k.len > format.max_key_bytes else false;
+    if (too_long) return null;
+    return keyBytes(K, k, held);
+}
+
 fn exactBytes(comptime K: type, k: K, held: *[8]u8) error{KeyTooLong}![]const u8 {
-    if (K == []const u8) {
-        if (k.len > format.max_key_bytes) return error.KeyTooLong;
-        return k;
-    }
+    return exactKept(K, k, held) orelse error.KeyTooLong;
+}
+
+/// An exact key's bytes: a byte string's own, an enum's tag name, an integer's
+/// eight bytes in `held`.
+fn keyBytes(comptime K: type, k: K, held: *[8]u8) []const u8 {
+    if (K == []const u8) return k;
     if (@typeInfo(K) == .@"enum") return @tagName(k);
     // An integer as its eight little-endian bytes, signed ones as their two's complement.
     const wide: u64 = if (@typeInfo(K).int.signedness == .signed) @bitCast(@as(i64, k)) else k;
@@ -266,6 +296,8 @@ test "an event's declared indexes, in order, and its keys by each" {
     var long: [format.max_key_bytes + 1]u8 = @splat('x');
     const too_long: Sample = .{ .paid = .{ .account = 1, .amount = 0, .note = &long } };
     try testing.expectError(error.KeyTooLong, D.keysOf(&too_long, &keys));
+    D.keysKept(&too_long, &keys);
+    try testing.expect(keys.has[0] and keys.has[1] and !keys.has[2] and keys.has[3]);
 }
 
 test "a read names its index and asks by the index's own key type, and a record is checked by its key" {

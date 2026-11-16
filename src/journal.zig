@@ -161,6 +161,11 @@ pub fn Journal(comptime Event: type) type {
             /// Per index, how many segments reads by key have read whole for
             /// want of a current index file.
             scanned: [declared.count]u64 = @splat(0),
+            /// Per index, how many segments' files `buildIndexes` has written.
+            rebuilt: [declared.count]u64 = @splat(0),
+            /// How many times the active segment was sealed early for its
+            /// indexes' memory.
+            sealed_early: u64 = 0,
 
             fn init(options: Options) Indexes {
                 return .{ .pendings = @splat(.{}), .budget = .{ .limit = indexMemory(options) }, .summaries = .init(options.summary_memory) };
@@ -1563,6 +1568,169 @@ pub fn Journal(comptime Event: type) type {
             try walk.rearmAt(io, from);
         }
 
+        /// What one call of `buildIndexes` did: the segment whose index files
+        /// it wrote, and how many sealed segments still lack a current file
+        /// of some declared index.
+        pub const BuildProgress = struct { segment: Seq, left: usize };
+
+        /// What building a segment's indexes can meet: reading and decoding
+        /// it, writing the files, and a journal opened to read.
+        pub const BuildError = ReadError || Log.WriteFileError || error{ReadOnly};
+
+        /// Per declared index, what its files and reads have come to.
+        pub const IndexStatus = struct {
+            pub const Index = struct {
+                name: []const u8,
+                /// Sealed segments with a file that describes them.
+                indexed: usize = 0,
+                /// Sealed segments without one: read whole by reads by key
+                /// until `buildIndexes` writes it.
+                missing: usize = 0,
+                /// Segments reads by key have read whole for want of one.
+                scanned: u64 = 0,
+                /// Files `buildIndexes` has written.
+                rebuilt: u64 = 0,
+            };
+            indexes: [declared.count]Index,
+            /// How many times the active segment was sealed early because its
+            /// indexes passed `Options.index_memory`.
+            sealed_early: u64,
+        };
+
+        /// Whether segment `segment`'s file of index `i` describes it: what
+        /// the summaries hold, else the file read and checked, its summary
+        /// kept. Under the lock.
+        fn indexCurrent(self: *Self, s: *State, io: Io, segment: Log.Segment, i: usize) (Allocator.Error || Io.Cancelable)!bool {
+            const of: field_index.read.Summaries.Of = .{ .base_seq = segment.base_seq.raw(), .segment_bytes = segment.bytes.raw(), .index = @intCast(i) };
+            if (s.indexes.summaries.get(of)) |found| return found == .summary;
+            const name: field_index.build.FileName = .of(segment.base_seq, nameOf(i));
+            const limit = (segment.bytes.mul(10) catch values.furthest).add(.fromRaw(4096)) catch values.furthest;
+            const bytes = aegis.own.readFile(io, s.log.dir.borrow().*, name.slice(), self.gpa, limit) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Canceled => return error.Canceled,
+                else => return false,
+            };
+            defer self.gpa.free(bytes);
+            const index = field_index.format.Index.parse(.init(bytes), fileOf(segment, i)) catch return false;
+            try s.indexes.summaries.put(self.gpa, of, index);
+            return true;
+        }
+
+        /// Which declared indexes of sealed segment `segment` lack a current
+        /// file. A segment with no records needs none.
+        fn indexesNeeded(self: *Self, s: *State, io: Io, segment: Log.Segment) (Allocator.Error || Io.Cancelable)![declared.count]bool {
+            var needed: [declared.count]bool = @splat(false);
+            if (segment.count().eql(values.no_records)) return needed;
+            for (&needed, 0..) |*need, i| need.* = !try self.indexCurrent(s, io, segment, i);
+            return needed;
+        }
+
+        /// The sealed segments: all but the newest, which is being appended to.
+        fn sealedSegments(s: *const State) []const Log.Segment {
+            const segments = s.log.segments.items;
+            return if (segments.len == 0) segments else segments[0 .. segments.len - 1];
+        }
+
+        /// Writes the declared indexes' files of the oldest sealed segment
+        /// that lacks a current one, read from the segment; null when every
+        /// sealed segment has them.
+        pub fn buildIndexes(self: *Self, io: Io) BuildError!?BuildProgress {
+            if (declared.count == 0) return null;
+            if (self.config.access == .read) return error.ReadOnly;
+            var scan: Log.Scan = undefined;
+            var segment: Log.Segment = undefined;
+            var needed: [declared.count]bool = undefined;
+            var decoder: Decoder = undefined;
+            {
+                var guard = try self.state.acquire(io);
+                defer guard.deinit(io);
+                const s = guard.value();
+                const found = for (sealedSegments(s)) |candidate| {
+                    needed = try self.indexesNeeded(s, io, candidate);
+                    if (std.mem.findScalar(bool, &needed, true) != null) break candidate;
+                } else return null;
+                segment = found;
+                decoder = self.captureDecoder();
+                scan = try s.log.scanIdle();
+                errdefer scan.deinit(io);
+                if (!try s.log.scanAtInto(io, &scan, segment.base_seq, values.no_bytes)) aegis.assert.never("a segment found under the lock is there under it");
+            }
+            defer scan.deinit(io);
+
+            // The segment read without the lock, each record's keys computed.
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena.deinit();
+            var record_arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer record_arena.deinit();
+            var entries: [declared.count]std.ArrayList(field_index.format.Entry) = @splat(.empty);
+            defer for (&entries) |*list| list.deinit(self.gpa);
+            while (try scan.next(io)) |line| {
+                _ = scan.takeBoundary();
+                if ((scan.walking() orelse break) != segment.base_seq) break;
+                const header = try line.parse({}, parseHeader);
+                if (values.below(segment.last_seq, header.seq)) break;
+                // A stub carries no key in a field index.
+                if (header.removed) continue;
+                _ = record_arena.reset(.retain_capacity);
+                const record = try recordFrom(decoder, record_arena.allocator(), header, line.readForParse());
+                var keys: declared.Keys = .{};
+                declared.keysKept(&record.event, &keys);
+                inline for (0..declared.count) |i| if (needed[i] and keys.has[i]) {
+                    const entry: field_index.format.Entry = switch (declared.kind(i)) {
+                        .exact => .exact(try arena.allocator().dupe(u8, keys.bytes[i]), header.seq, scan.line_start, 0),
+                        .ordered => .ordered(keys.words[i], header.seq, scan.line_start),
+                    };
+                    try entries[i].append(self.gpa, entry);
+                };
+            }
+
+            var guard = try self.state.acquire(io);
+            defer guard.deinit(io);
+            const s = guard.value();
+            // Written only for the segment as it was read: one compacted,
+            // cut or dropped since is found again by the next call.
+            const still = for (sealedSegments(s)) |now| {
+                if (now.base_seq == segment.base_seq) break now.bytes.eql(segment.bytes);
+            } else false;
+            if (still) inline for (0..declared.count) |i| if (needed[i]) {
+                const of = fileOf(segment, i);
+                try field_index.format.encode(self.gpa, of, entries[i].items, &s.indexes.buf);
+                const name: field_index.build.FileName = .of(segment.base_seq, declared.names[i]);
+                try s.log.writeCache(io, name.slice(), s.indexes.buf.items);
+                const written = field_index.format.Index.parse(.init(s.indexes.buf.items), of) catch aegis.assert.never("an index file encode wrote is one parse reads");
+                try s.indexes.summaries.put(self.gpa, .{ .base_seq = segment.base_seq.raw(), .segment_bytes = segment.bytes.raw(), .index = i }, written);
+                s.indexes.rebuilt[i] +|= 1;
+            };
+            var left: usize = 0;
+            for (sealedSegments(s)) |each| {
+                const lacking = try self.indexesNeeded(s, io, each);
+                if (std.mem.findScalar(bool, &lacking, true) != null) left += 1;
+            }
+            return .{ .segment = segment.base_seq, .left = left };
+        }
+
+        /// Per declared index, how many sealed segments have a current file
+        /// and how many lack one, and what reads and builds have counted. It
+        /// reads the files the summaries do not hold.
+        pub fn indexStatus(self: *Self, io: Io) (Allocator.Error || Io.Cancelable)!IndexStatus {
+            var guard = try self.state.acquire(io);
+            defer guard.deinit(io);
+            const s = guard.value();
+            var report: IndexStatus = .{ .indexes = undefined, .sealed_early = s.indexes.sealed_early };
+            inline for (&report.indexes, 0..) |*each, i| each.* = .{
+                .name = declared.names[i],
+                .scanned = s.indexes.scanned[i],
+                .rebuilt = s.indexes.rebuilt[i],
+            };
+            for (sealedSegments(s)) |segment| {
+                if (segment.count().eql(values.no_records)) continue;
+                for (&report.indexes, 0..) |*each, i| {
+                    if (try self.indexCurrent(s, io, segment, i)) each.indexed += 1 else each.missing += 1;
+                }
+            }
+            return report;
+        }
+
         pub fn replay(self: *Self, io: Io, cursor: Seq, walk: *Replay) ReplayError!void {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
@@ -2709,6 +2877,7 @@ pub fn Journal(comptime Event: type) type {
         fn roomForKeys(s: *State, cost: Bytes) void {
             const ix = &s.indexes;
             if (declared.count == 0 or ix.stale or ix.budget.fits(cost)) return;
+            if (!s.log.rotate_requested) ix.sealed_early +|= 1;
             s.log.requestRotation();
         }
 
