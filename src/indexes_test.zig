@@ -140,10 +140,12 @@ test "past its index memory the active segment is sealed early, each sealed one 
     var place = try Place.init();
     defer place.deinit();
     {
-        // Room for about four records' entries and keys across the three indexes.
-        const journal = try Journal.open(testing.allocator, io, place.path, .{ .index_memory = .fromRaw(4 * 3 * 32) });
+        // Room for the three indexes' first storage and a few growths: every byte
+        // their lists and tables hold is charged.
+        const journal = try Journal.open(testing.allocator, io, place.path, .{ .index_memory = .fromRaw(2048) });
         defer journal.deinit(io);
-        for (0..20) |i| _ = try journal.append(io, .fromRaw(0), paid(i, @intCast(i)));
+        for (0..200) |i| _ = try journal.append(io, .fromRaw(0), paid(i, @intCast(i)));
+        try testing.expect((try journal.indexStatus(io)).sealed_early > 1);
     }
     var dir = try Io.Dir.cwd().openDir(io, place.path, .{ .iterate = true });
     defer dir.close(io);

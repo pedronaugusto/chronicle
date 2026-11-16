@@ -237,6 +237,24 @@ fn appendInt(gpa: Allocator, out: *std.ArrayList(u8), comptime T: type, value: T
     try out.appendSlice(gpa, &bytes);
 }
 
+/// The most a file's header and the index's name after it take: what
+/// `describes` reads.
+pub const max_head_bytes = header_bytes + max_name_bytes;
+
+/// Whether the file whose first bytes are `head` says it is the index `of`
+/// names, of the segment it names: its header and name alone, the rest of the
+/// file unread and unchecked. What a status counts; a read checks the whole.
+pub fn describes(head: []const u8, of: Of) bool {
+    if (head.len < header_bytes) return false;
+    var header: Header = undefined;
+    @memcpy(std.mem.asBytes(&header), head[0..header_bytes]);
+    if (!std.mem.eql(u8, &header.magic, &magic) or header.format != format) return false;
+    if (header.kind != @backingInt(of.kind) or header.extra != @intFromBool(of.extra) or header.version != of.version) return false;
+    if (!of.base_seq.eql(.fromRaw(header.base_seq)) or !of.segment_bytes.eql(.fromRaw(header.segment_bytes))) return false;
+    const name = head[header_bytes..];
+    return header.name_len == of.name.len and name.len >= of.name.len and std.mem.eql(u8, name[0..of.name.len], of.name);
+}
+
 /// An index file read whole and checked against what it must describe.
 pub const Index = struct {
     /// The file, owned by whoever read it.

@@ -204,3 +204,22 @@ fn anyOne(_: void, case: *shakedown.Case) anyerror!void {
 test "fuzz: any bytes are refused as an index, or read within their bounds" {
     try shakedown.check(testing.allocator, {}, anyOne, .{ .seed = 0x66757a7a, .cases = 2000 });
 }
+
+test "a file's header alone says which segment and index it describes" {
+    const gpa = testing.allocator;
+    const of = ofKind(.exact, true);
+    const file = try encoded(&.{.exact("ab", .fromRaw(100), .fromRaw(0), 1)}, of);
+    defer gpa.free(file);
+    try testing.expect(format.describes(file[0..@min(file.len, format.max_head_bytes)], of));
+    var other = of;
+    other.version = 4;
+    try testing.expect(!format.describes(file, other));
+    other = of;
+    other.segment_bytes = .fromRaw(segment_bytes + 1);
+    try testing.expect(!format.describes(file, other));
+    other = of;
+    other.name = "accoun";
+    try testing.expect(!format.describes(file, other));
+    // Short of its header and name: not one.
+    for (0..format.max_head_bytes - format.max_name_bytes + of.name.len) |len| try testing.expect(!format.describes(file[0..len], of));
+}

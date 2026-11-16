@@ -299,3 +299,22 @@ test "summaries are kept under their limit, the least recently used dropped firs
     try tiny.put(gpa, .{ .base_seq = 1, .segment_bytes = 1, .index = 0 }, index);
     try testing.expectEqual(0, tiny.count());
 }
+
+test "the summaries of segments of a million distinct keys each stay under the default summary memory" {
+    const gpa = testing.allocator;
+    const limit: Bytes = .fromRaw(16 * 1024 * 1024);
+    const filter_bytes = try gpa.alloc(u8, filter.blocksFor(1_000_000) * filter.block_bytes);
+    defer gpa.free(filter_bytes);
+    @memset(filter_bytes, 0);
+    // What `Summary.of` reads of a parsed index: its kind, its filter and its count.
+    const index: format.Index = .{ .file = &.{}, .kind = .exact, .extra = false, .keys = 1_000_000, .postings = 1_000_000, .summary = filter_bytes, .table = &.{}, .heap = &.{}, .entries = &.{} };
+    var s: Summaries = .init(limit);
+    defer s.deinit(gpa);
+    for (0..40) |segment| {
+        try s.put(gpa, .{ .base_seq = segment, .segment_bytes = 1, .index = 0 }, index);
+        try testing.expect(s.charged <= values.limit(limit));
+    }
+    // About ten such summaries fit; the newest are kept.
+    try testing.expect(s.count() >= 8 and s.count() < 40);
+    try testing.expect(s.get(.{ .base_seq = 39, .segment_bytes = 1, .index = 0 }) != null);
+}

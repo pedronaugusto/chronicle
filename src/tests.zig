@@ -15,6 +15,7 @@ test {
     _ = @import("index_format_test.zig");
     _ = @import("indexes_test.zig");
     _ = @import("index_read_test.zig");
+    _ = @import("index_crash_test.zig");
     _ = @import("envelope_test.zig");
     _ = @import("testing/runtime_test.zig");
 }

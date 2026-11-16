@@ -196,13 +196,23 @@ past 255 bytes, and notes them after the record is staged, at its offset.
 records are appended: each distinct key once, whole, in a table found by the
 key's hash and compared byte for byte, and per record its key's number, seq,
 offset and extra column. Two keys sharing a hash are two entries of the table, so
-the seal files every record under its own key and reads nothing back. The
-records' entries (16 bytes in an exact index, 24 in an ordered one) and the
-distinct keys' bytes are charged to a budget (`Options.index_memory`), past which
-the next record starts a segment (`Log.requestRotation`). Its default is what a
-full segment's indexes can need: `max_segment_bytes` over the shortest a record
-can be (32 bytes) records, each with an entry in every declared index, and in each
-exact index a key of its longest for every record. The indexes are stale, and
+the seal files every record under its own key and reads nothing back. Its lists
+and table are std's, and allocate through a budget allocator (`build.Budget`,
+over the journal's allocator, limit `Options.index_memory`) that charges every
+allocation, resize and remap before it happens, refuses one past the limit, and
+credits every free: what is charged is what is held, spare capacity and a
+growth's old storage beside its new included. Before records are staged, room is
+made for them (`reserveExact`, `reserveOrdered`), so noting them allocates
+nothing; a refused reservation makes the next record start a segment
+(`Log.requestRotation`), counted as an early seal. A cleared index keeps its
+storage, charged, for the next segment. The default limit is what a full segment
+really allocates (`build.fullSegment`): `max_segment_bytes` over 32 bytes records,
+and per record of an exact index half again its entry (16), span (8) and key, 2.5
+table slots of 5 bytes, and the larger of the entry and the key for a growth's
+old storage; of an ordered one half again its entry (24) and the entry again;
+plus 4 KiB an index. For a default 8 MiB segment of distinct keys that is
+20.06 MB with `u64` keys (measured peak 15.84 MB), 179.8 MB with 255-byte keys
+(140.6 MB) and 15.7 MB for an ordered index (12.4 MB). The indexes are stale, and
 their segment seals without index files, when they may not hold all its records:
 it held records when the journal opened, a batch was taken back, the log was read
 again, compacted, rewritten or cut (`truncateAfter`), or the active segment is one a
@@ -255,8 +265,10 @@ append computes them, an exact key too long being no key), and its files written
 under the lock, through `format.encode` as a seal does, so a built file and a
 sealed one are the same bytes; a segment whose length changed or that went while
 it was read is left for the next call. `indexStatus` counts per index the sealed
-segments with and without a current file by the same check, the segments reads
-read whole, the files built, and the early seals for `index_memory`.
+segments with and without a current file, by the summaries or else by each
+file's header and name read into the stack (it allocates nothing; a file that
+cannot be read is missing), the segments reads read whole, the files built, and
+the early seals for `index_memory`.
 
 ## State that is checked in every build
 

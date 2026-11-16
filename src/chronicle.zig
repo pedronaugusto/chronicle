@@ -1046,9 +1046,12 @@ pub fn Journal(comptime Event: type) type {
         /// and how many lack one, how many segments reads by key have read
         /// whole for want of one, and how many files `buildIndexes` has
         /// written; and how many times the active segment sealed early
-        /// because its indexes passed `Options.index_memory`. It reads the
-        /// files whose summaries the journal does not hold.
-        pub fn indexStatus(self: *Self, io: Io) (Allocator.Error || Io.Cancelable)!IndexStatus {
+        /// because its indexes passed `Options.index_memory`. A file the
+        /// journal holds no summary of is current when its header names the
+        /// segment and the index: its header is read, into the stack, and the
+        /// rest is left to the reads, which check it whole. One that cannot be
+        /// read counts as missing. It allocates nothing.
+        pub fn indexStatus(self: *Self, io: Io) Io.Cancelable!IndexStatus {
             return State.indexStatus(self.inner(), io);
         }
 

@@ -167,12 +167,12 @@ pub fn Journal(comptime Event: type) type {
             /// indexes' memory.
             sealed_early: u64 = 0,
 
-            fn init(options: Options) Indexes {
-                return .{ .pendings = @splat(.{}), .budget = .{ .limit = indexMemory(options) }, .summaries = .init(options.summary_memory) };
+            fn init(gpa: Allocator, options: Options) Indexes {
+                return .{ .pendings = @splat(.{}), .budget = .init(gpa, indexMemory(options)), .summaries = .init(options.summary_memory) };
             }
 
             fn deinit(ix: *Indexes, gpa: Allocator) void {
-                for (&ix.pendings) |*p| p.deinit(gpa);
+                for (&ix.pendings) |*p| p.deinit(&ix.budget);
                 ix.buf.deinit(gpa);
                 ix.summaries.deinit(gpa);
             }
@@ -189,16 +189,10 @@ pub fn Journal(comptime Event: type) type {
         /// `Options.index_memory`, or the size its comment gives.
         fn indexMemory(options: Options) Bytes {
             if (options.index_memory) |given| return given;
-            // As many records as a full segment holds at their shortest; a sum past 64 bits is no limit.
-            const records = options.max_segment_bytes.ratio(.fromRaw(field_index.build.smallest_record_bytes)) catch aegis.assert.never("the shortest record is not zero bytes");
+            // Each index's need for a full segment; a sum past 64 bits is no limit.
             var total = values.no_bytes;
             inline for (0..declared.count) |i| {
-                const entries = field_index.build.entryBytes(declared.kind(i)).mul(records) catch values.furthest;
-                total = total.add(entries) catch values.furthest;
-                if (declared.kind(i) == .exact) {
-                    const key = Bytes.fromRaw(declared.longestKey(i)).add(field_index.build.key_overhead) catch values.furthest;
-                    total = total.add(key.mul(records) catch values.furthest) catch values.furthest;
-                }
+                total = total.add(field_index.build.fullSegment(options.max_segment_bytes, declared.kind(i), declared.longestKey(i))) catch values.furthest;
             }
             return total;
         }
@@ -728,7 +722,7 @@ pub fn Journal(comptime Event: type) type {
                     .nudges = 0,
                     .seq = values.beginning,
                     .streams = .init(gpa, options.stream_heads),
-                    .indexes = .init(options),
+                    .indexes = .init(gpa, options),
                     .write_failed = false,
                 }),
                 .changed = .initLimit(std.math.maxInt(usize)),
@@ -886,7 +880,9 @@ pub fn Journal(comptime Event: type) type {
             // Keyed before the write: a key no index can hold refuses the record.
             var keys: declared.Keys = .{};
             try declared.keysOf(&event, &keys);
-            roomForKeys(s, keysCost(s, &keys));
+            var room: Room = .{};
+            room.add(s, &keys);
+            roomForKeys(s, &room);
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
             var built = try self.encode(s, next, at, s.log.chainTip(), event, null, place);
@@ -969,13 +965,13 @@ pub fn Journal(comptime Event: type) type {
             else
                 null;
             // Keyed before anything is staged: a key no index can hold refuses the batch.
-            var batch_cost = values.no_bytes;
+            var room: Room = .{};
             for (entries) |entry| {
                 var keys: declared.Keys = .{};
                 try declared.keysOf(&entry.event, &keys);
-                batch_cost = values.plus(batch_cost, keysCost(s, &keys));
+                room.add(s, &keys);
             }
-            roomForKeys(s, batch_cost);
+            roomForKeys(s, &room);
             var link = s.log.chainTip();
             const staged_from = s.log.mark();
             for (entries, 0..) |entry, i| {
@@ -1709,10 +1705,31 @@ pub fn Journal(comptime Event: type) type {
             return .{ .segment = segment.base_seq, .left = left };
         }
 
+        /// Whether segment `segment`'s file of index `i` says it describes
+        /// it: the summaries' word, else the file's header and name read into
+        /// the stack, the rest unread. One that cannot be read or does not say
+        /// so is missing. Under the lock; it allocates nothing.
+        fn headerCurrent(s: *State, io: Io, segment: Log.Segment, i: usize) Io.Cancelable!bool {
+            const of: field_index.read.Summaries.Of = .{ .base_seq = segment.base_seq.raw(), .segment_bytes = segment.bytes.raw(), .index = @intCast(i) };
+            if (s.indexes.summaries.get(of)) |found| return found == .summary;
+            const name: field_index.build.FileName = .of(segment.base_seq, nameOf(i));
+            const file = s.log.dir.borrow().openFile(io, name.slice(), .{}) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return false,
+            };
+            defer file.close(io);
+            var head: [field_index.format.max_head_bytes]u8 = undefined;
+            const read = file.readPositionalAll(io, &head, 0) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return false,
+            };
+            return field_index.format.describes(head[0..read], fileOf(segment, i));
+        }
+
         /// Per declared index, how many sealed segments have a current file
         /// and how many lack one, and what reads and builds have counted. It
-        /// reads the files the summaries do not hold.
-        pub fn indexStatus(self: *Self, io: Io) (Allocator.Error || Io.Cancelable)!IndexStatus {
+        /// reads only the headers of the files the summaries do not hold.
+        pub fn indexStatus(self: *Self, io: Io) Io.Cancelable!IndexStatus {
             var guard = try self.state.acquire(io);
             defer guard.deinit(io);
             const s = guard.value();
@@ -1725,7 +1742,7 @@ pub fn Journal(comptime Event: type) type {
             for (sealedSegments(s)) |segment| {
                 if (segment.count().eql(values.no_records)) continue;
                 for (&report.indexes, 0..) |*each, i| {
-                    if (try self.indexCurrent(s, io, segment, i)) each.indexed += 1 else each.missing += 1;
+                    if (try headerCurrent(s, io, segment, i)) each.indexed += 1 else each.missing += 1;
                 }
             }
             return report;
@@ -2854,29 +2871,46 @@ pub fn Journal(comptime Event: type) type {
             const ix = &s.indexes;
             const segments = s.log.segments.items;
             const base = if (segments.len == 0) values.beginning else segments[segments.len - 1].base_seq;
-            for (&ix.pendings) |*p| p.clear(&ix.budget, base);
+            for (&ix.pendings) |*p| p.clear(base);
             ix.base = base;
             ix.stale = segments.len != 0 and !segments[segments.len - 1].count().eql(values.no_records);
         }
 
-        /// What a record with `keys` adds to the active segment's field
-        /// indexes' memory, at most.
-        fn keysCost(s: *const State, keys: *const declared.Keys) Bytes {
-            var cost = values.no_bytes;
-            inline for (0..declared.count) |i| if (keys.has[i]) {
-                cost = values.plus(cost, switch (declared.kind(i)) {
-                    .exact => s.indexes.pendings[i].costOf(keys.bytes[i]),
-                    .ordered => field_index.build.entryBytes(.ordered),
-                });
-            };
-            return cost;
-        }
+        /// What records about to be staged need of the field indexes: per
+        /// index, how many have a key, and the bytes of their keys not yet
+        /// interned (a key twice in a batch counted twice).
+        const Room = struct {
+            records: [declared.count]usize = @splat(0),
+            new_key_bytes: [declared.count]usize = @splat(0),
 
-        /// Room for `cost` more in the field indexes: past their memory the
-        /// next record starts a segment, sealing this one early.
-        fn roomForKeys(s: *State, cost: Bytes) void {
+            fn add(room: *Room, s: *const State, keys: *const declared.Keys) void {
+                inline for (0..declared.count) |i| if (keys.has[i]) {
+                    room.records[i] += 1;
+                    if (declared.kind(i) == .exact) room.new_key_bytes[i] += s.indexes.pendings[i].newKeyBytes(keys.bytes[i]);
+                };
+            }
+        };
+
+        /// The field indexes grown, through their budget, to hold the records
+        /// `room` describes before they are staged, so that noting them
+        /// allocates nothing: past the indexes' memory the next record starts
+        /// a segment, sealing this one early. What memory refuses is left to
+        /// the noting, which leaves the indexes stale.
+        fn roomForKeys(s: *State, room: *const Room) void {
             const ix = &s.indexes;
-            if (declared.count == 0 or ix.stale or ix.budget.fits(cost)) return;
+            if (declared.count == 0 or ix.stale) return;
+            const fits = fits: inline for (&ix.pendings, 0..) |*p, i| {
+                const grown = switch (declared.kind(i)) {
+                    .exact => p.reserveExact(&ix.budget, room.records[i], room.new_key_bytes[i]),
+                    .ordered => p.reserveOrdered(&ix.budget, room.records[i]),
+                };
+                grown catch |err| switch (err) {
+                    error.IndexMemory => break :fits false,
+                    // The noting meets it again, and leaves the indexes stale.
+                    error.OutOfMemory => break :fits true,
+                };
+            } else true;
+            if (fits) return;
             if (!s.log.rotate_requested) ix.sealed_early +|= 1;
             s.log.requestRotation();
         }
@@ -2907,11 +2941,11 @@ pub fn Journal(comptime Event: type) type {
             inline for (0..declared.count) |i| if (keys.has[i]) {
                 const p = &ix.pendings[i];
                 switch (declared.kind(i)) {
-                    .exact => p.addExact(self.gpa, &ix.budget, keys.bytes[i], seq, offset) catch {
+                    .exact => p.addExact(&ix.budget, keys.bytes[i], seq, offset) catch {
                         ix.stale = true;
                         return;
                     },
-                    .ordered => p.addOrdered(self.gpa, &ix.budget, keys.words[i], seq, offset) catch {
+                    .ordered => p.addOrdered(&ix.budget, keys.words[i], seq, offset) catch {
                         ix.stale = true;
                         return;
                     },
@@ -2931,7 +2965,7 @@ pub fn Journal(comptime Event: type) type {
                     std.log.debug("optional field index maintenance: {t}", .{err});
                 };
             };
-            for (&ix.pendings) |*p| p.clear(&ix.budget, base);
+            for (&ix.pendings) |*p| p.clear(base);
             ix.base = base;
             ix.stale = false;
         }
