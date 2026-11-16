@@ -127,6 +127,25 @@ pub const cursor_extension = Log.cursor_extension;
 /// How much of a journal `open` reads back before it returns.
 pub const Verify = implementation.Verify;
 
+/// A field index a journal's event declares, beside its records:
+///
+///     pub const chronicle = .{ .indexes = &.{
+///         index("account", 1, .exact, accountOf), // fn (Event) ?u64
+///         index("amount", 1, .ordered, amountOf), // fn (Event) ?i64
+///     } };
+///
+/// A name of 1 to 32 lower-case letters, digits and `_`; a version, raised
+/// when the key function changes; a kind; and a key function of the event,
+/// null for a record the index does not hold. An exact key is `[]const u8`
+/// (at most 255 bytes), an integer of at most 64 bits or an enum; an ordered
+/// key an integer of at most 64 bits or an aegis instant or id. A declaration
+/// that cannot work does not compile.
+pub const index = implementation.declareIndex;
+
+/// How a field index compares its keys: `exact` for equality, `ordered` for
+/// ranges.
+pub const IndexKind = implementation.IndexKind;
+
 /// The name of the segment file whose first record is `base_seq`, relative to
 /// the journal's directory. Exposed because a journal's directory is meant to
 /// be read with `tail -f` and with your eyes.

@@ -30,6 +30,7 @@ const strand = jsonl.strand;
 const airlock = @import("airlock");
 const aegis = @import("aegis");
 const values = @import("values.zig");
+const field_index = @import("index.zig");
 
 const Seq = values.Seq;
 const Bytes = values.Bytes;
@@ -370,6 +371,9 @@ pub const Options = struct {
     index_interval_bytes: Bytes = .fromRaw(4096),
     max_record_bytes: Bytes = .fromRaw(1024 * 1024),
     blocking: ?*airlock.Blocking = null,
+    /// The field indexes declared on the journal's event, by name: each
+    /// sealed segment may have a file of each beside it, which goes with it.
+    field_indexes: []const []const u8 = &.{},
 };
 
 pub const ReadError = Allocator.Error || Io.Cancelable || Io.File.OpenError ||
@@ -463,6 +467,9 @@ held_index: ?HeldIndex,
 /// them, and what refuses it may come after `load` (a later segment, the
 /// journal's own reading), so the repairs wait for `settle`.
 pending: std.ArrayList(Repair),
+/// The next record staged that may start a segment starts one: the active
+/// segment's field indexes would pass their memory with it.
+rotate_requested: bool = false,
 
 /// A change to the files that `load` decided on, written by `settle`.
 const Repair = union(enum) {
@@ -2485,6 +2492,12 @@ pub fn chainTip(log: *const Self) u32 {
 /// limits that takes it: a record of an atomic batch after the first, since
 /// a batch is never split across segments, which is what lets an open find a
 /// torn one in the active segment alone.
+/// Start a segment at the next record staged that may start one, however
+/// little the active segment holds: its field indexes' memory is full.
+pub fn requestRotation(log: *Self) void {
+    log.rotate_requested = true;
+}
+
 pub fn stageLine(log: *Self, io: Io, bytes: []const u8, at: Time, checksum: u32, rotation: Rotation) Self.StageError!void {
     log.assertValid();
     if (log.active == null) return error.ReadOnly;
@@ -2494,11 +2507,14 @@ pub fn stageLine(log: *Self, io: Io, bytes: []const u8, at: Time, checksum: u32,
     const needed: Bytes = .fromRaw(bytes.len + 1);
     const over_bytes = values.below(log.options.max_segment_bytes, values.plus(segment.bytes, needed));
     const over_records = if (log.options.max_segment_records) |limit| !values.below(segment.count(), limit) else false;
-    if (rotation == .may_rotate and segment.count() != values.no_records and (over_bytes or over_records)) {
+    // An empty segment cannot be sealed: a request to start another waits for its first record.
+    if (segment.count() == values.no_records) log.rotate_requested = false;
+    if (rotation == .may_rotate and segment.count() != values.no_records and (over_bytes or over_records or log.rotate_requested)) {
         // The rotation seals the segment being left, so the records staged
         // into it are durable before the new one is named. The chain carries
         // across it: a rotation is not a break in the records.
         try log.rotate(io);
+        log.rotate_requested = false;
         segment = &log.segments.items[log.segments.items.len - 1];
     }
 
@@ -3054,6 +3070,19 @@ fn deleteSegmentFiles(log: *Self, io: Io, base_seq: Seq) Io.Dir.DeleteFileError!
         // So is the stream index a cache.
         else => std.log.debug("optional stream index maintenance: {t}", .{err}),
     };
+    log.deleteFieldIndexes(io, base_seq);
+}
+
+/// The field index files of segment `base_seq`, each a cache: one the segment
+/// never had, or that cannot be removed, is no error.
+fn deleteFieldIndexes(log: *Self, io: Io, base_seq: Seq) void {
+    for (log.options.field_indexes) |name| {
+        const file: field_index.build.FileName = .of(base_seq, name);
+        log.dir.borrow().deleteFile(io, file.slice()) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => std.log.debug("optional field index maintenance: {t}", .{err}),
+        };
+    }
 }
 
 //========================================================================
@@ -3263,6 +3292,7 @@ pub fn redactSegment(
             else => std.log.debug("optional index maintenance: {t}", .{err}),
         };
     }
+    log.deleteFieldIndexes(io, base_seq);
     try log.syncDir(io);
     return true;
 }

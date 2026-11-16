@@ -34,21 +34,38 @@ pub const Budget = struct {
     }
 };
 
+/// The shortest a record's line can be, its seq, time, version, payload and
+/// checksum: what sizes the index memory a full segment can need.
+pub const smallest_record_bytes = 32;
+
 /// The active segment would pass its index memory: it is sealed early.
 pub const BudgetError = error{IndexMemory};
 
 /// A key too long for an index: refused before its record is written.
 pub const KeyError = error{KeyTooLong};
 
-/// One record of a pending index: its key's number in the key table (an
-/// exact index) or its key (an ordered one), its seq, offset and extra.
-const Posted = struct { key: u64, seq: Seq, offset: Bytes, extra: u64 };
+/// One record of a pending exact index, 16 bytes: its key's number in the key
+/// table, its seq as a count past the segment's first, and its offset.
+const ExactPosted = extern struct { key: u32, seq: u32, offset: u64 };
+
+/// One record of a pending ordered index, 24 bytes: its key, its offset, and
+/// its seq as a count past the segment's first.
+const OrderedPosted = extern struct { key: u64, offset: u64, seq: u32, pad: u32 = 0 };
 
 /// Where a distinct key's bytes lie in the table's heap.
 const KeySpan = struct { at: u32, len: u32 };
 
-/// What a record is charged.
-pub const entry_bytes: Bytes = .fromRaw(@sizeOf(Posted));
+/// What a record is charged: 16 bytes in an exact index, 24 in an ordered one.
+pub fn entryBytes(kind: format.Kind) Bytes {
+    return .fromRaw(switch (kind) {
+        .exact => @sizeOf(ExactPosted),
+        .ordered => @sizeOf(OrderedPosted),
+    });
+}
+
+comptime {
+    if (@sizeOf(ExactPosted) != 16 or @sizeOf(OrderedPosted) != 24) @compileError("chronicle: a pending record's size is the index memory's budget per record");
+}
 
 /// What a distinct key is charged besides its bytes: its span and its slot in
 /// the table.
@@ -65,7 +82,10 @@ pub fn PendingWith(comptime keyHash: fn ([]const u8) u64) type {
         spans: std.ArrayList(KeySpan) = .empty,
         /// The key numbers, found by their bytes.
         table: std.HashMapUnmanaged(u32, void, TableContext, std.hash_map.default_max_load_percentage) = .empty,
-        entries: std.ArrayList(Posted) = .empty,
+        /// The segment's first record, which the records' seqs count from.
+        base: Seq = .fromRaw(0),
+        exact: std.ArrayList(ExactPosted) = .empty,
+        ordered: std.ArrayList(OrderedPosted) = .empty,
         /// What the keys and entries were charged.
         charged: Bytes = values.no_bytes,
 
@@ -105,12 +125,14 @@ pub fn PendingWith(comptime keyHash: fn ([]const u8) u64) type {
         /// key interned: `error.KeyTooLong` past `format.max_key_bytes`,
         /// `error.IndexMemory` when the budget would be passed. Nothing is
         /// added on an error.
-        pub fn addExact(p: *Self, gpa: Allocator, budget: *Budget, key: []const u8, seq: Seq, offset: Bytes, extra: u64) (Allocator.Error || BudgetError || KeyError)!void {
+        pub fn addExact(p: *Self, gpa: Allocator, budget: *Budget, key: []const u8, seq: Seq, offset: Bytes) (Allocator.Error || BudgetError || KeyError)!void {
             if (key.len > format.max_key_bytes) return error.KeyTooLong;
+            const counted = try p.past(seq);
             const found = p.table.getKeyAdapted(key, ByBytes{ .pending = p });
             const key_cost: Bytes = if (found == null) values.plus(Bytes.fromRaw(key.len), key_overhead) else values.no_bytes;
-            if (!budget.fits(values.plus(key_cost, entry_bytes))) return error.IndexMemory;
-            try p.entries.ensureUnusedCapacity(gpa, 1);
+            const cost = values.plus(key_cost, entryBytes(.exact));
+            if (!budget.fits(cost)) return error.IndexMemory;
+            try p.exact.ensureUnusedCapacity(gpa, 1);
             const number: u32 = found orelse number: {
                 try p.heap.ensureUnusedCapacity(gpa, key.len);
                 try p.spans.ensureUnusedCapacity(gpa, 1);
@@ -124,45 +146,87 @@ pub fn PendingWith(comptime keyHash: fn ([]const u8) u64) type {
                 };
                 break :number n;
             };
-            p.entries.appendAssumeCapacity(.{ .key = number, .seq = seq, .offset = offset, .extra = extra });
-            p.charge(budget, values.plus(key_cost, entry_bytes));
+            p.exact.appendAssumeCapacity(.{ .key = number, .seq = counted, .offset = offset.raw() });
+            p.charge(budget, cost);
+        }
+
+        /// `seq` as a count past the segment's first: a segment of more than
+        /// four billion records has no room in this index, and seals early.
+        fn past(p: *const Self, seq: Seq) BudgetError!u32 {
+            const gap = p.base.distanceTo(seq) catch return error.IndexMemory;
+            return std.math.cast(u32, gap.raw()) orelse error.IndexMemory;
+        }
+
+        /// What a record whose exact key is `key` would be charged: its
+        /// entry, and the key's bytes when the key is new.
+        pub fn costOf(p: *const Self, key: []const u8) Bytes {
+            if (p.table.containsAdapted(key, ByBytes{ .pending = p })) return entryBytes(.exact);
+            return values.plus(values.plus(entryBytes(.exact), key_overhead), Bytes.fromRaw(key.len));
         }
 
         /// A record whose ordered key is `key` added, charged to `budget`.
         pub fn addOrdered(p: *Self, gpa: Allocator, budget: *Budget, key: u64, seq: Seq, offset: Bytes) (Allocator.Error || BudgetError)!void {
-            if (!budget.fits(entry_bytes)) return error.IndexMemory;
-            try p.entries.append(gpa, .{ .key = key, .seq = seq, .offset = offset, .extra = 0 });
-            p.charge(budget, entry_bytes);
+            const counted = try p.past(seq);
+            if (!budget.fits(entryBytes(.ordered))) return error.IndexMemory;
+            try p.ordered.append(gpa, .{ .key = key, .seq = counted, .offset = offset.raw() });
+            p.charge(budget, entryBytes(.ordered));
         }
 
-        /// Every key and entry dropped and given back to `budget`; the memory
-        /// is kept for the next segment.
-        pub fn clear(p: *Self, budget: *Budget) void {
+        /// How many records it holds.
+        pub fn len(p: *const Self) usize {
+            return p.exact.items.len + p.ordered.items.len;
+        }
+
+        /// The records past the first `kept` taken back, their entries'
+        /// memory given back to `budget`: a batch staged and taken back. Keys
+        /// they interned stay, charged, for the segment's later records.
+        pub fn rollback(p: *Self, budget: *Budget, kept: usize) void {
+            inline for (.{ &p.exact, &p.ordered }, .{ format.Kind.exact, format.Kind.ordered }) |list, kind| {
+                if (kept < list.items.len) {
+                    const back = entryBytes(kind).mul(list.items.len - kept) catch aegis.assert.never("the records taken back were each charged, so their total fits");
+                    budget.used = values.minus(budget.used, back);
+                    p.charged = values.minus(p.charged, back);
+                    list.shrinkRetainingCapacity(kept);
+                }
+            }
+        }
+
+        /// Every key and record dropped and given back to `budget`, to start
+        /// the segment whose first record is `base`; the memory is kept.
+        pub fn clear(p: *Self, budget: *Budget, base: Seq) void {
             budget.used = values.minus(budget.used, p.charged);
             p.charged = values.no_bytes;
+            p.base = base;
             p.heap.clearRetainingCapacity();
             p.spans.clearRetainingCapacity();
             p.table.clearRetainingCapacity();
-            p.entries.clearRetainingCapacity();
+            p.exact.clearRetainingCapacity();
+            p.ordered.clearRetainingCapacity();
         }
 
         pub fn deinit(p: *Self, gpa: Allocator) void {
             p.heap.deinit(gpa);
             p.spans.deinit(gpa);
             p.table.deinit(gpa);
-            p.entries.deinit(gpa);
+            p.exact.deinit(gpa);
+            p.ordered.deinit(gpa);
             p.* = undefined;
         }
 
         /// The index file of these entries for segment and index `of`, into
         /// `out`: each record under its own whole key.
         pub fn encode(p: *const Self, gpa: Allocator, of: format.Of, out: *std.ArrayList(u8)) Allocator.Error!void {
-            const entries = try gpa.alloc(format.Entry, p.entries.items.len);
+            aegis.assert.invariant(!of.extra and of.base_seq.eql(p.base), "a pending index keeps no extra column, and is encoded for its own segment");
+            const entries = try gpa.alloc(format.Entry, p.len());
             defer gpa.free(entries);
-            for (entries, p.entries.items) |*e, posted| e.* = switch (of.kind) {
-                .exact => .exact(p.keyBytes(@intCast(posted.key)), posted.seq, posted.offset, posted.extra),
-                .ordered => .ordered(posted.key, posted.seq, posted.offset),
-            };
+            switch (of.kind) {
+                .exact => for (entries, p.exact.items) |*e, posted| {
+                    e.* = .exact(p.keyBytes(posted.key), p.base.advance(.fromRaw(posted.seq)) catch aegis.assert.never("a record noted past the segment's first is a seq it was"), .fromRaw(posted.offset), 0);
+                },
+                .ordered => for (entries, p.ordered.items) |*e, posted| {
+                    e.* = .ordered(posted.key, p.base.advance(.fromRaw(posted.seq)) catch aegis.assert.never("a record noted past the segment's first is a seq it was"), .fromRaw(posted.offset));
+                },
+            }
             return format.encode(gpa, of, entries, out);
         }
     };
@@ -198,21 +262,28 @@ const testing = std.testing;
 
 test "records and new keys are charged to the budget, refused past it, and given back when cleared" {
     const gpa = testing.allocator;
-    const first = values.plus(values.plus(entry_bytes, key_overhead), Bytes.fromRaw(1));
+    const first = values.plus(values.plus(entryBytes(.exact), key_overhead), Bytes.fromRaw(1));
     // Room for a record with a new key and a second record of the same key.
-    var budget: Budget = .{ .limit = values.plus(first, entry_bytes) };
+    var budget: Budget = .{ .limit = values.plus(first, entryBytes(.exact)) };
     var p: Pending = .{};
     defer p.deinit(gpa);
-    try p.addExact(gpa, &budget, "a", .fromRaw(1), .fromRaw(0), 0);
-    try p.addExact(gpa, &budget, "a", .fromRaw(2), .fromRaw(10), 0);
-    try testing.expectError(error.IndexMemory, p.addExact(gpa, &budget, "b", .fromRaw(3), .fromRaw(20), 0));
-    try testing.expectEqual(2, p.entries.items.len);
+    p.clear(&budget, .fromRaw(1));
+    try p.addExact(gpa, &budget, "a", .fromRaw(1), .fromRaw(0));
+    try p.addExact(gpa, &budget, "a", .fromRaw(2), .fromRaw(10));
+    try testing.expectError(error.IndexMemory, p.addExact(gpa, &budget, "b", .fromRaw(3), .fromRaw(20)));
+    try testing.expectEqual(2, p.len());
     try testing.expectEqual(1, p.spans.items.len);
-    p.clear(&budget);
+    // A batch taken back gives back its records' memory.
+    p.rollback(&budget, 1);
+    try testing.expectEqual(1, p.len());
+    try p.addExact(gpa, &budget, "a", .fromRaw(2), .fromRaw(10));
+    p.clear(&budget, .fromRaw(3));
     try testing.expect(budget.used.eql(values.no_bytes));
-    try p.addExact(gpa, &budget, "b", .fromRaw(3), .fromRaw(20), 0);
+    try p.addExact(gpa, &budget, "b", .fromRaw(3), .fromRaw(20));
     var long: [format.max_key_bytes + 1]u8 = @splat('k');
-    try testing.expectError(error.KeyTooLong, p.addExact(gpa, &budget, &long, .fromRaw(4), .fromRaw(30), 0));
+    try testing.expectError(error.KeyTooLong, p.addExact(gpa, &budget, &long, .fromRaw(4), .fromRaw(30)));
+    // A record before the segment's first has no place in its index.
+    try testing.expectError(error.IndexMemory, p.addExact(gpa, &budget, "b", .fromRaw(2), .fromRaw(30)));
 }
 
 fn sameHash(_: []const u8) u64 {
@@ -224,10 +295,11 @@ test "keys sharing a hash are kept apart, and each record is filed under its own
     var budget: Budget = .{ .limit = values.furthest };
     var p: PendingWith(sameHash) = .{};
     defer p.deinit(gpa);
+    p.clear(&budget, .fromRaw(10));
     const keys = [_][]const u8{ "alpha", "beta", "alpha", "a key longer than eight bytes", "beta", "gamma" };
-    for (keys, 0..) |k, i| try p.addExact(gpa, &budget, k, .fromRaw(10 + i), .fromRaw(i * 8), i);
+    for (keys, 0..) |k, i| try p.addExact(gpa, &budget, k, .fromRaw(10 + i), .fromRaw(i * 8));
     try testing.expectEqual(4, p.spans.items.len);
-    const of: format.Of = .{ .base_seq = .fromRaw(10), .segment_bytes = .fromRaw(100), .name = "kind", .version = 1, .kind = .exact, .extra = true };
+    const of: format.Of = .{ .base_seq = .fromRaw(10), .segment_bytes = .fromRaw(100), .name = "kind", .version = 1, .kind = .exact };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(gpa);
     try p.encode(gpa, of, &out);
@@ -236,7 +308,7 @@ test "keys sharing a hash are kept apart, and each record is filed under its own
     for (keys) |k| {
         const run = index.find(k);
         // Each record found under its key is one that was added with it.
-        for (run.first..run.end) |i| try testing.expectEqualStrings(k, keys[index.at(i).extra]);
+        for (run.first..run.end) |i| try testing.expectEqualStrings(k, keys[index.at(i).seq.raw() - 10]);
         var expected: usize = 0;
         for (keys) |other| expected += @intFromBool(std.mem.eql(u8, other, k));
         try testing.expectEqual(expected, run.end - run.first);
@@ -248,6 +320,7 @@ test "an ordered pending index encodes its keys, and its file is named for the s
     var budget: Budget = .{ .limit = values.furthest };
     var p: Pending = .{};
     defer p.deinit(gpa);
+    p.clear(&budget, .fromRaw(5));
     try p.addOrdered(gpa, &budget, format.orderedKey(@as(i64, -3)), .fromRaw(5), .fromRaw(0));
     try p.addOrdered(gpa, &budget, format.orderedKey(@as(i64, 4)), .fromRaw(6), .fromRaw(9));
     const of: format.Of = .{ .base_seq = .fromRaw(5), .segment_bytes = .fromRaw(100), .name = "amount", .version = 1, .kind = .ordered };

@@ -185,13 +185,27 @@ sign bit flipped); its summary is the lowest and the highest key, and its
 postings, each a key, seq and offset, are sorted by key and then seq, which a
 range bisects.
 
+**Declared indexes** (`journal/index/declare.zig`): an event declares its field
+indexes as `pub const chronicle = .{ .indexes = &.{ index(...) } }`, each checked
+when `Journal(Event)` is made: its name, unique and not `stream`, its key function
+a function of the event giving `?Key`, its key type one its kind can hold. An
+append computes each record's keys before anything is written, refusing a key
+past 255 bytes, and notes them after the record is staged, at its offset.
+
 **The active segment's index** (`journal/index/build.zig`) is built in memory as
 records are appended: each distinct key once, whole, in a table found by the
 key's hash and compared byte for byte, and per record its key's number, seq,
 offset and extra column. Two keys sharing a hash are two entries of the table, so
 the seal files every record under its own key and reads nothing back. The
-records' entries and the distinct keys' bytes are charged to a budget
-(`Options.index_memory`), past which the active segment seals early. A key past
+records' entries (16 bytes in an exact index, 24 in an ordered one) and the
+distinct keys' bytes are charged to a budget (`Options.index_memory`), past which
+the next record starts a segment (`Log.requestRotation`). Its default is what a
+full segment's indexes can need: `max_segment_bytes` over the shortest a record
+can be (32 bytes) records, each with an entry in every declared index, and in each
+exact index a key of its longest for every record. The indexes are stale, and
+their segment seals without index files, when they may not hold all its records:
+it held records when the journal opened, a batch was taken back, the log was read
+again, compacted or rewritten. A key past
 255 bytes is refused before its record is written. Index files are written under
 a temporary name and renamed into place with no sync (`Log.writeCache`): a crash
 costs a rebuild, never a wrong answer.

@@ -16,6 +16,13 @@ const envelope = @import("journal/envelope.zig");
 const Encoding = @import("journal/Encoding.zig");
 const values = @import("journal/values.zig");
 const streams = @import("journal/streams.zig");
+const field_index = @import("journal/index.zig");
+
+/// A field index an event declares: `pub const chronicle = .{ .indexes = &.{
+/// index("account", 1, .exact, accountOf) } }`.
+pub const declareIndex = field_index.declare.index;
+/// How a field index compares its keys: `exact` for equality, `ordered` for ranges.
+pub const IndexKind = field_index.declare.Kind;
 
 pub const Seq = values.Seq;
 pub const Bytes = values.Bytes;
@@ -110,6 +117,9 @@ pub fn Journal(comptime Event: type) type {
     return struct {
         const Self = @This();
 
+        /// The field indexes `Event` declares (`pub const chronicle = .{ .indexes = ... }`).
+        const declared = field_index.declare.Declared(Event);
+
         // Only the journal facade hands out access to this state.
 
         /// The configuration supplied at open, which a caller sees through
@@ -132,6 +142,47 @@ pub fn Journal(comptime Event: type) type {
         /// instant as a signal for the cancel, so a reader stopped as a
         /// record arrives is stopped.
         changed: aegis.Condition,
+
+        /// The active segment's field indexes, built as records are appended
+        /// and written beside it when it seals. Stale when they may not hold
+        /// every record of the active segment (it was open before, or a batch
+        /// was taken back, or the log was read again): then the segment seals
+        /// with no field index files, and the next starts clean.
+        const Indexes = struct {
+            pendings: [declared.count]field_index.build.Pending,
+            budget: field_index.build.Budget,
+            /// The active segment the pendings describe.
+            base: Seq = values.beginning,
+            stale: bool = true,
+            /// Where an index file is built before it is written.
+            buf: std.ArrayList(u8) = .empty,
+
+            fn init(options: Options) Indexes {
+                return .{ .pendings = @splat(.{}), .budget = .{ .limit = indexMemory(options) } };
+            }
+
+            fn deinit(ix: *Indexes, gpa: Allocator) void {
+                for (&ix.pendings) |*p| p.deinit(gpa);
+                ix.buf.deinit(gpa);
+            }
+        };
+
+        /// `Options.index_memory`, or the size its comment gives.
+        fn indexMemory(options: Options) Bytes {
+            if (options.index_memory) |given| return given;
+            // As many records as a full segment holds at their shortest; a sum past 64 bits is no limit.
+            const records = options.max_segment_bytes.ratio(.fromRaw(field_index.build.smallest_record_bytes)) catch aegis.assert.never("the shortest record is not zero bytes");
+            var total = values.no_bytes;
+            inline for (0..declared.count) |i| {
+                const entries = field_index.build.entryBytes(declared.kind(i)).mul(records) catch values.furthest;
+                total = total.add(entries) catch values.furthest;
+                if (declared.kind(i) == .exact) {
+                    const key = Bytes.fromRaw(declared.longestKey(i)).add(field_index.build.key_overhead) catch values.furthest;
+                    total = total.add(key.mul(records) catch values.furthest) catch values.furthest;
+                }
+            }
+            return total;
+        }
 
         /// What the lock guards.
         const State = struct {
@@ -159,6 +210,8 @@ pub fn Journal(comptime Event: type) type {
             /// The streams: the active segment's, the heads looked up, and
             /// where each truncated stream now starts.
             streams: streams.Book,
+            /// The active segment's field indexes.
+            indexes: Indexes,
 
             /// Refuse a conditional append whose journal has moved on. Called
             /// after everything that says the journal cannot be appended to at
@@ -179,8 +232,9 @@ pub fn Journal(comptime Event: type) type {
             /// happened. Nothing here was ever acknowledged, so nothing is lost
             /// by it.
             fn unstage(s: *State, io: Io, from: Log.Mark) void {
-                // The records taken back may have been noted in the book.
+                // The records taken back may have been noted in the book and the field indexes.
                 s.streams.stale = true;
+                s.indexes.stale = true;
                 s.log.discardStaged(io, from) catch {
                     // The log could not be put back. What this process staged
                     // may reach the disk as records it never acknowledged, so it
@@ -431,6 +485,18 @@ pub fn Journal(comptime Event: type) type {
             /// may hold it. Memory is a few hundred bytes a stream, whatever
             /// number of streams the journal holds.
             stream_heads: u32 = 4096,
+            /// What the active segment's field indexes may hold in memory:
+            /// each record's entry (16 bytes in an exact index, 24 in an
+            /// ordered one) and each distinct key's bytes. Null sizes it so a
+            /// full segment's fit: as many records as `max_segment_bytes`
+            /// holds at the shortest a record can be, each with an entry in
+            /// every declared index, and in each exact index a key of its
+            /// longest for every record. Past it the active segment is sealed
+            /// early.
+            index_memory: ?Bytes = null,
+            /// What the summaries of sealed segments' field indexes, read for
+            /// lookups by key, may hold in memory.
+            summary_memory: Bytes = .fromRaw(16 * 1024 * 1024),
             /// How large a snapshot file may be to be written or read back. It holds
             /// whatever a fold serialises to, so this is the caller's number
             /// and not the package's; a larger one is
@@ -483,7 +549,7 @@ pub fn Journal(comptime Event: type) type {
         pub const OpenWithSnapshotError = OpenError || error{ CorruptSnapshot, SnapshotTooLarge };
 
         pub const AppendError = Allocator.Error || Log.StageError ||
-            error{ PersistenceFailed, NotRoundTrippable, RecordTooLarge };
+            error{ PersistenceFailed, NotRoundTrippable, RecordTooLarge, KeyTooLong };
 
         pub const AppendIfError = AppendError || error{WrongExpectedSeq};
 
@@ -643,6 +709,7 @@ pub fn Journal(comptime Event: type) type {
                     .nudges = 0,
                     .seq = values.beginning,
                     .streams = .init(gpa, options.stream_heads),
+                    .indexes = .init(options),
                     .write_failed = false,
                 }),
                 .changed = .initLimit(std.math.maxInt(usize)),
@@ -663,6 +730,7 @@ pub fn Journal(comptime Event: type) type {
                     .index_interval_bytes = options.index_interval_bytes,
                     .max_record_bytes = options.max_record_bytes,
                     .blocking = options.blocking,
+                    .field_indexes = &declared.names,
                 });
             }
             errdefer {
@@ -678,6 +746,7 @@ pub fn Journal(comptime Event: type) type {
                 const s = guard.value();
                 try self.fillTail(s, io);
                 try self.loadTruncations(s, io);
+                startIndexes(s);
             }
             if (options.verify == .full) _ = try self.verify(io);
         }
@@ -743,6 +812,7 @@ pub fn Journal(comptime Event: type) type {
 
         fn release(self: *Self, s: *State) void {
             s.streams.deinit();
+            s.indexes.deinit(self.gpa);
             s.clearTail();
             s.tail.deinit(self.gpa);
             s.line.deinit(self.gpa);
@@ -794,6 +864,10 @@ pub fn Journal(comptime Event: type) type {
             if (!streamed) try s.expect(expected);
             const place: ?StreamAt = if (streamed) .{ .id = in.stream.bytes, .version = (try self.placeAppend(s, io, in, 1)).last } else null;
             const next = try values.successor(s.seq);
+            // Keyed before the write: a key no index can hold refuses the record.
+            var keys: declared.Keys = .{};
+            try declared.keysOf(&event, &keys);
+            roomForKeys(s, keysCost(s, &keys));
             // Built before the write: a record the journal could not hold is a
             // record that must not reach the disk either.
             var built = try self.encode(s, next, at, s.log.chainTip(), event, null, place);
@@ -815,6 +889,7 @@ pub fn Journal(comptime Event: type) type {
                 }
             }
             self.noteStaged(s, io, place, next, built.bytes.len);
+            self.noteKeys(s, io, &keys, next, built.bytes.len);
 
             held = self.publish(s, built);
             self.wake(io);
@@ -874,6 +949,14 @@ pub fn Journal(comptime Event: type) type {
                 .{ .first = try values.successor(before), .last = last }
             else
                 null;
+            // Keyed before anything is staged: a key no index can hold refuses the batch.
+            var batch_cost = values.no_bytes;
+            for (entries) |entry| {
+                var keys: declared.Keys = .{};
+                try declared.keysOf(&entry.event, &keys);
+                batch_cost = values.plus(batch_cost, keysCost(s, &keys));
+            }
+            roomForKeys(s, batch_cost);
             var link = s.log.chainTip();
             const staged_from = s.log.mark();
             for (entries, 0..) |entry, i| {
@@ -895,6 +978,9 @@ pub fn Journal(comptime Event: type) type {
                     };
                 }
                 self.noteStaged(s, io, place, numbered, item.bytes.len);
+                var keys: declared.Keys = .{};
+                declared.keysOf(&entry.event, &keys) catch aegis.assert.never("each entry was keyed before the batch was staged");
+                self.noteKeys(s, io, &keys, numbered, item.bytes.len);
                 if (self.keepsRecords(s)) built.appendAssumeCapacity(item) else item.release();
             }
 
@@ -929,6 +1015,7 @@ pub fn Journal(comptime Event: type) type {
 
             const previous = s.seq;
             try s.log.reload(io);
+            s.indexes.stale = true;
             s.clearTail();
             try self.fillTail(s, io);
             s.write_failed = false;
@@ -1250,6 +1337,7 @@ pub fn Journal(comptime Event: type) type {
             defer _ = io.swapCancelProtection(protection);
             const previous = s.seq;
             try s.log.reload(io);
+            s.indexes.stale = true;
             s.clearTail();
             try self.fillTail(s, io);
             try self.caughtUp(s, io, previous);
@@ -1748,6 +1836,7 @@ pub fn Journal(comptime Event: type) type {
             if (s.write_failed) return error.PersistenceFailed;
             try self.raiseFloors(s, io, keep_after_seq, .every_record);
             try s.log.compact(io, keep_after_seq);
+            s.indexes.stale = true;
             // The streams' records below their truncation points become
             // stubs: their events leave the files.
             try self.redactTruncated(s, io);
@@ -1764,6 +1853,7 @@ pub fn Journal(comptime Event: type) type {
                 // open or refresh. Backup begins with a current directory
                 // view so rotations completed before this call are included.
                 try s.log.reload(io);
+                s.indexes.stale = true;
                 s.clearTail();
                 try self.fillTail(s, io);
             }
@@ -2254,6 +2344,101 @@ pub fn Journal(comptime Event: type) type {
             return .{ .head = head, .last = last };
         }
 
+        /// The field indexes from the log: the active segment's, which hold
+        /// its records only if it holds none yet.
+        fn startIndexes(s: *State) void {
+            const ix = &s.indexes;
+            const segments = s.log.segments.items;
+            const base = if (segments.len == 0) values.beginning else segments[segments.len - 1].base_seq;
+            for (&ix.pendings) |*p| p.clear(&ix.budget, base);
+            ix.base = base;
+            ix.stale = segments.len != 0 and !segments[segments.len - 1].count().eql(values.no_records);
+        }
+
+        /// What a record with `keys` adds to the active segment's field
+        /// indexes' memory, at most.
+        fn keysCost(s: *const State, keys: *const declared.Keys) Bytes {
+            var cost = values.no_bytes;
+            inline for (0..declared.count) |i| if (keys.has[i]) {
+                cost = values.plus(cost, switch (declared.kind(i)) {
+                    .exact => s.indexes.pendings[i].costOf(keys.bytes[i]),
+                    .ordered => field_index.build.entryBytes(.ordered),
+                });
+            };
+            return cost;
+        }
+
+        /// Room for `cost` more in the field indexes: past their memory the
+        /// next record starts a segment, sealing this one early.
+        fn roomForKeys(s: *State, cost: Bytes) void {
+            const ix = &s.indexes;
+            if (declared.count == 0 or ix.stale or ix.budget.fits(cost)) return;
+            s.log.requestRotation();
+        }
+
+        /// Note a record just staged in the field indexes: a segment the log
+        /// has just sealed gets its index files first. Never fails: what
+        /// cannot be noted leaves the active segment's indexes stale.
+        fn noteKeys(self: *Self, s: *State, io: Io, keys: *const declared.Keys, seq: Seq, line_len: usize) void {
+            if (declared.count == 0) return;
+            const ix = &s.indexes;
+            const segments = s.log.segments.items;
+            if (segments.len == 0) {
+                ix.stale = true;
+                return;
+            }
+            const active = segments[segments.len - 1];
+            if (active.base_seq != ix.base) self.sealIndexes(s, io, active.base_seq);
+            if (ix.stale) return;
+            const offset = active.bytes.sub(.fromRaw(line_len + 1)) catch {
+                ix.stale = true;
+                return;
+            };
+            inline for (0..declared.count) |i| if (keys.has[i]) {
+                const p = &ix.pendings[i];
+                switch (declared.kind(i)) {
+                    .exact => p.addExact(self.gpa, &ix.budget, keys.bytes[i], seq, offset) catch {
+                        ix.stale = true;
+                        return;
+                    },
+                    .ordered => p.addOrdered(self.gpa, &ix.budget, keys.words[i], seq, offset) catch {
+                        ix.stale = true;
+                        return;
+                    },
+                }
+            };
+        }
+
+        /// The segment the field indexes describe has been sealed: write its
+        /// index files, when they hold all its records, and start on the
+        /// segment `base`.
+        fn sealIndexes(self: *Self, s: *State, io: Io, base: Seq) void {
+            const ix = &s.indexes;
+            if (!ix.stale and self.config.access == .write) for (s.log.segments.items) |segment| {
+                if (segment.base_seq != ix.base) continue;
+                inline for (0..declared.count) |i| self.writeFieldIndex(s, io, segment, i) catch |err| {
+                    // A cache: a read finds none, and reads the segment.
+                    std.log.debug("optional field index maintenance: {t}", .{err});
+                };
+            };
+            for (&ix.pendings) |*p| p.clear(&ix.budget, base);
+            ix.base = base;
+            ix.stale = false;
+        }
+
+        fn writeFieldIndex(self: *Self, s: *State, io: Io, segment: Log.Segment, comptime i: usize) (Allocator.Error || Log.WriteFileError)!void {
+            const of: field_index.format.Of = .{
+                .base_seq = segment.base_seq,
+                .segment_bytes = segment.bytes,
+                .name = declared.names[i],
+                .version = declared.version(i),
+                .kind = declared.kind(i),
+            };
+            try s.indexes.pendings[i].encode(self.gpa, of, &s.indexes.buf);
+            const name: field_index.build.FileName = .of(segment.base_seq, declared.names[i]);
+            try s.log.writeCache(io, name.slice(), s.indexes.buf.items);
+        }
+
         /// Note a record just staged: a stream's record joins the active
         /// segment's, and a segment the log has just sealed gets its stream
         /// index. Never fails: what cannot be noted leaves the book stale,
@@ -2470,6 +2655,7 @@ pub fn Journal(comptime Event: type) type {
                 // A record now names the new active segment: the book is
                 // read again when it is next asked.
                 s.streams.stale = true;
+                s.indexes.stale = true;
             }
             var rewrote = false;
             var i: usize = 0;
