@@ -2082,6 +2082,25 @@ pub const Scan = struct {
         scan.lines.reset(.{ .offset = scan.position.raw() });
     }
 
+    /// Moves the walk to `offset` in the segment it is walking, past the
+    /// segment's header, so that the next `next` returns the line starting
+    /// there: a read by key, which an index sends from record to record. An
+    /// offset that is not a line's start reads as whatever is there, which
+    /// the reader checks against what it expected.
+    pub fn seekLine(scan: *Scan, offset: Bytes) ScanError!void {
+        aegis.assert.invariant(offset != values.no_bytes, "a record's line is never the segment's first");
+        scan.position = offset;
+        scan.at_header = false;
+        scan.boundary = null;
+        if (scan.file != null) try scan.reader.seekTo(offset.raw());
+        scan.lines.reset(.{ .offset = offset.raw() });
+    }
+
+    /// The segment the walk is in, or null past its last.
+    pub fn walking(scan: *const Scan) ?Seq {
+        return if (scan.at < scan.bases.len) scan.bases[scan.at] else null;
+    }
+
     /// Whether the bytes of the open segment from `from`, as far as a record
     /// may run, hold a zero.
     fn zeroIn(scan: *Scan, io: Io, from: Bytes) ScanError!bool {
@@ -3064,13 +3083,19 @@ fn deleteSegmentFiles(log: *Self, io: Io, base_seq: Seq) Io.Dir.DeleteFileError!
         // The index is a rebuildable cache; record durability is handled separately.
         std.log.debug("optional index maintenance: {t}", .{err});
     };
+    log.deleteStreamIndex(io, base_seq);
+    log.deleteFieldIndexes(io, base_seq);
+}
+
+/// The stream index of segment `base_seq`, a cache: one the segment never
+/// had, or that cannot be removed, is no error.
+fn deleteStreamIndex(log: *Self, io: Io, base_seq: Seq) void {
     log.dir.borrow().deleteFile(io, &segmentName(stream_index_extension, base_seq)) catch |err| switch (err) {
         // A segment no lookup has needed one for has none.
         error.FileNotFound => {},
         // So is the stream index a cache.
         else => std.log.debug("optional stream index maintenance: {t}", .{err}),
     };
-    log.deleteFieldIndexes(io, base_seq);
 }
 
 /// The field index files of segment `base_seq`, each a cache: one the segment
@@ -3145,6 +3170,13 @@ pub fn truncateAfter(log: *Self, io: Io, seq: Seq) Self.TruncateError!void {
     }
 
     if (offset != holder.bytes) {
+        // The stream and field indexes describe the segment by its first
+        // record and its length, and appends after the cut can bring it back
+        // to that length with other records: they go first, so that no crash
+        // leaves one beside the segment cut.
+        log.deleteStreamIndex(io, holder.base_seq);
+        log.deleteFieldIndexes(io, holder.base_seq);
+        try log.syncDir(io);
         const file = try log.dir.borrow().createFile(io, &segmentName(segment_extension, holder.base_seq), .{ .truncate = false });
         defer file.close(io);
         try file.setLength(io, offset.raw());
@@ -3283,7 +3315,9 @@ pub fn redactSegment(
         try writer.writeByte('\n');
     }
     if (!changed) return false;
-    _ = try pending.commit(io, .{ .level = .full, .blocking = log.options.blocking });
+    // The caches go before the segment is replaced: a stub can leave the
+    // segment as long as it was, and a cache of the old records must not
+    // outlive them by a crash.
     inline for (.{ index_extension, stream_index_extension }) |extension| {
         log.dir.borrow().deleteFile(io, &segmentName(extension, base_seq)) catch |err| switch (err) {
             error.FileNotFound => {},
@@ -3294,6 +3328,7 @@ pub fn redactSegment(
     }
     log.deleteFieldIndexes(io, base_seq);
     try log.syncDir(io);
+    _ = try pending.commit(io, .{ .level = .full, .blocking = log.options.blocking });
     return true;
 }
 

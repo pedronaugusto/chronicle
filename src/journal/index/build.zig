@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 const values = @import("../values.zig");
 const format = @import("format.zig");
 const filter = @import("filter.zig");
+const read = @import("read.zig");
 
 const Seq = values.Seq;
 const Bytes = values.Bytes;
@@ -170,6 +171,26 @@ pub fn PendingWith(comptime keyHash: fn ([]const u8) u64) type {
             if (!budget.fits(entryBytes(.ordered))) return error.IndexMemory;
             try p.ordered.append(gpa, .{ .key = key, .seq = counted, .offset = offset.raw() });
             p.charge(budget, entryBytes(.ordered));
+        }
+
+        /// The records `asked` asks for, past `after` and at most `through`,
+        /// oldest first, into `out`.
+        pub fn postings(p: *const Self, gpa: Allocator, asked: *const read.Asked, after: Seq, through: Seq, out: *std.ArrayList(format.Posting)) Allocator.Error!void {
+            out.clearRetainingCapacity();
+            switch (asked.*) {
+                .none => {},
+                .exact => {
+                    const number = p.table.getKeyAdapted(asked.keyBytes(), ByBytes{ .pending = p }) orelse return;
+                    for (p.exact.items) |posted| if (posted.key == number) try p.posting(gpa, posted.seq, posted.offset, after, through, out);
+                },
+                .ordered => for (p.ordered.items) |posted| if (asked.holdsWord(posted.key)) try p.posting(gpa, posted.seq, posted.offset, after, through, out),
+            }
+        }
+
+        fn posting(p: *const Self, gpa: Allocator, counted: u32, offset: u64, after: Seq, through: Seq, out: *std.ArrayList(format.Posting)) Allocator.Error!void {
+            const seq = p.base.advance(.fromRaw(counted)) catch aegis.assert.never("a record noted past the segment's first is a seq it was");
+            if (seq.compare(after) != .gt or seq.compare(through) == .gt) return;
+            try out.append(gpa, .{ .seq = seq, .offset = .fromRaw(offset), .extra = 0 });
         }
 
         /// How many records it holds.

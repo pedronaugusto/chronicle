@@ -205,7 +205,8 @@ can be (32 bytes) records, each with an entry in every declared index, and in ea
 exact index a key of its longest for every record. The indexes are stale, and
 their segment seals without index files, when they may not hold all its records:
 it held records when the journal opened, a batch was taken back, the log was read
-again, compacted or rewritten. A key past
+again, compacted, rewritten or cut (`truncateAfter`), or the active segment is one a
+cut left there and the indexes never saw its first records. A key past
 255 bytes is refused before its record is written. Index files are written under
 a temporary name and renamed into place with no sync (`Log.writeCache`): a crash
 costs a rebuild, never a wrong answer.
@@ -219,6 +220,31 @@ every exact key in its filter. What it refuses is no index. The tests hold a
 round trip by key and by range against the entries given, refuse every shorter
 file and every flipped bit, and fuzz the reader with any bytes and with good
 files changed and their checksum made to hold again.
+
+**Reads by key** (`readIndexed`, `readRange`; `journal/index/read.zig` and the
+`Replay` in `journal.zig`) are a `Replay` that walks segment by segment from
+where it stands, each segment chosen under the journal's lock and read without
+it. The active segment's postings come from its indexes in memory, at most to the
+last committed record. A sealed segment's summary (its filter, or its lowest and
+highest key) is held in memory, keyed by the segment's first record and length,
+under `Options.summary_memory`, the least recently used dropped past it; a
+segment it rules out is passed over with no file opened. One it admits has its
+index file read whole and parsed, and its postings past where the read stands
+read in seq order (an ordered index's range is sorted from key order), each by a
+seek of the walk's scan to its offset. A record found so must start at the
+offset, carry the posting's seq, not be a stub, and give the asked key when its
+event is decoded; one that does not marks the summary stale and the rest of the
+segment is read whole, past the last record handed on. A segment with no index
+file `parse` accepts, or with a stale mark, or the active one when its indexes
+are stale, is read whole, each record's key computed from its event, and counted
+per index. Where a read stands is its position's cursor: it has every record it
+asks for up to there, and the position names the last record it read, which a
+re-arm reads back first, as `replayAt` does. Reading again, compacting, cutting
+or rewriting segments clears the summaries. The tests hold every read, from any
+position and from where a read stopped, equal to a full replay filtered by its
+key, over random appends, batches, reopens, cuts, compactions and index files
+removed, cut short, flipped and swapped, and one index whose checksum holds while
+its postings lie.
 
 ## State that is checked in every build
 

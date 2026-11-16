@@ -189,3 +189,28 @@ test "a segment open before the journal was seals without index files; the next 
     }
     try testing.expect(try readIndex(dir, 3, "account", .exact, &bytes) == null);
 }
+
+test "a cut inside a sealed segment removes its index files, which appends could bring back to the segment's length" {
+    const io = testing.io;
+    var place = try Place.init();
+    defer place.deinit();
+    const options: Journal.Options = .{ .max_segment_records = .fromRaw(3) };
+    {
+        const journal = try Journal.open(testing.allocator, io, place.path, options);
+        defer journal.deinit(io);
+        for (0..4) |i| _ = try journal.append(io, .fromRaw(0), paid(i, 1));
+        var dir = try Io.Dir.cwd().openDir(io, place.path, .{});
+        defer dir.close(io);
+        var bytes: []u8 = &.{};
+        const sealed = (try readIndex(dir, 1, "account", .exact, &bytes)).?;
+        testing.allocator.free(bytes);
+        try testing.expectEqual(@as(u32, 3), sealed.postings);
+        try journal.truncateAfter(io, .fromRaw(2));
+        var name_buf: [64]u8 = undefined;
+        for ([_][]const u8{ "account", "amount" }) |name| {
+            try testing.expectError(error.FileNotFound, dir.access(io, fileName(&name_buf, 1, name), .{}));
+        }
+        // The same record again: segment 1 is as long as it was, with other contents.
+        _ = try journal.append(io, .fromRaw(0), paid(7, 1));
+    }
+}

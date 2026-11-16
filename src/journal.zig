@@ -156,14 +156,28 @@ pub fn Journal(comptime Event: type) type {
             stale: bool = true,
             /// Where an index file is built before it is written.
             buf: std.ArrayList(u8) = .empty,
+            /// The sealed segments' indexes' summaries, read for reads by key.
+            summaries: field_index.read.Summaries,
+            /// Per index, how many segments reads by key have read whole for
+            /// want of a current index file.
+            scanned: [declared.count]u64 = @splat(0),
 
             fn init(options: Options) Indexes {
-                return .{ .pendings = @splat(.{}), .budget = .{ .limit = indexMemory(options) } };
+                return .{ .pendings = @splat(.{}), .budget = .{ .limit = indexMemory(options) }, .summaries = .init(options.summary_memory) };
             }
 
             fn deinit(ix: *Indexes, gpa: Allocator) void {
                 for (&ix.pendings) |*p| p.deinit(gpa);
                 ix.buf.deinit(gpa);
+                ix.summaries.deinit(gpa);
+            }
+
+            /// The segments were read again or rewritten: the active
+            /// segment's indexes may not hold its records, and a summary may
+            /// describe a segment that is not there.
+            fn reread(ix: *Indexes, gpa: Allocator) void {
+                ix.stale = true;
+                ix.summaries.clear(gpa);
             }
         };
 
@@ -1015,7 +1029,7 @@ pub fn Journal(comptime Event: type) type {
 
             const previous = s.seq;
             try s.log.reload(io);
-            s.indexes.stale = true;
+            s.indexes.reread(self.gpa);
             s.clearTail();
             try self.fillTail(s, io);
             s.write_failed = false;
@@ -1116,8 +1130,12 @@ pub fn Journal(comptime Event: type) type {
             /// a record whose `at` is outside is stepped over before its
             /// event is read, its place in the sequence and the chain kept.
             window: ?Log.Window = null,
+            /// What a walk of `readIndexed` or `readRange` reads: the records
+            /// one index finds, segment by segment.
+            by: ?Indexed = null,
 
             pub fn deinit(walk: *Replay, io: Io) void {
+                if (walk.by) |*by| by.places.deinit(walk.journal.gpa);
                 walk.scan.deinit(io);
                 walk.arena.deinit();
                 walk.* = undefined;
@@ -1125,6 +1143,15 @@ pub fn Journal(comptime Event: type) type {
 
             pub fn rearmAt(walk: *Replay, io: Io, at: Position) ReplayAtError!void {
                 const self = walk.journal;
+                if (walk.by) |*by| if (at.last == null) {
+                    // Nothing to read back: the read goes on from the cursor.
+                    by.restart(at.cursor);
+                    walk.run = .{ .cursor = at.cursor };
+                    walk.last = null;
+                    _ = walk.arena.reset(.retain_capacity);
+                    return;
+                };
+                defer if (walk.by) |*by| by.restart(at.cursor);
                 if (at.last) |last| {
                     const found = found: {
                         var guard = try self.state.acquire(io);
@@ -1171,6 +1198,7 @@ pub fn Journal(comptime Event: type) type {
             }
 
             pub fn next(walk: *Replay, io: Io) ReplayError!?Record {
+                if (walk.by != null) return walk.nextIndexed(io);
                 while (try walk.scan.next(io)) |line| {
                     if (walk.scan.takeBoundary()) |boundary| {
                         if (boundary.after_gap) walk.run.restart();
@@ -1212,6 +1240,8 @@ pub fn Journal(comptime Event: type) type {
             }
 
             pub fn position(walk: *const Replay) Position {
+                // A read by key has every record it asks for up to where it has read.
+                if (walk.by) |by| return .{ .cursor = by.after, .last = walk.last };
                 const last = walk.last orelse return .{ .cursor = walk.run.cursor };
                 return .{ .cursor = values.greater(walk.run.cursor, last.seq), .last = last };
             }
@@ -1226,7 +1256,312 @@ pub fn Journal(comptime Event: type) type {
                     .checksum = header.c,
                 };
             }
+
+            /// The next record a read by key asks for: from the postings of
+            /// the segment being read, or from reading it whole, else from
+            /// the next segment that may hold one.
+            fn nextIndexed(walk: *Replay, io: Io) ReplayError!?Record {
+                const by = &walk.by.?;
+                while (true) {
+                    if (by.next_place < by.places.items.len) {
+                        const place = by.places.items[by.next_place];
+                        by.next_place += 1;
+                        if (try walk.readPlace(io, place)) |record| return record;
+                        continue;
+                    }
+                    if (by.scanning) {
+                        if (try walk.readWhole(io)) |record| return record;
+                        continue;
+                    }
+                    if (by.chosen) by.passed();
+                    if (!try walk.chooseSegment(io)) return null;
+                }
+            }
+
+            /// The next segment with a record past where the read stands
+            /// that may hold one it asks for, chosen under the lock: its
+            /// postings taken from the active segment's indexes or from the
+            /// segment's index file (read without the lock), or the walk set
+            /// to read it whole. False at the end of the log.
+            fn chooseSegment(walk: *Replay, io: Io) ReplayError!bool {
+                const self = walk.journal;
+                const by = &walk.by.?;
+                while (true) {
+                    const picked: Log.Segment = chosen: {
+                        var guard = try self.state.acquire(io);
+                        defer guard.deinit(io);
+                        const s = guard.value();
+                        const segments = s.log.segments.items;
+                        for (segments, 0..) |segment, i| {
+                            const through = if (values.below(s.seq, segment.last_seq)) s.seq else segment.last_seq;
+                            if (!values.below(by.after, through)) continue;
+                            const active = i + 1 == segments.len;
+                            by.choose(segment, through, !active);
+                            if (active) {
+                                const ix = &s.indexes;
+                                if (ix.stale or ix.base != segment.base_seq) {
+                                    if (try walk.readingWhole(s, io)) return true;
+                                    continue;
+                                }
+                                inline for (&ix.pendings, 0..) |*p, k| if (k == by.index) try p.postings(self.gpa, &by.asked, by.after, by.through, &by.places);
+                                if (by.places.items.len == 0) {
+                                    by.passed();
+                                    continue;
+                                }
+                                if (try walk.armPlaces(s, io)) return true;
+                                continue;
+                            }
+                            if (s.indexes.summaries.get(by.summaryOf())) |found| switch (found) {
+                                .stale => {
+                                    if (try walk.readingWhole(s, io)) return true;
+                                    continue;
+                                },
+                                .summary => |summary| if (!by.asked.admits(summary)) {
+                                    by.passed();
+                                    continue;
+                                },
+                            };
+                            break :chosen segment;
+                        }
+                        return false;
+                    };
+                    const file = try walk.indexFile(io, picked);
+                    defer if (file) |bytes| self.gpa.free(bytes);
+                    const parsed: ?field_index.format.Index = if (file) |bytes| field_index.format.Index.parse(.init(bytes), fileOf(picked, by.index)) catch null else null;
+                    var guard = try self.state.acquire(io);
+                    defer guard.deinit(io);
+                    const s = guard.value();
+                    const index = parsed orelse {
+                        if (try walk.readingWhole(s, io)) return true;
+                        continue;
+                    };
+                    try s.indexes.summaries.put(self.gpa, by.summaryOf(), index);
+                    try by.asked.postingsIn(self.gpa, index, by.after, &by.places);
+                    if (by.places.items.len == 0) {
+                        by.passed();
+                        continue;
+                    }
+                    if (try walk.armPlaces(s, io)) return true;
+                }
+            }
+
+            /// The chosen segment's index file, or null when it has none
+            /// that can be read.
+            fn indexFile(walk: *Replay, io: Io, segment: Log.Segment) ReplayError!?[]u8 {
+                const name: field_index.build.FileName = .of(segment.base_seq, nameOf(walk.by.?.index));
+                // An index is never more than ten times its segment: each
+                // record, at least 32 bytes, takes at most 24 for its posting
+                // and 268 for a key of its own.
+                const limit = (segment.bytes.mul(10) catch values.furthest).add(.fromRaw(4096)) catch values.furthest;
+                return aegis.own.readFile(io, walk.scan.dir.get(), name.slice(), walk.journal.gpa, limit) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.Canceled => return error.Canceled,
+                    else => return null,
+                };
+            }
+
+            /// The scan armed on the chosen segment to read its postings.
+            /// False when the segment has gone since it was chosen.
+            fn armPlaces(walk: *Replay, s: *State, io: Io) ReplayError!bool {
+                const by = &walk.by.?;
+                if (!try s.log.scanAtInto(io, &walk.scan, by.segment, values.no_bytes)) return false;
+                by.chosen = true;
+                return true;
+            }
+
+            /// The scan armed to read the chosen segment whole, which a read
+            /// by key does when the segment has no index that describes it.
+            /// False when the segment has gone since it was chosen.
+            fn readingWhole(walk: *Replay, s: *State, io: Io) ReplayError!bool {
+                const by = &walk.by.?;
+                by.places.clearRetainingCapacity();
+                by.next_place = 0;
+                if (!try s.log.scanAtInto(io, &walk.scan, by.segment, values.no_bytes)) return false;
+                inline for (&s.indexes.scanned, 0..) |*scanned, k| if (k == by.index) {
+                    scanned.* +|= 1;
+                };
+                by.scanning = true;
+                by.chosen = true;
+                return true;
+            }
+
+            /// The record a posting names, checked: null when it is not a
+            /// record the index asks for, which sets the walk to read the rest
+            /// of the segment whole.
+            fn readPlace(walk: *Replay, io: Io, place: field_index.format.Posting) ReplayError!?Record {
+                const by = &walk.by.?;
+                if (place.offset == values.no_bytes) return walk.distrust(io);
+                try walk.scan.seekLine(place.offset);
+                const line = (walk.scan.next(io) catch |err| switch (err) {
+                    error.TruncatedRecord, error.RecordTooLarge => null,
+                    else => |e| return e,
+                }) orelse return walk.distrust(io);
+                if (!walk.inSegment() or walk.scan.line_start != place.offset) return walk.distrust(io);
+                const header = line.parse({}, parseHeader) catch return walk.distrust(io);
+                // A stub carries no key in a field index.
+                if (header.seq != place.seq or header.removed) return walk.distrust(io);
+                _ = walk.arena.reset(.retain_capacity);
+                const record = try recordFrom(walk.decoder, walk.arena.allocator(), header, line.readForParse());
+                // Where the read stands moves only past a record handed on: a
+                // segment read whole after a posting that lied reads every
+                // record past the last one.
+                if (!declared.holds(&record.event, by.index, &by.asked)) return walk.distrust(io);
+                walk.last = walk.lastRead(header);
+                by.after = header.seq;
+                return record;
+            }
+
+            /// A posting did not name what its index says: the segment's
+            /// summary is marked stale, so reads pass it to a read of the
+            /// segment whole until its index is built again, and the rest of
+            /// this one is read whole.
+            fn distrust(walk: *Replay, io: Io) ReplayError!?Record {
+                const self = walk.journal;
+                const by = &walk.by.?;
+                var guard = try self.state.acquire(io);
+                defer guard.deinit(io);
+                const s = guard.value();
+                if (by.sealed) try s.indexes.summaries.markStale(self.gpa, by.summaryOf());
+                _ = try walk.readingWhole(s, io);
+                return null;
+            }
+
+            /// The next record asked for in the segment read whole, its key
+            /// computed from its event; null at the segment's end.
+            fn readWhole(walk: *Replay, io: Io) ReplayError!?Record {
+                const by = &walk.by.?;
+                while (try walk.scan.next(io)) |line| {
+                    _ = walk.scan.takeBoundary();
+                    if (!walk.inSegment()) break;
+                    const header = try line.parse({}, parseHeader);
+                    if (values.below(by.through, header.seq)) break;
+                    if (!values.below(by.after, header.seq)) continue;
+                    walk.last = walk.lastRead(header);
+                    by.after = header.seq;
+                    if (header.removed) continue;
+                    _ = walk.arena.reset(.retain_capacity);
+                    const record = try recordFrom(walk.decoder, walk.arena.allocator(), header, line.readForParse());
+                    if (declared.holds(&record.event, by.index, &by.asked)) return record;
+                }
+                by.scanning = false;
+                return null;
+            }
+
+            /// Whether the scan is still in the segment a read by key chose.
+            fn inSegment(walk: *const Replay) bool {
+                const at = walk.scan.walking() orelse return false;
+                return at == walk.by.?.segment;
+            }
         };
+
+        /// The key of the index `Event` declares as `name`: what its key
+        /// function gives, without the null.
+        pub fn KeyOf(comptime name: []const u8) type {
+            return declared.KeyOf(name);
+        }
+
+        /// A read by key: which index, what it asks, and where it stands.
+        const Indexed = struct {
+            index: usize,
+            asked: field_index.read.Asked,
+            /// Every record at or before it has been handed on or passed over.
+            after: Seq,
+            /// The segment being read: its first record, its length, whether
+            /// it is sealed, and the last of its records the read goes to.
+            segment: Seq = values.beginning,
+            segment_bytes: Bytes = values.no_bytes,
+            sealed: bool = false,
+            through: Seq = values.beginning,
+            /// A segment is being read: once its postings, or its reading
+            /// whole, are done, the read stands at `through`.
+            chosen: bool = false,
+            /// The segment's postings still to read, oldest first.
+            places: std.ArrayList(field_index.format.Posting) = .empty,
+            next_place: usize = 0,
+            /// The segment is read whole.
+            scanning: bool = false,
+
+            fn restart(by: *Indexed, cursor: Seq) void {
+                by.after = cursor;
+                by.chosen = false;
+                by.scanning = false;
+                by.places.clearRetainingCapacity();
+                by.next_place = 0;
+            }
+
+            fn choose(by: *Indexed, segment: Log.Segment, through: Seq, sealed: bool) void {
+                by.segment = segment.base_seq;
+                by.segment_bytes = segment.bytes;
+                by.through = through;
+                by.sealed = sealed;
+                by.chosen = false;
+                by.scanning = false;
+                by.places.clearRetainingCapacity();
+                by.next_place = 0;
+            }
+
+            /// The chosen segment holds nothing more asked for.
+            fn passed(by: *Indexed) void {
+                by.after = values.greater(by.after, by.through);
+                by.chosen = false;
+            }
+
+            fn summaryOf(by: *const Indexed) field_index.read.Summaries.Of {
+                return .{ .base_seq = by.segment.raw(), .segment_bytes = by.segment_bytes.raw(), .index = @intCast(by.index) };
+            }
+        };
+
+        /// The name of declared index `i`.
+        fn nameOf(i: usize) []const u8 {
+            inline for (0..declared.count) |k| if (k == i) return declared.names[k];
+            aegis.assert.never("a read names a declared index");
+        }
+
+        /// What index `i`'s file for `segment` must describe.
+        fn fileOf(segment: Log.Segment, i: usize) field_index.format.Of {
+            inline for (0..declared.count) |k| if (k == i) return .{
+                .base_seq = segment.base_seq,
+                .segment_bytes = segment.bytes,
+                .name = declared.names[k],
+                .version = declared.version(k),
+                .kind = declared.kind(k),
+            };
+            aegis.assert.never("a read names a declared index");
+        }
+
+        /// A walk over the records whose key in index `name` is `key`, after
+        /// `from`, oldest first: `replayAt`'s records, those without the key
+        /// passed over.
+        pub fn readIndexed(self: *Self, io: Io, comptime name: []const u8, key: declared.KeyOf(name), from: Position, walk: *Replay) ReplayAtError!void {
+            return self.readBy(io, comptime declared.indexOf(name), declared.askedFor(name, key), from, walk);
+        }
+
+        /// A walk over the records whose key in ordered index `name` is in
+        /// `[lo, hi]`, after `from`, oldest first.
+        pub fn readRange(self: *Self, io: Io, comptime name: []const u8, lo: declared.KeyOf(name), hi: declared.KeyOf(name), from: Position, walk: *Replay) ReplayAtError!void {
+            return self.readBy(io, comptime declared.indexOf(name), declared.askedBetween(name, lo, hi), from, walk);
+        }
+
+        fn readBy(self: *Self, io: Io, index: usize, asked: field_index.read.Asked, from: Position, walk: *Replay) ReplayAtError!void {
+            {
+                var guard = try self.state.acquire(io);
+                defer guard.deinit(io);
+                const s = guard.value();
+                var scan = try s.log.scanIdle();
+                errdefer scan.deinit(io);
+                walk.* = .{
+                    .journal = self,
+                    .decoder = self.captureDecoder(),
+                    .scan = scan,
+                    .arena = .init(self.gpa),
+                    .run = .{ .cursor = from.cursor },
+                    .whole_through = s.seq,
+                    .by = .{ .index = index, .asked = asked, .after = from.cursor },
+                };
+            }
+            errdefer walk.deinit(io);
+            try walk.rearmAt(io, from);
+        }
 
         pub fn replay(self: *Self, io: Io, cursor: Seq, walk: *Replay) ReplayError!void {
             var guard = try self.state.acquire(io);
@@ -1337,7 +1672,7 @@ pub fn Journal(comptime Event: type) type {
             defer _ = io.swapCancelProtection(protection);
             const previous = s.seq;
             try s.log.reload(io);
-            s.indexes.stale = true;
+            s.indexes.reread(self.gpa);
             s.clearTail();
             try self.fillTail(s, io);
             try self.caughtUp(s, io, previous);
@@ -1792,6 +2127,7 @@ pub fn Journal(comptime Event: type) type {
             if (s.write_failed) return error.PersistenceFailed;
             if (values.below(seq, s.seq)) try self.retireSnapshotAfter(s, io, seq);
             try s.log.truncateAfter(io, seq);
+            s.indexes.reread(self.gpa);
             s.clearTail();
             try self.fillTail(s, io);
         }
@@ -1836,7 +2172,7 @@ pub fn Journal(comptime Event: type) type {
             if (s.write_failed) return error.PersistenceFailed;
             try self.raiseFloors(s, io, keep_after_seq, .every_record);
             try s.log.compact(io, keep_after_seq);
-            s.indexes.stale = true;
+            s.indexes.reread(self.gpa);
             // The streams' records below their truncation points become
             // stubs: their events leave the files.
             try self.redactTruncated(s, io);
@@ -1853,7 +2189,7 @@ pub fn Journal(comptime Event: type) type {
                 // open or refresh. Backup begins with a current directory
                 // view so rotations completed before this call are included.
                 try s.log.reload(io);
-                s.indexes.stale = true;
+                s.indexes.reread(self.gpa);
                 s.clearTail();
                 try self.fillTail(s, io);
             }
@@ -2388,7 +2724,12 @@ pub fn Journal(comptime Event: type) type {
                 return;
             }
             const active = segments[segments.len - 1];
-            if (active.base_seq != ix.base) self.sealIndexes(s, io, active.base_seq);
+            if (active.base_seq != ix.base) {
+                self.sealIndexes(s, io, active.base_seq);
+                // A segment this record did not start (one a cut left active)
+                // holds records the indexes never noted.
+                if (active.base_seq != seq) ix.stale = true;
+            }
             if (ix.stale) return;
             const offset = active.bytes.sub(.fromRaw(line_len + 1)) catch {
                 ix.stale = true;
@@ -2664,7 +3005,10 @@ pub fn Journal(comptime Event: type) type {
                 if (!try self.holdsTruncated(s, io, segment)) continue;
                 if (try s.log.redactSegment(io, segment.base_seq, s, stubOf)) rewrote = true;
             }
-            if (rewrote) try s.log.reload(io);
+            if (rewrote) {
+                try s.log.reload(io);
+                s.indexes.summaries.clear(self.gpa);
+            }
         }
 
         /// Whether `segment`'s stream index has a record below its stream's

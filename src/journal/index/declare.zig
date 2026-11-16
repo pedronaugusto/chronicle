@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const format = @import("format.zig");
+const read = @import("read.zig");
 
 pub const Kind = format.Kind;
 
@@ -107,6 +108,63 @@ pub fn Declared(comptime Event: type) type {
                 return longest;
             }
             return 8;
+        }
+
+        /// The place of the index named `name` among the declarations: a
+        /// name not declared does not compile.
+        pub fn indexOf(comptime name: []const u8) usize {
+            inline for (final_names, 0..) |declared_name, i| if (comptime std.mem.eql(u8, declared_name, name)) return i;
+            @compileError("chronicle: no index \"" ++ name ++ "\" is declared on " ++ @typeName(Event));
+        }
+
+        /// The key of the index named `name`: what its key function gives.
+        pub fn KeyOf(comptime name: []const u8) type {
+            return @TypeOf(list[comptime indexOf(name)]).Key;
+        }
+
+        /// What a read of the index named `name` by `key` asks: an ordered
+        /// index read by one key asks for the range of that key alone.
+        pub fn askedFor(comptime name: []const u8, key: KeyOf(name)) read.Asked {
+            const D = @TypeOf(list[comptime indexOf(name)]);
+            switch (D.index_kind) {
+                .exact => {
+                    var held: [8]u8 = undefined;
+                    // A key too long for any record: none has it.
+                    const bytes = exactBytes(D.Key, key, &held) catch return .none;
+                    return .exactKey(bytes);
+                },
+                .ordered => {
+                    const word = orderedWord(D.Key, key);
+                    return .between(word, word);
+                },
+            }
+        }
+
+        /// What a read of the ordered index named `name` by the keys from
+        /// `lo` to `hi`, both in, asks.
+        pub fn askedBetween(comptime name: []const u8, lo: KeyOf(name), hi: KeyOf(name)) read.Asked {
+            const D = @TypeOf(list[comptime indexOf(name)]);
+            if (D.index_kind != .ordered) @compileError("chronicle: index \"" ++ name ++ "\" is exact: a range is read from an ordered index");
+            return .between(orderedWord(D.Key, lo), orderedWord(D.Key, hi));
+        }
+
+        /// Whether `event` has a key in index `i` that `asked` asks for: the
+        /// check a record found through an index passes before it is handed
+        /// on, and the filter of a segment read whole.
+        pub fn holds(event: *const Event, i: usize, asked: *const read.Asked) bool {
+            inline for (0..n) |k| if (k == i) {
+                const D = @TypeOf(list[k]);
+                const found = D.keyOf(event.*) orelse return false;
+                switch (D.index_kind) {
+                    .exact => {
+                        var held: [8]u8 = undefined;
+                        const bytes = exactBytes(D.Key, found, &held) catch return false;
+                        return asked.holdsBytes(bytes);
+                    },
+                    .ordered => return asked.holdsWord(orderedWord(D.Key, found)),
+                }
+            };
+            return false;
         }
 
         /// One event's keys: for each index, whether it has one, and its key,
@@ -208,6 +266,23 @@ test "an event's declared indexes, in order, and its keys by each" {
     var long: [format.max_key_bytes + 1]u8 = @splat('x');
     const too_long: Sample = .{ .paid = .{ .account = 1, .amount = 0, .note = &long } };
     try testing.expectError(error.KeyTooLong, D.keysOf(&too_long, &keys));
+}
+
+test "a read names its index and asks by the index's own key type, and a record is checked by its key" {
+    const D = Declared(Sample);
+    try testing.expectEqual(i64, D.KeyOf("amount"));
+    try testing.expectEqual(2, D.indexOf("note"));
+    const paid: Sample = .{ .paid = .{ .account = 7, .amount = -3, .note = "rent" } };
+    const closed: Sample = .{ .closed = .{ .account = 9 } };
+    const nine = D.askedFor("account", 9);
+    try testing.expect(D.holds(&closed, 0, &nine) and !D.holds(&paid, 0, &nine));
+    const below_zero = D.askedBetween("amount", -5, 0);
+    try testing.expect(D.holds(&paid, 1, &below_zero) and !D.holds(&closed, 1, &below_zero));
+    const exactly = D.askedFor("amount", -3);
+    try testing.expect(D.holds(&paid, 1, &exactly));
+    try testing.expect(D.holds(&paid, 3, &D.askedFor("kind", .paid)));
+    var long: [format.max_key_bytes + 1]u8 = @splat('x');
+    try testing.expect(D.askedFor("note", &long) == .none);
 }
 
 test "an event without declarations has no indexes" {

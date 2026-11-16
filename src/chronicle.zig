@@ -420,6 +420,11 @@ pub fn Journal(comptime Event: type) type {
         /// The records of one stream, from `readStream`.
         pub const StreamRead = facade.StreamReadOwner(State);
 
+        /// The key of the index `Event` declares as `name` (`chronicle.index`):
+        /// what its key function gives, without the null. A name not declared
+        /// does not compile.
+        pub const KeyOf = State.KeyOf;
+
         /// What `appendIf` and `appendAllIf` expect of the journal: the
         /// sequence number its newest record must still have, and where to
         /// say what it has instead.
@@ -947,6 +952,58 @@ pub fn Journal(comptime Event: type) type {
             const walk = try self.state.gpa.create(Replay);
             errdefer self.state.gpa.destroy(walk);
             try State.replayBetween(self.inner(), io, lo, hi, &walk.state);
+            return walk;
+        }
+
+        /// A walk over the records whose key in the index `Event` declares as
+        /// `name` is `key`, after `from`, oldest first: the records `replayAt`
+        /// gives from `from` that have the key, and no others. An ordered
+        /// index read by one key gives the records with that key.
+        ///
+        /// It opens only the segments that may hold the key: a sealed
+        /// segment's index summary (an exact index's filter, an ordered
+        /// index's lowest and highest key) is read once and kept in memory
+        /// under `Options.summary_memory`, so a segment that cannot hold the
+        /// key is passed over without a file being opened, and in one that
+        /// may, its index file names the records to read, which are read and
+        /// no others. The active segment's records are found through its
+        /// indexes in memory. A segment with no index file that describes it
+        /// (one sealed before the index was declared, one whose file was
+        /// damaged or removed) is read whole, each record's key computed from
+        /// its event; `indexStatus` counts these.
+        ///
+        /// No record is handed on by an index's say-so: each one read through
+        /// a posting must be where the posting says, carry its sequence
+        /// number, and give the key asked for when its event is decoded. One
+        /// that does not marks the segment's index stale, and the rest of the
+        /// segment is read whole.
+        ///
+        /// It is a `Replay`: `next`, `position`, `deinit`, and `rearmAt`, which
+        /// keeps the key. Its position says it has every record with the key
+        /// up to its cursor, and names the last record it read, which a
+        /// `rearmAt` or a `readIndexed` from it reads back first, as
+        /// `replayAt` does: one changed or removed is `error.StalePosition`.
+        /// A record is read only once the whole of its batch is committed.
+        /// The segments it will cross are chosen one at a time under the
+        /// journal's lock; the records are read without it. Safe to call from
+        /// any task or thread, except from inside a sink.
+        pub fn readIndexed(self: *Self, io: Io, comptime name: []const u8, key: KeyOf(name), from: Position) ReplayAtError!*Replay {
+            const walk = try self.state.gpa.create(Replay);
+            errdefer self.state.gpa.destroy(walk);
+            try State.readIndexed(self.inner(), io, name, key, from, &walk.state);
+            return walk;
+        }
+
+        /// A walk over the records whose key in the ordered index `Event`
+        /// declares as `name` is in `[lo, hi]`, both ends in, after `from`,
+        /// in sequence order, not key order: `readIndexed` for a range of
+        /// keys. A segment whose lowest and highest key miss the range is
+        /// passed over unopened. `lo` above `hi` is an empty range. An exact
+        /// index has no order, and a range of one does not compile.
+        pub fn readRange(self: *Self, io: Io, comptime name: []const u8, lo: KeyOf(name), hi: KeyOf(name), from: Position) ReplayAtError!*Replay {
+            const walk = try self.state.gpa.create(Replay);
+            errdefer self.state.gpa.destroy(walk);
+            try State.readRange(self.inner(), io, name, lo, hi, from, &walk.state);
             return walk;
         }
 
