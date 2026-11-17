@@ -18,6 +18,5 @@
     }
   ],
   "compile_once": false,
-  "hardened": true,
-  "test_job_timeout": 40
+  "hardened": true
 }
