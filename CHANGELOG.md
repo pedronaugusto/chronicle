@@ -27,7 +27,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- A sealed segment's stream index (`<base>.sdx`) is a field index file: the exact index named `stream`, each stream's id kept whole and each record's version beside its seq and offset, after a split-block Bloom filter, with a CRC-32C; it is written under a temporary name and renamed into place, with no sync. A stream index in the format before reads as none and is rebuilt from its segment when first read.
+- A sealed segment's stream index (`<base>.sdx`) is a field index file: the exact index named `stream`, each stream's id kept whole and each record's version beside its seq and offset, after a split-block Bloom filter, with a CRC-32C, every byte of its header written in its place, little endian, so a segment's index file is the same bytes on every host and whoever writes it; it is written under a temporary name and renamed into place, with no sync. A stream index in the format before reads as none and is rebuilt from its segment when first read.
 - Pins strand cb3d74c, on airlock 3ef2f54 as chronicle is, so a build has one airlock. The sync tests name the call the BSDs make, a plain fsync, for an append's sync and each file a backup copies.
 - Pins aegis f52eabe, airlock 3ef2f54, strand 8155bf9, reactor 2d72792 and warp fb3a584; development on preflight's ci-standard 158c176 and shakedown c29751d. When there is no memory to keep a stream's head, chronicle logs that at debug level (scope `chronicle`) and goes on without it, where it went on silently.
 - Development on preflight's ci-standard f991816 and shakedown 327bc61, whose fuzz runner takes the options preflight passes it.

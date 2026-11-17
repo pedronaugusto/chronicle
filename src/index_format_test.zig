@@ -205,6 +205,28 @@ test "fuzz: any bytes are refused as an index, or read within their bounds" {
     try shakedown.check(testing.allocator, {}, anyOne, .{ .seed = 0x66757a7a, .cases = 2000 });
 }
 
+test "a file's header is the same bytes on every host, its zero bytes zero, and a file with one set is refused" {
+    const gpa = testing.allocator;
+    const of = ofKind(.ordered, false);
+    const file = try encoded(&.{.ordered(7, .fromRaw(100), .fromRaw(0))}, of);
+    defer gpa.free(file);
+    const expected = "chroncdx" ++
+        [_]u8{ 1, 0, 0, 0 } ++ // format
+        [_]u8{ 2, 0, 7, 0 } ++ // kind, extra, name's length, zero
+        [_]u8{ 3, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{ 1, 0, 0, 0 } ++ // version, keys, postings
+        [_]u8{ 16, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 0, 0 } ++ // summary and heap bytes, zero
+        [_]u8{ 100, 0, 0, 0, 0, 0, 0, 0 } ++ [_]u8{ 0, 0, 16, 0, 0, 0, 0, 0 }; // base seq, segment bytes
+    try testing.expectEqualSlices(u8, expected, file[0..expected.len]);
+    for ([_]usize{ 15, 36, 39 }) |at| {
+        const copy = try gpa.dupe(u8, file);
+        defer gpa.free(copy);
+        copy[at] = 1;
+        std.mem.writeInt(u32, copy[copy.len - 4 ..][0..4], @import("warp").Crc32c.hash(copy[0 .. copy.len - 4]), .little);
+        try testing.expectError(error.NotIndex, Index.parse(.init(copy), of));
+        try testing.expect(!format.describes(copy, of));
+    }
+}
+
 test "a file's header alone says which segment and index it describes" {
     const gpa = testing.allocator;
     const of = ofKind(.exact, true);

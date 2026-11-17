@@ -112,13 +112,17 @@ pub const Of = struct {
 const magic = "chroncdx".*;
 const format: u32 = 1;
 
-const Header = extern struct {
-    magic: [8]u8,
+/// A file's first `header_bytes`, each field written at its place, little
+/// endian: the magic (0), format (8), kind (12), extra (13), name's length
+/// (14), a zero byte (15), version (16), keys (20), postings (24), summary
+/// bytes (28), heap bytes (32), four zero bytes (36), the segment's first seq
+/// (40) and its length (48). Every byte is written, so a segment's file is the
+/// same bytes whoever writes it.
+const Header = struct {
     format: u32,
     kind: u8,
     extra: u8,
     name_len: u8,
-    pad: u8 = 0,
     version: u32,
     keys: u32,
     postings: u32,
@@ -126,9 +130,46 @@ const Header = extern struct {
     heap_bytes: u32,
     base_seq: u64,
     segment_bytes: u64,
+
+    fn write(h: Header) [header_bytes]u8 {
+        var b: [header_bytes]u8 = @splat(0);
+        b[0..8].* = magic;
+        std.mem.writeInt(u32, b[8..12], h.format, .little);
+        b[12] = h.kind;
+        b[13] = h.extra;
+        b[14] = h.name_len;
+        std.mem.writeInt(u32, b[16..20], h.version, .little);
+        std.mem.writeInt(u32, b[20..24], h.keys, .little);
+        std.mem.writeInt(u32, b[24..28], h.postings, .little);
+        std.mem.writeInt(u32, b[28..32], h.summary_bytes, .little);
+        std.mem.writeInt(u32, b[32..36], h.heap_bytes, .little);
+        std.mem.writeInt(u64, b[40..48], h.base_seq, .little);
+        std.mem.writeInt(u64, b[48..56], h.segment_bytes, .little);
+        return b;
+    }
+
+    /// The header `b` holds, or null when its magic or format is not this
+    /// file's or a zero byte is not zero.
+    fn read(b: *const [header_bytes]u8) ?Header {
+        if (!std.mem.eql(u8, b[0..8], &magic) or b[15] != 0 or std.mem.readInt(u32, b[36..40], .little) != 0) return null;
+        const h: Header = .{
+            .format = std.mem.readInt(u32, b[8..12], .little),
+            .kind = b[12],
+            .extra = b[13],
+            .name_len = b[14],
+            .version = std.mem.readInt(u32, b[16..20], .little),
+            .keys = std.mem.readInt(u32, b[20..24], .little),
+            .postings = std.mem.readInt(u32, b[24..28], .little),
+            .summary_bytes = std.mem.readInt(u32, b[28..32], .little),
+            .heap_bytes = std.mem.readInt(u32, b[32..36], .little),
+            .base_seq = std.mem.readInt(u64, b[40..48], .little),
+            .segment_bytes = std.mem.readInt(u64, b[48..56], .little),
+        };
+        return if (h.format == format) h else null;
+    }
 };
 
-const header_bytes = @sizeOf(Header);
+const header_bytes = 56;
 /// A key in an exact index's table: where its bytes start in the heap, its
 /// length, where its postings start and how many.
 const key_bytes = 4 + 1 + 4 + 4;
@@ -172,7 +213,6 @@ pub fn encode(gpa: Allocator, of: Of, entries: []const Entry, out: *std.ArrayLis
     };
     out.clearRetainingCapacity();
     const header: Header = .{
-        .magic = magic,
         .format = format,
         .kind = @backingInt(of.kind),
         .extra = @intFromBool(of.extra),
@@ -185,7 +225,7 @@ pub fn encode(gpa: Allocator, of: Of, entries: []const Entry, out: *std.ArrayLis
         .base_seq = of.base_seq.raw(),
         .segment_bytes = of.segment_bytes.raw(),
     };
-    try out.appendSlice(gpa, std.mem.asBytes(&header));
+    try out.appendSlice(gpa, &header.write());
     try out.appendSlice(gpa, of.name);
     const summary_at = out.items.len;
     try out.appendNTimes(gpa, 0, summary_bytes);
@@ -246,9 +286,7 @@ pub const max_head_bytes = header_bytes + max_name_bytes;
 /// file unread and unchecked. What a status counts; a read checks the whole.
 pub fn describes(head: []const u8, of: Of) bool {
     if (head.len < header_bytes) return false;
-    var header: Header = undefined;
-    @memcpy(std.mem.asBytes(&header), head[0..header_bytes]);
-    if (!std.mem.eql(u8, &header.magic, &magic) or header.format != format) return false;
+    const header = Header.read(head[0..header_bytes]) orelse return false;
     if (header.kind != @backingInt(of.kind) or header.extra != @intFromBool(of.extra) or header.version != of.version) return false;
     if (!of.base_seq.eql(.fromRaw(header.base_seq)) or !of.segment_bytes.eql(.fromRaw(header.segment_bytes))) return false;
     const name = head[header_bytes..];
@@ -289,9 +327,7 @@ pub const Index = struct {
         if (file.len < header_bytes + 4) return error.NotIndex;
         const body = file[0 .. file.len - 4];
         if (Crc32c.hash(body) != std.mem.readInt(u32, file[file.len - 4 ..][0..4], .little)) return error.NotIndex;
-        var header: Header = undefined;
-        @memcpy(std.mem.asBytes(&header), body[0..header_bytes]);
-        if (!std.mem.eql(u8, &header.magic, &magic) or header.format != format) return error.NotIndex;
+        const header = Header.read(body[0..header_bytes]) orelse return error.NotIndex;
         if (header.kind != @backingInt(of.kind) or header.extra != @intFromBool(of.extra) or header.version != of.version) return error.NotIndex;
         if (!of.base_seq.eql(.fromRaw(header.base_seq)) or !of.segment_bytes.eql(.fromRaw(header.segment_bytes))) return error.NotIndex;
         if (of.kind == .ordered and (of.extra or header.keys != 0 or header.heap_bytes != 0)) return error.NotIndex;
