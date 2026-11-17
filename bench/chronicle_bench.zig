@@ -21,7 +21,15 @@
 //! round robin over a thousand of them (fewer when COUNT is less):
 //! `append_to` (each append expecting the stream's exact version),
 //! `stream_prepare`, then `read_stream [REPETITIONS]` (one whole stream) and
-//! `stream_version [REPETITIONS]` (every stream's) over what it wrote.
+//! `stream_version [REPETITIONS]` (every stream's) over what it wrote; and
+//! over field indexes, each record with an account (a thousand, round
+//! robin), an amount (rising) and a region: `append_indexes_0`,
+//! `append_indexes_1` and `append_indexes_3` (appends with none, one and
+//! three indexes declared), `indexed_prepare`, then `read_indexed` (one
+//! account's records) and `read_range` (a thousand amounts in a row)
+//! `[REPETITIONS]`, each with a `_baseline` that replays the whole journal and
+//! keeps the same records; and `unindexed_prepare` (no index declared), then
+//! `build_indexes` over it with three.
 /// Set once by `main` from `--smoke`: every workload once, at its smallest,
 /// reading no clock, as `zig build test` runs it to keep it working.
 var smoke = false;
@@ -29,6 +37,7 @@ const std = @import("std");
 const aegis = @import("aegis");
 const chronicle = @import("chronicle");
 const strand = @import("strand");
+const index = chronicle.index;
 
 const record_bytes: usize = 200;
 const prefix = "{\"value\":1,\"padding\":\"";
@@ -379,6 +388,148 @@ fn reopen(io: std.Io, gpa: std.mem.Allocator, path: []const u8, repetitions: usi
     try printMetric(io, "clean_reopen", "elapsed", elapsed * 1000.0 / @as(f64, @floatFromInt(repetitions)), "ms");
 }
 
+/// The accounts an indexed workload spreads its records over, round robin,
+/// and the regions, so a read by account or region finds one record in so
+/// many.
+const accounts: usize = 1000;
+const regions = [_][]const u8{ "north", "south", "east", "west", "centre", "coast", "hills", "plain" };
+
+/// The indexed workloads' event: an account, an amount that rises with the
+/// record and a region beside the input's padding, with the first `count` of
+/// three indexes declared on them (account exact, amount ordered, region
+/// exact over bytes).
+fn IndexedEvent(comptime count: usize) type {
+    return struct {
+        value: u64,
+        account: u64,
+        amount: i64,
+        region: []const u8,
+        padding: []const u8,
+
+        const Self = @This();
+        pub const chronicle = .{ .indexes = switch (count) {
+            0 => &.{},
+            1 => &.{index("account", 1, .exact, accountOf)},
+            3 => &.{
+                index("account", 1, .exact, accountOf),
+                index("amount", 1, .ordered, amountOf),
+                index("region", 1, .exact, regionOf),
+            },
+            else => @compileError("zero, one or three indexes"),
+        } };
+
+        fn accountOf(e: Self) ?u64 {
+            return e.account;
+        }
+        fn amountOf(e: Self) ?i64 {
+            return e.amount;
+        }
+        fn regionOf(e: Self) ?[]const u8 {
+            return e.region;
+        }
+
+        /// Record `i`'s event (from 0).
+        fn of(i: usize, padding: []const u8) Self {
+            return .{ .value = 1, .account = i % accounts, .amount = @intCast(i), .region = regions[i % regions.len], .padding = padding };
+        }
+    };
+}
+
+const Indexed3 = chronicle.Journal(IndexedEvent(3));
+
+/// `append_indexes_N` (timed, N of 0, 1 and 3 indexes declared, into a fresh
+/// journal) or `indexed_prepare` (untimed, three indexes, for the reads), or
+/// `unindexed_prepare` (untimed, none, for `build_indexes`).
+fn indexedAppend(comptime n: usize, io: std.Io, gpa: std.mem.Allocator, input_path: []const u8, path: []const u8, count: usize, workload: []const u8) !void {
+    var input = try Input.load(io, gpa, input_path, count);
+    defer input.deinit(gpa);
+    scrub(io, path);
+    const J = chronicle.Journal(IndexedEvent(n));
+    var opened: J.Options = .{
+        .sync = .never,
+        .tail_records = .fromRaw(0),
+        .tail_bytes = .fromRaw(0),
+        .max_segment_bytes = .fromRaw(8 * 1024 * 1024),
+        .verify_round_trip = false,
+    };
+    // A smoke run's few records seal segments too, so its reads and its build
+    // cross sealed ones.
+    if (smoke) opened.max_segment_records = .fromRaw(4);
+    const journal = try J.open(gpa, io, path, opened);
+    defer journal.deinit(io);
+    const started = benchmarkNow(io);
+    for (0..count) |i| _ = try journal.append(io, .fromRaw(@intCast(i + 1)), IndexedEvent(n).of(i, input.event.padding));
+    const elapsed = seconds(started, io);
+    if (std.mem.startsWith(u8, workload, "append_indexes")) {
+        try printMetric(io, workload, "records_per_second", @as(f64, @floatFromInt(count)) / elapsed, "records/s");
+    }
+}
+
+fn indexedOptions() Indexed3.Options {
+    return .{
+        .access = .read,
+        .sync = .never,
+        .tail_records = .fromRaw(0),
+        .tail_bytes = .fromRaw(0),
+        .max_segment_bytes = .fromRaw(8 * 1024 * 1024),
+        .verify_round_trip = false,
+    };
+}
+
+/// One account's records (`read_indexed`) or a run of a thousand amounts
+/// (`read_range`), `repetitions` times, a different one each, from a journal
+/// `indexed_prepare` wrote with `count` records. A `_baseline` reads the
+/// same records by a replay of the whole journal that keeps those with the
+/// key, reported under the same name.
+fn indexedRead(io: std.Io, gpa: std.mem.Allocator, path: []const u8, count: usize, repetitions: usize, workload: []const u8) !void {
+    const baseline = std.mem.endsWith(u8, workload, "_baseline");
+    const name = if (baseline) workload[0 .. workload.len - "_baseline".len] else workload;
+    const by_range = std.mem.eql(u8, name, "read_range");
+    const journal = try Indexed3.open(gpa, io, path, indexedOptions());
+    defer journal.deinit(io);
+    const span: usize = @min(accounts, count);
+    var elapsed: f64 = 0;
+    for (0..repetitions) |r| {
+        const account: u64 = (r * 7) % @min(accounts, count);
+        const lo: i64 = @intCast(((r * 7919) % (count / span)) * span);
+        const hi: i64 = lo + @as(i64, @intCast(span)) - 1;
+        const started = benchmarkNow(io);
+        const walk = if (baseline)
+            try journal.replay(io, chronicle.beginning)
+        else if (by_range)
+            try journal.readRange(io, "amount", lo, hi, .after(chronicle.beginning))
+        else
+            try journal.readIndexed(io, "account", account, .after(chronicle.beginning));
+        var seen: usize = 0;
+        while (try walk.next(io)) |record| {
+            const held = if (by_range) record.event.amount >= lo and record.event.amount <= hi else record.event.account == account;
+            if (held) seen += 1 else if (!baseline) return error.FoldMismatch;
+        }
+        walk.deinit(io);
+        elapsed += seconds(started, io);
+        const want = if (by_range) span else count / accounts + @intFromBool(account < count % accounts);
+        if (seen != want) return error.FoldMismatch;
+    }
+    try printMetric(io, name, "per_read", elapsed * 1000.0 / @as(f64, @floatFromInt(repetitions)), "ms");
+}
+
+/// `buildIndexes` over a journal `unindexed_prepare` wrote with no index
+/// declared, opened with three: every sealed segment's files written, one
+/// call a segment.
+fn buildIndexes(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !void {
+    var opened = indexedOptions();
+    opened.access = .write;
+    const journal = try Indexed3.open(gpa, io, path, opened);
+    defer journal.deinit(io);
+    var segments: usize = 0;
+    const started = benchmarkNow(io);
+    while (try journal.buildIndexes(io)) |_| segments += 1;
+    const elapsed = seconds(started, io);
+    const status = try journal.indexStatus(io);
+    if (segments == 0 or status.indexes[0].missing != 0) return error.FoldMismatch;
+    try printMetric(io, "build_indexes", "per_segment", elapsed * 1000.0 / @as(f64, @floatFromInt(segments)), "ms");
+}
+
 // Raw-event case: each record carries generated JSON, cycled to `count`.
 const RawJournal = chronicle.Journal(strand.json.Raw);
 
@@ -494,6 +645,18 @@ pub fn main(init: std.process.Init) !void {
         const repetitions = if (args.next()) |text| try std.fmt.parseInt(usize, text, 10) else 1;
         return reopen(io, gpa, path, repetitions);
     }
+    if (std.mem.eql(u8, workload, "append_indexes_0") or std.mem.eql(u8, workload, "unindexed_prepare")) {
+        return indexedAppend(0, io, gpa, input_path, path, count, workload);
+    }
+    if (std.mem.eql(u8, workload, "append_indexes_1")) return indexedAppend(1, io, gpa, input_path, path, count, workload);
+    if (std.mem.eql(u8, workload, "append_indexes_3") or std.mem.eql(u8, workload, "indexed_prepare")) {
+        return indexedAppend(3, io, gpa, input_path, path, count, workload);
+    }
+    if (std.mem.startsWith(u8, workload, "read_indexed") or std.mem.startsWith(u8, workload, "read_range")) {
+        const repetitions = if (args.next()) |text| try std.fmt.parseInt(usize, text, 10) else 1;
+        return indexedRead(io, gpa, path, count, repetitions, workload);
+    }
+    if (std.mem.eql(u8, workload, "build_indexes")) return buildIndexes(io, gpa, path);
     return error.UnknownWorkload;
 }
 
@@ -527,10 +690,22 @@ fn everyWorkload(io: std.Io, gpa: std.mem.Allocator) !void {
     try streamAppend(io, gpa, input, streamed, count, "stream_prepare");
     try readStream(io, gpa, streamed, count, if (smoke) 2 else 100);
     try streamVersion(io, gpa, streamed, count, if (smoke) 1 else 100);
+    const indexed = "indexed";
+    try indexedAppend(0, io, gpa, input, scratch, count, "append_indexes_0");
+    try indexedAppend(1, io, gpa, input, scratch, count, "append_indexes_1");
+    try indexedAppend(3, io, gpa, input, scratch, count, "append_indexes_3");
+    try indexedAppend(3, io, gpa, input, indexed, count, "indexed_prepare");
+    inline for (.{ "read_indexed", "read_indexed_baseline", "read_range", "read_range_baseline" }) |workload| {
+        const baseline = comptime std.mem.endsWith(u8, workload, "_baseline");
+        try indexedRead(io, gpa, indexed, count, if (smoke) 2 else if (baseline) 5 else 100, workload);
+    }
+    try indexedAppend(0, io, gpa, input, scratch, count, "unindexed_prepare");
+    try buildIndexes(io, gpa, scratch);
     scrub(io, scratch);
     scrub(io, prepared);
     scrub(io, raw);
     scrub(io, streamed);
+    scrub(io, indexed);
 }
 
 // Smoke exercises correctness without sampling a benchmark clock.

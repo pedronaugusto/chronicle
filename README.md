@@ -140,6 +140,22 @@ still verify. Until that compaction a global `replay` still shows the records; a
 it steps over the stubs. A segment with stubs is format 2, which chronicle 0.10 and older
 refuse by its header.
 
+An event declares its field indexes as `pub const chronicle = .{ .indexes = &.{
+chronicle.index("account", 1, .exact, accountOf) } }`: each a name, a version, a kind
+(`.exact`, or `.ordered` for keys with an order) and a function giving a record's key or
+null. As records are appended the active segment's keys are kept in memory, within
+`Options.index_memory`, past which the segment seals early; when a segment seals, each
+index is written beside it as `<base>.<name>.cdx`. `readIndexed(io, "account", 42, from)`
+reads the records with one key, and `readRange(io, "amount", lo, hi, from)` those whose
+key lies between two, oldest first. A read opens only the segments whose summary (a Bloom
+filter, or the lowest and highest key) admits the key, reads only the records the index
+file names, and checks each one by its offset, its sequence number and its key computed
+again. A segment without a file that describes it is read whole. The files are a cache.
+`buildIndexes` writes the files a sealed segment lacks, one segment a call (a segment
+sealed before an index was declared, or before its version was raised, has none), and
+`indexStatus` counts per index the segments with and without one. A read by key is not ended by a compaction
+beside it: it reads the records compaction keeps.
+
 `subscribe` streams disk history and then live appends through the same sink under the
 journal lock. Sink records last for the callback, which must not call back into the
 journal. Replay records last until the next read, re-arm or replay release. `position`
@@ -165,8 +181,9 @@ exercises schema migration.
 - It does not provide transactions spanning journals, or across appends: one atomic
   batch is the unit that is all or nothing.
 - It does not replicate a journal or coordinate writers across machines.
-- It does not query event fields or build application indexes; the stream index finds a
-  stream's records, nothing more.
+- It does not query event fields beyond the indexes an event declares: a read by key reads
+  one index by one key or one range, with no joins across indexes and no other order than
+  the records'.
 - It does not serialize the application's snapshot state for it.
 - It does not choose retention policy or protect history automatically from compaction.
 
