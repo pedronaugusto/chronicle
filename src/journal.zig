@@ -1395,6 +1395,7 @@ pub fn Journal(comptime Event: type) type {
                 try walk.scan.seekLine(place.offset);
                 const line = (walk.scan.next(io) catch |err| switch (err) {
                     error.TruncatedRecord, error.RecordTooLarge => null,
+                    error.FileNotFound => return walk.gone(),
                     else => |e| return e,
                 }) orelse return walk.distrust(io);
                 if (!walk.inSegment() or walk.scan.line_start != place.offset) return walk.distrust(io);
@@ -1431,7 +1432,10 @@ pub fn Journal(comptime Event: type) type {
             /// computed from its event; null at the segment's end.
             fn readWhole(walk: *Replay, io: Io) ReplayError!?Record {
                 const by = &walk.by.?;
-                while (try walk.scan.next(io)) |line| {
+                while (walk.scan.next(io) catch |err| switch (err) {
+                    error.FileNotFound => return walk.gone(),
+                    else => |e| return e,
+                }) |line| {
                     _ = walk.scan.takeBoundary();
                     if (!walk.inSegment()) break;
                     const header = try line.parse({}, parseHeader);
@@ -1445,6 +1449,21 @@ pub fn Journal(comptime Event: type) type {
                     if (declared.holds(&record.event, by.index, &by.asked)) return record;
                 }
                 by.scanning = false;
+                return null;
+            }
+
+            /// The file of the segment being read has gone since the segment
+            /// was chosen: a compaction put its kept records in another, or
+            /// the segment was dropped. Nothing is passed over: the next
+            /// segment is chosen again, under the lock, from where the read
+            /// stands, so what compaction kept is read and what it removed
+            /// is not.
+            fn gone(walk: *Replay) ?Record {
+                const by = &walk.by.?;
+                by.places.clearRetainingCapacity();
+                by.next_place = 0;
+                by.scanning = false;
+                by.chosen = false;
                 return null;
             }
 

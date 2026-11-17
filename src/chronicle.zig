@@ -992,6 +992,12 @@ pub fn Journal(comptime Event: type) type {
         /// that does not marks the segment's index stale, and the rest of the
         /// segment is read whole.
         ///
+        /// Unlike `replay`, it is not ended by a `compact` or a
+        /// `dropSegmentsBefore` beside it: a segment whose file has gone
+        /// since the read chose it is chosen again from where the read
+        /// stands, so the records compaction keeps are read and those it
+        /// removed are not.
+        ///
         /// It is a `Replay`: `next`, `position`, `deinit`, and `rearmAt`, which
         /// keeps the key. Its position says it has every record with the key
         /// up to its cursor, and names the last record it read, which a
