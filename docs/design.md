@@ -256,6 +256,13 @@ key, over random appends, batches, reopens, cuts, compactions and index files
 removed, cut short, flipped and swapped, and one index whose checksum holds while
 its postings lie.
 
+**Time ranges** (`replayBetween`, `seqAtOrBefore`) read the stream index's
+times: `replayBetween(lo, hi)` starts at the lowest seq whose `at` reaches `lo`;
+past it a segment whose times miss the window is left out unopened, one whose
+times rose is left at its first record past `hi`, and in the rest the records
+outside are stepped over. `seqAtOrBefore` skips a segment whose lowest `at` is
+past the moment, and halves or walks the one that holds the answer.
+
 **Building** (`buildIndexes`): a sealed segment lacks an index's file when the
 summaries hold a stale mark for it, or hold nothing and its file is missing or
 refused by `parse` (a file `parse` accepts has its summary kept, so the next
@@ -340,6 +347,15 @@ turn and is canceled there like every other call, and the tests hold the lock to
 prove that.
 
 ## What was left out, and why
+
+- **Queries over several indexes, or expressions over fields.** That is a query
+  engine: an application intersects two reads, and full text is probe's.
+- **An index over the whole journal** (a global B-tree or LSM). An index per
+  segment is what compaction, cuts and rebuilds already work with; a global one
+  would need durability and recovery of its own, and pruning by summaries keeps
+  reads of selective keys close to it.
+- **Unique constraints.** A journal records what happened; uniqueness is the
+  application's, through `appendIf`.
 
 - **`own.Owned` for an encoded record.** A `Built` record's arena moves from a
   local to the tail array, whose elements are moved by `removePrefix`, or is
