@@ -42,14 +42,8 @@ const Self = @This();
 
 /// A directory or file the log opened, with its one owner: aegis checks that
 /// it is closed once, and from where it was first used.
-const OwnedDir = aegis.own.OwnedIo(Io.Dir, closeDir);
-const OwnedFile = aegis.own.OwnedIo(Io.File, closeFile);
-fn closeDir(handle: *Io.Dir, io: Io) void {
-    handle.close(io);
-}
-fn closeFile(handle: *Io.File, io: Io) void {
-    handle.close(io);
-}
+const OwnedDir = aegis.own.Dir;
+const OwnedFile = aegis.own.File;
 
 /// The file a writer holds its advisory lock on. It is never read or written:
 /// locking a data file instead would mean the lock changed identity every time
