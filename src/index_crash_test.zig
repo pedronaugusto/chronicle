@@ -84,13 +84,14 @@ fn event(id: u64, account: u32) Event {
 pub const Operation = struct {
     kind: Kind,
     h: ?*Seam = null,
-    /// What a run allocates: a crash abandons its tasks with their defers
-    /// unrun, so what the journal held is given back here.
-    arena: std.heap.ArenaAllocator = .init(testing.allocator),
+    /// What a run allocates, over the simulation's allocator, made in
+    /// `setUp`: a crash abandons its tasks with their defers unrun, so what
+    /// the journal held is given back here.
+    arena: std.heap.ArenaAllocator = undefined,
 
     pub fn setUp(s: *Operation, sim: *shakedown.Sim) !void {
-        s.h = try Seam.create(testing.allocator, sim.io(), .{ .trace = .off });
-        s.arena = .init(testing.allocator);
+        s.h = try Seam.create(sim.allocator(), sim.io(), .{ .trace = .off });
+        s.arena = .init(sim.allocator());
     }
 
     pub fn tearDown(s: *Operation) void {
@@ -132,10 +133,10 @@ pub const Operation = struct {
 
     /// A program restarting: a writer opens the journal, which repairs what
     /// the crash left.
-    pub fn recover(s: *Operation, io: Io) !void {
-        const h = try Seam.create(testing.allocator, io, .{ .trace = .off });
+    pub fn recover(s: *Operation, io: Io, gpa: std.mem.Allocator) !void {
+        const h = try Seam.create(gpa, io, .{ .trace = .off });
         defer h.destroy();
-        const journal = Journal.open(testing.allocator, h.io(), "log", options(s.kind.records())) catch |err| switch (err) {
+        const journal = Journal.open(gpa, h.io(), "log", options(s.kind.records())) catch |err| switch (err) {
             // A crash before the first segment was made leaves nothing to open.
             error.FileNotFound => return,
             else => |e| return e,
@@ -143,11 +144,11 @@ pub const Operation = struct {
         journal.deinit(h.io());
     }
 
-    pub fn check(s: *Operation, io: Io) !void {
-        const h = try Seam.create(testing.allocator, io, .{ .trace = .off });
+    pub fn check(s: *Operation, io: Io, gpa: std.mem.Allocator) !void {
+        const h = try Seam.create(gpa, io, .{ .trace = .off });
         defer h.destroy();
         const hooked = h.io();
-        const journal = Journal.open(testing.allocator, hooked, "log", options(s.kind.records())) catch |err| switch (err) {
+        const journal = Journal.open(gpa, hooked, "log", options(s.kind.records())) catch |err| switch (err) {
             error.FileNotFound => return,
             else => |e| return e,
         };
