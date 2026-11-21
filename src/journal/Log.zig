@@ -1434,19 +1434,20 @@ fn resumeIndex(log: *Self, io: Io, segment: Segment) OpenError!?Resumed {
         if (!values.below(last.offset, segment.bytes)) return null;
         builder.last_offset = last.offset;
     }
-    const length = (indexFileLength(indexed.entries) orelse return null).raw();
+    const length = indexFileLength(indexed.entries) orelse return null;
     {
         var buffer: [64 * index_entry_len]u8 = undefined;
-        var at: u64 = index_header_len;
-        while (at < length) {
-            const want: usize = @intCast(@min(buffer.len, length - at));
-            const read = held.readPositionalAll(io, buffer[0..want], at) catch |e| {
+        var at: Bytes = .fromRaw(index_header_len);
+        while (at.compare(length) == .lt) {
+            const left = length.sub(at) catch aegis.assert.never("the reads end at the index's length");
+            const want: usize = @intCast(@min(buffer.len, left.raw())); // safe: at most the buffer's length.
+            const read = held.readPositionalAll(io, buffer[0..want], at.raw()) catch |e| {
                 try cancelOf(e);
                 return null;
             };
             if (read != want) return null;
             builder.checksum.update(buffer[0..want]);
-            at += want;
+            at = at.add(.fromRaw(want)) catch aegis.assert.never("the reads end at the index's length");
         }
     }
     log.releaseIndex(io);
@@ -1460,7 +1461,7 @@ fn resumeIndex(log: *Self, io: Io, segment: Segment) OpenError!?Resumed {
     };
     var returned = false;
     defer if (!returned) file.close(io);
-    file.setLength(io, length) catch |e| {
+    file.setLength(io, length.raw()) catch |e| {
         try cancelOf(e);
         return null;
     };
@@ -1474,7 +1475,7 @@ fn resumeIndex(log: *Self, io: Io, segment: Segment) OpenError!?Resumed {
     };
 
     var writer = file.writer(io, log.index_buf);
-    writer.pos = length;
+    writer.pos = length.raw();
     returned = true;
     return .{ .file = .init(file), .writer = writer, .indexed = indexed, .builder = builder };
 }

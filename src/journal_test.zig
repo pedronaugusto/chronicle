@@ -6338,15 +6338,15 @@ fn fuzzRoundTrip(_: void, c: *shakedown.Case) anyerror!void {
                     else => .{ .removed = .{ .id = id } },
                 } };
             }
-            const before = (try journal.lastSeq(io)).raw();
+            const before = try journal.lastSeq(io);
             // Every name is text, with what JSON escapes in it: every one of
             // these is a record.
             const last = if (n == 1)
                 try journal.append(io, batch[0].at, batch[0].event)
             else
                 try journal.appendAll(io, batch[0..n], .group);
-            try testing.expectEqual(Seq.fromRaw(before + n), last);
-            for (batch[0..n], before + 1..) |entry, seq| {
+            try testing.expectEqual(try before.advance(.fromRaw(n)), last);
+            for (batch[0..n], (try before.successor()).raw()..) |entry, seq| {
                 try appended.append(a, entry);
                 expected.apply(seq, entry.at.raw(), entry.event);
             }

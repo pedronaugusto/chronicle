@@ -190,9 +190,10 @@ fn modelOne(_: void, case: *shakedown.Case) anyerror!void {
                 journal = try Journal.open(gpa, io, place.path, options);
             },
             6 => {
-                const last = (try journal.lastSeq(io)).raw();
-                const cut = last -| gen.intRange(s, u64, 0, 3);
-                journal.truncateAfter(io, .fromRaw(cut)) catch |err| switch (err) {
+                const last = try journal.lastSeq(io);
+                // Up to three records back, and no further than the first.
+                const cut = last.retreat(.fromRaw(gen.intRange(s, u64, 0, 3))) catch chronicle.Seq.fromRaw(0);
+                journal.truncateAfter(io, cut) catch |err| switch (err) {
                     error.SeqTooOld => {},
                     else => |e| return e,
                 };

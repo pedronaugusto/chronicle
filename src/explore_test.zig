@@ -36,19 +36,18 @@ fn tail(io: Io) !void {
     defer journal.deinit(hooked);
     const Reader = struct {
         fn run(inner: Io, j: *Journal) !void {
-            var seen: u64 = 0;
-            while (seen < appended) {
-                const newest = (try j.waitPast(inner, Seq.fromRaw(seen))).raw();
-                if (newest <= seen) return error.WokenWithNothing;
-                const walk = try j.replay(inner, Seq.fromRaw(seen));
+            var seen: Seq = .fromRaw(0);
+            while (seen.compare(.fromRaw(appended)) == .lt) {
+                const newest = try j.waitPast(inner, seen);
+                if (newest.compare(seen) != .gt) return error.WokenWithNothing;
+                const walk = try j.replay(inner, seen);
                 defer walk.deinit(inner);
                 while (try walk.next(inner)) |record| {
-                    const seq = record.seq.raw();
-                    if (seq != seen + 1) return error.RecordsOutOfOrder;
-                    if (record.event.created.id != seq) return error.RecordTorn;
-                    seen = seq;
+                    if (!record.seq.eql(try seen.successor())) return error.RecordsOutOfOrder;
+                    if (!record.seq.eql(.fromRaw(record.event.created.id))) return error.RecordTorn;
+                    seen = record.seq;
                 }
-                if (seen < newest) return error.RecordsMissing;
+                if (seen.compare(newest) == .lt) return error.RecordsMissing;
             }
         }
     };
