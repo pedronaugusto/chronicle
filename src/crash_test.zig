@@ -60,17 +60,18 @@ fn event(seq: u64) Event {
 pub const Operation = struct {
     kind: Kind,
     h: ?*Seam = null,
-    /// What a run allocates: a crash abandons its tasks with their defers
-    /// unrun, so what the journal held is given back here.
-    arena: std.heap.ArenaAllocator = .init(testing.allocator),
+    /// What a run allocates, over the simulation's allocator, made in
+    /// `setUp`: a crash abandons its tasks with their defers unrun, so what
+    /// the journal held is given back here.
+    arena: std.heap.ArenaAllocator = undefined,
     /// The appends that returned before the crash.
     acknowledged: u64 = 0,
     /// Whether the compaction or the truncation returned.
     finished: bool = false,
 
     pub fn setUp(s: *Operation, sim: *shakedown.Sim) !void {
-        s.h = try Seam.create(testing.allocator, sim.io(), .{ .trace = .off });
-        s.arena = .init(testing.allocator);
+        s.h = try Seam.create(sim.allocator(), sim.io(), .{ .trace = .off });
+        s.arena = .init(sim.allocator());
         s.acknowledged = 0;
         s.finished = false;
     }
@@ -108,19 +109,19 @@ pub const Operation = struct {
 
     /// A program restarting: a writer opens the journal, which repairs what
     /// the crash left and finishes what it had begun.
-    pub fn recover(s: *Operation, io: Io) !void {
+    pub fn recover(s: *Operation, io: Io, gpa: std.mem.Allocator) !void {
         _ = s;
-        const h = try Seam.create(testing.allocator, io, .{ .trace = .off });
+        const h = try Seam.create(gpa, io, .{ .trace = .off });
         defer h.destroy();
-        const journal = try Journal.open(testing.allocator, h.io(), "log", options());
+        const journal = try Journal.open(gpa, h.io(), "log", options());
         journal.deinit(h.io());
     }
 
-    pub fn check(s: *Operation, io: Io) !void {
-        const h = try Seam.create(testing.allocator, io, .{ .trace = .off });
+    pub fn check(s: *Operation, io: Io, gpa: std.mem.Allocator) !void {
+        const h = try Seam.create(gpa, io, .{ .trace = .off });
         defer h.destroy();
         const hooked = h.io();
-        const journal = try Journal.open(testing.allocator, hooked, "log", .{ .access = .read, .verify = .full });
+        const journal = try Journal.open(gpa, hooked, "log", .{ .access = .read, .verify = .full });
         defer journal.deinit(hooked);
         const last = try journal.lastSeq(hooked);
         // Nothing the run did not append, and nothing it was told is
