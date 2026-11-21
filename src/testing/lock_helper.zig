@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
                     io,
                     // The chaos helper draws from the raw bounds it was just handed;
                     // a position below the oldest is the error it tolerates.
-                    .fromRaw(random.random().intRangeAtMost(u64, oldest.raw() -| 1, newest.raw())),
+                    .fromRaw(random.random().intRangeAtMost(u64, (oldest.predecessor() catch oldest).raw(), newest.raw())),
                 ) catch |err| switch (err) {
                     error.SeqTooOld => {},
                     else => return err,

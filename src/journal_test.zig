@@ -124,38 +124,49 @@ fn created(id: u32, name: []const u8) Event {
     return .{ .created = .{ .id = id, .name = name } };
 }
 
-/// This process's identifier — the one thing a worker forked from the test
-/// runner does not share with the runner or with its siblings.
-fn processId() u64 {
-    if (builtin.target.os.tag == .windows) return std.os.windows.GetCurrentProcessId();
-    return @intCast(std.posix.system.getpid());
-}
-
-/// Counts the workspaces this process has made, so that two of them in the
-/// same test binary cannot share a name either.
+/// Counts the workspaces this process has named, so that two of them in the
+/// same test binary differ in name before any randomness.
 var workspaces: aegis.Atomic(Workspaces) = .init(.fromRaw(0));
 const Workspaces = aegis.units.Count(enum { workspace }, u64);
 
-/// A directory name no other process can choose.
+/// Where every workspace is made.
+const workspace_parent = ".zig-cache/tmp";
+
+/// A directory name for a workspace, which `createWorkspace` makes only if no
+/// other process holds it.
 ///
 /// `std.testing.tmpDir` names its directory from the test runner's random
 /// stream. A fuzzing run forks several workers, each inheriting that stream at
 /// the point it was forked, so every worker asks for the same directory in the
 /// same order: one of them removes the directory another is working in, and
 /// the failure that comes back is whatever the loser happened to be doing —
-/// `error.FileNotFound`, `error.Locked`, `error.BadPathName`. The process id
-/// and a counter are unique without depending on randomness at all; the
-/// trailing bytes come from `randomSecure`, which reads fresh entropy rather
-/// than a stored state a fork could have copied, so a directory a crashed run
-/// left behind is not picked up either.
+/// `error.FileNotFound`, `error.Locked`, `error.BadPathName`. The trailing
+/// bytes come from `randomSecure`, which reads fresh entropy rather than a
+/// stored state a fork could have copied; and since a name is taken only by
+/// creating its directory, which fails where it exists, two workers that drew
+/// the same name still never share it.
 fn workspaceName(buffer: *[64]u8) []const u8 {
     var fresh: [8]u8 = undefined;
     testing.io.randomSecure(&fresh) catch testing.io.random(&fresh);
-    return std.mem.print(buffer, ".zig-cache/tmp/chronicle-{d}-{d}-{x}", .{
-        processId(),
+    return std.mem.print(buffer, workspace_parent ++ "/chronicle-{d}-{x}", .{
         workspaces.fetchAddWrapping(.fromRaw(1), .monotonic).raw(),
         std.mem.readInt(u64, &fresh, .little),
     }) catch unreachable;
+}
+
+/// Makes a workspace directory no other process holds: a name is drawn again
+/// while its directory exists already.
+fn createWorkspace(io: Io, buffer: *[64]u8) ![]const u8 {
+    const cwd: Io.Dir = .cwd();
+    try cwd.createDirPath(io, workspace_parent);
+    while (true) {
+        const name = workspaceName(buffer);
+        cwd.createDir(io, name, .default_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => continue,
+            else => |e| return e,
+        };
+        return name;
+    }
 }
 
 /// A temporary directory plus the absolute path of a journal inside it, torn
@@ -175,9 +186,8 @@ const Workspace = struct {
         errdefer arena.deinit();
 
         var buffer: [64]u8 = undefined;
-        const root_path = try arena.allocator().dupe(u8, workspaceName(&buffer));
+        const root_path = try arena.allocator().dupe(u8, try createWorkspace(io, &buffer));
         const cwd: Io.Dir = .cwd();
-        try cwd.createDirPath(io, root_path);
         errdefer cwd.deleteTree(io, root_path) catch |err| {
             // Rollback must preserve the original setup failure.
             std.log.debug("fixture rollback: {t}", .{err});
@@ -6338,15 +6348,15 @@ fn fuzzRoundTrip(_: void, c: *shakedown.Case) anyerror!void {
                     else => .{ .removed = .{ .id = id } },
                 } };
             }
-            const before = (try journal.lastSeq(io)).raw();
+            const before = try journal.lastSeq(io);
             // Every name is text, with what JSON escapes in it: every one of
             // these is a record.
             const last = if (n == 1)
                 try journal.append(io, batch[0].at, batch[0].event)
             else
                 try journal.appendAll(io, batch[0..n], .group);
-            try testing.expectEqual(Seq.fromRaw(before + n), last);
-            for (batch[0..n], before + 1..) |entry, seq| {
+            try testing.expectEqual(try before.advance(.fromRaw(n)), last);
+            for (batch[0..n], (try before.successor()).raw()..) |entry, seq| {
                 try appended.append(a, entry);
                 expected.apply(seq, entry.at.raw(), entry.event);
             }

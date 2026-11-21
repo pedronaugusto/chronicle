@@ -205,6 +205,12 @@ fn reopenFull(io: Io, gpa: std.mem.Allocator, data: []const u8, repetitions: usi
     try check("clean_reopen", "last", last);
 }
 
+/// A record's place from the journal's beginning, the term the sums below add: as many records
+/// as its sequence number counts.
+fn place(seq: chronicle.Seq) !chronicle.Records {
+    return chronicle.beginning.distanceTo(seq);
+}
+
 /// `replay(cursor)` and one `next`, at 2,000 pseudo-random cursors.
 fn seek(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const journal = try J.open(gpa, io, data, options(.never, .read));
@@ -212,7 +218,7 @@ fn seek(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const count = (try journal.lastSeq(io)).raw();
     const rounds: usize = if (smoke) 1 else 2_000;
     var cursors: Cursors = .{};
-    var sum: u64 = 0;
+    var sum: chronicle.Records = .fromRaw(0);
     const started = now(io);
     for (0..rounds) |_| {
         const cursor = cursors.next(count);
@@ -220,11 +226,11 @@ fn seek(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
         defer walk.deinit(io);
         const record = (try walk.next(io)) orelse return error.NoRecord;
         if (record.seq != chronicle.Seq.fromRaw(cursor + 1)) return error.WrongSequence;
-        sum += record.seq.raw();
+        sum = try sum.add(try place(record.seq));
     }
     const elapsed = since(io, started);
     try rate("seek", rounds, elapsed);
-    try check("seek", "sum", sum);
+    try check("seek", "sum", sum.raw());
 }
 
 /// `seqAtOrAfter` at 10,000 pseudo-random times (`at` is the record's number).
@@ -234,15 +240,15 @@ fn seqAt(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const count = (try journal.lastSeq(io)).raw();
     const rounds: usize = if (smoke) 1 else 10_000;
     var cursors: Cursors = .{};
-    var sum: u64 = 0;
+    var sum: chronicle.Records = .fromRaw(0);
     const started = now(io);
     for (0..rounds) |_| {
         const at = cursors.next(count) + 1;
-        sum += ((try journal.seqAtOrAfter(io, .fromRaw(@intCast(at)))) orelse return error.NoRecord).raw();
+        sum = try sum.add(try place((try journal.seqAtOrAfter(io, .fromRaw(@intCast(at)))) orelse return error.NoRecord));
     }
     const elapsed = since(io, started);
     try rate("seq-at", rounds, elapsed);
-    try check("seq-at", "sum", sum);
+    try check("seq-at", "sum", sum.raw());
 }
 
 const Fold = struct {
@@ -256,19 +262,21 @@ const Fold = struct {
     }
 };
 
-/// `subscribeFrom` and `subscribeAllFrom` over the last tenth of the journal.
+/// `subscribeFrom` and `subscribeAllFrom` over the last 100,000 records (2 in a smoke run): the
+/// last tenth of the journal `fill` writes.
 fn subscribeFrom(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
     const journal = try J.open(gpa, io, data, options(.never, .read));
     defer journal.deinit(io);
-    const count = (try journal.lastSeq(io)).raw();
-    const from = count - count / 10;
+    const last = try journal.lastSeq(io);
+    const from = last.retreat(.fromRaw(if (smoke) 2 else 100_000)) catch chronicle.beginning;
+    const items = (try from.distanceTo(last)).raw();
     {
         var one: Fold = .{};
         const started = now(io);
-        try journal.subscribeFrom(io, one.sink(), .fromRaw(from));
+        try journal.subscribeFrom(io, one.sink(), from);
         const elapsed = since(io, started);
         _ = try journal.unsubscribe(io, one.sink());
-        try rate("subscribe-from", count - from, elapsed);
+        try rate("subscribe-from", items, elapsed);
         try check("subscribe-from", "seen", one.seen);
     }
     {
@@ -276,11 +284,11 @@ fn subscribeFrom(io: Io, gpa: std.mem.Allocator, data: []const u8) !void {
         var sinks: [5]J.Sink = undefined;
         for (&five, &sinks) |*fold, *s| s.* = fold.sink();
         const started = now(io);
-        try journal.subscribeAllFrom(io, &sinks, .fromRaw(from));
+        try journal.subscribeAllFrom(io, &sinks, from);
         const elapsed = since(io, started);
         var seen: u64 = 0;
         for (five) |fold| seen += fold.seen;
-        try rate("subscribe-all-from", count - from, elapsed);
+        try rate("subscribe-all-from", items, elapsed);
         try check("subscribe-all-from", "seen", seen);
     }
 }
@@ -435,9 +443,9 @@ fn tailers(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
         list.deinit();
     }
     try rate("readers", rounds, since(io, list_started));
-    var lowest: u64 = 0;
+    var lowest: chronicle.Records = .fromRaw(0);
     const min_started = now(io);
-    for (0..rounds) |_| lowest += ((try journal.minCursor(io)) orelse return error.NoCursor).raw();
+    for (0..rounds) |_| lowest = try lowest.add(try place((try journal.minCursor(io)) orelse return error.NoCursor));
     try rate("min-cursor", rounds, since(io, min_started));
     var replayed: u64 = 0;
     const replay_started = now(io);
@@ -450,7 +458,7 @@ fn tailers(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
     }
     try rate("tailer-replay", replayed, since(io, replay_started));
     try check("tailer", "listed", listed);
-    try check("tailer", "lowest", lowest);
+    try check("tailer", "lowest", lowest.raw());
     try check("tailer", "replayed", replayed);
 }
 
@@ -469,17 +477,17 @@ fn snapshots(io: Io, gpa: std.mem.Allocator, scratch: []const u8) !void {
         try rate("snapshot", rounds, since(io, started));
     }
     const rounds: usize = if (smoke) 1 else 20;
-    var seq: u64 = 0;
+    var seq: chronicle.Records = .fromRaw(0);
     const started = now(io);
     for (0..rounds) |_| {
         const opened = try J.openWithSnapshot(gpa, io, scratch, .{ .sync = .never });
         defer opened.journal.deinit(io);
         const taken = opened.snapshot orelse return error.NoSnapshot;
-        seq += taken.seq.raw();
+        seq = try seq.add(try place(taken.seq));
         taken.deinit();
     }
     try rate("open-with-snapshot", rounds, since(io, started));
-    try check("snapshot", "seq", seq);
+    try check("snapshot", "seq", seq.raw());
 }
 
 /// Retention on a fresh 200,000-record journal each: `dropSegmentsBefore`,

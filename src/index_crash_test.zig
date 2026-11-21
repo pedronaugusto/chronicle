@@ -198,7 +198,7 @@ fn agree(journal: *Journal, io: Io, q: Query) !void {
     defer walk.deinit(io);
     var got: usize = 0;
     while (try walk.next(io)) |r| {
-        if (got == wanted or r.seq.raw() != want[got]) return error.ReadByKeyDisagrees;
+        if (got == wanted or !r.seq.eql(.fromRaw(want[got]))) return error.ReadByKeyDisagrees;
         got += 1;
     }
     if (got != wanted) return error.ReadByKeyMissedRecords;

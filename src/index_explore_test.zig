@@ -48,20 +48,21 @@ fn put(journal: *Journal, io: Io, seq: u64) !void {
 /// with the key, and every record with the key that compaction keeps and
 /// that was appended before the read began is among them.
 fn read(io: Io, journal: *Journal) !void {
-    const last = (try journal.lastSeq(io)).raw();
+    const last = try journal.lastSeq(io);
     const walk = try journal.readIndexed(io, "key", asked, .after(.fromRaw(0)));
     defer walk.deinit(io);
-    var seen: u64 = 0;
+    var seen: chronicle.Seq = .fromRaw(0);
     var found: [keys.len]bool = @splat(false);
     while (try walk.next(io)) |record| {
-        const seq = record.seq.raw();
-        if (seq <= seen) return error.RecordsOutOfOrder;
-        if (record.event.put.key != asked or keys[seq - 1] != asked) return error.WrongKey;
-        found[seq - 1] = true;
-        seen = seq;
+        if (record.seq.compare(seen) != .gt) return error.RecordsOutOfOrder;
+        // Record `seq` was the write of `keys[seq - 1]`.
+        const index = (try record.seq.predecessor()).raw();
+        if (record.event.put.key != asked or keys[index] != asked) return error.WrongKey;
+        found[index] = true;
+        seen = record.seq;
     }
     for (keys, 1..) |key, seq| {
-        if (key == asked and seq > kept_after and seq <= last and !found[seq - 1]) return error.RecordMissing;
+        if (key == asked and seq > kept_after and last.compare(.fromRaw(seq)) != .lt and !found[seq - 1]) return error.RecordMissing;
     }
 }
 

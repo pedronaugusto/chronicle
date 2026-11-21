@@ -122,40 +122,44 @@ pub const Operation = struct {
         const hooked = h.io();
         const journal = try Journal.open(testing.allocator, hooked, "log", .{ .access = .read, .verify = .full });
         defer journal.deinit(hooked);
-        const last = (try journal.lastSeq(hooked)).raw();
+        const last = try journal.lastSeq(hooked);
         // Nothing the run did not append, and nothing it was told is
         // durable lost.
-        if (last > appended) return error.RecordFromNowhere;
+        if (last.compare(.fromRaw(appended)) == .gt) return error.RecordFromNowhere;
         switch (s.kind) {
             // Cut short, a truncation leaves a prefix of what it was cutting,
             // never less than it keeps; `truncateAfter` again finishes it.
             .truncate => if (s.finished) {
-                if (last != 3) return error.TruncationLost;
-            } else if (last < @min(3, s.acknowledged)) return error.AcknowledgedLost,
-            else => if (last < s.acknowledged) return error.AcknowledgedLost,
+                if (!last.eql(.fromRaw(3))) return error.TruncationLost;
+            } else if (last.compare(.fromRaw(@min(3, s.acknowledged))) == .lt) return error.AcknowledgedLost,
+            else => if (last.compare(.fromRaw(s.acknowledged)) == .lt) return error.AcknowledgedLost,
         }
         // The records there are are those appended, in order, each whole.
         const walk = try journal.replay(hooked, Seq.fromRaw(0));
         defer walk.deinit(hooked);
-        var expected: ?u64 = null;
+        var expected: ?Seq = null;
         while (try walk.next(hooked)) |record| {
-            const seq = record.seq.raw();
+            const seq = record.seq;
             if (expected) |e| {
-                if (seq != e) return error.RecordsOutOfOrder;
+                if (!seq.eql(e)) return error.RecordsOutOfOrder;
             } else {
                 // A compaction drops what it was told to, once it returned
                 // and perhaps before; nothing else goes.
                 const first_ok = switch (s.kind) {
-                    .compact => if (s.finished) seq == 5 else seq == 1 or seq == 5,
-                    else => seq == 1,
+                    .compact => if (s.finished) seq.eql(.fromRaw(5)) else seq.eql(.fromRaw(1)) or seq.eql(.fromRaw(5)),
+                    else => seq.eql(.fromRaw(1)),
                 };
                 if (!first_ok) return error.HistoryLost;
             }
-            try testing.expectEqual(@as(u32, @intCast(seq)), record.event.created.id);
-            try testing.expectEqual(@as(i64, @intCast(seq)), record.at.raw());
-            expected = seq + 1;
+            // Each record's event and time carry its number (`event`, `.fromRaw(seq)` above).
+            try testing.expectEqual(seq.raw(), record.event.created.id);
+            try testing.expectEqual(@as(?u64, seq.raw()), std.math.cast(u64, record.at.raw()));
+            expected = try seq.successor();
         }
-        if (last != 0 and expected != last + 1) return error.RecordsMissing;
+        if (!last.eql(.fromRaw(0))) {
+            const e = expected orelse return error.RecordsMissing;
+            if (!e.eql(try last.successor())) return error.RecordsMissing;
+        }
     }
 };
 

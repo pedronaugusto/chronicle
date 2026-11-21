@@ -459,7 +459,7 @@ fn streamProgram(_: void, c: *shakedown.Case) anyerror!void {
             .any => true,
             .no_stream => versions[k] == 0,
             .exists => versions[k] != 0,
-            .exact => |v| v.raw() == versions[k],
+            .exact => |v| v.eql(.fromRaw(versions[k])),
         };
         const n = shakedown.gen.intRange(s, usize, 1, 3);
         if (counts[k] + n > written[k].len) break;
