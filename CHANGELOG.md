@@ -28,6 +28,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- chronicle's own development holds it to the family's policy: `"policy": "family"` in ci/preflight.json, beside the hardened profile ci/workflow.json declares; the hardened and hardened-tsan legs pass.
 - Development on shakedown 53158a4. The crash sweeps' contexts allocate from what shakedown hands them, the simulation's allocator in `setUp` and the recovery's in `recover` and `check`, where they used the testing allocator, whose stack trace per allocation made the index crash sweeps take 33 s each in Debug, close enough to the test runner's 120 s bound that a loaded machine ran them out; they take about 2 s, and a leak in a recovery fails the sweep at its crash point.
 - A sealed segment's stream index (`<base>.sdx`) is a field index file: the exact index named `stream`, each stream's id kept whole and each record's version beside its seq and offset, after a split-block Bloom filter, with a CRC-32C, every byte of its header written in its place, little endian, so a segment's index file is the same bytes on every host and whoever writes it; it is written under a temporary name and renamed into place, with no sync. A stream index in the format before reads as none and is rebuilt from its segment when first read.
 - Pins strand cb3d74c, on airlock 3ef2f54 as chronicle is, so a build has one airlock. The sync tests name the call the BSDs make, a plain fsync, for an append's sync and each file a backup copies.
